@@ -3718,6 +3718,16 @@ class AIAgent:
                 continue
 
             role = item.get("role")
+            # CCH doesn't support 'developer' role, convert to 'user' with [SYSTEM]: prefix
+            if role == "developer":
+                content = item.get("content", "")
+                if content is None:
+                    content = ""
+                if not isinstance(content, str):
+                    content = str(content)
+                normalized.append({"role": "user", "content": f"[SYSTEM]: {content}"})
+                continue
+
             if role in {"user", "assistant"}:
                 content = item.get("content", "")
                 if content is None:
@@ -4328,9 +4338,186 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _run_codex_stream_httpx_direct(self, api_kwargs: dict, on_first_delta: callable = None):
+        """Bypass OpenAI SDK and use httpx directly for Responses API streaming.
+
+        Workaround for Python OpenAI SDK compatibility issues with some proxies (e.g. CCH).
+        """
+        import httpx as _httpx
+        import json as _json
+        import uuid
+
+        base_url = (self.base_url or "").rstrip("/")
+        url = f"{base_url}/responses"
+        api_key = self.api_key or ""
+
+        # Force stream=True for httpx direct mode (bypass path skips SDK preflight)
+        api_kwargs = dict(api_kwargs)
+        api_kwargs["stream"] = True
+
+        logger.info(f"[CODEX_HTTPX_DIRECT] url={url}, model={self.model}")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        # Build payload
+        payload = dict(api_kwargs)
+
+        has_tool_calls = False
+        first_delta_fired = False
+        self._codex_streamed_text_parts: list = []
+        collected_output_items: list = []
+        terminal_response_data = None
+
+        timeout = _httpx.Timeout(
+            connect=30.0,
+            read=float(os.getenv("HERMES_STREAM_READ_TIMEOUT", "60.0")),
+            write=300.0,
+            pool=30.0,
+        )
+
+        try:
+            with _httpx.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                if response.status_code >= 400:
+                    error_body = response.read()
+                    raise RuntimeError(f"HTTP {response.status_code}: {error_body.decode('utf-8', errors='replace')[:500]}")
+
+                for line in response.iter_lines():
+                    if self._interrupt_requested:
+                        break
+
+                    self._touch_activity("receiving stream response")
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Parse SSE format: "data: {...}"
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        if data_str == "[DONE]":
+                            continue
+
+                        try:
+                            event = _json.loads(data_str)
+                        except _json.JSONDecodeError:
+                            continue
+
+                        event_type = event.get("type", "")
+
+                        # Handle text deltas
+                        if "output_text.delta" in event_type or event_type == "response.output_text.delta":
+                            delta_text = event.get("delta", "")
+                            if delta_text:
+                                self._codex_streamed_text_parts.append(delta_text)
+                            if delta_text and not has_tool_calls:
+                                if not first_delta_fired:
+                                    first_delta_fired = True
+                                    if on_first_delta:
+                                        try:
+                                            on_first_delta()
+                                        except Exception:
+                                            pass
+                                self._fire_stream_delta(delta_text)
+
+                        # Track tool calls
+                        elif "function_call" in event_type:
+                            has_tool_calls = True
+
+                        # Handle reasoning deltas
+                        elif "reasoning" in event_type and "delta" in event_type:
+                            reasoning_text = event.get("delta", "")
+                            if reasoning_text:
+                                self._fire_reasoning_delta(reasoning_text)
+
+                        # Collect completed output items
+                        elif event_type == "response.output_item.done":
+                            done_item = event.get("item")
+                            if done_item:
+                                collected_output_items.append(done_item)
+
+                        # Handle terminal events
+                        elif event_type in ("response.completed", "response.incomplete", "response.failed"):
+                            terminal_response_data = event.get("response", event)
+
+        except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            logger.error(f"[CODEX_HTTPX_DIRECT] Connection error: {exc}")
+            raise
+
+        # Build response object
+        if terminal_response_data is None:
+            # Synthesize from collected data
+            if self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                terminal_response_data = {
+                    "id": f"resp_{uuid.uuid4().hex[:24]}",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": assembled}]
+                    }]
+                }
+            else:
+                raise RuntimeError("Responses stream did not emit a terminal response")
+
+        # Backfill output if empty
+        output = terminal_response_data.get("output", [])
+        if isinstance(output, list) and not output:
+            if collected_output_items:
+                terminal_response_data["output"] = collected_output_items
+            elif self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                terminal_response_data["output"] = [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": assembled}]
+                }]
+
+        # Return a SimpleNamespace object that mimics SDK response
+        return self._build_responses_object(terminal_response_data)
+
+    def _build_responses_object(self, data: dict) -> Any:
+        """Build a response object from parsed JSON that mimics SDK's response object."""
+        from types import SimpleNamespace
+
+        def build_content_item(item):
+            if not isinstance(item, dict):
+                return item
+            return SimpleNamespace(**{k: v for k, v in item.items()})
+
+        def build_output_item(item):
+            if not isinstance(item, dict):
+                return item
+            content = item.get("content")
+            if isinstance(content, list):
+                item["content"] = [build_content_item(c) for c in content]
+            return SimpleNamespace(**item)
+
+        output = data.get("output", [])
+        if isinstance(output, list):
+            data["output"] = [build_output_item(o) for o in output]
+
+        return SimpleNamespace(**data)
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
+
+        # Check if we should bypass SDK and use httpx directly
+        # Useful for proxies that don't work well with Python OpenAI SDK (e.g. CCH)
+        bypass_sdk = os.getenv("HERMES_CODEX_BYPASS_SDK", "").lower() in ("true", "1", "yes")
+        if bypass_sdk:
+            logger.info("[CODEX_STREAM] Bypassing SDK, using httpx directly")
+            return self._run_codex_stream_httpx_direct(api_kwargs, on_first_delta=on_first_delta)
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
