@@ -6517,7 +6517,7 @@ class HermesCLI:
         original_count = len(self.conversation_history)
 
         try:
-            from agent.auxiliary_client import call_llm
+            from agent.auxiliary_client import call_llm, _resolve_task_provider_model
             from agent.model_metadata import estimate_messages_tokens_rough
 
             approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
@@ -6542,12 +6542,46 @@ class HermesCLI:
                         f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
                     )
 
-                response = call_llm(
-                    task="compression",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=summary_budget * 2,
+                main_runtime = self.agent._current_main_runtime()
+                resolved_provider, resolved_model, _resolved_base_url, _resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
+                    "compression", None, None, None, None
                 )
-                content = response.choices[0].message.content
+                print(
+                    "  ℹ /mycompress debug: "
+                    f"main={main_runtime.get('provider','?')}/{main_runtime.get('model','?')}"
+                    f" api_mode={main_runtime.get('api_mode','?')} "
+                    f"cfg={resolved_provider or 'auto'}/{resolved_model or '<default>'}"
+                    f" cfg_api_mode={resolved_api_mode or '<auto>'}"
+                )
+
+                if (main_runtime.get("api_mode") or getattr(self.agent, "api_mode", "")) == "codex_responses":
+                    system_prompt = self.agent._cached_system_prompt or self.agent._build_system_prompt()
+                    api_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ]
+                    codex_kwargs = self.agent._build_api_kwargs(api_messages)
+                    codex_kwargs.pop("tools", None)
+                    codex_kwargs.pop("tool_choice", None)
+                    codex_kwargs.pop("parallel_tool_calls", None)
+                    codex_kwargs["max_output_tokens"] = summary_budget * 2
+                    summary_response = self.agent._run_codex_stream(codex_kwargs)
+                    assistant_message, _ = self.agent._normalize_codex_response(summary_response)
+                    content = ""
+                    if assistant_message:
+                        content = (
+                            getattr(assistant_message, "content", None)
+                            or getattr(assistant_message, "reasoning", None)
+                            or ""
+                        )
+                else:
+                    response = call_llm(
+                        task="compression",
+                        main_runtime=main_runtime,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=summary_budget * 2,
+                    )
+                    content = response.choices[0].message.content
                 if not isinstance(content, str):
                     content = str(content) if content else ""
                 summary = content.strip()

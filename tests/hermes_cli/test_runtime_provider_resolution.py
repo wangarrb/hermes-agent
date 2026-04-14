@@ -171,6 +171,38 @@ def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     assert resolved["requested_provider"] == "qwen-oauth"
 
 
+def test_named_custom_provider_preserves_requested_provider_label(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda requested_provider: {
+            "name": "CCH",
+            "base_url": "http://cch.jmadas.com/v1",
+            "api_mode": "codex_responses",
+            "model": "gpt-5.4",
+            "provider_key": "cch",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda base_url, provider_label, api_mode_override: {
+            "provider": provider_label,
+            "api_mode": api_mode_override,
+            "base_url": base_url,
+            "api_key": "pool-token",
+            "source": "pool:custom:cch",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="cch")
+
+    assert resolved["provider"] == "cch"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "http://cch.jmadas.com/v1"
+    assert resolved["model"] == "gpt-5.4"
+
+
 def test_resolve_runtime_provider_uses_qwen_pool_entry(monkeypatch):
     class _Entry:
         access_token = "pool-qwen-token"
@@ -564,7 +596,7 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="local")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "local"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "http://1.2.3.4:1234/v1"
     assert resolved["api_key"] == "local-provider-key"
@@ -604,7 +636,7 @@ def test_named_custom_provider_uses_providers_dict_when_list_missing(monkeypatch
 
     resolved = rp.resolve_runtime_provider(requested="openai-direct-primary")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "openai-direct-primary"
     assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "https://api.openai.com/v1"
     assert resolved["api_key"] == "dir-key"
@@ -644,7 +676,7 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="mycorp-proxy")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "mycorp-proxy"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "https://proxy.example.com/v1"
     assert resolved["api_key"] == "env-secret"
@@ -683,7 +715,7 @@ def test_named_custom_provider_uses_api_key_env_alias_from_providers_dict(monkey
 
     resolved = rp.resolve_runtime_provider(requested="cch")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "cch"
     assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "http://cch.jmadas.com/v1"
     assert resolved["api_key"] == "cch-env-secret"
@@ -1402,7 +1434,7 @@ def test_named_custom_runtime_propagates_model_direct_path(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="my-server")
     assert resolved["model"] == "qwen3.6-plus"
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "my-server"
 
 
 def test_named_custom_runtime_propagates_model_pool_path(monkeypatch):
