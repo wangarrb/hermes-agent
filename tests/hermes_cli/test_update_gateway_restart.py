@@ -799,6 +799,31 @@ class TestFindGatewayPidsExclude:
 
         assert pids == [100]
 
+    def test_falls_back_when_ps_eww_is_unsupported(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "_get_service_pids", lambda: set())
+        monkeypatch.setattr("os.getpid", lambda: 999)
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["ps", "eww"]:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unsupported")
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout="100 /home/wyr/.local/bin/hermes gateway run --replace\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        pids = gateway_cli.find_gateway_pids()
+
+        assert pids == [100]
+        assert calls[0][:2] == ["ps", "eww"]
+        assert calls[1][:3] == ["ps", "-eo", "pid=,args="]
+
 
 # ---------------------------------------------------------------------------
 # Gateway mode writes exit code before restart (#8300)
