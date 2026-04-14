@@ -1298,6 +1298,25 @@ class AIAgent:
                                 except (TypeError, ValueError):
                                     pass
                     break
+
+        # Check providers.{provider_name}.context_length (new format)
+        # This supports the v12+ providers format where context_length is set
+        # at the provider level rather than per-model.
+        if _config_context_length is None and self.provider:
+            _providers_cfg = _agent_cfg.get("providers", {})
+            if isinstance(_providers_cfg, dict):
+                _prov_cfg = _providers_cfg.get(self.provider, {})
+                if isinstance(_prov_cfg, dict):
+                    _prov_ctx = _prov_cfg.get("context_length")
+                    if _prov_ctx is not None:
+                        try:
+                            _config_context_length = int(_prov_ctx)
+                        except (TypeError, ValueError):
+                            pass
+        
+        # Update stored config_context_length if we found a value
+        if _config_context_length is not None:
+            self._config_context_length = _config_context_length
         
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
@@ -3551,6 +3570,24 @@ class AIAgent:
             if role == "system":
                 continue
 
+            # Handle developer role for CCH compatibility
+            # Convert developer to user with [SYSTEM]: prefix (same as _preflight_codex_input_items)
+            if role == "developer":
+                content = msg.get("content", "")
+                if content is None:
+                    content = ""
+                # Handle content list format: [{"type": "input_text", "text": "..."}]
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "input_text":
+                            text_parts.append(part.get("text", ""))
+                    content = "\n".join(text_parts) if text_parts else ""
+                elif not isinstance(content, str):
+                    content = str(content)
+                items.append({"role": "user", "content": f"[SYSTEM]: {content}"})
+                continue
+
             if role in {"user", "assistant"}:
                 content = msg.get("content", "")
                 content_text = str(content) if content is not None else ""
@@ -3723,7 +3760,14 @@ class AIAgent:
                 content = item.get("content", "")
                 if content is None:
                     content = ""
-                if not isinstance(content, str):
+                # Handle content list format: [{"type": "input_text", "text": "..."}]
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "input_text":
+                            text_parts.append(part.get("text", ""))
+                    content = "\n".join(text_parts) if text_parts else ""
+                elif not isinstance(content, str):
                     content = str(content)
                 normalized.append({"role": "user", "content": f"[SYSTEM]: {content}"})
                 continue
@@ -4365,7 +4409,16 @@ class AIAgent:
 
         # Build payload
         payload = dict(api_kwargs)
-
+        
+        # Debug: check if identity supplement is in the first input item
+        input_items = payload.get("input", [])
+        if isinstance(input_items, list) and input_items:
+            first_item = input_items[0]
+            first_role = first_item.get("role", "unknown") if isinstance(first_item, dict) else "unknown"
+            first_content = first_item.get("content", "") if isinstance(first_item, dict) else ""
+            has_identity = "Right now in this chat" in str(first_content)
+            logger.info(f"[CODEX_PAYLOAD_DEBUG] first_role={first_role} has_identity={has_identity} model={self.model}")
+        
         has_tool_calls = False
         first_delta_fired = False
         self._codex_streamed_text_parts: list = []
@@ -6323,6 +6376,42 @@ class AIAgent:
                 self.provider == "openai-codex"
                 or "chatgpt.com/backend-api/codex" in self.base_url.lower()
             )
+
+            # For non-Github Responses proxies (like CCH), inject instructions as
+            # developer role input message to bypass instructions field override.
+            # CCH may inject its own Codex CLI instructions, so we use developer role
+            # to preserve our identity/system prompt.
+            _model_lower = (self.model or "").lower()
+            use_developer_input = (
+                not is_github_responses
+                and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
+            )
+            
+            # Generate model/provider identity supplement for self-identification
+            _provider_display = self.provider or "default"
+            if _provider_display == "custom":
+                # Use base_url hostname for custom providers
+                _base_url_host = (self.base_url or "").rstrip("/").split("//")[-1].split("/")[0]
+                _provider_display = _base_url_host if _base_url_host else "custom endpoint"
+            _model_identity_supplement = (
+                f"Right now in this chat, I'm running on {self.model or 'unknown model'} "
+                f"via {_provider_display}."
+            )
+            
+            if use_developer_input and instructions:
+                # Prepend developer role input message with system prompt content
+                # Include model identity supplement so the model knows its current runtime
+                _enhanced_instructions = f"{instructions}\n\n{_model_identity_supplement}"
+                logger.info(f"[CODEX_IDENTITY_INJECT] model={self.model} provider={_provider_display} identity_line={_model_identity_supplement}")
+                dev_input_item = {
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": _enhanced_instructions}],
+                }
+                # Build input list with developer message first
+                dev_payload = [dev_input_item] + list(payload_messages)
+                payload_messages = dev_payload
+                # Keep instructions field minimal (CCH may override it anyway)
+                instructions = DEFAULT_AGENT_IDENTITY
 
             # Resolve reasoning effort: config > default (medium)
             reasoning_effort = "medium"
