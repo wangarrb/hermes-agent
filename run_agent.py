@@ -1717,10 +1717,13 @@ class AIAgent:
         In headless/stdio-protocol environments, a raw spinner with no custom
         ``_print_fn`` falls back to ``sys.stdout`` and can corrupt protocol
         streams such as ACP JSON-RPC. Allow quiet spinners only when either:
-        - output is explicitly rerouted via ``_print_fn``; or
+        - output is explicitly rerouted via ``_print_fn``;
+        - ``HERMES_FORCE_SPINNER=1`` explicitly enables pseudo-TTY rendering; or
         - stdout is a real TTY.
         """
         if self._print_fn is not None:
+            return True
+        if os.getenv("HERMES_FORCE_SPINNER") == "1":
             return True
         stream = getattr(sys, "stdout", None)
         if stream is None:
