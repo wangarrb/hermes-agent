@@ -1302,6 +1302,10 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    # Keep the raw provider name around so configured named custom providers
+    # (e.g. "bailian") can win over built-in aliases before normalization.
+    raw_provider = (provider or "").strip()
+
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
@@ -1445,10 +1449,18 @@ def resolve_provider_client(
                        "but no endpoint credentials found")
         return None, None
 
-    # ── Named custom providers (config.yaml custom_providers list) ───
+    # ── Named custom providers (config.yaml custom_providers / providers) ───
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        custom_entry = _get_named_custom_provider(provider)
+        custom_entry = None
+        custom_provider_name = provider
+        for candidate in (raw_provider, provider):
+            if not candidate:
+                continue
+            custom_entry = _get_named_custom_provider(candidate)
+            if custom_entry:
+                custom_provider_name = candidate
+                break
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
             custom_key = custom_entry.get("api_key", "").strip()
@@ -1459,18 +1471,18 @@ def resolve_provider_client(
             if custom_base:
                 final_model = _normalize_resolved_model(
                     model or custom_entry.get("model") or _read_main_model() or "gpt-4o-mini",
-                    provider,
+                    custom_provider_name,
                 )
                 client = OpenAI(api_key=custom_key, base_url=custom_base)
                 client = _wrap_if_needed(client, final_model, custom_base)
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s)",
-                    provider, final_model)
+                    custom_provider_name, final_model)
                 return (_to_async_client(client, final_model) if async_mode
                         else (client, final_model))
             logger.warning(
                 "resolve_provider_client: named custom provider %r has no base_url",
-                provider)
+                custom_provider_name)
             return None, None
     except ImportError:
         pass

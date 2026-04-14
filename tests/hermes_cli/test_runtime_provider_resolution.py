@@ -653,6 +653,45 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
     assert resolved["model"] == "acme-large"
 
 
+def test_named_custom_provider_uses_api_key_env_alias_from_providers_dict(monkeypatch):
+    """providers dict entries with api_key_env should behave like key_env."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("CCH_API_KEY", "cch-env-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "cch": {
+                    "base_url": "http://cch.jmadas.com/v1",
+                    "default_model": "gpt-5.4",
+                    "api_key_env": "CCH_API_KEY",
+                    "api_mode": "codex_responses",
+                    "name": "CCH",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("resolve_provider should not be called for named custom providers")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="cch")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "http://cch.jmadas.com/v1"
+    assert resolved["api_key"] == "cch-env-secret"
+    assert resolved["requested_provider"] == "cch"
+    assert resolved["source"] == "custom_provider:CCH"
+    assert resolved["model"] == "gpt-5.4"
+
+
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
