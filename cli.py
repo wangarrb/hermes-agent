@@ -4546,11 +4546,57 @@ class HermesCLI:
         else:
             try:
                 from agent.model_metadata import get_model_context_length
+                from hermes_cli.config import load_config
+
+                # Check custom_providers for explicit context_length first
+                cfg = load_config()
+                custom_providers = cfg.get("custom_providers") or cfg.get("providers") or {}
+                custom_ctx = None
+                target_base_url = (result.base_url or self.base_url or "").rstrip("/")
+                for entry in custom_providers:
+                    if isinstance(custom_providers, dict):
+                        # providers: is keyed, iterate values
+                        entry_data = custom_providers.get(entry) if isinstance(entry, str) else entry
+                        if not isinstance(entry_data, dict):
+                            continue
+                        entry_url = (entry_data.get("base_url") or "").rstrip("/")
+                        entry_models = entry_data.get("models", [])
+                        entry_ctx = entry_data.get("context_length")
+                    else:
+                        # custom_providers: is list
+                        if not isinstance(entry, dict):
+                            continue
+                        entry_url = (entry.get("base_url") or "").rstrip("/")
+                        entry_models = entry.get("models", [])
+                        entry_ctx = entry.get("context_length")
+
+                    if entry_url != target_base_url:
+                        continue
+                    if isinstance(entry_models, list) and result.new_model in entry_models:
+                        if entry_ctx is not None:
+                            try:
+                                custom_ctx = int(entry_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        break
+                    elif isinstance(entry_models, dict):
+                        model_cfg = entry_models.get(result.new_model)
+                        if isinstance(model_cfg, dict):
+                            model_ctx = model_cfg.get("context_length", entry_ctx)
+                            if model_ctx is not None:
+                                try:
+                                    custom_ctx = int(model_ctx)
+                                except (TypeError, ValueError):
+                                    pass
+                        if custom_ctx is not None:
+                            break
+
                 ctx = get_model_context_length(
                     result.new_model,
                     base_url=result.base_url or self.base_url,
                     api_key=result.api_key or self.api_key,
                     provider=result.target_provider,
+                    config_context_length=custom_ctx,
                 )
                 _cprint(f"    Context: {ctx:,} tokens")
             except Exception:
@@ -4770,11 +4816,57 @@ class HermesCLI:
             # Fallback to old context length lookup
             try:
                 from agent.model_metadata import get_model_context_length
+                from hermes_cli.config import load_config
+
+                # Check custom_providers for explicit context_length first
+                cfg = load_config()
+                custom_providers_cfg = cfg.get("custom_providers") or cfg.get("providers") or {}
+                custom_ctx = None
+                target_base_url = (result.base_url or self.base_url or "").rstrip("/")
+                for key_or_entry in custom_providers_cfg:
+                    if isinstance(custom_providers_cfg, dict):
+                        # providers: is keyed
+                        entry = custom_providers_cfg.get(key_or_entry) if isinstance(key_or_entry, str) else key_or_entry
+                        if not isinstance(entry, dict):
+                            continue
+                        entry_url = (entry.get("base_url") or "").rstrip("/")
+                        entry_models = entry.get("models", [])
+                        entry_ctx = entry.get("context_length")
+                    else:
+                        # custom_providers: is list
+                        if not isinstance(key_or_entry, dict):
+                            continue
+                        entry_url = (key_or_entry.get("base_url") or "").rstrip("/")
+                        entry_models = key_or_entry.get("models", [])
+                        entry_ctx = key_or_entry.get("context_length")
+
+                    if entry_url != target_base_url:
+                        continue
+                    if isinstance(entry_models, list) and result.new_model in entry_models:
+                        if entry_ctx is not None:
+                            try:
+                                custom_ctx = int(entry_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        break
+                    elif isinstance(entry_models, dict):
+                        model_cfg = entry_models.get(result.new_model)
+                        if isinstance(model_cfg, dict):
+                            model_ctx = model_cfg.get("context_length", entry_ctx)
+                            if model_ctx is not None:
+                                try:
+                                    custom_ctx = int(model_ctx)
+                                except (TypeError, ValueError):
+                                    pass
+                        if custom_ctx is not None:
+                            break
+
                 ctx = get_model_context_length(
                     result.new_model,
                     base_url=result.base_url or self.base_url,
                     api_key=result.api_key or self.api_key,
                     provider=result.target_provider,
+                    config_context_length=custom_ctx,
                 )
                 _cprint(f"    Context: {ctx:,} tokens")
             except Exception:
