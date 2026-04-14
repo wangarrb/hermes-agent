@@ -496,6 +496,18 @@ class TestExplicitProviderRouting:
             client, model = resolve_provider_client("zai")
             assert client is not None
 
+    def test_explicit_bailian_alias_uses_alibaba_credentials(self, monkeypatch):
+        """provider='bailian' should normalize to alibaba and use DASHSCOPE_API_KEY."""
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test-key")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = resolve_provider_client("bailian")
+
+        assert client is not None
+        assert model == "qwen3.5-plus"
+        assert mock_openai.call_args.kwargs["api_key"] == "dashscope-test-key"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
     def test_explicit_google_alias_uses_gemini_credentials(self):
         """provider='google' should route through the gemini API-key provider."""
         with (
