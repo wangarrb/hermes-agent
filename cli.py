@@ -5568,16 +5568,19 @@ class HermesCLI:
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
                 user_instruction = cmd_original[len(base_cmd):].strip()
-                msg = build_skill_invocation_message(
-                    base_cmd, user_instruction, task_id=self.session_id
-                )
-                if msg:
-                    skill_name = _skill_commands[base_cmd]["name"]
-                    print(f"\n⚡ Loading skill: {skill_name}")
-                    if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                if base_cmd == "/mycompress":
+                    self._handle_skill_compress_command(base_cmd, user_instruction)
                 else:
-                    ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
+                    msg = build_skill_invocation_message(
+                        base_cmd, user_instruction, task_id=self.session_id
+                    )
+                    if msg:
+                        skill_name = _skill_commands[base_cmd]["name"]
+                        print(f"\n⚡ Loading skill: {skill_name}")
+                        if hasattr(self, '_pending_input'):
+                            self._pending_input.put(msg)
+                    else:
+                        ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
                 # Prefix matching: if input uniquely identifies one command, execute it.
                 # Matches against both built-in COMMANDS and installed skill commands so
@@ -6375,6 +6378,94 @@ class HermesCLI:
 
         except Exception as e:
             print(f"  ❌ Compression failed: {e}")
+
+    def _handle_skill_compress_command(self, cmd_key: str, user_instruction: str = ""):
+        """Run a skill-backed compression pass that replaces conversation history."""
+        if not self.conversation_history or len(self.conversation_history) < 4:
+            print("(._.) Not enough conversation to compress (need at least 4 messages).")
+            return
+
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        if not self.agent.compression_enabled:
+            print("(._.) Compression is disabled in config.")
+            return
+
+        skill_prompt = build_skill_invocation_message(
+            cmd_key,
+            user_instruction,
+            task_id=self.session_id,
+            runtime_note=(
+                "This invocation should perform a real context replacement. "
+                "Use the skill only as the summary template and content policy."
+            ),
+        )
+        if not skill_prompt:
+            print(f"  ❌ Failed to load skill for {cmd_key}")
+            return
+
+        compressor = self.agent.context_compressor
+        original_generate_summary = getattr(compressor, "_generate_summary")
+        original_count = len(self.conversation_history)
+
+        try:
+            from agent.auxiliary_client import call_llm
+            from agent.model_metadata import estimate_messages_tokens_rough
+
+            approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(f"🗜️  Skill-compressing {original_count} messages (~{approx_tokens:,} tokens)...")
+
+            def custom_generate_summary(turns_to_summarize, focus_topic=None):
+                summary_budget = compressor._compute_summary_budget(turns_to_summarize)
+                content_to_summarize = compressor._serialize_for_summary(turns_to_summarize)
+                previous_summary = getattr(compressor, "_previous_summary", None)
+                if previous_summary:
+                    prompt = (
+                        f"{skill_prompt}\n\n"
+                        "你现在是在更新上一版 handoff 摘要。保留仍然有效的信息，合并新的进展，删除已失效内容。\n\n"
+                        f"PREVIOUS SUMMARY:\n{previous_summary}\n\n"
+                        f"TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n"
+                        f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
+                    )
+                else:
+                    prompt = (
+                        f"{skill_prompt}\n\n"
+                        f"TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n"
+                        f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
+                    )
+
+                response = call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=summary_budget * 2,
+                )
+                content = response.choices[0].message.content
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                summary = content.strip()
+                compressor._previous_summary = summary
+                compressor._summary_failure_cooldown_until = 0.0
+                return compressor._with_summary_prefix(summary)
+
+            compressor._generate_summary = custom_generate_summary
+            compressed, _new_system = self.agent._compress_context(
+                self.conversation_history,
+                self.agent._cached_system_prompt or "",
+                approx_tokens=approx_tokens,
+            )
+            self.conversation_history = compressed
+            new_count = len(self.conversation_history)
+            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(
+                f"  ✅ Skill compressed: {original_count} → {new_count} messages "
+                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
+            )
+        except Exception as e:
+            print(f"  ❌ Skill compression failed: {e}")
+        finally:
+            compressor._generate_summary = original_generate_summary
 
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""
