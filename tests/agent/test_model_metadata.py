@@ -350,6 +350,39 @@ class TestGetModelContextLength:
         assert result == 65536
 
     @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_provider_config_context_length_is_used_when_not_explicitly_passed(
+        self, mock_endpoint_fetch, mock_fetch, tmp_path, monkeypatch
+    ):
+        """providers.<name>.context_length should be honored by all callers."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "providers": {
+                        "cch": {
+                            "base_url": "http://cch.jmadas.com/v1",
+                            "context_length": 1050000,
+                            "models": ["gpt-5.4"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "gpt-5.4",
+            base_url="http://cch.jmadas.com/v1",
+            provider="cch",
+        )
+
+        assert result == 1050000
+        mock_endpoint_fetch.assert_not_called()
+
+    @patch("agent.model_metadata.fetch_model_metadata")
     def test_config_context_length_zero_is_ignored(self, mock_fetch):
         """config_context_length=0 should be treated as unset."""
         mock_fetch.return_value = {}

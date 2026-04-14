@@ -2011,6 +2011,35 @@ class HermesCLI:
             return 0
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
+    def _get_spinner_fragments(self):
+        """Return live spinner/status fragments for the TUI row above the status bar."""
+        txt = getattr(self, "_spinner_text", "")
+        if not txt:
+            return []
+
+        frame = self._command_spinner_frame()
+        t0 = getattr(self, "_tool_start_time", 0.0)
+        if t0 > 0:
+            import time as _time
+
+            elapsed = _time.monotonic() - t0
+            if elapsed >= 60:
+                _m, _s = int(elapsed // 60), int(elapsed % 60)
+                elapsed_str = f"{_m}m {_s}s"
+            else:
+                elapsed_str = f"{elapsed:.1f}s"
+            return [('class:hint', f'  {frame} {txt}  ({elapsed_str})')]
+
+        return [('class:hint', f'  {frame} {txt}')]
+
+    def _needs_live_spinner_refresh(self) -> bool:
+        """Return True when the TUI should repaint at spinner cadence."""
+        return bool(
+            getattr(self, "_command_running", False)
+            or getattr(self, "_spinner_text", "")
+            or getattr(self, "_tool_start_time", 0.0) > 0
+        )
+
     def _get_voice_status_fragments(self, width: Optional[int] = None):
         """Return the voice status bar fragments for the interactive TUI."""
         width = width or self._get_tui_terminal_width()
@@ -4524,12 +4553,6 @@ class HermesCLI:
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
 
-        self._pending_model_switch_note = (
-            f"[Note: model was just switched from {old_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
-        )
-
         provider_label = result.provider_label or result.target_provider
         _cprint(f"  ✓ Model switched: {result.new_model}")
         _cprint(f"    Provider: {provider_label}")
@@ -4787,15 +4810,6 @@ class HermesCLI:
                 )
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
-
-        # Store a note to prepend to the next user message so the model
-        # knows a switch occurred (avoids injecting system messages mid-history
-        # which breaks providers and prompt caching).
-        self._pending_model_switch_note = (
-            f"[Note: model was just switched from {old_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
-        )
 
         # Display confirmation with full metadata
         provider_label = result.provider_label or result.target_provider
@@ -9184,21 +9198,7 @@ class HermesCLI:
             return cli_ref._agent_spacer_height()
 
         def get_spinner_text():
-            txt = cli_ref._spinner_text
-            if not txt:
-                return []
-            # Append live elapsed timer when a tool is running
-            t0 = cli_ref._tool_start_time
-            if t0 > 0:
-                import time as _time
-                elapsed = _time.monotonic() - t0
-                if elapsed >= 60:
-                    _m, _s = int(elapsed // 60), int(elapsed % 60)
-                    elapsed_str = f"{_m}m {_s}s"
-                else:
-                    elapsed_str = f"{elapsed:.1f}s"
-                return [('class:hint', f'  {txt}  ({elapsed_str})')]
-            return [('class:hint', f'  {txt}')]
+            return cli_ref._get_spinner_fragments()
 
         def get_spinner_height():
             return cli_ref._spinner_widget_height()
@@ -9649,7 +9649,7 @@ class HermesCLI:
                 if not self._app:
                     _time.sleep(0.1)
                     continue
-                if self._command_running:
+                if self._needs_live_spinner_refresh():
                     self._invalidate(min_interval=0.1)
                     _time.sleep(0.1)
                 else:

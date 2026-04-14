@@ -303,8 +303,17 @@ def _to_int(value: Any) -> int:
         return 0
 
 
+def _usage_get(container: Any, key: str, default: Any = 0) -> Any:
+    if container is None:
+        return default
+    if isinstance(container, dict):
+        return container.get(key, default)
+    return getattr(container, key, default)
+
+
 def resolve_billing_route(
     model_name: str,
+    *,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> BillingRoute:
@@ -441,33 +450,33 @@ def normalize_usage(
     mode = (api_mode or "").strip().lower()
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
-        input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
-        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
-        cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
-        cache_write_tokens = _to_int(getattr(response_usage, "cache_creation_input_tokens", 0))
+        input_tokens = _to_int(_usage_get(response_usage, "input_tokens", 0))
+        output_tokens = _to_int(_usage_get(response_usage, "output_tokens", 0))
+        cache_read_tokens = _to_int(_usage_get(response_usage, "cache_read_input_tokens", 0))
+        cache_write_tokens = _to_int(_usage_get(response_usage, "cache_creation_input_tokens", 0))
     elif mode == "codex_responses":
-        input_total = _to_int(getattr(response_usage, "input_tokens", 0))
-        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
-        details = getattr(response_usage, "input_tokens_details", None)
-        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
+        input_total = _to_int(_usage_get(response_usage, "input_tokens", 0))
+        output_tokens = _to_int(_usage_get(response_usage, "output_tokens", 0))
+        details = _usage_get(response_usage, "input_tokens_details", None)
+        cache_read_tokens = _to_int(_usage_get(details, "cached_tokens", 0) if details else 0)
         cache_write_tokens = _to_int(
-            getattr(details, "cache_creation_tokens", 0) if details else 0
+            _usage_get(details, "cache_creation_tokens", 0) if details else 0
         )
         input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
     else:
-        prompt_total = _to_int(getattr(response_usage, "prompt_tokens", 0))
-        output_tokens = _to_int(getattr(response_usage, "completion_tokens", 0))
-        details = getattr(response_usage, "prompt_tokens_details", None)
-        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
+        prompt_total = _to_int(_usage_get(response_usage, "prompt_tokens", 0))
+        output_tokens = _to_int(_usage_get(response_usage, "completion_tokens", 0))
+        details = _usage_get(response_usage, "prompt_tokens_details", None)
+        cache_read_tokens = _to_int(_usage_get(details, "cached_tokens", 0) if details else 0)
         cache_write_tokens = _to_int(
-            getattr(details, "cache_write_tokens", 0) if details else 0
+            _usage_get(details, "cache_write_tokens", 0) if details else 0
         )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0
-    output_details = getattr(response_usage, "output_tokens_details", None)
+    output_details = _usage_get(response_usage, "output_tokens_details", None)
     if output_details:
-        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
+        reasoning_tokens = _to_int(_usage_get(output_details, "reasoning_tokens", 0))
 
     return CanonicalUsage(
         input_tokens=input_tokens,

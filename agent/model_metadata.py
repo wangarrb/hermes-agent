@@ -259,6 +259,97 @@ def _infer_provider_from_url(base_url: str) -> Optional[str]:
     return None
 
 
+def _read_configured_context_length(
+    model: str,
+    *,
+    base_url: str = "",
+    provider: str = "",
+) -> Optional[int]:
+    """Read user-configured context_length for provider/model from config.yaml."""
+    try:
+        from hermes_constants import get_config_path
+
+        config_path = get_config_path()
+        if not config_path.exists():
+            return None
+        with open(config_path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except Exception:
+        return None
+
+    if not isinstance(config, dict):
+        return None
+
+    def _as_positive_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    # Global model.context_length remains the most explicit config override.
+    model_cfg = config.get("model", {})
+    if isinstance(model_cfg, dict):
+        ctx = _as_positive_int(model_cfg.get("context_length"))
+        if ctx is not None:
+            return ctx
+
+    normalized_base = _normalize_base_url(base_url)
+    provider_key = (provider or "").strip().lower()
+    model_keys = {model, _strip_provider_prefix(model)}
+
+    providers_cfg = config.get("providers")
+    if isinstance(providers_cfg, dict):
+        provider_entries = []
+        if provider_key:
+            entry = providers_cfg.get(provider_key)
+            if isinstance(entry, dict):
+                provider_entries.append(entry)
+        if normalized_base:
+            for entry in providers_cfg.values():
+                if isinstance(entry, dict) and _normalize_base_url(entry.get("base_url", "")) == normalized_base:
+                    provider_entries.append(entry)
+
+        for entry in provider_entries:
+            models_cfg = entry.get("models", {})
+            if isinstance(models_cfg, dict):
+                for key in model_keys:
+                    model_entry = models_cfg.get(key)
+                    if isinstance(model_entry, dict):
+                        ctx = _as_positive_int(model_entry.get("context_length"))
+                        if ctx is not None:
+                            return ctx
+            ctx = _as_positive_int(entry.get("context_length"))
+            if ctx is not None:
+                return ctx
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            entry_base = _normalize_base_url(entry.get("base_url", ""))
+            if normalized_base and entry_base and entry_base != normalized_base:
+                continue
+            models_cfg = entry.get("models", {})
+            if isinstance(models_cfg, dict):
+                for key in model_keys:
+                    model_entry = models_cfg.get(key)
+                    if isinstance(model_entry, dict):
+                        ctx = _as_positive_int(model_entry.get("context_length"))
+                        if ctx is not None:
+                            return ctx
+            elif isinstance(models_cfg, list) and model not in models_cfg and _strip_provider_prefix(model) not in models_cfg:
+                continue
+            ctx = _as_positive_int(entry.get("context_length"))
+            if ctx is not None:
+                return ctx
+
+    return None
+
+
 def _is_known_provider_base_url(base_url: str) -> bool:
     return _infer_provider_from_url(base_url) is not None
 
@@ -953,6 +1044,14 @@ def get_model_context_length(
     """
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+        return config_context_length
+
+    config_context_length = _read_configured_context_length(
+        model,
+        base_url=base_url,
+        provider=provider,
+    )
+    if config_context_length is not None:
         return config_context_length
 
     # Normalise provider-prefixed model names (e.g. "local:model-name" →

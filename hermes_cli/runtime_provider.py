@@ -297,7 +297,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
         }
-        key_env = str(entry.get("key_env", "") or "").strip()
+        key_env = str(entry.get("key_env", "") or entry.get("api_key_env", "") or "").strip()
         if key_env:
             result["key_env"] = key_env
         if provider_key:

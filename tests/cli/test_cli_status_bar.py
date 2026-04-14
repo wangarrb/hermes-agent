@@ -237,6 +237,38 @@ class TestCLIStatusBar:
         cli_obj._spinner_text = ""
         assert cli_obj._spinner_widget_height(width=90) == 0
 
+    def test_spinner_fragments_include_animated_frame(self):
+        cli_obj = _make_cli()
+        cli_obj._spinner_text = "Thinking..."
+        cli_obj._tool_start_time = 0.0
+
+        with patch.object(cli_obj, "_command_spinner_frame", return_value="⠋"):
+            fragments = cli_obj._get_spinner_fragments()
+
+        assert fragments == [("class:hint", "  ⠋ Thinking...")]
+
+    def test_spinner_fragments_include_elapsed_time_for_tools(self):
+        cli_obj = _make_cli()
+        cli_obj._spinner_text = "🔧 read_file"
+        cli_obj._tool_start_time = 100.0
+
+        with patch.object(cli_obj, "_command_spinner_frame", return_value="⠙"), \
+             patch("time.monotonic", return_value=101.25):
+            fragments = cli_obj._get_spinner_fragments()
+
+        assert fragments == [("class:hint", "  ⠙ 🔧 read_file  (1.2s)")]
+
+    def test_live_spinner_refresh_activates_for_agent_spinner_state(self):
+        cli_obj = _make_cli()
+        cli_obj._command_running = False
+        cli_obj._spinner_text = "Thinking..."
+        cli_obj._tool_start_time = 0.0
+
+        assert cli_obj._needs_live_spinner_refresh() is True
+
+        cli_obj._spinner_text = ""
+        assert cli_obj._needs_live_spinner_refresh() is False
+
     def test_voice_status_bar_compacts_on_narrow_terminals(self):
         cli_obj = _make_cli()
         cli_obj._voice_mode = True

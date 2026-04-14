@@ -70,6 +70,27 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     return agent
 
 
+def _build_cch_agent(monkeypatch, *, model="gpt-5.4"):
+    _patch_agent_bootstrap(monkeypatch)
+
+    agent = run_agent.AIAgent(
+        model=model,
+        provider="cch",
+        api_mode="codex_responses",
+        base_url="http://cch.jmadas.com/v1",
+        api_key="cch-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+    return agent
+
+
 def _codex_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -307,6 +328,20 @@ def test_build_api_kwargs_copilot_responses_omits_reasoning_for_non_reasoning_mo
     assert "reasoning" not in kwargs
     assert "include" not in kwargs
     assert "prompt_cache_key" not in kwargs
+
+
+def test_build_api_kwargs_cch_does_not_inject_runtime_identity(monkeypatch):
+    agent = _build_cch_agent(monkeypatch)
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert kwargs["input"][0]["role"] == "user"
+    assert kwargs["input"][0]["content"] == "[SYSTEM]: You are Hermes."
+    assert "Right now in this chat" not in kwargs["input"][0]["content"]
 
 
 def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):

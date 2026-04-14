@@ -3277,10 +3277,6 @@ class AIAgent:
         timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
         if self.pass_session_id and self.session_id:
             timestamp_line += f"\nSession ID: {self.session_id}"
-        if self.model:
-            timestamp_line += f"\nModel: {self.model}"
-        if self.provider:
-            timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
 
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
@@ -4409,15 +4405,6 @@ class AIAgent:
 
         # Build payload
         payload = dict(api_kwargs)
-        
-        # Debug: check if identity supplement is in the first input item
-        input_items = payload.get("input", [])
-        if isinstance(input_items, list) and input_items:
-            first_item = input_items[0]
-            first_role = first_item.get("role", "unknown") if isinstance(first_item, dict) else "unknown"
-            first_content = first_item.get("content", "") if isinstance(first_item, dict) else ""
-            has_identity = "Right now in this chat" in str(first_content)
-            logger.info(f"[CODEX_PAYLOAD_DEBUG] first_role={first_role} has_identity={has_identity} model={self.model}")
         
         has_tool_calls = False
         first_delta_fired = False
@@ -6387,25 +6374,13 @@ class AIAgent:
                 and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
             )
             
-            # Generate model/provider identity supplement for self-identification
-            _provider_display = self.provider or "default"
-            if _provider_display == "custom":
-                # Use base_url hostname for custom providers
-                _base_url_host = (self.base_url or "").rstrip("/").split("//")[-1].split("/")[0]
-                _provider_display = _base_url_host if _base_url_host else "custom endpoint"
-            _model_identity_supplement = (
-                f"Right now in this chat, I'm running on {self.model or 'unknown model'} "
-                f"via {_provider_display}."
-            )
-            
             if use_developer_input and instructions:
-                # Prepend developer role input message with system prompt content
-                # Include model identity supplement so the model knows its current runtime
-                _enhanced_instructions = f"{instructions}\n\n{_model_identity_supplement}"
-                logger.info(f"[CODEX_IDENTITY_INJECT] model={self.model} provider={_provider_display} identity_line={_model_identity_supplement}")
+                # Prepend developer role input message with system prompt content.
+                # For CCH/proxy compatibility we preserve the original system prompt,
+                # but do not append runtime identity lines.
                 dev_input_item = {
                     "role": "developer",
-                    "content": [{"type": "input_text", "text": _enhanced_instructions}],
+                    "content": [{"type": "input_text", "text": instructions}],
                 }
                 # Build input list with developer message first
                 dev_payload = [dev_input_item] + list(payload_messages)

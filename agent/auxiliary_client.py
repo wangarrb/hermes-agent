@@ -1464,7 +1464,9 @@ def resolve_provider_client(
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
             custom_key = custom_entry.get("api_key", "").strip()
-            custom_key_env = custom_entry.get("key_env", "").strip()
+            custom_key_env = custom_entry.get("key_env", "") or custom_entry.get("api_key_env", "")
+            if isinstance(custom_key_env, str):
+                custom_key_env = custom_key_env.strip()
             if not custom_key and custom_key_env:
                 custom_key = os.getenv(custom_key_env, "").strip()
             custom_key = custom_key or "no-key-required"
