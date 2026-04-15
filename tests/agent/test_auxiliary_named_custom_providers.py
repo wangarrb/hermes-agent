@@ -238,6 +238,26 @@ class TestResolveVisionProviderClientModelNormalization:
 class TestVisionPathApiMode:
     """Vision path should propagate api_mode to _get_cached_client."""
 
+    def test_explicit_bailian_alias_preserves_raw_provider_for_cache_lookup(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "kimi-k2.5"},
+            "auxiliary": {"vision": {"api_mode": "chat_completions"}},
+        })
+        with patch("agent.auxiliary_client._get_cached_client") as mock_gcc:
+            mock_gcc.return_value = (MagicMock(), "kimi-k2.5")
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client(
+                provider="bailian",
+                model="kimi-k2.5",
+            )
+
+        mock_gcc.assert_called_once()
+        assert mock_gcc.call_args.args[0] == "bailian"
+        assert provider == "alibaba"
+        assert client is not None
+        assert model == "kimi-k2.5"
+
     def test_explicit_provider_passes_api_mode(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "test-model"},

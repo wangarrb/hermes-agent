@@ -1721,6 +1721,7 @@ def resolve_vision_provider_client(
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
     )
+    raw_requested = requested
     requested = _normalize_vision_provider(requested)
 
     def _finalize(resolved_provider: str, sync_client: Any, default_model: Optional[str]):
@@ -1789,7 +1790,7 @@ def resolve_vision_provider_client(
         sync_client, default_model = _resolve_strict_vision_backend(requested)
         return _finalize(requested, sync_client, default_model)
 
-    client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+    client, final_model = _get_cached_client(raw_requested or requested, resolved_model, async_mode,
                                              api_mode=resolved_api_mode)
     if client is None:
         return requested, None, None
