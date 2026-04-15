@@ -108,7 +108,7 @@ class TestResolveProviderClientNamedCustom:
         _write_config(tmp_path, {
             "model": {"default": "test-model"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "***"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client
@@ -116,6 +116,19 @@ class TestResolveProviderClientNamedCustom:
         assert client is not None
         assert model == "my-model"
         assert "beans.local" in str(client.base_url)
+
+    def test_named_custom_provider_beats_builtin_alias(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "glm-5", "provider": "bailian"},
+            "custom_providers": [
+                {"name": "bailian", "base_url": "http://bailian.local/v1", "api_key": "***", "model": "glm-5"},
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+        client, model = resolve_provider_client("bailian", "glm-5")
+        assert client is not None
+        assert model == "glm-5"
+        assert "bailian.local" in str(client.base_url)
 
     def test_named_custom_provider_default_model(self, tmp_path):
         _write_config(tmp_path, {

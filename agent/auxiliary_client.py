@@ -62,6 +62,9 @@ _PROVIDER_ALIASES = {
     "z-ai": "zai",
     "z.ai": "zai",
     "zhipu": "zai",
+    "bailian": "alibaba",
+    "dashscope": "alibaba",
+    "aliyun": "alibaba",
     "kimi": "kimi-coding",
     "moonshot": "kimi-coding",
     "kimi-cn": "kimi-coding-cn",
@@ -95,6 +98,7 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
     "zai": "glm-4.5-flash",
+    "alibaba": "qwen3.5-plus",
     "kimi-coding": "kimi-k2-turbo-preview",
     "kimi-coding-cn": "kimi-k2-turbo-preview",
     "minimax": "MiniMax-M2.7",
@@ -1012,6 +1016,24 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     provider = normalized.get("provider")
     if provider:
         normalized["provider"] = provider.lower()
+
+    provider = normalized.get("provider") or ""
+    base_url = (normalized.get("base_url") or "").rstrip("/")
+    if provider == "custom" and base_url:
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            providers_cfg = cfg.get("providers", {}) if isinstance(cfg, dict) else {}
+            if isinstance(providers_cfg, dict):
+                for provider_name, provider_cfg in providers_cfg.items():
+                    if not isinstance(provider_cfg, dict):
+                        continue
+                    candidate_url = str(provider_cfg.get("base_url", "") or "").strip().rstrip("/")
+                    if candidate_url and candidate_url == base_url:
+                        normalized["provider"] = str(provider_name).strip().lower()
+                        break
+        except Exception:
+            pass
     return normalized
 
 
@@ -1299,6 +1321,10 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    # Keep the raw provider name around so configured named custom providers
+    # (e.g. "bailian") can win over built-in aliases before normalization.
+    raw_provider = (provider or "").strip()
+
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
@@ -1442,32 +1468,42 @@ def resolve_provider_client(
                        "but no endpoint credentials found")
         return None, None
 
-    # ── Named custom providers (config.yaml custom_providers list) ───
+    # ── Named custom providers (config.yaml custom_providers / providers) ───
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        custom_entry = _get_named_custom_provider(provider)
+        custom_entry = None
+        custom_provider_name = provider
+        for candidate in (raw_provider, provider):
+            if not candidate:
+                continue
+            custom_entry = _get_named_custom_provider(candidate)
+            if custom_entry:
+                custom_provider_name = candidate
+                break
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
             custom_key = custom_entry.get("api_key", "").strip()
-            custom_key_env = custom_entry.get("key_env", "").strip()
+            custom_key_env = custom_entry.get("key_env", "") or custom_entry.get("api_key_env", "")
+            if isinstance(custom_key_env, str):
+                custom_key_env = custom_key_env.strip()
             if not custom_key and custom_key_env:
                 custom_key = os.getenv(custom_key_env, "").strip()
             custom_key = custom_key or "no-key-required"
             if custom_base:
                 final_model = _normalize_resolved_model(
                     model or custom_entry.get("model") or _read_main_model() or "gpt-4o-mini",
-                    provider,
+                    custom_provider_name,
                 )
                 client = OpenAI(api_key=custom_key, base_url=custom_base)
                 client = _wrap_if_needed(client, final_model, custom_base)
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s)",
-                    provider, final_model)
+                    custom_provider_name, final_model)
                 return (_to_async_client(client, final_model) if async_mode
                         else (client, final_model))
             logger.warning(
                 "resolve_provider_client: named custom provider %r has no base_url",
-                provider)
+                custom_provider_name)
             return None, None
     except ImportError:
         pass
@@ -1762,8 +1798,13 @@ def resolve_vision_provider_client(
                     return _finalize(main_provider, sync_client, default_model)
             else:
                 # Exotic provider (DeepSeek, Alibaba, Xiaomi, named custom, etc.)
-                # Use provider-specific vision model if available, otherwise main model.
-                vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
+                # If the main model explicitly includes this provider prefix, keep that
+                # normalized model; otherwise fall back to the provider's vision default.
+                normalized_main_model = _normalize_resolved_model(main_model, main_provider)
+                if normalized_main_model and normalized_main_model != main_model:
+                    vision_model = normalized_main_model
+                else:
+                    vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,
                     api_mode=resolved_api_mode)

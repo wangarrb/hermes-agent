@@ -275,46 +275,47 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             return None
 
     config = load_config()
-    
+
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
         for ep_name, entry in providers.items():
             if not isinstance(entry, dict):
                 continue
-            # Match exact name or normalized name
             name_norm = _normalize_custom_provider_name(ep_name)
-            # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
+            key_env = str(entry.get("key_env", "") or entry.get("api_key_env", "") or "").strip()
             resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
-            # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
                 resolved_api_key = str(entry.get("api_key", "") or "").strip()
+            resolved_api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
 
             if requested_norm in {ep_name, name_norm, f"custom:{name_norm}"}:
-                # Found match by provider key
                 base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                 if base_url:
-                    return {
+                    result = {
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
                     }
-            # Also check the 'name' field if present
+                    if resolved_api_mode:
+                        result["api_mode"] = resolved_api_mode
+                    return result
             display_name = entry.get("name", "")
             if display_name:
                 display_norm = _normalize_custom_provider_name(display_name)
                 if requested_norm in {display_name, display_norm, f"custom:{display_norm}"}:
-                    # Found match by display name
                     base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                     if base_url:
-                        return {
+                        result = {
                             "name": display_name,
                             "base_url": base_url.strip(),
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
                         }
+                        if resolved_api_mode:
+                            result["api_mode"] = resolved_api_mode
+                        return result
 
     # Fall back to custom_providers: list (legacy format)
     custom_providers = config.get("custom_providers")
@@ -349,7 +350,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
         }
-        key_env = str(entry.get("key_env", "") or "").strip()
+        key_env = str(entry.get("key_env", "") or entry.get("api_key_env", "") or "").strip()
         if key_env:
             result["key_env"] = key_env
         if provider_key:
@@ -383,10 +384,10 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    provider_label = str(custom_provider.get("provider_key") or requested_provider or "custom").strip().lower() or "custom"
+    pool_result = _try_resolve_from_custom_pool(base_url, provider_label, custom_provider.get("api_mode"))
     if pool_result:
-        # Propagate the model name even when using pooled credentials —
-        # the pool doesn't know about the custom_providers model field.
+        pool_result["provider"] = provider_label
         model_name = custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
@@ -402,7 +403,7 @@ def _resolve_named_custom_runtime(
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
     result = {
-        "provider": "custom",
+        "provider": provider_label,
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",
@@ -410,8 +411,6 @@ def _resolve_named_custom_runtime(
         "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
     }
-    # Propagate the model name so callers can override self.model when the
-    # provider name differs from the actual model string the API expects.
     if custom_provider.get("model"):
         result["model"] = custom_provider["model"]
     return result

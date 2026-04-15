@@ -65,6 +65,18 @@ class TestPrintAbove:
         
         assert "should go to buf" in buf.getvalue()
 
+    def test_force_spinner_env_treats_non_tty_as_tty(self, monkeypatch):
+        """HERMES_FORCE_SPINNER=1 should enable spinner in pseudo-TTY environments."""
+        class _FakeOut:
+            def isatty(self):
+                return False
+
+        spinner = KawaiiSpinner("test")
+        spinner._out = _FakeOut()
+        monkeypatch.setenv("HERMES_FORCE_SPINNER", "1")
+
+        assert spinner._is_tty is True
+
 
 # =========================================================================
 # _build_child_progress_callback tests

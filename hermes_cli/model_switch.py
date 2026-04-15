@@ -1007,15 +1007,25 @@ def list_authenticated_providers(
             default_model = ep_cfg.get("default_model", "")
 
             # Build models list from both default_model and full models array
-            models_list = []
+            models_list: list[str] = []
             if default_model:
                 models_list.append(default_model)
-            # Also include the full models list from config
-            cfg_models = ep_cfg.get("models", [])
+
+            # Also include the full models list from config.
+            # Support both legacy list form (['glm-5', ...]) and
+            # v12+ dict form ({'glm-5': {context_length: ...}, ...}).
+            cfg_models = ep_cfg.get("models")
+            iter_models: list[str] = []
             if isinstance(cfg_models, list):
                 for m in cfg_models:
-                    if m and m not in models_list:
-                        models_list.append(m)
+                    if isinstance(m, str):
+                        iter_models.append(m)
+            elif isinstance(cfg_models, dict):
+                iter_models.extend(str(k) for k in cfg_models.keys())
+
+            for m in iter_models:
+                if m and m not in models_list:
+                    models_list.append(m)
 
             # Try to probe /v1/models if URL is set (but don't block on it)
             # For now just show what we know from config

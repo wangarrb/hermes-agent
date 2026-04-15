@@ -39,6 +39,22 @@ def test_normalize_usage_openai_subtracts_cached_prompt_tokens():
     assert normalized.output_tokens == 700
 
 
+def test_normalize_usage_codex_accepts_dict_usage():
+    usage = {
+        "input_tokens": 3000,
+        "output_tokens": 700,
+        "input_tokens_details": {"cached_tokens": 1800},
+        "output_tokens_details": {"reasoning_tokens": 55},
+    }
+
+    normalized = normalize_usage(usage, provider="cch", api_mode="codex_responses")
+
+    assert normalized.input_tokens == 1200
+    assert normalized.cache_read_tokens == 1800
+    assert normalized.output_tokens == 700
+    assert normalized.reasoning_tokens == 55
+
+
 def test_openrouter_models_api_pricing_is_converted_from_per_token_to_per_million(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",

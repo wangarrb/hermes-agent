@@ -2015,6 +2015,35 @@ class HermesCLI:
             return 0
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
+    def _get_spinner_fragments(self):
+        """Return live spinner/status fragments for the TUI row above the status bar."""
+        txt = getattr(self, "_spinner_text", "")
+        if not txt:
+            return []
+
+        frame = self._command_spinner_frame()
+        t0 = getattr(self, "_tool_start_time", 0.0)
+        if t0 > 0:
+            import time as _time
+
+            elapsed = _time.monotonic() - t0
+            if elapsed >= 60:
+                _m, _s = int(elapsed // 60), int(elapsed % 60)
+                elapsed_str = f"{_m}m {_s}s"
+            else:
+                elapsed_str = f"{elapsed:.1f}s"
+            return [('class:hint', f'  {frame} {txt}  ({elapsed_str})')]
+
+        return [('class:hint', f'  {frame} {txt}')]
+
+    def _needs_live_spinner_refresh(self) -> bool:
+        """Return True when the TUI should repaint at spinner cadence."""
+        return bool(
+            getattr(self, "_command_running", False)
+            or getattr(self, "_spinner_text", "")
+            or getattr(self, "_tool_start_time", 0.0) > 0
+        )
+
     def _get_voice_status_fragments(self, width: Optional[int] = None):
         """Return the voice status bar fragments for the interactive TUI."""
         width = width or self._get_tui_terminal_width()
@@ -4528,12 +4557,6 @@ class HermesCLI:
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
 
-        self._pending_model_switch_note = (
-            f"[Note: model was just switched from {old_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
-        )
-
         provider_label = result.provider_label or result.target_provider
         _cprint(f"  ✓ Model switched: {result.new_model}")
         _cprint(f"    Provider: {provider_label}")
@@ -4550,11 +4573,57 @@ class HermesCLI:
         else:
             try:
                 from agent.model_metadata import get_model_context_length
+                from hermes_cli.config import load_config
+
+                # Check custom_providers for explicit context_length first
+                cfg = load_config()
+                custom_providers = cfg.get("custom_providers") or cfg.get("providers") or {}
+                custom_ctx = None
+                target_base_url = (result.base_url or self.base_url or "").rstrip("/")
+                for entry in custom_providers:
+                    if isinstance(custom_providers, dict):
+                        # providers: is keyed, iterate values
+                        entry_data = custom_providers.get(entry) if isinstance(entry, str) else entry
+                        if not isinstance(entry_data, dict):
+                            continue
+                        entry_url = (entry_data.get("base_url") or "").rstrip("/")
+                        entry_models = entry_data.get("models", [])
+                        entry_ctx = entry_data.get("context_length")
+                    else:
+                        # custom_providers: is list
+                        if not isinstance(entry, dict):
+                            continue
+                        entry_url = (entry.get("base_url") or "").rstrip("/")
+                        entry_models = entry.get("models", [])
+                        entry_ctx = entry.get("context_length")
+
+                    if entry_url != target_base_url:
+                        continue
+                    if isinstance(entry_models, list) and result.new_model in entry_models:
+                        if entry_ctx is not None:
+                            try:
+                                custom_ctx = int(entry_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        break
+                    elif isinstance(entry_models, dict):
+                        model_cfg = entry_models.get(result.new_model)
+                        if isinstance(model_cfg, dict):
+                            model_ctx = model_cfg.get("context_length", entry_ctx)
+                            if model_ctx is not None:
+                                try:
+                                    custom_ctx = int(model_ctx)
+                                except (TypeError, ValueError):
+                                    pass
+                        if custom_ctx is not None:
+                            break
+
                 ctx = get_model_context_length(
                     result.new_model,
                     base_url=result.base_url or self.base_url,
                     api_key=result.api_key or self.api_key,
                     provider=result.target_provider,
+                    config_context_length=custom_ctx,
                 )
                 _cprint(f"    Context: {ctx:,} tokens")
             except Exception:
@@ -4749,15 +4818,6 @@ class HermesCLI:
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
 
-        # Store a note to prepend to the next user message so the model
-        # knows a switch occurred (avoids injecting system messages mid-history
-        # which breaks providers and prompt caching).
-        self._pending_model_switch_note = (
-            f"[Note: model was just switched from {old_model} to {result.new_model} "
-            f"via {result.provider_label or result.target_provider}. "
-            f"Adjust your self-identification accordingly.]"
-        )
-
         # Display confirmation with full metadata
         provider_label = result.provider_label or result.target_provider
         _cprint(f"  ✓ Model switched: {result.new_model}")
@@ -4777,11 +4837,57 @@ class HermesCLI:
             # Fallback to old context length lookup
             try:
                 from agent.model_metadata import get_model_context_length
+                from hermes_cli.config import load_config
+
+                # Check custom_providers for explicit context_length first
+                cfg = load_config()
+                custom_providers_cfg = cfg.get("custom_providers") or cfg.get("providers") or {}
+                custom_ctx = None
+                target_base_url = (result.base_url or self.base_url or "").rstrip("/")
+                for key_or_entry in custom_providers_cfg:
+                    if isinstance(custom_providers_cfg, dict):
+                        # providers: is keyed
+                        entry = custom_providers_cfg.get(key_or_entry) if isinstance(key_or_entry, str) else key_or_entry
+                        if not isinstance(entry, dict):
+                            continue
+                        entry_url = (entry.get("base_url") or "").rstrip("/")
+                        entry_models = entry.get("models", [])
+                        entry_ctx = entry.get("context_length")
+                    else:
+                        # custom_providers: is list
+                        if not isinstance(key_or_entry, dict):
+                            continue
+                        entry_url = (key_or_entry.get("base_url") or "").rstrip("/")
+                        entry_models = key_or_entry.get("models", [])
+                        entry_ctx = key_or_entry.get("context_length")
+
+                    if entry_url != target_base_url:
+                        continue
+                    if isinstance(entry_models, list) and result.new_model in entry_models:
+                        if entry_ctx is not None:
+                            try:
+                                custom_ctx = int(entry_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        break
+                    elif isinstance(entry_models, dict):
+                        model_cfg = entry_models.get(result.new_model)
+                        if isinstance(model_cfg, dict):
+                            model_ctx = model_cfg.get("context_length", entry_ctx)
+                            if model_ctx is not None:
+                                try:
+                                    custom_ctx = int(model_ctx)
+                                except (TypeError, ValueError):
+                                    pass
+                        if custom_ctx is not None:
+                            break
+
                 ctx = get_model_context_length(
                     result.new_model,
                     base_url=result.base_url or self.base_url,
                     api_key=result.api_key or self.api_key,
                     provider=result.target_provider,
+                    config_context_length=custom_ctx,
                 )
                 _cprint(f"    Context: {ctx:,} tokens")
             except Exception:
@@ -5575,16 +5681,19 @@ class HermesCLI:
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
                 user_instruction = cmd_original[len(base_cmd):].strip()
-                msg = build_skill_invocation_message(
-                    base_cmd, user_instruction, task_id=self.session_id
-                )
-                if msg:
-                    skill_name = _skill_commands[base_cmd]["name"]
-                    print(f"\n⚡ Loading skill: {skill_name}")
-                    if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                if base_cmd == "/mycompress":
+                    self._handle_skill_compress_command(base_cmd, user_instruction)
                 else:
-                    ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
+                    msg = build_skill_invocation_message(
+                        base_cmd, user_instruction, task_id=self.session_id
+                    )
+                    if msg:
+                        skill_name = _skill_commands[base_cmd]["name"]
+                        print(f"\n⚡ Loading skill: {skill_name}")
+                        if hasattr(self, '_pending_input'):
+                            self._pending_input.put(msg)
+                    else:
+                        ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
                 # Prefix matching: if input uniquely identifies one command, execute it.
                 # Matches against both built-in COMMANDS and installed skill commands so
@@ -6383,6 +6492,128 @@ class HermesCLI:
 
         except Exception as e:
             print(f"  ❌ Compression failed: {e}")
+
+    def _handle_skill_compress_command(self, cmd_key: str, user_instruction: str = ""):
+        """Run a skill-backed compression pass that replaces conversation history."""
+        if not self.conversation_history or len(self.conversation_history) < 4:
+            print("(._.) Not enough conversation to compress (need at least 4 messages).")
+            return
+
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        if not self.agent.compression_enabled:
+            print("(._.) Compression is disabled in config.")
+            return
+
+        skill_prompt = build_skill_invocation_message(
+            cmd_key,
+            user_instruction,
+            task_id=self.session_id,
+            runtime_note=(
+                "This invocation should perform a real context replacement. "
+                "Use the skill only as the summary template and content policy."
+            ),
+        )
+        if not skill_prompt:
+            print(f"  ❌ Failed to load skill for {cmd_key}")
+            return
+
+        compressor = self.agent.context_compressor
+        original_generate_summary = getattr(compressor, "_generate_summary")
+        original_count = len(self.conversation_history)
+
+        try:
+            from agent.auxiliary_client import call_llm, _resolve_task_provider_model
+            from agent.model_metadata import estimate_messages_tokens_rough
+
+            approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(f"🗜️  Skill-compressing {original_count} messages (~{approx_tokens:,} tokens)...")
+
+            def custom_generate_summary(turns_to_summarize, focus_topic=None):
+                summary_budget = compressor._compute_summary_budget(turns_to_summarize)
+                content_to_summarize = compressor._serialize_for_summary(turns_to_summarize)
+                previous_summary = getattr(compressor, "_previous_summary", None)
+                if previous_summary:
+                    prompt = (
+                        f"{skill_prompt}\n\n"
+                        "你现在是在更新上一版 handoff 摘要。保留仍然有效的信息，合并新的进展，删除已失效内容。\n\n"
+                        f"PREVIOUS SUMMARY:\n{previous_summary}\n\n"
+                        f"TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n"
+                        f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
+                    )
+                else:
+                    prompt = (
+                        f"{skill_prompt}\n\n"
+                        f"TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n"
+                        f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
+                    )
+
+                main_runtime = self.agent._current_main_runtime()
+                resolved_provider, resolved_model, _resolved_base_url, _resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
+                    "compression", None, None, None, None
+                )
+                print(
+                    "  ℹ /mycompress debug: "
+                    f"main={main_runtime.get('provider','?')}/{main_runtime.get('model','?')}"
+                    f" api_mode={main_runtime.get('api_mode','?')} "
+                    f"cfg={resolved_provider or 'auto'}/{resolved_model or '<default>'}"
+                    f" cfg_api_mode={resolved_api_mode or '<auto>'}"
+                )
+
+                if (main_runtime.get("api_mode") or getattr(self.agent, "api_mode", "")) == "codex_responses":
+                    system_prompt = self.agent._cached_system_prompt or self.agent._build_system_prompt()
+                    api_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ]
+                    codex_kwargs = self.agent._build_api_kwargs(api_messages)
+                    codex_kwargs.pop("tools", None)
+                    codex_kwargs.pop("tool_choice", None)
+                    codex_kwargs.pop("parallel_tool_calls", None)
+                    codex_kwargs["max_output_tokens"] = summary_budget * 2
+                    summary_response = self.agent._run_codex_stream(codex_kwargs)
+                    assistant_message, _ = self.agent._normalize_codex_response(summary_response)
+                    content = ""
+                    if assistant_message:
+                        content = (
+                            getattr(assistant_message, "content", None)
+                            or getattr(assistant_message, "reasoning", None)
+                            or ""
+                        )
+                else:
+                    response = call_llm(
+                        task="compression",
+                        main_runtime=main_runtime,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=summary_budget * 2,
+                    )
+                    content = response.choices[0].message.content
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                summary = content.strip()
+                compressor._previous_summary = summary
+                compressor._summary_failure_cooldown_until = 0.0
+                return compressor._with_summary_prefix(summary)
+
+            compressor._generate_summary = custom_generate_summary
+            compressed, _new_system = self.agent._compress_context(
+                self.conversation_history,
+                self.agent._cached_system_prompt or "",
+                approx_tokens=approx_tokens,
+            )
+            self.conversation_history = compressed
+            new_count = len(self.conversation_history)
+            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(
+                f"  ✅ Skill compressed: {original_count} → {new_count} messages "
+                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
+            )
+        except Exception as e:
+            print(f"  ❌ Skill compression failed: {e}")
+        finally:
+            compressor._generate_summary = original_generate_summary
 
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""
@@ -9027,21 +9258,7 @@ class HermesCLI:
             return cli_ref._agent_spacer_height()
 
         def get_spinner_text():
-            txt = cli_ref._spinner_text
-            if not txt:
-                return []
-            # Append live elapsed timer when a tool is running
-            t0 = cli_ref._tool_start_time
-            if t0 > 0:
-                import time as _time
-                elapsed = _time.monotonic() - t0
-                if elapsed >= 60:
-                    _m, _s = int(elapsed // 60), int(elapsed % 60)
-                    elapsed_str = f"{_m}m {_s}s"
-                else:
-                    elapsed_str = f"{elapsed:.1f}s"
-                return [('class:hint', f'  {txt}  ({elapsed_str})')]
-            return [('class:hint', f'  {txt}')]
+            return cli_ref._get_spinner_fragments()
 
         def get_spinner_height():
             return cli_ref._spinner_widget_height()
@@ -9492,7 +9709,7 @@ class HermesCLI:
                 if not self._app:
                     _time.sleep(0.1)
                     continue
-                if self._command_running:
+                if self._needs_live_spinner_refresh():
                     self._invalidate(min_interval=0.1)
                     _time.sleep(0.1)
                 else:

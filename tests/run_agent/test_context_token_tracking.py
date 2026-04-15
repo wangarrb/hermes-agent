@@ -126,3 +126,14 @@ def test_codex_no_cache_fields(monkeypatch):
     agent = _make_agent(monkeypatch, "codex_responses", "openai-codex", resp)
     agent.run_conversation("hi")
     assert agent.context_compressor.last_prompt_tokens == 3000
+
+
+def test_codex_dict_usage_updates_context_tokens(monkeypatch):
+    resp = lambda: SimpleNamespace(
+        output=[SimpleNamespace(type="message", content=[SimpleNamespace(type="output_text", text="ok")])],
+        usage={"input_tokens": 3000, "output_tokens": 50, "total_tokens": 3050},
+        status="completed", model="gpt-5-codex",
+    )
+    agent = _make_agent(monkeypatch, "codex_responses", "openai-codex", resp)
+    agent.run_conversation("hi")
+    assert agent.context_compressor.last_prompt_tokens == 3000

@@ -1324,6 +1324,25 @@ class AIAgent:
                                         file=sys.stderr,
                                     )
                     break
+
+        # Check providers.{provider_name}.context_length (new format)
+        # This supports the v12+ providers format where context_length is set
+        # at the provider level rather than per-model.
+        if _config_context_length is None and self.provider:
+            _providers_cfg = _agent_cfg.get("providers", {})
+            if isinstance(_providers_cfg, dict):
+                _prov_cfg = _providers_cfg.get(self.provider, {})
+                if isinstance(_prov_cfg, dict):
+                    _prov_ctx = _prov_cfg.get("context_length")
+                    if _prov_ctx is not None:
+                        try:
+                            _config_context_length = int(_prov_ctx)
+                        except (TypeError, ValueError):
+                            pass
+        
+        # Update stored config_context_length if we found a value
+        if _config_context_length is not None:
+            self._config_context_length = _config_context_length
         
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
@@ -1743,10 +1762,13 @@ class AIAgent:
         In headless/stdio-protocol environments, a raw spinner with no custom
         ``_print_fn`` falls back to ``sys.stdout`` and can corrupt protocol
         streams such as ACP JSON-RPC. Allow quiet spinners only when either:
-        - output is explicitly rerouted via ``_print_fn``; or
+        - output is explicitly rerouted via ``_print_fn``;
+        - ``HERMES_FORCE_SPINNER=1`` explicitly enables pseudo-TTY rendering; or
         - stdout is a real TTY.
         """
         if self._print_fn is not None:
+            return True
+        if os.getenv("HERMES_FORCE_SPINNER") == "1":
             return True
         stream = getattr(sys, "stdout", None)
         if stream is None:
@@ -3281,10 +3303,6 @@ class AIAgent:
         timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
         if self.pass_session_id and self.session_id:
             timestamp_line += f"\nSession ID: {self.session_id}"
-        if self.model:
-            timestamp_line += f"\nModel: {self.model}"
-        if self.provider:
-            timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
 
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
@@ -3574,6 +3592,24 @@ class AIAgent:
             if role == "system":
                 continue
 
+            # Handle developer role for CCH compatibility
+            # Convert developer to user with [SYSTEM]: prefix (same as _preflight_codex_input_items)
+            if role == "developer":
+                content = msg.get("content", "")
+                if content is None:
+                    content = ""
+                # Handle content list format: [{"type": "input_text", "text": "..."}]
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "input_text":
+                            text_parts.append(part.get("text", ""))
+                    content = "\n".join(text_parts) if text_parts else ""
+                elif not isinstance(content, str):
+                    content = str(content)
+                items.append({"role": "user", "content": f"[SYSTEM]: {content}"})
+                continue
+
             if role in {"user", "assistant"}:
                 content = msg.get("content", "")
                 content_text = str(content) if content is not None else ""
@@ -3748,6 +3784,23 @@ class AIAgent:
                 continue
 
             role = item.get("role")
+            # CCH doesn't support 'developer' role, convert to 'user' with [SYSTEM]: prefix
+            if role == "developer":
+                content = item.get("content", "")
+                if content is None:
+                    content = ""
+                # Handle content list format: [{"type": "input_text", "text": "..."}]
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "input_text":
+                            text_parts.append(part.get("text", ""))
+                    content = "\n".join(text_parts) if text_parts else ""
+                elif not isinstance(content, str):
+                    content = str(content)
+                normalized.append({"role": "user", "content": f"[SYSTEM]: {content}"})
+                continue
+
             if role in {"user", "assistant"}:
                 content = item.get("content", "")
                 if content is None:
@@ -4358,9 +4411,186 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _run_codex_stream_httpx_direct(self, api_kwargs: dict, on_first_delta: callable = None):
+        """Bypass OpenAI SDK and use httpx directly for Responses API streaming.
+
+        Workaround for Python OpenAI SDK compatibility issues with some proxies (e.g. CCH).
+        """
+        import httpx as _httpx
+        import json as _json
+        import uuid
+
+        base_url = (self.base_url or "").rstrip("/")
+        url = f"{base_url}/responses"
+        api_key = self.api_key or ""
+
+        # Force stream=True for httpx direct mode (bypass path skips SDK preflight)
+        api_kwargs = dict(api_kwargs)
+        api_kwargs["stream"] = True
+
+        logger.info(f"[CODEX_HTTPX_DIRECT] url={url}, model={self.model}")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        # Build payload
+        payload = dict(api_kwargs)
+        
+        has_tool_calls = False
+        first_delta_fired = False
+        self._codex_streamed_text_parts: list = []
+        collected_output_items: list = []
+        terminal_response_data = None
+
+        timeout = _httpx.Timeout(
+            connect=30.0,
+            read=float(os.getenv("HERMES_STREAM_READ_TIMEOUT", "60.0")),
+            write=300.0,
+            pool=30.0,
+        )
+
+        try:
+            with _httpx.stream(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                if response.status_code >= 400:
+                    error_body = response.read()
+                    raise RuntimeError(f"HTTP {response.status_code}: {error_body.decode('utf-8', errors='replace')[:500]}")
+
+                for line in response.iter_lines():
+                    if self._interrupt_requested:
+                        break
+
+                    self._touch_activity("receiving stream response")
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Parse SSE format: "data: {...}"
+                    if line.startswith("data: "):
+                        data_str = line[6:]  # Remove "data: " prefix
+                        if data_str == "[DONE]":
+                            continue
+
+                        try:
+                            event = _json.loads(data_str)
+                        except _json.JSONDecodeError:
+                            continue
+
+                        event_type = event.get("type", "")
+
+                        # Handle text deltas
+                        if "output_text.delta" in event_type or event_type == "response.output_text.delta":
+                            delta_text = event.get("delta", "")
+                            if delta_text:
+                                self._codex_streamed_text_parts.append(delta_text)
+                            if delta_text and not has_tool_calls:
+                                if not first_delta_fired:
+                                    first_delta_fired = True
+                                    if on_first_delta:
+                                        try:
+                                            on_first_delta()
+                                        except Exception:
+                                            pass
+                                self._fire_stream_delta(delta_text)
+
+                        # Track tool calls
+                        elif "function_call" in event_type:
+                            has_tool_calls = True
+
+                        # Handle reasoning deltas
+                        elif "reasoning" in event_type and "delta" in event_type:
+                            reasoning_text = event.get("delta", "")
+                            if reasoning_text:
+                                self._fire_reasoning_delta(reasoning_text)
+
+                        # Collect completed output items
+                        elif event_type == "response.output_item.done":
+                            done_item = event.get("item")
+                            if done_item:
+                                collected_output_items.append(done_item)
+
+                        # Handle terminal events
+                        elif event_type in ("response.completed", "response.incomplete", "response.failed"):
+                            terminal_response_data = event.get("response", event)
+
+        except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            logger.error(f"[CODEX_HTTPX_DIRECT] Connection error: {exc}")
+            raise
+
+        # Build response object
+        if terminal_response_data is None:
+            # Synthesize from collected data
+            if self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                terminal_response_data = {
+                    "id": f"resp_{uuid.uuid4().hex[:24]}",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": assembled}]
+                    }]
+                }
+            else:
+                raise RuntimeError("Responses stream did not emit a terminal response")
+
+        # Backfill output if empty
+        output = terminal_response_data.get("output", [])
+        if isinstance(output, list) and not output:
+            if collected_output_items:
+                terminal_response_data["output"] = collected_output_items
+            elif self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                terminal_response_data["output"] = [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": assembled}]
+                }]
+
+        # Return a SimpleNamespace object that mimics SDK response
+        return self._build_responses_object(terminal_response_data)
+
+    def _build_responses_object(self, data: dict) -> Any:
+        """Build a response object from parsed JSON that mimics SDK's response object."""
+        from types import SimpleNamespace
+
+        def build_content_item(item):
+            if not isinstance(item, dict):
+                return item
+            return SimpleNamespace(**{k: v for k, v in item.items()})
+
+        def build_output_item(item):
+            if not isinstance(item, dict):
+                return item
+            content = item.get("content")
+            if isinstance(content, list):
+                item["content"] = [build_content_item(c) for c in content]
+            return SimpleNamespace(**item)
+
+        output = data.get("output", [])
+        if isinstance(output, list):
+            data["output"] = [build_output_item(o) for o in output]
+
+        return SimpleNamespace(**data)
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
+
+        # Check if we should bypass SDK and use httpx directly
+        # Useful for proxies that don't work well with Python OpenAI SDK (e.g. CCH)
+        bypass_sdk = os.getenv("HERMES_CODEX_BYPASS_SDK", "").lower() in ("true", "1", "yes")
+        if bypass_sdk:
+            logger.info("[CODEX_STREAM] Bypassing SDK, using httpx directly")
+            return self._run_codex_stream_httpx_direct(api_kwargs, on_first_delta=on_first_delta)
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
@@ -6166,6 +6396,30 @@ class AIAgent:
                 self.provider == "openai-codex"
                 or "chatgpt.com/backend-api/codex" in self.base_url.lower()
             )
+
+            # For non-Github Responses proxies (like CCH), inject instructions as
+            # developer role input message to bypass instructions field override.
+            # CCH may inject its own Codex CLI instructions, so we use developer role
+            # to preserve our identity/system prompt.
+            _model_lower = (self.model or "").lower()
+            use_developer_input = (
+                not is_github_responses
+                and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
+            )
+            
+            if use_developer_input and instructions:
+                # Prepend developer role input message with system prompt content.
+                # For CCH/proxy compatibility we preserve the original system prompt,
+                # but do not append runtime identity lines.
+                dev_input_item = {
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": instructions}],
+                }
+                # Build input list with developer message first
+                dev_payload = [dev_input_item] + list(payload_messages)
+                payload_messages = dev_payload
+                # Keep instructions field minimal (CCH may override it anyway)
+                instructions = DEFAULT_AGENT_IDENTITY
 
             # Resolve reasoning effort: config > default (medium)
             reasoning_effort = "medium"

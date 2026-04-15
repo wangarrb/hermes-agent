@@ -221,12 +221,22 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
                             pass
                     current_cmd = ""
         else:
-            result = subprocess.run(
+            ps_commands = [
                 ["ps", "eww", "-ax", "-o", "pid=,command="],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+                ["ps", "-eo", "pid=,args="],
+            ]
+            result = None
+            for ps_cmd in ps_commands:
+                result = subprocess.run(
+                    ps_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    break
+            if result is None or result.returncode != 0:
+                return pids
             for line in result.stdout.split('\n'):
                 stripped = line.strip()
                 if not stripped or 'grep' in stripped:

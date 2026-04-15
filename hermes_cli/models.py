@@ -1033,6 +1033,35 @@ def detect_provider_for_model(
     if any(name_lower == m.lower() for m in current_models):
         return None
 
+    # --- Step 0.5: check user-configured providers first ---
+    # User custom providers take priority over static catalogs
+    try:
+        import os as _os
+        from hermes_cli.config import load_config
+        config = load_config()
+        user_providers = config.get("providers", {})
+        for pid, pconfig in user_providers.items():
+            if pid == current_provider or pid in _AGGREGATORS:
+                continue
+            models = pconfig.get("models", [])
+            if isinstance(models, list) and any(name_lower == m.lower() for m in models):
+                # User has this model configured in a custom provider
+                # Check if credentials exist
+                api_key_env = pconfig.get("api_key_env", "")
+                api_key = pconfig.get("api_key", "")
+                has_creds = False
+                if api_key_env and _os.getenv(api_key_env, "").strip():
+                    has_creds = True
+                if api_key.strip():
+                    has_creds = True
+                if has_creds:
+                    return (pid, name)
+                # No creds but user explicitly configured this provider — return it
+                # Credential resolution will give a clear error
+                return (pid, name)
+    except Exception:
+        pass
+
     # --- Step 1: check static provider catalogs for a direct match ---
     direct_match: Optional[str] = None
     for pid, models in _PROVIDER_MODELS.items():
