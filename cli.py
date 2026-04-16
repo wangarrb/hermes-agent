@@ -6522,14 +6522,12 @@ class HermesCLI:
 
         compressor = self.agent.context_compressor
         original_generate_summary = getattr(compressor, "_generate_summary")
-        original_count = len(self.conversation_history)
 
         try:
             from agent.auxiliary_client import call_llm, _resolve_task_provider_model
             from agent.model_metadata import estimate_messages_tokens_rough
 
             approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
-            print(f"🗜️  Skill-compressing {original_count} messages (~{approx_tokens:,} tokens)...")
 
             def custom_generate_summary(turns_to_summarize, focus_topic=None):
                 summary_budget = compressor._compute_summary_budget(turns_to_summarize)
@@ -6554,13 +6552,14 @@ class HermesCLI:
                 resolved_provider, resolved_model, _resolved_base_url, _resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
                     "compression", None, None, None, None
                 )
-                print(
-                    "  ℹ /mycompress debug: "
-                    f"main={main_runtime.get('provider','?')}/{main_runtime.get('model','?')}"
-                    f" api_mode={main_runtime.get('api_mode','?')} "
-                    f"cfg={resolved_provider or 'auto'}/{resolved_model or '<default>'}"
-                    f" cfg_api_mode={resolved_api_mode or '<auto>'}"
-                )
+                if self.verbose:
+                    print(
+                        "  ℹ /mycompress debug: "
+                        f"main={main_runtime.get('provider','?')}/{main_runtime.get('model','?')}"
+                        f" api_mode={main_runtime.get('api_mode','?')} "
+                        f"cfg={resolved_provider or 'auto'}/{resolved_model or '<default>'}"
+                        f" cfg_api_mode={resolved_api_mode or '<auto>'}"
+                    )
 
                 if (main_runtime.get("api_mode") or getattr(self.agent, "api_mode", "")) == "codex_responses":
                     system_prompt = self.agent._cached_system_prompt or self.agent._build_system_prompt()
@@ -6573,7 +6572,17 @@ class HermesCLI:
                     codex_kwargs.pop("tool_choice", None)
                     codex_kwargs.pop("parallel_tool_calls", None)
                     codex_kwargs["max_output_tokens"] = summary_budget * 2
-                    summary_response = self.agent._run_codex_stream(codex_kwargs)
+
+                    original_stream_delta_callback = getattr(self.agent, "stream_delta_callback", None)
+                    original_stream_callback = getattr(self.agent, "_stream_callback", None)
+                    try:
+                        self.agent.stream_delta_callback = None
+                        self.agent._stream_callback = None
+                        summary_response = self.agent._run_codex_stream(codex_kwargs)
+                    finally:
+                        self.agent.stream_delta_callback = original_stream_delta_callback
+                        self.agent._stream_callback = original_stream_callback
+
                     assistant_message, _ = self.agent._normalize_codex_response(summary_response)
                     content = ""
                     if assistant_message:
@@ -6604,14 +6613,9 @@ class HermesCLI:
                 approx_tokens=approx_tokens,
             )
             self.conversation_history = compressed
-            new_count = len(self.conversation_history)
-            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
-            print(
-                f"  ✅ Skill compressed: {original_count} → {new_count} messages "
-                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
-            )
+            print("已压缩完成。")
         except Exception as e:
-            print(f"  ❌ Skill compression failed: {e}")
+            print(f"压缩失败：{e}")
         finally:
             compressor._generate_summary = original_generate_summary
 

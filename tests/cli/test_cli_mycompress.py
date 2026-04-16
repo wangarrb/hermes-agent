@@ -147,3 +147,149 @@ def test_mycompress_uses_main_codex_chain_for_codex_responses():
     assert "parallel_tool_calls" not in sent_kwargs
     assert sent_kwargs["max_output_tokens"] == 128
     assert compressor._previous_summary == "handoff summary"
+
+
+def test_mycompress_suppresses_stream_callbacks_while_generating_codex_summary():
+    shell = _make_cli()
+    handler_globals = shell._handle_skill_compress_command.__func__.__globals__
+    history = _make_history()
+    compressed = [history[0], history[-1]]
+    shell.conversation_history = list(history)
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = "system prompt"
+    shell.agent.api_mode = "codex_responses"
+
+    compressor = MagicMock()
+    original_generate_summary = MagicMock(return_value="orig")
+    compressor._generate_summary = original_generate_summary
+    compressor._compute_summary_budget.return_value = 64
+    compressor._serialize_for_summary.return_value = "serialized turns"
+    compressor._with_summary_prefix.side_effect = lambda summary: f"[CONTEXT SUMMARY]: {summary}"
+    compressor._previous_summary = None
+    compressor._summary_failure_cooldown_until = 123.0
+    shell.agent.context_compressor = compressor
+    shell.agent._current_main_runtime.return_value = {
+        "provider": "cch",
+        "model": "gpt-5.4",
+        "base_url": "http://cch.jmadas.com/v1",
+        "api_mode": "codex_responses",
+    }
+
+    def fake_compress(history_arg, system_prompt, approx_tokens):
+        compressor._generate_summary(history_arg)
+        return compressed, ""
+
+    shell.agent._compress_context.side_effect = fake_compress
+    shell.agent._build_api_kwargs.return_value = {
+        "model": "gpt-5.4",
+        "instructions": "system prompt",
+        "input": [{"role": "user", "content": "prompt"}],
+        "tools": [{"type": "function", "name": "noop"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    streamed_chunks = []
+
+    def primary_stream_cb(text):
+        streamed_chunks.append(("primary", text))
+
+    def secondary_stream_cb(text):
+        streamed_chunks.append(("secondary", text))
+
+    shell.agent.stream_delta_callback = primary_stream_cb
+    shell.agent._stream_callback = secondary_stream_cb
+
+    def fake_run_codex_stream(_api_kwargs):
+        if shell.agent.stream_delta_callback is not None:
+            shell.agent.stream_delta_callback("LEAKED_SUMMARY")
+        if shell.agent._stream_callback is not None:
+            shell.agent._stream_callback("LEAKED_SUMMARY")
+        return SimpleNamespace(output=[])
+
+    shell.agent._run_codex_stream.side_effect = fake_run_codex_stream
+    shell.agent._normalize_codex_response.return_value = (
+        SimpleNamespace(content="handoff summary", reasoning=None),
+        "stop",
+    )
+
+    mock_build = MagicMock(return_value="skill prompt")
+
+    def estimate(messages):
+        return 100 if messages == history else 2
+
+    with patch.dict(handler_globals, {"build_skill_invocation_message": mock_build}), \
+         patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=estimate), \
+         patch("agent.auxiliary_client.call_llm") as mock_call:
+        shell._handle_skill_compress_command("/mycompress", "保留关键结论")
+
+    mock_call.assert_not_called()
+    assert streamed_chunks == []
+    assert shell.agent.stream_delta_callback is primary_stream_cb
+    assert shell.agent._stream_callback is secondary_stream_cb
+    assert compressor._previous_summary == "handoff summary"
+
+
+def test_mycompress_only_prints_minimal_completion_status(capsys):
+    shell = _make_cli()
+    handler_globals = shell._handle_skill_compress_command.__func__.__globals__
+    history = _make_history()
+    compressed = [history[0], history[-1]]
+    shell.conversation_history = list(history)
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = "system prompt"
+    shell.agent.api_mode = "codex_responses"
+
+    compressor = MagicMock()
+    original_generate_summary = MagicMock(return_value="orig")
+    compressor._generate_summary = original_generate_summary
+    compressor._compute_summary_budget.return_value = 64
+    compressor._serialize_for_summary.return_value = "serialized turns"
+    compressor._with_summary_prefix.side_effect = lambda summary: f"[CONTEXT SUMMARY]: {summary}"
+    compressor._previous_summary = None
+    compressor._summary_failure_cooldown_until = 123.0
+    shell.agent.context_compressor = compressor
+    shell.agent._current_main_runtime.return_value = {
+        "provider": "cch",
+        "model": "gpt-5.4",
+        "base_url": "http://cch.jmadas.com/v1",
+        "api_mode": "codex_responses",
+    }
+
+    def fake_compress(history_arg, system_prompt, approx_tokens):
+        compressor._generate_summary(history_arg)
+        return compressed, ""
+
+    shell.agent._compress_context.side_effect = fake_compress
+    shell.agent._build_api_kwargs.return_value = {
+        "model": "gpt-5.4",
+        "instructions": "system prompt",
+        "input": [{"role": "user", "content": "prompt"}],
+        "tools": [{"type": "function", "name": "noop"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+    shell.agent._run_codex_stream.return_value = SimpleNamespace(output=[])
+    shell.agent._normalize_codex_response.return_value = (
+        SimpleNamespace(content="handoff summary", reasoning=None),
+        "stop",
+    )
+
+    mock_build = MagicMock(return_value="skill prompt")
+
+    def estimate(messages):
+        return 100 if messages == history else 2
+
+    with patch.dict(handler_globals, {"build_skill_invocation_message": mock_build}), \
+         patch("agent.model_metadata.estimate_messages_tokens_rough", side_effect=estimate), \
+         patch("agent.auxiliary_client.call_llm") as mock_call:
+        shell._handle_skill_compress_command("/mycompress", "保留关键结论")
+
+    mock_call.assert_not_called()
+    output = capsys.readouterr().out
+    assert "已压缩完成。" in output
+    assert "Skill-compressing" not in output
+    assert "/mycompress debug" not in output
+    assert "Skill compressed" not in output
