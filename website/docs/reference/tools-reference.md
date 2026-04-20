@@ -6,13 +6,17 @@ description: "Authoritative reference for Hermes built-in tools, grouped by tool
 
 # Built-in Tools Reference
 
-This page documents all 47 built-in tools in the Hermes tool registry, grouped by toolset. Availability varies by platform, credentials, and enabled toolsets.
-
-**Quick counts:** 10 browser tools, 4 file tools, 10 RL tools, 4 Home Assistant tools, 2 terminal tools, 2 web tools, and 15 standalone tools across other toolsets.
+This page documents Hermes built-in tools, grouped by toolset. Availability varies by platform, credentials, enabled toolsets, and local runtime dependencies such as `ffmpeg` or `yt-dlp`.
 
 :::tip MCP Tools
 In addition to built-in tools, Hermes can load tools dynamically from MCP servers. MCP tools appear with a server-name prefix (e.g., `github_create_issue` for the `github` MCP server). See [MCP Integration](/docs/user-guide/features/mcp) for configuration.
 :::
+
+## `audio` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `audio_transcribe` | Transcribe local or remote audio files into text. Supports long recordings by chunking through `ffmpeg`, and can use direct URLs or non-direct media pages when `yt-dlp` is installed. Saves transcript artifacts under the Hermes media cache or a user-provided output directory. | STT provider configured; `ffmpeg` required for long or converted media |
 
 ## `browser` toolset
 
@@ -160,4 +164,10 @@ In addition to built-in tools, Hermes can load tools dynamically from MCP server
 |------|-------------|----------------------|
 | `text_to_speech` | Convert text to speech audio. Returns a MEDIA: path that the platform delivers as a voice message. On Telegram it plays as a voice bubble, on Discord/WhatsApp as an audio attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider… | — |
 
+## `video` toolset
 
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `video_analyze` | Parse local or remote videos by extracting speech transcript and, optionally, sampled frame analyses via the vision tool. Supports direct video URLs or media pages when `yt-dlp` is installed, chunks long audio with `ffmpeg`, and writes transcript/report artifacts to the Hermes media cache or a custom output directory. | `ffmpeg`; vision provider required only when `deep=true` |
+
+## `vision` toolset

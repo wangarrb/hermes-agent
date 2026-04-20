@@ -35,6 +35,8 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
+    # Audio + video parsing
+    "audio_transcribe", "video_analyze",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -77,6 +79,24 @@ TOOLSETS = {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
         "includes": []
+    },
+    
+    "audio": {
+        "description": "Audio transcription tools for local or remote media",
+        "tools": ["audio_transcribe"],
+        "includes": []
+    },
+    
+    "video": {
+        "description": "Video parsing tools for transcript extraction and optional frame analysis",
+        "tools": ["video_analyze"],
+        "includes": []
+    },
+    
+    "media": {
+        "description": "Combined audio and video parsing tools",
+        "tools": [],
+        "includes": ["audio", "video"]
     },
     
     "vision": {
@@ -251,6 +271,8 @@ TOOLSETS = {
             "terminal", "process",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
+            # Audio + video parsing
+            "audio_transcribe", "video_analyze",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # Skills

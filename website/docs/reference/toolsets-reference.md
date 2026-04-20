@@ -52,6 +52,7 @@ Or in-session:
 
 | Toolset | Tools | Purpose |
 |---------|-------|---------|
+| `audio` | `audio_transcribe` | Transcribe local or remote audio into text, with chunking for long recordings. |
 | `browser` | `browser_back`, `browser_click`, `browser_console`, `browser_get_images`, `browser_navigate`, `browser_press`, `browser_scroll`, `browser_snapshot`, `browser_type`, `browser_vision`, `web_search` | Full browser automation. Includes `web_search` as a fallback for quick lookups. |
 | `clarify` | `clarify` | Ask the user a question when the agent needs clarification. |
 | `code_execution` | `execute_code` | Run Python scripts that call Hermes tools programmatically. |
@@ -70,6 +71,7 @@ Or in-session:
 | `terminal` | `process`, `terminal` | Shell command execution and background process management. |
 | `todo` | `todo` | Task list management within a session. |
 | `tts` | `text_to_speech` | Text-to-speech audio generation. |
+| `video` | `video_analyze` | Parse local or remote videos by extracting transcript and optional frame analysis. |
 | `vision` | `vision_analyze` | Image analysis via vision-capable models. |
 | `web` | `web_extract`, `web_search` | Web search and page content extraction. |
 
@@ -80,6 +82,7 @@ These expand to multiple core toolsets, providing a convenient shorthand for com
 | Toolset | Expands to | Use case |
 |---------|-----------|----------|
 | `debugging` | `patch`, `process`, `read_file`, `search_files`, `terminal`, `web_extract`, `web_search`, `write_file` | Debug sessions — file access, terminal, and web research without browser or delegation overhead. |
+| `media` | `audio_transcribe`, `video_analyze` | Audio/video parsing workflows — transcription, long-media chunking, and optional sampled frame analysis. |
 | `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search` | Read-only research and media generation. No file writes, no terminal access, no code execution. Good for untrusted or constrained environments. |
 
 ## Platform Toolsets
@@ -88,7 +91,7 @@ Platform toolsets define the complete tool configuration for a deployment target
 
 | Toolset | Differences from `hermes-cli` |
 |---------|-------------------------------|
-| `hermes-cli` | Full toolset — all 36 tools including `clarify`. The default for interactive CLI sessions. |
+| `hermes-cli` | Full toolset — all default tools including `clarify`. The default for interactive CLI sessions. |
 | `hermes-acp` | Drops `clarify`, `cronjob`, `image_generate`, `send_message`, `text_to_speech`, homeassistant tools. Focused on coding tasks in IDE context. |
 | `hermes-api-server` | Drops `clarify`, `send_message`, and `text_to_speech`. Adds everything else — suitable for programmatic access where user interaction isn't possible. |
 | `hermes-telegram` | Same as `hermes-cli`. |
