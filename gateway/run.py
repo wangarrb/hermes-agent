@@ -276,6 +276,76 @@ def _normalize_whatsapp_identifier(value: str) -> str:
     )
 
 
+def _parse_mycompress_args(user_instruction: str) -> tuple[Optional[int], str]:
+    """Extract optional keep-last-rounds flags from a gateway /mycompress invocation."""
+    if not user_instruction or not user_instruction.strip():
+        return None, ""
+
+    try:
+        tokens = shlex.split(user_instruction)
+    except ValueError:
+        tokens = user_instruction.split()
+
+    if not tokens:
+        return None, ""
+
+    keep_last_rounds: Optional[int] = None
+    remainder_start = 0
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        value_text = None
+        if token in ("-n", "--keep-last-turns", "--keep-last-rounds"):
+            if index + 1 >= len(tokens):
+                raise ValueError("`/mycompress -n` 缺少轮数，示例：/mycompress -n 3 保留关键结论")
+            value_text = tokens[index + 1]
+            index += 2
+        elif token.startswith("--keep-last-turns="):
+            value_text = token.split("=", 1)[1]
+            index += 1
+        elif token.startswith("--keep-last-rounds="):
+            value_text = token.split("=", 1)[1]
+            index += 1
+        else:
+            remainder_start = index
+            break
+
+        if keep_last_rounds is not None:
+            raise ValueError("`/mycompress` 只接受一个保留最近轮次参数。")
+        try:
+            keep_last_rounds = int(value_text)
+        except (TypeError, ValueError):
+            raise ValueError("`/mycompress -n` 需要正整数轮数。") from None
+        if keep_last_rounds < 1:
+            raise ValueError("`/mycompress -n` 需要大于 0 的轮数。")
+        remainder_start = index
+    else:
+        remainder_start = index
+
+    return keep_last_rounds, " ".join(tokens[remainder_start:]).strip()
+
+
+def _find_mycompress_tail_start(
+    messages: list[dict[str, Any]],
+    keep_last_rounds: int,
+    *,
+    protected_prefix: int = 0,
+) -> int:
+    """Return the earliest message index that keeps the last N user rounds verbatim."""
+    if keep_last_rounds < 1:
+        raise ValueError("keep_last_rounds must be >= 1")
+
+    safe_prefix = max(0, min(protected_prefix, len(messages)))
+    user_indices = [
+        index
+        for index, msg in enumerate(messages)
+        if index >= safe_prefix and msg.get("role") == "user"
+    ]
+    if not user_indices or keep_last_rounds >= len(user_indices):
+        return safe_prefix
+    return user_indices[-keep_last_rounds]
+
+
 def _expand_whatsapp_auth_aliases(identifier: str) -> set:
     """Resolve WhatsApp phone/LID aliases using bridge session mapping files."""
     normalized = _normalize_whatsapp_identifier(identifier)
@@ -3154,8 +3224,12 @@ class GatewayRunner:
                                 f"Enable it with: `hermes skills config`"
                             )
                     user_instruction = event.get_command_args().strip()
+                    if cmd_key == "/mycompress":
+                        return await self._handle_skill_compress_command(event, cmd_key, user_instruction)
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key,
+                        user_instruction,
+                        task_id=_quick_key,
                     )
                     if msg:
                         event.text = msg
@@ -6135,6 +6209,224 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{descriptions[new_mode]}\n_(could not save to config: {e})_"
+
+    async def _handle_skill_compress_command(
+        self,
+        event: MessageEvent,
+        cmd_key: str,
+        user_instruction: str = "",
+    ) -> str:
+        """Handle skill-backed /mycompress with real transcript replacement."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+
+        if not history or len(history) < 4:
+            return "Not enough conversation to compress (need at least 4 messages)."
+
+        try:
+            keep_last_rounds, user_instruction = _parse_mycompress_args(user_instruction)
+        except ValueError as e:
+            return str(e)
+
+        session_key = self._session_key_for_source(source)
+        runtime_note = (
+            "This invocation should perform a real context replacement. "
+            "Use the skill only as the summary template and content policy."
+        )
+        if keep_last_rounds is not None:
+            runtime_note += f" Preserve the most recent {keep_last_rounds} user conversation rounds verbatim."
+
+        from agent.skill_commands import build_skill_invocation_message
+
+        skill_prompt = build_skill_invocation_message(
+            cmd_key,
+            user_instruction,
+            task_id=session_key,
+            runtime_note=runtime_note,
+        )
+        if not skill_prompt:
+            return f"压缩失败：Failed to load skill for {cmd_key}"
+
+        compressor = None
+        original_generate_summary = None
+        original_find_tail_cut = None
+        original_protect_last_n = None
+
+        try:
+            from run_agent import AIAgent
+            from agent.auxiliary_client import call_llm
+            from agent.model_metadata import estimate_messages_tokens_rough
+
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+            )
+            if not runtime_kwargs.get("api_key"):
+                return "压缩失败：No provider configured -- cannot compress."
+
+            msgs = []
+            for message in history:
+                role = message.get("role")
+                if role not in ("user", "assistant", "tool"):
+                    continue
+                normalized = {"role": role}
+                for key in (
+                    "content",
+                    "tool_calls",
+                    "tool_call_id",
+                    "tool_name",
+                    "reasoning",
+                    "reasoning_details",
+                    "codex_reasoning_items",
+                ):
+                    if key in message:
+                        normalized[key] = message.get(key)
+                if role == "user" and not normalized.get("content"):
+                    continue
+                if role == "assistant" and not normalized.get("content") and not normalized.get("tool_calls"):
+                    continue
+                if role == "tool" and not normalized.get("content") and not normalized.get("tool_call_id"):
+                    continue
+                msgs.append(normalized)
+
+            if len(msgs) < 4:
+                return "Not enough conversation to compress (need at least 4 messages)."
+
+            approx_tokens = estimate_messages_tokens_rough(msgs)
+
+            tmp_agent = AIAgent(
+                **runtime_kwargs,
+                model=model,
+                max_iterations=4,
+                quiet_mode=True,
+                enabled_toolsets=["memory"],
+                session_id=session_entry.session_id,
+            )
+            tmp_agent._print_fn = lambda *a, **kw: None
+
+            compressor = tmp_agent.context_compressor
+            original_generate_summary = getattr(compressor, "_generate_summary")
+            original_find_tail_cut = getattr(compressor, "_find_tail_cut_by_tokens", None)
+            original_protect_last_n = getattr(compressor, "protect_last_n", None)
+
+            if keep_last_rounds is not None and callable(original_find_tail_cut):
+                explicit_tail_start = _find_mycompress_tail_start(
+                    msgs,
+                    keep_last_rounds,
+                    protected_prefix=getattr(compressor, "protect_first_n", 0) or 0,
+                )
+                explicit_tail_messages = max(0, len(msgs) - explicit_tail_start)
+                compressor.protect_last_n = max(int(original_protect_last_n or 0), explicit_tail_messages)
+
+                def _keep_recent_rounds_tail_cut(messages, head_end, token_budget=None):
+                    default_cut = original_find_tail_cut(messages, head_end, token_budget)
+                    explicit_cut = _find_mycompress_tail_start(
+                        messages,
+                        keep_last_rounds,
+                        protected_prefix=head_end,
+                    )
+                    if explicit_cut <= head_end:
+                        return head_end
+                    aligned_cut = compressor._align_boundary_backward(messages, explicit_cut)
+                    return min(default_cut, aligned_cut)
+
+                compressor._find_tail_cut_by_tokens = _keep_recent_rounds_tail_cut
+
+            def custom_generate_summary(turns_to_summarize, focus_topic=None):
+                summary_budget = compressor._compute_summary_budget(turns_to_summarize)
+                content_to_summarize = compressor._serialize_for_summary(turns_to_summarize)
+                previous_summary = getattr(compressor, "_previous_summary", None)
+                if previous_summary:
+                    prompt = (
+                        f"{skill_prompt}\n\n"
+                        "你现在是在更新上一版 handoff 摘要。保留仍然有效的信息，合并新的进展，删除已失效内容。\n\n"
+                        f"PREVIOUS SUMMARY:\n{previous_summary}\n\n"
+                        f"TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n"
+                        f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
+                    )
+                else:
+                    prompt = (
+                        f"{skill_prompt}\n\n"
+                        f"TURNS TO SUMMARIZE:\n{content_to_summarize}\n\n"
+                        f"目标长度约 {summary_budget} tokens。只输出摘要正文。"
+                    )
+
+                main_runtime = tmp_agent._current_main_runtime()
+                if (main_runtime.get("api_mode") or getattr(tmp_agent, "api_mode", "")) == "codex_responses":
+                    system_prompt = tmp_agent._cached_system_prompt or tmp_agent._build_system_prompt()
+                    api_messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ]
+                    codex_kwargs = tmp_agent._build_api_kwargs(api_messages)
+                    codex_kwargs.pop("tools", None)
+                    codex_kwargs.pop("tool_choice", None)
+                    codex_kwargs.pop("parallel_tool_calls", None)
+                    codex_kwargs["max_output_tokens"] = summary_budget * 2
+
+                    original_stream_delta_callback = getattr(tmp_agent, "stream_delta_callback", None)
+                    original_stream_callback = getattr(tmp_agent, "_stream_callback", None)
+                    try:
+                        tmp_agent.stream_delta_callback = None
+                        tmp_agent._stream_callback = None
+                        summary_response = tmp_agent._run_codex_stream(codex_kwargs)
+                    finally:
+                        tmp_agent.stream_delta_callback = original_stream_delta_callback
+                        tmp_agent._stream_callback = original_stream_callback
+
+                    assistant_message, _ = tmp_agent._normalize_codex_response(summary_response)
+                    content = ""
+                    if assistant_message:
+                        content = (
+                            getattr(assistant_message, "content", None)
+                            or getattr(assistant_message, "reasoning", None)
+                            or ""
+                        )
+                else:
+                    response = call_llm(
+                        task="compression",
+                        main_runtime=main_runtime,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=summary_budget * 2,
+                    )
+                    content = response.choices[0].message.content
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                summary = content.strip()
+                compressor._previous_summary = summary
+                compressor._summary_failure_cooldown_until = 0.0
+                return compressor._with_summary_prefix(summary)
+
+            compressor._generate_summary = custom_generate_summary
+
+            loop = asyncio.get_event_loop()
+            compressed, _new_system = await loop.run_in_executor(
+                None,
+                lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens),
+            )
+
+            new_session_id = tmp_agent.session_id
+            if new_session_id != session_entry.session_id:
+                session_entry.session_id = new_session_id
+                self.session_store._save()
+
+            self.session_store.rewrite_transcript(new_session_id, compressed)
+            self.session_store.update_session(
+                session_entry.session_key,
+                last_prompt_tokens=0,
+            )
+            return "已压缩完成。"
+        except Exception as e:
+            logger.warning("Skill compress failed: %s", e)
+            return f"压缩失败：{e}"
+        finally:
+            if compressor is not None and original_generate_summary is not None:
+                compressor._generate_summary = original_generate_summary
+            if compressor is not None and original_find_tail_cut is not None:
+                compressor._find_tail_cut_by_tokens = original_find_tail_cut
+            if compressor is not None and original_protect_last_n is not None:
+                compressor.protect_last_n = original_protect_last_n
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context.

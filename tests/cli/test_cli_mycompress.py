@@ -26,6 +26,84 @@ def test_process_command_routes_mycompress_to_special_handler():
     mock_handler.assert_called_once_with("/mycompress", "保留关键结论")
 
 
+def test_mycompress_parses_keep_last_rounds_flags():
+    shell = _make_cli()
+    handler_globals = shell._handle_skill_compress_command.__func__.__globals__
+    parse_args = handler_globals["_parse_mycompress_args"]
+
+    assert parse_args("-n 3 保留关键结论") == (3, "保留关键结论")
+    assert parse_args("--keep-last-turns=2") == (2, "")
+    assert parse_args("--keep-last-rounds 4 聚焦 AEB") == (4, "聚焦 AEB")
+
+
+def test_mycompress_keep_last_rounds_overrides_tail_cut_and_strips_flag_from_prompt():
+    shell = _make_cli()
+    handler_globals = shell._handle_skill_compress_command.__func__.__globals__
+    history = [
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "u3"},
+        {"role": "assistant", "content": "a3"},
+    ]
+    compressed = [history[0], history[-2], history[-1]]
+    shell.conversation_history = list(history)
+    shell.agent = MagicMock()
+    shell.agent.compression_enabled = True
+    shell.agent._cached_system_prompt = "system"
+    shell.agent.api_mode = "chat_completions"
+
+    compressor = MagicMock()
+    original_generate_summary = MagicMock(return_value="orig")
+    original_find_tail_cut = MagicMock(return_value=5)
+    compressor._generate_summary = original_generate_summary
+    compressor._find_tail_cut_by_tokens = original_find_tail_cut
+    compressor._align_boundary_backward.side_effect = lambda messages, idx: idx
+    compressor._compute_summary_budget.return_value = 64
+    compressor._serialize_for_summary.return_value = "serialized turns"
+    compressor._with_summary_prefix.side_effect = lambda summary: f"[CONTEXT SUMMARY]: {summary}"
+    compressor._previous_summary = None
+    compressor._summary_failure_cooldown_until = 123.0
+    compressor.protect_first_n = 0
+    compressor.protect_last_n = 1
+    shell.agent.context_compressor = compressor
+    shell.agent._current_main_runtime.return_value = {
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4.6",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_mode": "chat_completions",
+    }
+
+    observed = {}
+
+    def fake_compress(history_arg, system_prompt, approx_tokens):
+        observed["cut_idx"] = compressor._find_tail_cut_by_tokens(history_arg, 0)
+        observed["protect_last_n_during_call"] = compressor.protect_last_n
+        compressor._generate_summary(history_arg[:observed["cut_idx"]])
+        return compressed, ""
+
+    shell.agent._compress_context.side_effect = fake_compress
+
+    llm_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="handoff summary"))]
+    )
+    mock_build = MagicMock(return_value="skill prompt")
+
+    with patch.dict(handler_globals, {"build_skill_invocation_message": mock_build}), \
+         patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=100), \
+         patch("agent.auxiliary_client.call_llm", return_value=llm_response):
+        shell._handle_skill_compress_command("/mycompress", "-n 2 保留关键结论")
+
+    assert observed["cut_idx"] == 2
+    assert observed["protect_last_n_during_call"] == 4
+    assert shell.conversation_history == compressed
+    assert compressor.protect_last_n == 1
+    assert compressor._find_tail_cut_by_tokens is original_find_tail_cut
+    mock_build.assert_called_once()
+    assert mock_build.call_args.args[1] == "保留关键结论"
+
+
 def test_mycompress_replaces_history_with_skill_summary():
     shell = _make_cli()
     handler_globals = shell._handle_skill_compress_command.__func__.__globals__
