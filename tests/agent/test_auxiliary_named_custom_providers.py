@@ -267,7 +267,10 @@ class TestVisionPathApiMode:
 
         mock_gcc.assert_called_once()
         assert mock_gcc.call_args.args[0] == "bailian"
-        assert provider == "alibaba"
+        # Keep the explicit raw alias as the resolved provider label so named
+        # custom providers such as "bailian" are not collapsed to a built-in
+        # alias before cache/runtime lookup.
+        assert provider == "bailian"
         assert client is not None
         assert model == "kimi-k2.5"
 
