@@ -60,6 +60,7 @@ class ResponsesApiTransport(ProviderTransport):
             _chat_messages_to_responses_input,
             _responses_tools,
         )
+        from utils import base_url_host_matches
 
         from run_agent import DEFAULT_AGENT_IDENTITY
 
@@ -72,9 +73,26 @@ class ResponsesApiTransport(ProviderTransport):
         if not instructions:
             instructions = DEFAULT_AGENT_IDENTITY
 
+        provider = str(params.get("provider") or "").strip().lower()
+        base_url = str(params.get("base_url") or "").strip()
+        base_url_hostname = str(params.get("base_url_hostname") or "").strip().lower()
+
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
+        is_cch_responses = (
+            provider == "cch"
+            or base_url_hostname == "cch.jmadas.com"
+            or base_url_host_matches(base_url, "cch.jmadas.com")
+        )
+
+        # CCH-style Responses proxies may override/ignore the top-level
+        # instructions field and do not reliably support developer-role
+        # semantics. Preserve the system prompt by prepending it as a user
+        # message with a [SYSTEM]: prefix, then keep instructions minimal.
+        if is_cch_responses and instructions:
+            payload_messages = [{"role": "user", "content": f"[SYSTEM]: {instructions}"}] + list(payload_messages)
+            instructions = DEFAULT_AGENT_IDENTITY
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
