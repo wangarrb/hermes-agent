@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
+from utils import base_url_host_matches
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -284,6 +285,80 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://ai.google.dev/pricing",
         pricing_version="google-pricing-2026-03-16",
     ),
+    # AWS Bedrock — pricing per the Bedrock pricing page.
+    # Bedrock charges the same per-token rates as the model provider but
+    # through AWS billing.  These are the on-demand prices (no commitment).
+    # Source: https://aws.amazon.com/bedrock/pricing/
+    (
+        "bedrock",
+        "anthropic.claude-opus-4-6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("15.00"),
+        output_cost_per_million=Decimal("75.00"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-sonnet-4-6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-sonnet-4-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("3.00"),
+        output_cost_per_million=Decimal("15.00"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "anthropic.claude-haiku-4-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.80"),
+        output_cost_per_million=Decimal("4.00"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "amazon.nova-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.80"),
+        output_cost_per_million=Decimal("3.20"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "amazon.nova-lite",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.06"),
+        output_cost_per_million=Decimal("0.24"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
+    (
+        "bedrock",
+        "amazon.nova-micro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.035"),
+        output_cost_per_million=Decimal("0.14"),
+        source="official_docs_snapshot",
+        source_url="https://aws.amazon.com/bedrock/pricing/",
+        pricing_version="bedrock-pricing-2026-04",
+    ),
 }
 
 
@@ -303,17 +378,8 @@ def _to_int(value: Any) -> int:
         return 0
 
 
-def _usage_get(container: Any, key: str, default: Any = 0) -> Any:
-    if container is None:
-        return default
-    if isinstance(container, dict):
-        return container.get(key, default)
-    return getattr(container, key, default)
-
-
 def resolve_billing_route(
     model_name: str,
-    *,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> BillingRoute:
@@ -328,7 +394,7 @@ def resolve_billing_route(
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
-    if provider_name == "openrouter" or "openrouter.ai" in base:
+    if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
@@ -450,33 +516,45 @@ def normalize_usage(
     mode = (api_mode or "").strip().lower()
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
-        input_tokens = _to_int(_usage_get(response_usage, "input_tokens", 0))
-        output_tokens = _to_int(_usage_get(response_usage, "output_tokens", 0))
-        cache_read_tokens = _to_int(_usage_get(response_usage, "cache_read_input_tokens", 0))
-        cache_write_tokens = _to_int(_usage_get(response_usage, "cache_creation_input_tokens", 0))
+        input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
+        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
+        cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
+        cache_write_tokens = _to_int(getattr(response_usage, "cache_creation_input_tokens", 0))
     elif mode == "codex_responses":
-        input_total = _to_int(_usage_get(response_usage, "input_tokens", 0))
-        output_tokens = _to_int(_usage_get(response_usage, "output_tokens", 0))
-        details = _usage_get(response_usage, "input_tokens_details", None)
-        cache_read_tokens = _to_int(_usage_get(details, "cached_tokens", 0) if details else 0)
+        input_total = _to_int(getattr(response_usage, "input_tokens", 0))
+        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
+        details = getattr(response_usage, "input_tokens_details", None)
+        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         cache_write_tokens = _to_int(
-            _usage_get(details, "cache_creation_tokens", 0) if details else 0
+            getattr(details, "cache_creation_tokens", 0) if details else 0
         )
         input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
     else:
-        prompt_total = _to_int(_usage_get(response_usage, "prompt_tokens", 0))
-        output_tokens = _to_int(_usage_get(response_usage, "completion_tokens", 0))
-        details = _usage_get(response_usage, "prompt_tokens_details", None)
-        cache_read_tokens = _to_int(_usage_get(details, "cached_tokens", 0) if details else 0)
+        prompt_total = _to_int(getattr(response_usage, "prompt_tokens", 0))
+        output_tokens = _to_int(getattr(response_usage, "completion_tokens", 0))
+        details = getattr(response_usage, "prompt_tokens_details", None)
+        # Primary: OpenAI-style prompt_tokens_details. Fallback: Anthropic-style
+        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Vercel
+        # AI Gateway, Cline) expose when routing Claude models — without this
+        # fallback, cache writes are undercounted as 0 and cache reads can be
+        # missed when the proxy only surfaces them at the top level.
+        # Port of cline/cline#10266.
+        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
+        if not cache_read_tokens:
+            cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
         cache_write_tokens = _to_int(
-            _usage_get(details, "cache_write_tokens", 0) if details else 0
+            getattr(details, "cache_write_tokens", 0) if details else 0
         )
+        if not cache_write_tokens:
+            cache_write_tokens = _to_int(
+                getattr(response_usage, "cache_creation_input_tokens", 0)
+            )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0
-    output_details = _usage_get(response_usage, "output_tokens_details", None)
+    output_details = getattr(response_usage, "output_tokens_details", None)
     if output_details:
-        reasoning_tokens = _to_int(_usage_get(output_details, "reasoning_tokens", 0))
+        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
 
     return CanonicalUsage(
         input_tokens=input_tokens,

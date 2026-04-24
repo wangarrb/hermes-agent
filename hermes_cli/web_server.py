@@ -11,10 +11,12 @@ Usage:
 
 import asyncio
 import hmac
+import importlib.util
 import json
 import logging
 import os
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -55,10 +57,10 @@ try:
 except ImportError:
     raise SystemExit(
         "Web UI requires fastapi and uvicorn.\n"
-        "Run 'hermes web' to auto-install, or: pip install hermes-agent[web]"
+        f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
     )
 
-WEB_DIST = Path(__file__).parent / "web_dist"
+WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
@@ -69,6 +71,7 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 # Injected into the SPA HTML so only the legitimate web UI can use it.
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = secrets.token_urlsafe(32)
+_SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -96,28 +99,129 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/config/defaults",
     "/api/config/schema",
     "/api/model/info",
+    "/api/dashboard/themes",
+    "/api/dashboard/plugins",
+    "/api/dashboard/plugins/rescan",
 })
 
 
-def _require_token(request: Request) -> None:
-    """Validate the ephemeral session token.  Raises 401 on mismatch.
+def _has_valid_session_token(request: Request) -> bool:
+    """True if the request carries a valid dashboard session token.
 
-    Uses ``hmac.compare_digest`` to prevent timing side-channels.
+    The dedicated session header avoids collisions with reverse proxies that
+    already use ``Authorization`` (for example Caddy ``basic_auth``). We still
+    accept the legacy Bearer path for backward compatibility with older
+    dashboard bundles.
     """
+    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
+    if session_header and hmac.compare_digest(
+        session_header.encode(),
+        _SESSION_TOKEN.encode(),
+    ):
+        return True
+
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    if not hmac.compare_digest(auth.encode(), expected.encode()):
+    return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+def _require_token(request: Request) -> None:
+    """Validate the ephemeral session token.  Raises 401 on mismatch."""
+    if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# Accepted Host header values for loopback binds. DNS rebinding attacks
+# point a victim browser at an attacker-controlled hostname (evil.test)
+# which resolves to 127.0.0.1 after a TTL flip — bypassing same-origin
+# checks because the browser now considers evil.test and our dashboard
+# "same origin". Validating the Host header at the app layer rejects any
+# request whose Host isn't one we bound for. See GHSA-ppp5-vxwm-4cf7.
+_LOOPBACK_HOST_VALUES: frozenset = frozenset({
+    "localhost", "127.0.0.1", "::1",
+})
+
+
+def _is_accepted_host(host_header: str, bound_host: str) -> bool:
+    """True if the Host header targets the interface we bound to.
+
+    Accepts:
+    - Exact bound host (with or without port suffix)
+    - Loopback aliases when bound to loopback
+    - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
+      no protection possible at this layer)
+    """
+    if not host_header:
+        return False
+    # Strip port suffix. IPv6 addresses use bracket notation:
+    #   [::1]         — no port
+    #   [::1]:9119    — with port
+    # Plain hosts/v4:
+    #   localhost:9119
+    #   127.0.0.1:9119
+    h = host_header.strip()
+    if h.startswith("["):
+        # IPv6 bracketed — port (if any) follows "]:"
+        close = h.find("]")
+        if close != -1:
+            host_only = h[1:close]  # strip brackets
+        else:
+            host_only = h.strip("[]")
+    else:
+        host_only = h.rsplit(":", 1)[0] if ":" in h else h
+    host_only = host_only.lower()
+
+    # 0.0.0.0 bind means operator explicitly opted into all-interfaces
+    # (requires --insecure per web_server.start_server). No Host-layer
+    # defence can protect that mode; rely on operator network controls.
+    if bound_host in ("0.0.0.0", "::"):
+        return True
+
+    # Loopback bind: accept the loopback names
+    bound_lc = bound_host.lower()
+    if bound_lc in _LOOPBACK_HOST_VALUES:
+        return host_only in _LOOPBACK_HOST_VALUES
+
+    # Explicit non-loopback bind: require exact host match
+    return host_only == bound_lc
+
+
+@app.middleware("http")
+async def host_header_middleware(request: Request, call_next):
+    """Reject requests whose Host header doesn't match the bound interface.
+
+    Defends against DNS rebinding: a victim browser on a localhost
+    dashboard is tricked into fetching from an attacker hostname that
+    TTL-flips to 127.0.0.1. CORS and same-origin checks don't help —
+    the browser now treats the attacker origin as same-origin with the
+    dashboard. Host-header validation at the app layer catches it.
+
+    See GHSA-ppp5-vxwm-4cf7.
+    """
+    # Store the bound host on app.state so this middleware can read it —
+    # set by start_server() at listen time.
+    bound_host = getattr(app.state, "bound_host", None)
+    if bound_host:
+        host_header = request.headers.get("host", "")
+        if not _is_accepted_host(host_header, bound_host):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": (
+                        "Invalid Host header. Dashboard requests must use "
+                        "the hostname the server was bound to."
+                    ),
+                },
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
-        auth = request.headers.get("authorization", "")
-        expected = f"Bearer {_SESSION_TOKEN}"
-        if not hmac.compare_digest(auth.encode(), expected.encode()):
+    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
+        if not _has_valid_session_token(request):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Unauthorized"},
@@ -165,6 +269,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "select",
         "description": "CLI visual theme",
         "options": ["default", "ares", "mono", "slate"],
+    },
+    "dashboard.theme": {
+        "type": "select",
+        "description": "Web dashboard visual theme",
+        "options": ["default", "midnight", "ember", "mono", "cyberpunk", "rose"],
     },
     "display.resume_display": {
         "type": "select",
@@ -223,7 +332,8 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "checkpoints": "agent",
     "approvals": "security",
     "human_delay": "display",
-    "smart_model_routing": "agent",
+    "dashboard": "display",
+    "code_execution": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -321,7 +431,14 @@ class EnvVarReveal(BaseModel):
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
-_GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
+try:
+    _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
+except (ValueError, TypeError):
+    _log.warning(
+        "Invalid GATEWAY_HEALTH_TIMEOUT value %r — using default 3.0s",
+        os.getenv("GATEWAY_HEALTH_TIMEOUT"),
+    )
+    _GATEWAY_HEALTH_TIMEOUT = 3.0
 
 
 def _probe_gateway_health() -> tuple[bool, dict | None]:
@@ -457,11 +574,144 @@ async def get_status():
         "latest_config_version": latest_ver,
         "gateway_running": gateway_running,
         "gateway_pid": gateway_pid,
+        "gateway_health_url": _GATEWAY_HEALTH_URL,
         "gateway_state": gateway_state,
         "gateway_platforms": gateway_platforms,
         "gateway_exit_reason": gateway_exit_reason,
         "gateway_updated_at": gateway_updated_at,
         "active_sessions": active_sessions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gateway + update actions (invoked from the Status page).
+#
+# Both commands are spawned as detached subprocesses so the HTTP request
+# returns immediately.  stdin is closed (``DEVNULL``) so any stray ``input()``
+# calls fail fast with EOF rather than hanging forever.  stdout/stderr are
+# streamed to a per-action log file under ``~/.hermes/logs/<action>.log`` so
+# the dashboard can tail them back to the user.
+# ---------------------------------------------------------------------------
+
+_ACTION_LOG_DIR: Path = get_hermes_home() / "logs"
+
+# Short ``name`` (from the URL) → absolute log file path.
+_ACTION_LOG_FILES: Dict[str, str] = {
+    "gateway-restart": "gateway-restart.log",
+    "hermes-update": "hermes-update.log",
+}
+
+# ``name`` → most recently spawned Popen handle.  Used so ``status`` can
+# report liveness and exit code without shelling out to ``ps``.
+_ACTION_PROCS: Dict[str, subprocess.Popen] = {}
+
+
+def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+    """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
+
+    Uses the running interpreter's ``hermes_cli.main`` module so the action
+    inherits the same venv/PYTHONPATH the web server is using.
+    """
+    log_file_name = _ACTION_LOG_FILES[name]
+    _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _ACTION_LOG_DIR / log_file_name
+    log_file = open(log_path, "ab", buffering=0)
+    log_file.write(
+        f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
+    )
+
+    cmd = [sys.executable, "-m", "hermes_cli.main", *subcommand]
+
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(PROJECT_ROOT),
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
+        "env": {**os.environ, "HERMES_NONINTERACTIVE": "1"},
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    _ACTION_PROCS[name] = proc
+    return proc
+
+
+def _tail_lines(path: Path, n: int) -> List[str]:
+    """Return the last ``n`` lines of ``path``.  Reads the whole file — fine
+    for our small per-action logs.  Binary-decoded with ``errors='replace'``
+    so log corruption doesn't 500 the endpoint."""
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    lines = text.splitlines()
+    return lines[-n:] if n > 0 else lines
+
+
+@app.post("/api/gateway/restart")
+async def restart_gateway():
+    """Kick off a ``hermes gateway restart`` in the background."""
+    try:
+        proc = _spawn_hermes_action(["gateway", "restart"], "gateway-restart")
+    except Exception as exc:
+        _log.exception("Failed to spawn gateway restart")
+        raise HTTPException(status_code=500, detail=f"Failed to restart gateway: {exc}")
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "gateway-restart",
+    }
+
+
+@app.post("/api/hermes/update")
+async def update_hermes():
+    """Kick off ``hermes update`` in the background."""
+    try:
+        proc = _spawn_hermes_action(["update"], "hermes-update")
+    except Exception as exc:
+        _log.exception("Failed to spawn hermes update")
+        raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "hermes-update",
+    }
+
+
+@app.get("/api/actions/{name}/status")
+async def get_action_status(name: str, lines: int = 200):
+    """Tail an action log and report whether the process is still running."""
+    log_file_name = _ACTION_LOG_FILES.get(name)
+    if log_file_name is None:
+        raise HTTPException(status_code=404, detail=f"Unknown action: {name}")
+
+    log_path = _ACTION_LOG_DIR / log_file_name
+    tail = _tail_lines(log_path, min(max(lines, 1), 2000))
+
+    proc = _ACTION_PROCS.get(name)
+    if proc is None:
+        running = False
+        exit_code: Optional[int] = None
+        pid: Optional[int] = None
+    else:
+        exit_code = proc.poll()
+        running = exit_code is None
+        pid = proc.pid
+
+    return {
+        "name": name,
+        "running": running,
+        "exit_code": exit_code,
+        "pid": pid,
+        "lines": tail,
     }
 
 
@@ -1433,38 +1683,8 @@ def _nous_poller(session_id: str) -> None:
             auth_state, min_key_ttl_seconds=300, timeout_seconds=15.0,
             force_refresh=False, force_mint=True,
         )
-        # Save into credential pool same as auth_commands.py does
-        from agent.credential_pool import (
-            PooledCredential,
-            load_pool,
-            AUTH_TYPE_OAUTH,
-            SOURCE_MANUAL,
-        )
-        pool = load_pool("nous")
-        entry = PooledCredential.from_dict("nous", {
-            **full_state,
-            "label": "dashboard device_code",
-            "auth_type": AUTH_TYPE_OAUTH,
-            "source": f"{SOURCE_MANUAL}:dashboard_device_code",
-            "base_url": full_state.get("inference_base_url"),
-        })
-        pool.add_entry(entry)
-        # Also persist to auth store so get_nous_auth_status() sees it
-        # (matches what _login_nous in auth.py does for the CLI flow).
-        try:
-            from hermes_cli.auth import (
-                _load_auth_store, _save_provider_state, _save_auth_store,
-                _auth_store_lock,
-            )
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                _save_provider_state(auth_store, "nous", full_state)
-                _save_auth_store(auth_store)
-        except Exception as store_exc:
-            _log.warning(
-                "oauth/device: credential pool saved but auth store write failed "
-                "(session=%s): %s", session_id, store_exc,
-            )
+        from hermes_cli.auth import persist_nous_credentials
+        persist_nous_credentials(full_state)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: nous login completed (session=%s)", session_id)
@@ -1977,6 +2197,8 @@ async def update_config_raw(body: RawConfigUpdate):
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
     from hermes_state import SessionDB
+    from agent.insights import InsightsEngine
+
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
@@ -1988,7 +2210,8 @@ async def get_usage_analytics(days: int = 30):
                    SUM(reasoning_tokens) as reasoning_tokens,
                    COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
                    COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
-                   COUNT(*) as sessions
+                   COUNT(*) as sessions,
+                   SUM(COALESCE(api_call_count, 0)) as api_calls
             FROM sessions WHERE started_at > ?
             GROUP BY day ORDER BY day
         """, (cutoff,))
@@ -1999,7 +2222,8 @@ async def get_usage_analytics(days: int = 30):
                    SUM(input_tokens) as input_tokens,
                    SUM(output_tokens) as output_tokens,
                    COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
-                   COUNT(*) as sessions
+                   COUNT(*) as sessions,
+                   SUM(COALESCE(api_call_count, 0)) as api_calls
             FROM sessions WHERE started_at > ? AND model IS NOT NULL
             GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
         """, (cutoff,))
@@ -2012,12 +2236,29 @@ async def get_usage_analytics(days: int = 30):
                    SUM(reasoning_tokens) as total_reasoning,
                    COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
                    COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
-                   COUNT(*) as total_sessions
+                   COUNT(*) as total_sessions,
+                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
             FROM sessions WHERE started_at > ?
         """, (cutoff,))
         totals = dict(cur3.fetchone())
+        insights_report = InsightsEngine(db).generate(days=days)
+        skills = insights_report.get("skills", {
+            "summary": {
+                "total_skill_loads": 0,
+                "total_skill_edits": 0,
+                "total_skill_actions": 0,
+                "distinct_skills_used": 0,
+            },
+            "top_skills": [],
+        })
 
-        return {"daily": daily, "by_model": by_model, "totals": totals, "period_days": days}
+        return {
+            "daily": daily,
+            "by_model": by_model,
+            "totals": totals,
+            "period_days": days,
+            "skills": skills,
+        }
     finally:
         db.close()
 
@@ -2068,6 +2309,487 @@ def mount_spa(application: FastAPI):
         return _serve_index()
 
 
+# ---------------------------------------------------------------------------
+# Dashboard theme endpoints
+# ---------------------------------------------------------------------------
+
+# Built-in dashboard themes — label + description only.  The actual color
+# definitions live in the frontend (web/src/themes/presets.ts).
+_BUILTIN_DASHBOARD_THEMES = [
+    {"name": "default",   "label": "Hermes Teal",  "description": "Classic dark teal — the canonical Hermes look"},
+    {"name": "midnight",  "label": "Midnight",      "description": "Deep blue-violet with cool accents"},
+    {"name": "ember",     "label": "Ember",          "description": "Warm crimson and bronze — forge vibes"},
+    {"name": "mono",      "label": "Mono",           "description": "Clean grayscale — minimal and focused"},
+    {"name": "cyberpunk", "label": "Cyberpunk",      "description": "Neon green on black — matrix terminal"},
+    {"name": "rose",      "label": "Rosé",           "description": "Soft pink and warm ivory — easy on the eyes"},
+]
+
+
+def _parse_theme_layer(value: Any, default_hex: str, default_alpha: float = 1.0) -> Optional[Dict[str, Any]]:
+    """Normalise a theme layer spec from YAML into `{hex, alpha}` form.
+
+    Accepts shorthand (a bare hex string) or full dict form.  Returns
+    ``None`` on garbage input so the caller can fall back to a built-in
+    default rather than blowing up.
+    """
+    if value is None:
+        return {"hex": default_hex, "alpha": default_alpha}
+    if isinstance(value, str):
+        return {"hex": value, "alpha": default_alpha}
+    if isinstance(value, dict):
+        hex_val = value.get("hex", default_hex)
+        alpha_val = value.get("alpha", default_alpha)
+        if not isinstance(hex_val, str):
+            return None
+        try:
+            alpha_f = float(alpha_val)
+        except (TypeError, ValueError):
+            alpha_f = default_alpha
+        return {"hex": hex_val, "alpha": max(0.0, min(1.0, alpha_f))}
+    return None
+
+
+_THEME_DEFAULT_TYPOGRAPHY: Dict[str, str] = {
+    "fontSans": 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+    "fontMono": 'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace',
+    "baseSize": "15px",
+    "lineHeight": "1.55",
+    "letterSpacing": "0",
+}
+
+_THEME_DEFAULT_LAYOUT: Dict[str, str] = {
+    "radius": "0.5rem",
+    "density": "comfortable",
+}
+
+_THEME_OVERRIDE_KEYS = {
+    "card", "cardForeground", "popover", "popoverForeground",
+    "primary", "primaryForeground", "secondary", "secondaryForeground",
+    "muted", "mutedForeground", "accent", "accentForeground",
+    "destructive", "destructiveForeground", "success", "warning",
+    "border", "input", "ring",
+}
+
+# Well-known named asset slots themes can populate.  Any other keys under
+# ``assets.custom`` are exposed as ``--theme-asset-custom-<key>`` CSS vars
+# for plugin/shell use.
+_THEME_NAMED_ASSET_KEYS = {"bg", "hero", "logo", "crest", "sidebar", "header"}
+
+# Component-style buckets themes can override.  The value under each bucket
+# is a mapping from camelCase property name to CSS string; each pair emits
+# ``--component-<bucket>-<kebab-property>`` on :root.  The frontend's shell
+# components (Card, App header, Backdrop, etc.) consume these vars so themes
+# can restyle chrome (clip-path, border-image, segmented progress, etc.)
+# without shipping their own CSS.
+_THEME_COMPONENT_BUCKETS = {
+    "card", "header", "footer", "sidebar", "tab",
+    "progress", "badge", "backdrop", "page",
+}
+
+_THEME_LAYOUT_VARIANTS = {"standard", "cockpit", "tiled"}
+
+# Cap on customCSS length so a malformed/oversized theme YAML can't blow up
+# the response payload or the <style> tag.  32 KiB is plenty for every
+# practical reskin (the Strike Freedom demo is ~2 KiB).
+_THEME_CUSTOM_CSS_MAX = 32 * 1024
+
+
+def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalise a user theme YAML into the wire format `ThemeProvider`
+    expects.  Returns ``None`` if the theme is unusable.
+
+    Accepts both the full schema (palette/typography/layout) and a loose
+    form with bare hex strings, so hand-written YAMLs stay friendly.
+    """
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    # Palette
+    palette_src = data.get("palette", {}) if isinstance(data.get("palette"), dict) else {}
+    # Allow top-level `colors.background` as a shorthand too.
+    colors_src = data.get("colors", {}) if isinstance(data.get("colors"), dict) else {}
+
+    def _layer(key: str, default_hex: str, default_alpha: float = 1.0) -> Dict[str, Any]:
+        spec = palette_src.get(key, colors_src.get(key))
+        parsed = _parse_theme_layer(spec, default_hex, default_alpha)
+        return parsed if parsed is not None else {"hex": default_hex, "alpha": default_alpha}
+
+    palette = {
+        "background": _layer("background", "#041c1c", 1.0),
+        "midground": _layer("midground", "#ffe6cb", 1.0),
+        "foreground": _layer("foreground", "#ffffff", 0.0),
+        "warmGlow": palette_src.get("warmGlow") or data.get("warmGlow") or "rgba(255, 189, 56, 0.35)",
+        "noiseOpacity": 1.0,
+    }
+    raw_noise = palette_src.get("noiseOpacity", data.get("noiseOpacity"))
+    try:
+        palette["noiseOpacity"] = float(raw_noise) if raw_noise is not None else 1.0
+    except (TypeError, ValueError):
+        palette["noiseOpacity"] = 1.0
+
+    # Typography
+    typo_src = data.get("typography", {}) if isinstance(data.get("typography"), dict) else {}
+    typography = dict(_THEME_DEFAULT_TYPOGRAPHY)
+    for key in ("fontSans", "fontMono", "fontDisplay", "fontUrl", "baseSize", "lineHeight", "letterSpacing"):
+        val = typo_src.get(key)
+        if isinstance(val, str) and val.strip():
+            typography[key] = val
+
+    # Layout
+    layout_src = data.get("layout", {}) if isinstance(data.get("layout"), dict) else {}
+    layout = dict(_THEME_DEFAULT_LAYOUT)
+    radius = layout_src.get("radius")
+    if isinstance(radius, str) and radius.strip():
+        layout["radius"] = radius
+    density = layout_src.get("density")
+    if isinstance(density, str) and density in ("compact", "comfortable", "spacious"):
+        layout["density"] = density
+
+    # Color overrides — keep only valid keys with string values.
+    overrides_src = data.get("colorOverrides", {})
+    color_overrides: Dict[str, str] = {}
+    if isinstance(overrides_src, dict):
+        for key, val in overrides_src.items():
+            if key in _THEME_OVERRIDE_KEYS and isinstance(val, str) and val.strip():
+                color_overrides[key] = val
+
+    # Assets — named slots + arbitrary user-defined keys.  Values must be
+    # strings (URLs or CSS ``url(...)``/``linear-gradient(...)`` expressions).
+    # We don't fetch remote assets here; the frontend just injects them as
+    # CSS vars.  Empty values are dropped so a theme can explicitly clear a
+    # slot by setting ``hero: ""``.
+    assets_out: Dict[str, Any] = {}
+    assets_src = data.get("assets", {}) if isinstance(data.get("assets"), dict) else {}
+    for key in _THEME_NAMED_ASSET_KEYS:
+        val = assets_src.get(key)
+        if isinstance(val, str) and val.strip():
+            assets_out[key] = val
+    custom_assets_src = assets_src.get("custom")
+    if isinstance(custom_assets_src, dict):
+        custom_assets: Dict[str, str] = {}
+        for key, val in custom_assets_src.items():
+            if (
+                isinstance(key, str)
+                and key.replace("-", "").replace("_", "").isalnum()
+                and isinstance(val, str)
+                and val.strip()
+            ):
+                custom_assets[key] = val
+        if custom_assets:
+            assets_out["custom"] = custom_assets
+
+    # Custom CSS — raw CSS text the frontend injects as a scoped <style>
+    # tag on theme apply.  Clipped to _THEME_CUSTOM_CSS_MAX to keep the
+    # payload bounded.  We intentionally do NOT parse/sanitise the CSS
+    # here — the dashboard is localhost-only and themes are user-authored
+    # YAML in ~/.hermes/, same trust level as the config file itself.
+    custom_css_val = data.get("customCSS")
+    custom_css: Optional[str] = None
+    if isinstance(custom_css_val, str) and custom_css_val.strip():
+        custom_css = custom_css_val[:_THEME_CUSTOM_CSS_MAX]
+
+    # Component style overrides — per-bucket dicts of camelCase CSS
+    # property -> CSS string.  The frontend converts these into CSS vars
+    # that shell components (Card, App header, Backdrop) consume.
+    component_styles_src = data.get("componentStyles", {})
+    component_styles: Dict[str, Dict[str, str]] = {}
+    if isinstance(component_styles_src, dict):
+        for bucket, props in component_styles_src.items():
+            if bucket not in _THEME_COMPONENT_BUCKETS or not isinstance(props, dict):
+                continue
+            clean: Dict[str, str] = {}
+            for prop, value in props.items():
+                if (
+                    isinstance(prop, str)
+                    and prop.replace("-", "").replace("_", "").isalnum()
+                    and isinstance(value, (str, int, float))
+                    and str(value).strip()
+                ):
+                    clean[prop] = str(value)
+            if clean:
+                component_styles[bucket] = clean
+
+    layout_variant_src = data.get("layoutVariant")
+    layout_variant = (
+        layout_variant_src
+        if isinstance(layout_variant_src, str) and layout_variant_src in _THEME_LAYOUT_VARIANTS
+        else "standard"
+    )
+
+    result: Dict[str, Any] = {
+        "name": name,
+        "label": data.get("label") or name,
+        "description": data.get("description", ""),
+        "palette": palette,
+        "typography": typography,
+        "layout": layout,
+        "layoutVariant": layout_variant,
+    }
+    if color_overrides:
+        result["colorOverrides"] = color_overrides
+    if assets_out:
+        result["assets"] = assets_out
+    if custom_css is not None:
+        result["customCSS"] = custom_css
+    if component_styles:
+        result["componentStyles"] = component_styles
+    return result
+
+
+def _discover_user_themes() -> list:
+    """Scan ~/.hermes/dashboard-themes/*.yaml for user-created themes.
+
+    Returns a list of fully-normalised theme definitions ready to ship
+    to the frontend, so the client can apply them without a secondary
+    round-trip or a built-in stub.
+    """
+    themes_dir = get_hermes_home() / "dashboard-themes"
+    if not themes_dir.is_dir():
+        return []
+    result = []
+    for f in sorted(themes_dir.glob("*.yaml")):
+        try:
+            data = yaml.safe_load(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        normalised = _normalise_theme_definition(data)
+        if normalised is not None:
+            result.append(normalised)
+    return result
+
+
+@app.get("/api/dashboard/themes")
+async def get_dashboard_themes():
+    """Return available themes and the currently active one.
+
+    Built-in entries ship name/label/description only (the frontend owns
+    their full definitions in `web/src/themes/presets.ts`).  User themes
+    from `~/.hermes/dashboard-themes/*.yaml` ship with their full
+    normalised definition under `definition`, so the client can apply
+    them without a stub.
+    """
+    config = load_config()
+    active = config.get("dashboard", {}).get("theme", "default")
+    user_themes = _discover_user_themes()
+    seen = set()
+    themes = []
+    for t in _BUILTIN_DASHBOARD_THEMES:
+        seen.add(t["name"])
+        themes.append(t)
+    for t in user_themes:
+        if t["name"] in seen:
+            continue
+        themes.append({
+            "name": t["name"],
+            "label": t["label"],
+            "description": t["description"],
+            "definition": t,
+        })
+        seen.add(t["name"])
+    return {"themes": themes, "active": active}
+
+
+class ThemeSetBody(BaseModel):
+    name: str
+
+
+@app.put("/api/dashboard/theme")
+async def set_dashboard_theme(body: ThemeSetBody):
+    """Set the active dashboard theme (persists to config.yaml)."""
+    config = load_config()
+    if "dashboard" not in config:
+        config["dashboard"] = {}
+    config["dashboard"]["theme"] = body.name
+    save_config(config)
+    return {"ok": True, "theme": body.name}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard plugin system
+# ---------------------------------------------------------------------------
+
+def _discover_dashboard_plugins() -> list:
+    """Scan plugins/*/dashboard/manifest.json for dashboard extensions.
+
+    Checks three plugin sources (same as hermes_cli.plugins):
+    1. User plugins:    ~/.hermes/plugins/<name>/dashboard/manifest.json
+    2. Bundled plugins: <repo>/plugins/<name>/dashboard/manifest.json  (memory/, etc.)
+    3. Project plugins: ./.hermes/plugins/  (only if HERMES_ENABLE_PROJECT_PLUGINS)
+    """
+    plugins = []
+    seen_names: set = set()
+
+    search_dirs = [
+        (get_hermes_home() / "plugins", "user"),
+        (PROJECT_ROOT / "plugins" / "memory", "bundled"),
+        (PROJECT_ROOT / "plugins", "bundled"),
+    ]
+    if os.environ.get("HERMES_ENABLE_PROJECT_PLUGINS"):
+        search_dirs.append((Path.cwd() / ".hermes" / "plugins", "project"))
+
+    for plugins_root, source in search_dirs:
+        if not plugins_root.is_dir():
+            continue
+        for child in sorted(plugins_root.iterdir()):
+            if not child.is_dir():
+                continue
+            manifest_file = child / "dashboard" / "manifest.json"
+            if not manifest_file.exists():
+                continue
+            try:
+                data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                name = data.get("name", child.name)
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                # Tab options: ``path`` + ``position`` for a new tab, optional
+                # ``override`` to replace a built-in route, and ``hidden`` to
+                # register the plugin component/slots without adding a tab
+                # (useful for slot-only plugins like a header-crest injector).
+                raw_tab = data.get("tab", {}) if isinstance(data.get("tab"), dict) else {}
+                tab_info = {
+                    "path": raw_tab.get("path", f"/{name}"),
+                    "position": raw_tab.get("position", "end"),
+                }
+                override_path = raw_tab.get("override")
+                if isinstance(override_path, str) and override_path.startswith("/"):
+                    tab_info["override"] = override_path
+                if bool(raw_tab.get("hidden")):
+                    tab_info["hidden"] = True
+                # Slots: list of named slot locations this plugin populates.
+                # The frontend exposes ``registerSlot(pluginName, slotName, Component)``
+                # on window; plugins with non-empty slots call it from their JS bundle.
+                slots_src = data.get("slots")
+                slots: List[str] = []
+                if isinstance(slots_src, list):
+                    slots = [s for s in slots_src if isinstance(s, str) and s]
+                plugins.append({
+                    "name": name,
+                    "label": data.get("label", name),
+                    "description": data.get("description", ""),
+                    "icon": data.get("icon", "Puzzle"),
+                    "version": data.get("version", "0.0.0"),
+                    "tab": tab_info,
+                    "slots": slots,
+                    "entry": data.get("entry", "dist/index.js"),
+                    "css": data.get("css"),
+                    "has_api": bool(data.get("api")),
+                    "source": source,
+                    "_dir": str(child / "dashboard"),
+                    "_api_file": data.get("api"),
+                })
+            except Exception as exc:
+                _log.warning("Bad dashboard plugin manifest %s: %s", manifest_file, exc)
+                continue
+    return plugins
+
+
+# Cache discovered plugins per-process (refresh on explicit re-scan).
+_dashboard_plugins_cache: Optional[list] = None
+
+
+def _get_dashboard_plugins(force_rescan: bool = False) -> list:
+    global _dashboard_plugins_cache
+    if _dashboard_plugins_cache is None or force_rescan:
+        _dashboard_plugins_cache = _discover_dashboard_plugins()
+    return _dashboard_plugins_cache
+
+
+@app.get("/api/dashboard/plugins")
+async def get_dashboard_plugins():
+    """Return discovered dashboard plugins."""
+    plugins = _get_dashboard_plugins()
+    # Strip internal fields before sending to frontend.
+    return [
+        {k: v for k, v in p.items() if not k.startswith("_")}
+        for p in plugins
+    ]
+
+
+@app.get("/api/dashboard/plugins/rescan")
+async def rescan_dashboard_plugins():
+    """Force re-scan of dashboard plugins."""
+    plugins = _get_dashboard_plugins(force_rescan=True)
+    return {"ok": True, "count": len(plugins)}
+
+
+@app.get("/dashboard-plugins/{plugin_name}/{file_path:path}")
+async def serve_plugin_asset(plugin_name: str, file_path: str):
+    """Serve static assets from a dashboard plugin directory.
+
+    Only serves files from the plugin's ``dashboard/`` subdirectory.
+    Path traversal is blocked by checking ``resolve().is_relative_to()``.
+    """
+    plugins = _get_dashboard_plugins()
+    plugin = next((p for p in plugins if p["name"] == plugin_name), None)
+    if not plugin:
+        raise HTTPException(status_code=404, detail="Plugin not found")
+
+    base = Path(plugin["_dir"])
+    target = (base / file_path).resolve()
+
+    if not target.is_relative_to(base.resolve()):
+        raise HTTPException(status_code=403, detail="Path traversal blocked")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Guess content type
+    suffix = target.suffix.lower()
+    content_types = {
+        ".js": "application/javascript",
+        ".mjs": "application/javascript",
+        ".css": "text/css",
+        ".json": "application/json",
+        ".html": "text/html",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".woff2": "font/woff2",
+        ".woff": "font/woff",
+    }
+    media_type = content_types.get(suffix, "application/octet-stream")
+    return FileResponse(target, media_type=media_type)
+
+
+def _mount_plugin_api_routes():
+    """Import and mount backend API routes from plugins that declare them.
+
+    Each plugin's ``api`` field points to a Python file that must expose
+    a ``router`` (FastAPI APIRouter).  Routes are mounted under
+    ``/api/plugins/<name>/``.
+    """
+    for plugin in _get_dashboard_plugins():
+        api_file_name = plugin.get("_api_file")
+        if not api_file_name:
+            continue
+        api_path = Path(plugin["_dir"]) / api_file_name
+        if not api_path.exists():
+            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"hermes_dashboard_plugin_{plugin['name']}", api_path,
+            )
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            router = getattr(mod, "router", None)
+            if router is None:
+                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
+                continue
+            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
+            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
+        except Exception as exc:
+            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+
+
+# Mount plugin API routes before the SPA catch-all.
+_mount_plugin_api_routes()
+
 mount_spa(app)
 
 
@@ -2093,13 +2815,15 @@ def start_server(
             "authentication. Only use on trusted networks.", host,
         )
 
+    # Record the bound host so host_header_middleware can validate incoming
+    # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
+    app.state.bound_host = host
+
     if open_browser:
-        import threading
         import webbrowser
 
         def _open():
-            import time as _t
-            _t.sleep(1.0)
+            time.sleep(1.0)
             webbrowser.open(f"http://{host}:{port}")
 
         threading.Thread(target=_open, daemon=True).start()
