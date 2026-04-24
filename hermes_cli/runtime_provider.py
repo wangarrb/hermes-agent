@@ -415,6 +415,8 @@ def _resolve_named_custom_runtime(
     provider_label = str(custom_provider.get("provider_key") or requested_provider or "custom").strip().lower() or "custom"
     pool_result = _try_resolve_from_custom_pool(base_url, provider_label, custom_provider.get("api_mode"))
     if pool_result:
+        # Propagate the model name even when using pooled credentials —
+        # the pool doesn't know about the custom provider model field.
         pool_result["provider"] = provider_label
         model_name = custom_provider.get("model")
         if model_name:

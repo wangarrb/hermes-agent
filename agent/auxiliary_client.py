@@ -1269,6 +1269,24 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     provider = normalized.get("provider")
     if provider:
         normalized["provider"] = provider.lower()
+
+    provider = normalized.get("provider") or ""
+    base_url = (normalized.get("base_url") or "").rstrip("/")
+    if provider == "custom" and base_url:
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+            providers_cfg = cfg.get("providers", {}) if isinstance(cfg, dict) else {}
+            if isinstance(providers_cfg, dict):
+                for provider_name, provider_cfg in providers_cfg.items():
+                    if not isinstance(provider_cfg, dict):
+                        continue
+                    candidate_url = str(provider_cfg.get("base_url", "") or "").strip().rstrip("/")
+                    if candidate_url and candidate_url == base_url:
+                        normalized["provider"] = str(provider_name).strip().lower()
+                        break
+        except Exception:
+            pass
     return normalized
 
 

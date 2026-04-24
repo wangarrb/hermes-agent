@@ -21,6 +21,7 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _try_payment_fallback,
     _resolve_auto,
+    _normalize_main_runtime,
 )
 
 
@@ -52,6 +53,32 @@ def codex_auth_dir(tmp_path, monkeypatch):
         lambda: "codex-test-token-abc123",
     )
     return codex_dir
+
+
+class TestNormalizeMainRuntime:
+    def test_custom_provider_restored_from_configured_base_url(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True)
+        (hermes_home / "config.yaml").write_text(
+            "providers:\n"
+            "  cch:\n"
+            "    base_url: http://cch.jmadas.com/v1\n"
+            "    api_mode: codex_responses\n"
+            "    models:\n"
+            "      - gpt-5.4\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        runtime = _normalize_main_runtime({
+            "provider": "custom",
+            "model": "gpt-5.4",
+            "base_url": "http://cch.jmadas.com/v1/",
+            "api_mode": "codex_responses",
+        })
+
+        assert runtime["provider"] == "cch"
+        assert runtime["api_mode"] == "codex_responses"
 
 
 class TestReadCodexAccessToken:
