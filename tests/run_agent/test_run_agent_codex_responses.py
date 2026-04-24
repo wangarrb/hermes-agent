@@ -433,6 +433,66 @@ def test_build_api_kwargs_cch_does_not_inject_runtime_identity(monkeypatch):
     assert "Right now in this chat" not in kwargs["input"][0]["content"]
 
 
+def test_run_codex_stream_cch_bypasses_sdk_with_direct_post(monkeypatch):
+    agent = _build_cch_agent(monkeypatch)
+    captured = {}
+
+    class _FakeHttpResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "direct cch ok"}],
+                    }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+                "status": "completed",
+                "model": "gpt-5.4",
+            }
+
+    class _FakeHttpClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return _FakeHttpResponse()
+
+    def _unexpected_stream(**kwargs):
+        raise AssertionError("CCH should bypass SDK streaming and use direct POST")
+
+    monkeypatch.setattr(
+        run_agent.AIAgent,
+        "_build_keepalive_http_client",
+        staticmethod(lambda: _FakeHttpClient()),
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_unexpected_stream,
+            create=lambda **kwargs: _codex_message_response("unexpected"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert captured["url"] == "http://cch.jmadas.com/v1/responses"
+    assert captured["headers"]["Authorization"] == "Bearer cch-token"
+    assert captured["headers"]["Content-Type"] == "application/json"
+    assert captured["json"] == _codex_request_kwargs()
+    assert response.output[0].content[0].text == "direct cch ok"
+    assert response.usage.input_tokens == 5
+
+
 def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"stream": 0}

@@ -4779,9 +4779,76 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _should_bypass_codex_stream_sdk(self) -> bool:
+        """Return True when provider-specific stream incompatibilities require direct HTTP."""
+        if self.api_mode != "codex_responses":
+            return False
+        if (self.provider or "").strip().lower() == "cch":
+            return True
+        effective_base = str((self._client_kwargs or {}).get("base_url") or self.base_url or "")
+        return base_url_host_matches(effective_base, "cch.jmadas.com")
+
+    @staticmethod
+    def _codex_response_json_to_namespace(value: Any) -> Any:
+        """Recursively convert JSON-like Responses payloads into attribute objects."""
+        if isinstance(value, dict):
+            return SimpleNamespace(**{
+                key: AIAgent._codex_response_json_to_namespace(item)
+                for key, item in value.items()
+            })
+        if isinstance(value, list):
+            return [AIAgent._codex_response_json_to_namespace(item) for item in value]
+        return value
+
+    def _run_codex_direct_response_fallback(self, api_kwargs: dict):
+        """Bypass SDK streaming and POST directly to /responses.
+
+        CCH currently accepts the same Responses payload via plain HTTP POST but
+        returns 503 through the OpenAI SDK's ``responses.stream()`` path.
+        Use a non-stream direct request so the existing normalization pipeline can
+        continue working with the returned response object.
+        """
+        import httpx as _httpx
+
+        client_kwargs = dict(self._client_kwargs or {})
+        base_url = str(client_kwargs.get("base_url") or self.base_url or "").rstrip("/")
+        if not base_url:
+            raise RuntimeError("Codex direct response fallback requires a base_url.")
+
+        headers = dict(client_kwargs.get("default_headers") or {})
+        api_key = str(client_kwargs.get("api_key") or self.api_key or "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        headers.setdefault("Content-Type", "application/json")
+
+        url = f"{base_url}/responses"
+        timeout = client_kwargs.get("timeout", None)
+        http_client = self._build_keepalive_http_client()
+        if http_client is None:
+            http_client = _httpx.Client(proxy=_get_proxy_from_env())
+
+        logger.debug(
+            "Codex Responses stream: bypassing SDK stream via direct POST to %s. %s",
+            url,
+            self._client_log_context(),
+        )
+        with http_client as direct_client:
+            response = direct_client.post(url, headers=headers, json=api_kwargs, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Codex direct response fallback expected JSON object, got {type(payload).__name__}."
+            )
+        return self._codex_response_json_to_namespace(payload)
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
+
+        if self._should_bypass_codex_stream_sdk():
+            return self._run_codex_direct_response_fallback(api_kwargs)
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
