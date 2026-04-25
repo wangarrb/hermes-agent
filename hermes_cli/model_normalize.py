@@ -47,7 +47,7 @@ _VENDOR_PREFIXES: dict[str, str] = {
     "deepseek": "deepseek",
     "glm": "z-ai",
     "kimi": "moonshotai",
-    "minimax": "minimax",
+    "minimax": "minimax-cn",
     "grok": "x-ai",
     "qwen": "qwen",
     "mimo": "xiaomi",

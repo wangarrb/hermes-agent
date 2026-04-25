@@ -200,13 +200,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("ARCEEAI_API_KEY",),
         base_url_env_var="ARCEE_BASE_URL",
     ),
-    "minimax": ProviderConfig(
-        id="minimax",
-        name="MiniMax",
+    "minimax-cn": ProviderConfig(
+        id="minimax-cn",
+        name="MiniMax (China)",
         auth_type="api_key",
-        inference_base_url="https://api.minimax.io/anthropic",
-        api_key_env_vars=("MINIMAX_API_KEY",),
-        base_url_env_var="MINIMAX_BASE_URL",
+        inference_base_url="https://api.minimaxi.com/anthropic",
+        api_key_env_vars=("MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"),
+        base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
     "anthropic": ProviderConfig(
         id="anthropic",
@@ -223,14 +223,6 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         api_key_env_vars=("DASHSCOPE_API_KEY",),
         base_url_env_var="DASHSCOPE_BASE_URL",
-    ),
-    "minimax-cn": ProviderConfig(
-        id="minimax-cn",
-        name="MiniMax (China)",
-        auth_type="api_key",
-        inference_base_url="https://api.minimaxi.com/anthropic",
-        api_key_env_vars=("MINIMAX_CN_API_KEY",),
-        base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
     "deepseek": ProviderConfig(
         id="deepseek",
@@ -428,7 +420,11 @@ def _resolve_api_key_provider_secret(
         return "", ""
 
     for env_var in pconfig.api_key_env_vars:
-        val = os.getenv(env_var, "").strip()
+        try:
+            from hermes_cli.config import get_env_value
+            val = (get_env_value(env_var) or "").strip()
+        except ImportError:
+            val = os.getenv(env_var, "").strip()
         if has_usable_secret(val):
             return val, env_var
 
@@ -1023,7 +1019,7 @@ def resolve_provider(
         "kimi-cn": "kimi-coding-cn", "moonshot-cn": "kimi-coding-cn",
         "step": "stepfun", "stepfun-coding-plan": "stepfun",
         "arcee-ai": "arcee", "arceeai": "arcee",
-        "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
+        "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn", "minimax": "minimax-cn",
         "claude": "anthropic", "claude-code": "anthropic",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",

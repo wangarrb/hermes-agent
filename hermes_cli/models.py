@@ -52,9 +52,6 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("qwen/qwen3.5-plus-02-15",         ""),
     ("qwen/qwen3.5-35b-a3b",            ""),
     ("stepfun/step-3.5-flash",          ""),
-    ("minimax/minimax-m2.7",            ""),
-    ("minimax/minimax-m2.5",            ""),
-    ("minimax/minimax-m2.5:free",       "free"),
     ("z-ai/glm-5.1",                    ""),
     ("z-ai/glm-5v-turbo",               ""),
     ("z-ai/glm-5-turbo",                ""),
@@ -78,7 +75,6 @@ VERCEL_AI_GATEWAY_MODELS: list[tuple[str, str]] = [
     ("moonshotai/kimi-k2.6",                 "recommended"),
     ("alibaba/qwen3.6-plus",                 ""),
     ("zai/glm-5.1",                          ""),
-    ("minimax/minimax-m2.7",                 ""),
     ("anthropic/claude-sonnet-4.6",          ""),
     ("anthropic/claude-opus-4.7",            ""),
     ("anthropic/claude-opus-4.6",            ""),
@@ -126,10 +122,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen/qwen3.5-plus-02-15",
         "qwen/qwen3.5-35b-a3b",
         "stepfun/step-3.5-flash",
-        "minimax/minimax-m2.7",
-        "minimax/minimax-m2.5",
-        "minimax/minimax-m2.5:free",
-        "z-ai/glm-5.1",
+        "zai/glm-5.1",
         "z-ai/glm-5v-turbo",
         "z-ai/glm-5-turbo",
         "x-ai/grok-4.20-beta",
@@ -192,7 +185,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen/qwen3.5-397b-a17b",
         "deepseek-ai/deepseek-v3.2",
         "moonshotai/kimi-k2.6",
-        "minimaxai/minimax-m2.5",
         "z-ai/glm5",
         "openai/gpt-oss-120b",
     ],
@@ -222,12 +214,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-thinking",
         "kimi-k2-turbo-preview",
         "kimi-k2-0905-preview",
-    ],
-    "minimax": [
-        "MiniMax-M2.7",
-        "MiniMax-M2.5",
-        "MiniMax-M2.1",
-        "MiniMax-M2",
     ],
     "minimax-cn": [
         "MiniMax-M2.7",
@@ -286,10 +272,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-pro",
         "gemini-3-pro",
         "gemini-3-flash",
-        "minimax-m2.7",
-        "minimax-m2.5",
-        "minimax-m2.5-free",
-        "minimax-m2.1",
         "glm-5",
         "glm-4.7",
         "glm-4.6",
@@ -307,8 +289,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "mimo-v2.5",
         "mimo-v2-pro",
         "mimo-v2-omni",
-        "minimax-m2.7",
-        "minimax-m2.5",
         "qwen3.6-plus",
         "qwen3.5-plus",
     ],
@@ -710,7 +690,6 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("kimi-coding",    "Kimi / Kimi Coding Plan",  "Kimi Coding Plan (api.kimi.com) & Moonshot API"),
     ProviderEntry("kimi-coding-cn", "Kimi / Moonshot (China)",  "Kimi / Moonshot China (Moonshot CN direct API)"),
     ProviderEntry("stepfun",        "StepFun Step Plan",       "StepFun Step Plan (agent/coding models via Step Plan API)"),
-    ProviderEntry("minimax",        "MiniMax",                  "MiniMax (global direct API)"),
     ProviderEntry("minimax-cn",     "MiniMax (China)",          "MiniMax China (domestic direct API)"),
     ProviderEntry("alibaba",        "Alibaba Cloud (DashScope)","Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
     ProviderEntry("ollama-cloud",   "Ollama Cloud",             "Ollama Cloud (cloud-hosted open models — ollama.com)"),
@@ -748,7 +727,6 @@ _PROVIDER_ALIASES = {
     "stepfun-coding-plan": "stepfun",
     "arcee-ai": "arcee",
     "arceeai": "arcee",
-    "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
     "claude-code": "anthropic",
@@ -2127,8 +2105,6 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
         return "chat_completions"
 
     if provider == "opencode-go":
-        if normalized.startswith("minimax-"):
-            return "anthropic_messages"
         return "chat_completions"
 
     if provider == "opencode-zen":
@@ -2558,7 +2534,7 @@ def validate_requested_model(
 
     # MiniMax providers don't expose a /models endpoint — validate against
     # the static catalog instead, similar to openai-codex.
-    if normalized in ("minimax", "minimax-cn"):
+    if normalized == "minimax-cn":
         try:
             catalog_models = provider_model_ids(normalized)
         except Exception:

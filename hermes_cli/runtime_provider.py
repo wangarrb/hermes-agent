@@ -312,7 +312,11 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 continue
             name_norm = _normalize_custom_provider_name(ep_name)
             key_env = str(entry.get("key_env", "") or entry.get("api_key_env", "") or "").strip()
-            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
+            try:
+                from hermes_cli.config import get_env_value
+                resolved_api_key = (get_env_value(key_env) or "").strip() if key_env else ""
+            except ImportError:
+                resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
             if not resolved_api_key:
                 resolved_api_key = str(entry.get("api_key", "") or "").strip()
             resolved_api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
@@ -423,10 +427,15 @@ def _resolve_named_custom_runtime(
             pool_result["model"] = model_name
         return pool_result
 
+    try:
+        from hermes_cli.config import get_env_value
+        key_env_val = (get_env_value(str(custom_provider.get("key_env", "") or "").strip()) or "").strip()
+    except ImportError:
+        key_env_val = os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip()
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
-        os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
+        key_env_val,
         os.getenv("OPENAI_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY", "").strip(),
     ]
