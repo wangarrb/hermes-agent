@@ -5173,7 +5173,7 @@ class AIAgent:
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "cch.jmadas.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "@openai/codex-cli/0.28.0"}
+            self._client_kwargs["default_headers"] = {"User-Agent": "openai-codex/0.121.0"}
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.auxiliary_client import _codex_cloudflare_headers
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
