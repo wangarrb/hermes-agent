@@ -1193,6 +1193,8 @@ class AIAgent:
                 elif base_url_host_matches(effective_base, "chatgpt.com"):
                     from agent.auxiliary_client import _codex_cloudflare_headers
                     client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+                elif base_url_host_matches(effective_base, "cch.jmadas.com"):
+                    client_kwargs["default_headers"] = {"User-Agent": "openai-codex/0.121.0"}
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -1208,6 +1210,9 @@ class AIAgent:
                     # Preserve any default_headers the router set
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
+                    # CCH requires specific User-Agent header for Responses API
+                    if base_url_host_matches(str(_routed_client.base_url), "cch.jmadas.com"):
+                        client_kwargs["default_headers"] = {"User-Agent": "openai-codex/0.121.0"}
                 else:
                     # When the user explicitly chose a non-OpenRouter provider
                     # but no credentials were found, fail fast with a clear
@@ -4780,13 +4785,17 @@ class AIAgent:
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _should_bypass_codex_stream_sdk(self) -> bool:
-        """Return True when provider-specific stream incompatibilities require direct HTTP."""
+        """Return True when provider-specific stream incompatibilities require direct HTTP.
+        
+        CCH requires streaming requests (stream=True) and rejects non-streaming POSTs with 503.
+        Do NOT bypass the SDK streaming path for CCH - let it use responses.stream() normally.
+        """
         if self.api_mode != "codex_responses":
             return False
-        if (self.provider or "").strip().lower() == "cch":
-            return True
-        effective_base = str((self._client_kwargs or {}).get("base_url") or self.base_url or "")
-        return base_url_host_matches(effective_base, "cch.jmadas.com")
+        # CCH must use streaming - bypass would cause 503 errors
+        # if (self.provider or "").strip().lower() == "cch":
+        #     return True  # REMOVED: CCH needs streaming, not direct POST
+        return False
 
     @staticmethod
     def _codex_response_json_to_namespace(value: Any) -> Any:
