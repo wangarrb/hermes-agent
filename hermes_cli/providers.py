@@ -183,6 +183,7 @@ class ProviderDef:
     auth_type: str = "api_key"
     doc: str = ""
     source: str = ""                      # "models.dev", "hermes", "user-config"
+    models: Tuple[str, ...] = ()          # models available for this provider (from user config)
 
 
 # -- Aliases ------------------------------------------------------------------
@@ -495,6 +496,13 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     key_env = entry.get("key_env", "") or ""
     transport = entry.get("transport", "openai_chat") or "openai_chat"
 
+    # Extract models list
+    models_list = entry.get("models", [])
+    if isinstance(models_list, list):
+        models_tuple = tuple(str(m) for m in models_list)
+    else:
+        models_tuple = ()
+
     env_vars: List[str] = []
     if key_env:
         env_vars.append(key_env)
@@ -508,6 +516,7 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
         is_aggregator=False,
         auth_type="api_key",
         source="user-config",
+        models=models_tuple,
     )
 
 

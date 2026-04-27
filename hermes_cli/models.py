@@ -2394,6 +2394,7 @@ def validate_requested_model(
     *,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
+    config_models: Optional[List[str]] = None,
 ) -> dict[str, Any]:
     """
     Validate a ``/model`` value for the active provider.
@@ -2580,9 +2581,12 @@ def validate_requested_model(
     # Probe the live API to check if the model actually exists
     api_models = fetch_api_models(api_key, base_url)
 
-    if api_models is not None:
-        if requested_for_lookup in set(api_models):
-            # API confirmed the model exists
+    # If API returns empty list, fallback to config_models (user-defined provider)
+    effective_models = api_models if api_models else config_models
+
+    if effective_models is not None:
+        if requested_for_lookup in set(effective_models):
+            # Model confirmed in listing (API or config)
             return {
                 "accepted": True,
                 "persist": True,
@@ -2590,13 +2594,13 @@ def validate_requested_model(
                 "message": None,
             }
         else:
-            # API responded but model is not listed.  Accept anyway —
+            # Model not in listing. Accept anyway —
             # the user may have access to models not shown in the public
             # listing (e.g. Z.AI Pro/Max plans can use glm-5 on coding
             # endpoints even though it's not in /models).  Warn but allow.
 
             # Auto-correct if the top match is very similar (e.g. typo)
-            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
+            auto = get_close_matches(requested_for_lookup, effective_models, n=1, cutoff=0.9)
             if auto:
                 return {
                     "accepted": True,
@@ -2606,7 +2610,7 @@ def validate_requested_model(
                     "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
                 }
 
-            suggestions = get_close_matches(requested, api_models, n=3, cutoff=0.5)
+            suggestions = get_close_matches(requested, effective_models, n=3, cutoff=0.5)
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)

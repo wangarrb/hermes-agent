@@ -655,6 +655,25 @@ def switch_model(
                     ),
                 )
 
+        # Validate model against provider's models list (if configured)
+        if pdef.models and new_model:
+            new_model_lower = new_model.lower()
+            matched_models = [m for m in pdef.models if m.lower() == new_model_lower]
+            if not matched_models:
+                # Model not in provider's list — show available models
+                available = list(pdef.models)
+                if available:
+                    return ModelSwitchResult(
+                        success=False,
+                        target_provider=target_provider,
+                        provider_label=pdef.name,
+                        is_global=is_global,
+                        error_message=(
+                            f"Model `{new_model}` was not found in this provider's model listing.\n"
+                            f"Available models for {pdef.name}: {', '.join(available)}"
+                        ),
+                    )
+
         # Resolve alias on the TARGET provider
         alias_result = resolve_alias(new_model, target_provider)
         if alias_result is not None:
@@ -808,6 +827,13 @@ def switch_model(
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
+    # --- Get config_models for user-defined providers ---
+    config_models_list: Optional[List[str]] = None
+    if user_providers and target_provider in user_providers:
+        models_entry = user_providers.get(target_provider, {}).get("models", [])
+        if isinstance(models_entry, list) and models_entry:
+            config_models_list = list(models_entry)
+
     # --- Validate ---
     try:
         validation = validate_requested_model(
@@ -815,6 +841,7 @@ def switch_model(
             target_provider,
             api_key=api_key,
             base_url=base_url,
+            config_models=config_models_list,
         )
     except Exception as e:
         validation = {
