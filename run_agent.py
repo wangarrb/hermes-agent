@@ -1623,41 +1623,78 @@ class AIAgent:
 
         # Check custom_providers per-model context_length
         if _config_context_length is None:
-            try:
-                from hermes_cli.config import get_compatible_custom_providers
-                _custom_providers = get_compatible_custom_providers(_agent_cfg)
-            except Exception:
-                _custom_providers = _agent_cfg.get("custom_providers")
-                if not isinstance(_custom_providers, list):
-                    _custom_providers = []
-            for _cp_entry in _custom_providers:
-                if not isinstance(_cp_entry, dict):
-                    continue
-                _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
-                if _cp_url and _cp_url == self.base_url.rstrip("/"):
-                    _cp_models = _cp_entry.get("models", {})
-                    if isinstance(_cp_models, dict):
-                        _cp_model_cfg = _cp_models.get(self.model, {})
-                        if isinstance(_cp_model_cfg, dict):
-                            _cp_ctx = _cp_model_cfg.get("context_length")
-                            if _cp_ctx is not None:
-                                try:
-                                    _config_context_length = int(_cp_ctx)
-                                except (TypeError, ValueError):
-                                    logger.warning(
-                                        "Invalid context_length for model %r in "
-                                        "custom_providers: %r — must be a plain "
-                                        "integer (e.g. 256000, not '256K'). "
-                                        "Falling back to auto-detection.",
-                                        self.model, _cp_ctx,
-                                    )
-                                    print(
-                                        f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
-                                        f"  Must be a plain integer (e.g. 256000, not '256K').\n"
-                                        f"  Falling back to auto-detected context window.\n",
-                                        file=sys.stderr,
-                                    )
-                    break
+            # First check providers dict (e.g. providers.cch.context_length)
+            _providers_cfg = _agent_cfg.get("providers", {})
+            if isinstance(_providers_cfg, dict):
+                _current_provider = getattr(self, "provider", "") or ""
+                _current_base = (getattr(self, "base_url", "") or "").rstrip("/")
+                for _prov_name, _prov_entry in _providers_cfg.items():
+                    if not isinstance(_prov_entry, dict):
+                        continue
+                    _prov_url = (_prov_entry.get("base_url") or "").rstrip("/")
+                    _prov_matches = (
+                        (_prov_name == _current_provider) or
+                        (_prov_url and _prov_url == _current_base)
+                    )
+                    if _prov_matches:
+                        # Check provider-level context_length
+                        _prov_ctx = _prov_entry.get("context_length")
+                        if _prov_ctx is not None:
+                            try:
+                                _config_context_length = int(_prov_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        # Check per-model context_length in provider.models dict
+                        if _config_context_length is None:
+                            _prov_models = _prov_entry.get("models", {})
+                            if isinstance(_prov_models, dict):
+                                _prov_model_cfg = _prov_models.get(self.model, {})
+                                if isinstance(_prov_model_cfg, dict):
+                                    _prov_ctx = _prov_model_cfg.get("context_length")
+                                    if _prov_ctx is not None:
+                                        try:
+                                            _config_context_length = int(_prov_ctx)
+                                        except (TypeError, ValueError):
+                                            pass
+                        break
+
+            # Then check custom_providers list (legacy format)
+            if _config_context_length is None:
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    _custom_providers = get_compatible_custom_providers(_agent_cfg)
+                except Exception:
+                    _custom_providers = _agent_cfg.get("custom_providers")
+                    if not isinstance(_custom_providers, list):
+                        _custom_providers = []
+                for _cp_entry in _custom_providers:
+                    if not isinstance(_cp_entry, dict):
+                        continue
+                    _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
+                    if _cp_url and _cp_url == self.base_url.rstrip("/"):
+                        _cp_models = _cp_entry.get("models", {})
+                        if isinstance(_cp_models, dict):
+                            _cp_model_cfg = _cp_models.get(self.model, {})
+                            if isinstance(_cp_model_cfg, dict):
+                                _cp_ctx = _cp_model_cfg.get("context_length")
+                                if _cp_ctx is not None:
+                                    try:
+                                        _config_context_length = int(_cp_ctx)
+                                    except (TypeError, ValueError):
+                                        logger.warning(
+                                            "Invalid context_length for model %r in "
+                                            "custom_providers: %r — must be a plain "
+                                            "integer (e.g. 256000, not '256K'). "
+                                            "Falling back to auto-detection.",
+                                            self.model, _cp_ctx,
+                                        )
+                                        print(
+                                            f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
+                                            f"  Must be a plain integer (e.g. 256000, not '256K').\n"
+                                            f"  Falling back to auto-detected context window.\n",
+                                            file=sys.stderr,
+                                        )
+                        break
         
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
@@ -10684,7 +10721,20 @@ class AIAgent:
                             # Step down to the next probe tier
                             new_ctx = get_next_probe_tier(old_ctx)
 
-                        if new_ctx and new_ctx < old_ctx:
+                        # Probe-down protection: if user explicitly configured context_length
+                        # in config.yaml, don't let heuristic probe-down override it.
+                        # Only accept parsed_limit from provider's explicit error message.
+                        _explicit_ctx = getattr(self, "_config_context_length", None)
+                        _allow_probe_down = True
+                        if _explicit_ctx is not None and _explicit_ctx > 0:
+                            # User set model.context_length or provider.context_length explicitly
+                            # Only override if provider told us the actual limit (parsed_limit)
+                            if parsed_limit and parsed_limit == new_ctx:
+                                _allow_probe_down = True  # Provider explicitly said the limit
+                            else:
+                                _allow_probe_down = False  # Heuristic probe-down, reject
+
+                        if new_ctx and new_ctx < old_ctx and _allow_probe_down:
                             compressor.update_model(
                                 model=self.model,
                                 context_length=new_ctx,
