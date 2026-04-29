@@ -4889,6 +4889,12 @@ class AIAgent:
             )
         return self._codex_response_json_to_namespace(payload)
 
+    def _normalize_codex_response(self, response: Any) -> tuple[Any, str]:
+        """Compatibility wrapper for legacy Codex Responses call sites."""
+        from agent.codex_responses_adapter import _normalize_codex_response
+
+        return _normalize_codex_response(response)
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -7407,7 +7413,11 @@ class AIAgent:
             or base_url_host_matches(self.base_url, "moonshot.ai")
             or base_url_host_matches(self.base_url, "moonshot.cn")
         )
-        if kimi_requires_reasoning and source_msg.get("tool_calls"):
+        deepseek_requires_reasoning_for_tool_calls = (
+            self.provider == "deepseek"
+            or base_url_host_matches(self.base_url, "api.deepseek.com")
+        )
+        if (kimi_requires_reasoning or deepseek_requires_reasoning_for_tool_calls) and source_msg.get("tool_calls"):
             api_msg["reasoning_content"] = ""
 
     @staticmethod

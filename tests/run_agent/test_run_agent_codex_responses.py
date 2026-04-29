@@ -114,6 +114,18 @@ def _codex_message_response(text: str):
     )
 
 
+def test_aiagent_exposes_codex_response_normalizer_for_legacy_callers(monkeypatch):
+    """Legacy call sites such as /mycompress still call the AIAgent method."""
+    agent = _build_agent(monkeypatch)
+
+    assistant_message, finish_reason = agent._normalize_codex_response(
+        _codex_message_response("handoff summary")
+    )
+
+    assert assistant_message.content == "handoff summary"
+    assert finish_reason == "stop"
+
+
 def _codex_tool_call_response():
     return SimpleNamespace(
         output=[

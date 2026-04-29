@@ -117,23 +117,27 @@ _DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
 _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-chat",
     "deepseek-reasoner",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "v4-flash",
+    "v4-pro",
 })
 
 
 def _normalize_for_deepseek(model_name: str) -> str:
-    """Map any model input to one of DeepSeek's two accepted identifiers.
+    """Map any model input to one of DeepSeek's accepted identifiers.
 
     Rules:
-    - Already ``deepseek-chat`` or ``deepseek-reasoner`` -> pass through.
+    - Already a canonical DeepSeek model name -> pass through.
     - Contains any reasoner keyword (r1, think, reasoning, cot, reasoner)
       -> ``deepseek-reasoner``.
-    - Everything else -> ``deepseek-chat``.
+    - Everything else -> ``deepseek-v4-pro`` (default chat model).
 
     Args:
         model_name: The bare model name (vendor prefix already stripped).
 
     Returns:
-        One of ``"deepseek-chat"`` or ``"deepseek-reasoner"``.
+        One of the canonical DeepSeek model names.
     """
     bare = _strip_vendor_prefix(model_name).lower()
 
@@ -145,7 +149,7 @@ def _normalize_for_deepseek(model_name: str) -> str:
         if keyword in bare:
             return "deepseek-reasoner"
 
-    return "deepseek-chat"
+    return "deepseek-v4-pro"
 
 
 # ---------------------------------------------------------------------------
