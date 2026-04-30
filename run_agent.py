@@ -1620,11 +1620,25 @@ class AIAgent:
 
         # Store for reuse in switch_model (so config override persists across model switches)
         self._config_context_length = _config_context_length
+        # Debug log: record what context_length was resolved during init
+        print(
+            f"\n[CTX_INIT] model={getattr(self, 'model', '')}, provider={getattr(self, 'provider', '')}, "
+            f"base_url={getattr(self, 'base_url', '')}, "
+            f"_config_context_length={_config_context_length}, "
+            f"_agent_cfg_keys={list(_agent_cfg.keys()) if _agent_cfg else []}\n",
+            file=sys.stderr,
+        )
 
         # Check custom_providers per-model context_length
         if _config_context_length is None:
             # First check providers dict (e.g. providers.cch.context_length)
             _providers_cfg = _agent_cfg.get("providers", {})
+            print(
+                f"[CTX_INIT_PROVIDERS] _providers_cfg type={type(_providers_cfg).__name__}, "
+                f"keys={list(_providers_cfg.keys()) if isinstance(_providers_cfg, dict) else 'NOT dict'}, "
+                f"self.provider='{getattr(self, 'provider', '')}', self.base_url='{getattr(self, 'base_url', '')}'\n",
+                file=sys.stderr,
+            )
             if isinstance(_providers_cfg, dict):
                 _current_provider = getattr(self, "provider", "") or ""
                 _current_base = (getattr(self, "base_url", "") or "").rstrip("/")
@@ -1637,11 +1651,18 @@ class AIAgent:
                         (_prov_url and _prov_url == _current_base)
                     )
                     if _prov_matches:
+                        # Debug log: provider matched
+                        print(
+                            f"\n[CTX_MATCH] matched provider '{_prov_name}' "
+                            f"(_current_provider='{_current_provider}', _current_base='{_current_base}')\n",
+                            file=sys.stderr,
+                        )
                         # Check provider-level context_length
                         _prov_ctx = _prov_entry.get("context_length")
                         if _prov_ctx is not None:
                             try:
                                 _config_context_length = int(_prov_ctx)
+                                print(f"[CTX_MATCH] provider-level context_length={_config_context_length}\n", file=sys.stderr)
                             except (TypeError, ValueError):
                                 pass
                         # Check per-model context_length in provider.models dict
@@ -1654,9 +1675,26 @@ class AIAgent:
                                     if _prov_ctx is not None:
                                         try:
                                             _config_context_length = int(_prov_ctx)
+                                            print(f"[CTX_MATCH] per-model context_length={_config_context_length} for model={self.model}\n", file=sys.stderr)
                                         except (TypeError, ValueError):
                                             pass
                         break
+
+            # Debug: final _config_context_length after providers matching
+            print(
+                f"[CTX_INIT_FINAL] after providers matching: _config_context_length={_config_context_length}\n",
+                file=sys.stderr,
+            )
+
+            # CRITICAL FIX: Update self._config_context_length if providers matching succeeded
+            # The assignment at line 1622 happened BEFORE providers matching, so it stored None.
+            # Now that providers matching may have set _config_context_length, we must sync it back.
+            if _config_context_length is not None and _config_context_length > 0:
+                self._config_context_length = _config_context_length
+                print(
+                    f"[CTX_INIT_FINAL] synced to self._config_context_length={self._config_context_length}\n",
+                    file=sys.stderr,
+                )
 
             # Then check custom_providers list (legacy format)
             if _config_context_length is None:
@@ -10735,6 +10773,67 @@ class AIAgent:
                         # in config.yaml, don't let heuristic probe-down override it.
                         # Only accept parsed_limit from provider's explicit error message.
                         _explicit_ctx = getattr(self, "_config_context_length", None)
+                        # Debug log: probe-down trigger state
+                        print(
+                            f"\n[CTX_PROBE] triggered probe-down: old_ctx={old_ctx}, new_ctx={new_ctx}, "
+                            f"parsed_limit={parsed_limit}, _config_context_length={_explicit_ctx}, "
+                            f"provider={self.provider}, base_url={self.base_url}, model={self.model}\n",
+                            file=sys.stderr,
+                        )
+                        # Fallback: if _config_context_length wasn't set during init (e.g. config load failure),
+                        # try to read it now from the fresh config.
+                        if _explicit_ctx is None or _explicit_ctx <= 0:
+                            print(f"[CTX_PROBE] _config_context_length missing/invalid, attempting fallback config reload\n", file=sys.stderr)
+                            try:
+                                from hermes_cli.config import load_config as _reload_config
+                                _fallback_cfg = _reload_config()
+                                _fallback_providers = _fallback_cfg.get("providers", {})
+                                _current_provider = (self.provider or "").strip().lower()
+                                _current_base = (self.base_url or "").rstrip("/")
+                                print(
+                                    f"[CTX_PROBE] fallback: providers keys={list(_fallback_providers.keys())}, "
+                                    f"looking for provider='{_current_provider}' or base='{_current_base}'\n",
+                                    file=sys.stderr,
+                                )
+                                for _fp_name, _fp_entry in _fallback_providers.items():
+                                    if not isinstance(_fp_entry, dict):
+                                        continue
+                                    _fp_url = (_fp_entry.get("base_url") or "").rstrip("/")
+                                    _fp_matches = (
+                                        (_fp_name == _current_provider) or
+                                        (_fp_url and _fp_url == _current_base)
+                                    )
+                                    if _fp_matches:
+                                        print(f"[CTX_PROBE] fallback matched provider '{_fp_name}'\n", file=sys.stderr)
+                                        _fp_ctx = _fp_entry.get("context_length")
+                                        if _fp_ctx is not None:
+                                            try:
+                                                _explicit_ctx = int(_fp_ctx)
+                                                # Also cache it back to _config_context_length for future turns
+                                                self._config_context_length = _explicit_ctx
+                                                print(f"[CTX_PROBE] fallback resolved context_length={_explicit_ctx}\n", file=sys.stderr)
+                                            except (TypeError, ValueError):
+                                                pass
+                                        # Check per-model context_length under provider.models dict
+                                        if _explicit_ctx is None or _explicit_ctx <= 0:
+                                            _fp_models = _fp_entry.get("models", {})
+                                            if isinstance(_fp_models, dict):
+                                                _fp_model_cfg = _fp_models.get(self.model, {})
+                                                if isinstance(_fp_model_cfg, dict):
+                                                    _fp_ctx = _fp_model_cfg.get("context_length")
+                                                    if _fp_ctx is not None:
+                                                        try:
+                                                            _explicit_ctx = int(_fp_ctx)
+                                                            self._config_context_length = _explicit_ctx
+                                                            print(f"[CTX_PROBE] fallback per-model context_length={_explicit_ctx}\n", file=sys.stderr)
+                                                        except (TypeError, ValueError):
+                                                            pass
+                                        break
+                            except Exception as _fb_exc:
+                                print(f"[CTX_PROBE] fallback config reload failed: {_fb_exc}\n", file=sys.stderr)
+                            # Log final fallback result
+                            print(f"[CTX_PROBE] fallback final _explicit_ctx={_explicit_ctx}\n", file=sys.stderr)
+
                         _allow_probe_down = True
                         if _explicit_ctx is not None and _explicit_ctx > 0:
                             # User set model.context_length or provider.context_length explicitly
@@ -10743,8 +10842,18 @@ class AIAgent:
                                 _allow_probe_down = True  # Provider explicitly said the limit
                             else:
                                 _allow_probe_down = False  # Heuristic probe-down, reject
+                        # Debug log: final probe-down decision
+                        print(
+                            f"[CTX_PROBE] decision: _allow_probe_down={_allow_probe_down}, "
+                            f"_explicit_ctx={_explicit_ctx}, new_ctx={new_ctx}, old_ctx={old_ctx}\n",
+                            file=sys.stderr,
+                        )
 
                         if new_ctx and new_ctx < old_ctx and _allow_probe_down:
+                            print(
+                                f"[CTX_PROBE] >>> ACTUALLY STEPPING DOWN: {old_ctx:,} → {new_ctx:,} <<<\n",
+                                file=sys.stderr,
+                            )
                             compressor.update_model(
                                 model=self.model,
                                 context_length=new_ctx,
