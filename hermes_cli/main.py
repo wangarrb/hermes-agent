@@ -9551,25 +9551,28 @@ Examples:
                 return
             has_titles = any(s.get("title") for s in sessions)
             if has_titles:
-                print(f"{'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-                print("─" * 110)
+                print(f"{'Title':<30} {'Msgs':>5} {'CTX':>9} {'In':>7} {'Out':>7} {'Cache':>11} {'Last Active':<11} {'ID'}")
+                print("─" * 120)
             else:
-                print(f"{'Preview':<50} {'Last Active':<13} {'Src':<6} {'ID'}")
-                print("─" * 95)
+                print(f"{'Preview':<40} {'Msgs':>5} {'CTX':>9} {'In':>7} {'Out':>7} {'Cache':>11} {'Last Active':<11} {'Src':<6} {'ID'}")
+                print("─" * 125)
             for s in sessions:
                 last_active = _relative_time(s.get("last_active"))
-                preview = (
-                    s.get("preview", "")[:38]
-                    if has_titles
-                    else s.get("preview", "")[:48]
-                )
+                preview = s.get("preview", "")[:40]
+                msgs = s.get("message_count") or 0
+                inp = s.get("input_tokens") or 0
+                out = s.get("output_tokens") or 0
+                cr = s.get("cache_read_tokens") or 0
+                cw = s.get("cache_write_tokens") or 0
+                ctx = inp + out + cr + cw
+                cache = f"{cr}/{cw}"
                 if has_titles:
                     title = (s.get("title") or "—")[:30]
                     sid = s["id"]
-                    print(f"{title:<32} {preview:<40} {last_active:<13} {sid}")
+                    print(f"{title:<30} {msgs:>5} {ctx:>9,} {inp:>7,} {out:>7,} {cache:>11} {last_active:<11} {sid}")
                 else:
                     sid = s["id"]
-                    print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
+                    print(f"{preview:<40} {msgs:>5} {ctx:>9,} {inp:>7,} {out:>7,} {cache:>11} {last_active:<11} {s['source']:<6} {sid}")
 
         elif action == "export":
             if args.session_id:
