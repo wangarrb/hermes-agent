@@ -1475,11 +1475,16 @@ class SlashCommandCompleter(Completer):
 
         word = text[1:]
 
+        # Track commands already yielded from COMMANDS to avoid duplicates
+        # from skill_commands (e.g., /mycompress registered in both)
+        yielded_cmds: set[str] = set()
+
         for cmd, desc in COMMANDS.items():
             if not self._command_allowed(cmd):
                 continue
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
+                yielded_cmds.add(cmd_name)
                 yield Completion(
                     self._completion_text(cmd_name, word),
                     start_position=-len(word),
@@ -1489,6 +1494,9 @@ class SlashCommandCompleter(Completer):
 
         for cmd, info in self._iter_skill_commands().items():
             cmd_name = cmd[1:]
+            # Skip if already registered in COMMANDS (avoid duplicate display)
+            if cmd_name in yielded_cmds:
+                continue
             if cmd_name.startswith(word):
                 description = str(info.get("description", "Skill command"))
                 short_desc = description[:50] + ("..." if len(description) > 50 else "")

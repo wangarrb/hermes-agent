@@ -242,6 +242,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):
                         continue
+                    # Skip skills that don't want slash command registration
+                    if frontmatter.get('no_slash', False):
+                        continue
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
                         continue
