@@ -46,6 +46,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
+    # Audio + video parsing (fork customization)
+    "audio_transcribe", "video_analyze",
     # Planning & memory
     "todo", "memory",
     # Session history search
