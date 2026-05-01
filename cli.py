@@ -6355,6 +6355,8 @@ class HermesCLI:
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "mycompress":
+            self._handle_mycompress_command(cmd_original)
         elif canonical == "usage":
             self._show_usage()
         elif canonical == "insights":
@@ -7297,6 +7299,129 @@ class HermesCLI:
 
             except Exception as e:
                 print(f"  ❌ Compression failed: {e}")
+
+    def _handle_mycompress_command(self, cmd_original: str = ""):
+        """Handle /mycompress command -- skill-backed compression wrapper.
+        
+        This is a wrapper around /compress that:
+        1. Loads the mycompress skill prompt as focus_topic
+        2. Supports -n N / --keep-last-rounds N to protect last N user turns
+        3. Delegates to _manual_compress with the computed parameters
+        """
+        import shlex
+        from typing import Optional
+        
+        user_instruction = ""
+        if cmd_original:
+            parts = cmd_original.strip().split(None, 1)
+            if len(parts) > 1:
+                user_instruction = parts[1]
+        
+        # Parse arguments
+        try:
+            keep_last_rounds, remainder = _parse_mycompress_args_cli(user_instruction)
+        except ValueError as e:
+            print(f"  ❌ {e}")
+            return
+        
+        # Load mycompress skill prompt as focus_topic
+        from agent.skill_commands import build_skill_invocation_message
+        skill_msg = build_skill_invocation_message("mycompress", runtime_note="cli")
+        focus_topic = skill_msg.get("content", "")
+        if remainder:
+            focus_topic += f"\n用户补充要求：{remainder}"
+        
+        # If keep_last_rounds specified, temporarily adjust protect_last_n
+        original_protect_last_n = None
+        if keep_last_rounds is not None and self.agent:
+            original_protect_last_n = self.agent.context_compressor.protect_last_n
+            if self.conversation_history:
+                tail_start = _find_mycompress_tail_start_cli(
+                    self.conversation_history, keep_last_rounds
+                )
+                self.agent.context_compressor.protect_last_n = len(self.conversation_history) - tail_start
+        
+        # Call _manual_compress with computed focus_topic
+        # _manual_compress extracts focus_topic from cmd_original, so we need to construct it
+        compress_cmd = f"/compress {focus_topic}" if focus_topic else "/compress"
+        self._manual_compress(compress_cmd)
+        
+        # Restore original protect_last_n
+        if original_protect_last_n is not None and self.agent:
+            self.agent.context_compressor.protect_last_n = original_protect_last_n
+
+
+def _parse_mycompress_args_cli(user_instruction: str) -> tuple[Optional[int], str]:
+    """Extract optional keep-last-rounds flags from a CLI /mycompress invocation."""
+    from typing import Optional
+    import shlex
+    
+    if not user_instruction or not user_instruction.strip():
+        return None, ""
+
+    try:
+        tokens = shlex.split(user_instruction)
+    except ValueError:
+        tokens = user_instruction.split()
+
+    if not tokens:
+        return None, ""
+
+    keep_last_rounds: Optional[int] = None
+    remainder_start = 0
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        value_text = None
+        if token in ("-n", "--keep-last-turns", "--keep-last-rounds"):
+            if index + 1 >= len(tokens):
+                raise ValueError("`/mycompress -n` 缺少轮数，示例：/mycompress -n 3 保留关键结论")
+            value_text = tokens[index + 1]
+            index += 2
+        elif token.startswith("--keep-last-turns="):
+            value_text = token.split("=", 1)[1]
+            index += 1
+        elif token.startswith("--keep-last-rounds="):
+            value_text = token.split("=", 1)[1]
+            index += 1
+        else:
+            remainder_start = index
+            break
+
+        if keep_last_rounds is not None:
+            raise ValueError("`/mycompress` 只接受一个保留最近轮次参数。")
+        try:
+            keep_last_rounds = int(value_text)
+        except (TypeError, ValueError):
+            raise ValueError("`/mycompress -n` 需要正整数轮数。") from None
+        if keep_last_rounds < 1:
+            raise ValueError("`/mycompress -n` 需要大于 0 的轮数。")
+        remainder_start = index
+    else:
+        remainder_start = index
+
+    return keep_last_rounds, " ".join(tokens[remainder_start:]).strip()
+
+
+def _find_mycompress_tail_start_cli(
+    messages: list,
+    keep_last_rounds: int,
+    *,
+    protected_prefix: int = 0,
+) -> int:
+    """Return the earliest message index that keeps the last N user rounds verbatim."""
+    if keep_last_rounds < 1:
+        raise ValueError("keep_last_rounds must be >= 1")
+
+    safe_prefix = max(0, min(protected_prefix, len(messages)))
+    user_indices = [
+        index
+        for index, msg in enumerate(messages)
+        if index >= safe_prefix and msg.get("role") == "user"
+    ]
+    if not user_indices or keep_last_rounds >= len(user_indices):
+        return safe_prefix
+    return user_indices[-keep_last_rounds]
 
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""

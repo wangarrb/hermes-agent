@@ -4497,6 +4497,9 @@ class GatewayRunner:
         if canonical == "compress":
             return await self._handle_compress_command(event)
 
+        if canonical == "mycompress":
+            return await self._handle_mycompress_command(event)
+
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
@@ -8004,12 +8007,22 @@ class GatewayRunner:
             f"_(saved globally — takes effect on next message)_"
         )
 
-    async def _handle_compress_command(self, event: MessageEvent) -> str:
+    async def _handle_compress_command(
+        self, 
+        event: MessageEvent, 
+        focus_topic_override: str = None,
+        protect_last_n_override: int = None,
+    ) -> str:
         """Handle /compress command -- manually compress conversation context.
 
         Accepts an optional focus topic: ``/compress <focus>`` guides the
         summariser to preserve information related to *focus* while being
         more aggressive about discarding everything else.
+        
+        Args:
+            event: The message event triggering compression.
+            focus_topic_override: Optional focus topic to use instead of event args.
+            protect_last_n_override: Optional number of messages to protect at tail.
         """
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
@@ -8018,8 +8031,8 @@ class GatewayRunner:
         if not history or len(history) < 4:
             return "Not enough conversation to compress (need at least 4 messages)."
 
-        # Extract optional focus topic from command args
-        focus_topic = (event.get_command_args() or "").strip() or None
+        # Use override if provided, otherwise extract from command args
+        focus_topic = focus_topic_override or (event.get_command_args() or "").strip() or None
 
         try:
             from run_agent import AIAgent
@@ -8054,6 +8067,9 @@ class GatewayRunner:
                 tmp_agent._print_fn = lambda *a, **kw: None
 
                 compressor = tmp_agent.context_compressor
+                # Apply protect_last_n override if provided
+                if protect_last_n_override is not None:
+                    compressor.protect_last_n = protect_last_n_override
                 if not compressor.has_content_to_compress(msgs):
                     return "Nothing to compress yet (the transcript is still all protected context)."
 
@@ -8121,6 +8137,46 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return f"Compression failed: {e}"
+
+    async def _handle_mycompress_command(self, event: MessageEvent) -> str:
+        """Handle /mycompress command -- skill-backed compression wrapper.
+        
+        This is a wrapper around /compress that:
+        1. Loads the mycompress skill prompt as focus_topic
+        2. Supports -n N / --keep-last-rounds N to protect last N user turns
+        3. Delegates to _handle_compress_command with the computed parameters
+        """
+        user_instruction = event.get_command_args() or ""
+        
+        try:
+            keep_last_rounds, remainder = _parse_mycompress_args(user_instruction)
+        except ValueError as e:
+            return f"❌ {e}"
+        
+        # Load mycompress skill prompt as focus_topic
+        from agent.skill_commands import build_skill_invocation_message
+        skill_msg = build_skill_invocation_message("mycompress", runtime_note="gateway")
+        focus_topic = skill_msg.get("content", "")
+        if remainder:
+            focus_topic += f"\n用户补充要求：{remainder}"
+        
+        # If keep_last_rounds specified, calculate protect_last_n (message count)
+        protect_last_n_override = None
+        if keep_last_rounds is not None:
+            source = event.source
+            session_entry = self.session_store.get_or_create_session(source)
+            history = self.session_store.load_transcript(session_entry.session_id)
+            if history:
+                # Find the message index that keeps last N user turns
+                tail_start = _find_mycompress_tail_start(history, keep_last_rounds)
+                protect_last_n_override = len(history) - tail_start
+        
+        # Delegate to compress with computed parameters
+        return await self._handle_compress_command(
+            event,
+            focus_topic_override=focus_topic,
+            protect_last_n_override=protect_last_n_override,
+        )
 
     async def _handle_title_command(self, event: MessageEvent) -> str:
         """Handle /title command — set or show the current session's title."""
