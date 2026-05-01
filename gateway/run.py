@@ -8214,11 +8214,30 @@ class GatewayRunner:
                         "then `/resume My Session` to return to it later."
                     )
                 lines = ["📋 **Named Sessions**\n"]
+                # Header with token stats
+                lines.append(f"  {'Title':<28} {'Msgs':>5} {'CTX':>8} {'Last Active':<11}")
+                lines.append(f"  {'─'*28} {'─'*5} {'─'*8} {'─'*11}")
                 for s in titled[:10]:
-                    title = s["title"]
-                    preview = s.get("preview", "")[:40]
-                    preview_part = f" — _{preview}_" if preview else ""
-                    lines.append(f"• **{title}**{preview_part}")
+                    title = (s.get("title") or "—")[:28]
+                    msgs = s.get("message_count") or 0
+                    inp = s.get("input_tokens") or 0
+                    out = s.get("output_tokens") or 0
+                    cr = s.get("cache_read_tokens") or 0
+                    cw = s.get("cache_write_tokens") or 0
+                    ctx = inp + out + cr + cw
+                    last_active_ts = s.get("last_active") or s.get("started_at") or 0
+                    # Relative time
+                    import time as _time
+                    delta = _time.time() - last_active_ts
+                    if delta < 60:
+                        last_active = "just now"
+                    elif delta < 3600:
+                        last_active = f"{int(delta/60)}m"
+                    elif delta < 86400:
+                        last_active = f"{int(delta/3600)}h"
+                    else:
+                        last_active = f"{int(delta/86400)}d"
+                    lines.append(f"  {title:<28} {msgs:>5} {ctx:>8,} {last_active:<11}")
                 lines.append("\nUsage: `/resume <session name>`")
                 return "\n".join(lines)
             except Exception as e:
