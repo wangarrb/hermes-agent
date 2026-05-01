@@ -26,6 +26,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from .store import MemoryStore
 from .retrieval import FactRetriever
+from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ def _load_plugin_config() -> dict:
         import yaml
         with open(config_path) as f:
             all_config = yaml.safe_load(f) or {}
-        return all_config.get("plugins", {}).get("hermes-memory-store", {}) or {}
+        return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
     except Exception:
         return {}
 
@@ -360,18 +361,10 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
-            re.compile(r'\b(?:remember|note|important)\s*[:：]?\s*(.+)', re.IGNORECASE),
-            re.compile(r"\bdon'?t\s+(?:forget|forget to)\s+(.+)", re.IGNORECASE),
         ]
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
-            re.compile(r'\b(?:decision|conclusion)\s*[:：]?\s*(.+)', re.IGNORECASE),
-        ]
-        _LEARNING_PATTERNS = [
-            re.compile(r'\b(?:learned|found out|discovered|realized)\s+(?:that\s+)?(.+)', re.IGNORECASE),
-            re.compile(r'\b(?:lesson|insight|takeaway)\s*[:：]?\s*(.+)', re.IGNORECASE),
-            re.compile(r'\b(?:error|bug|issue|problem)\s*[:：]?\s*(.+)', re.IGNORECASE),
         ]
         _CN_PREF_PATTERNS = [
             re.compile(r'我(?:喜欢|偏好|习惯|常用|想要|需要|用)(.+?)(?:[，。！？\n]|$)'),
@@ -411,17 +404,14 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'保存到记忆[：:]?\s*(.+)'),
         ]
 
-        def _add_fact(content: str, category: str) -> bool:
-            try:
-                self._store.add_fact(content[:400], category=category)
-                return True
-            except Exception:
-                return False
-
-        def _match_any(content: str, patterns: list[re.Pattern[str]], category: str) -> bool:
+        def _match_any(text: str, patterns: list, category: str) -> bool:
             for pattern in patterns:
-                if pattern.search(content):
-                    return _add_fact(content, category)
+                if pattern.search(text):
+                    try:
+                        self._store.add_fact(text[:400], category=category)
+                        return True
+                    except Exception:
+                        pass
             return False
 
         extracted = 0
@@ -437,7 +427,6 @@ class HolographicMemoryProvider(MemoryProvider):
                     or _match_any(content, _CN_PREF_PATTERNS, "user_pref")
                     or _match_any(content, _DECISION_PATTERNS, "project")
                     or _match_any(content, _CN_DECISION_PATTERNS, "project")
-                    or _match_any(content, _LEARNING_PATTERNS, "tool")
                     or _match_any(content, _CN_LEARNING_PATTERNS, "tool")
                 ):
                     extracted += 1

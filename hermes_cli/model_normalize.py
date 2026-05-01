@@ -52,7 +52,7 @@ _VENDOR_PREFIXES: dict[str, str] = {
     "deepseek": "deepseek",
     "glm": "z-ai",
     "kimi": "moonshotai",
-    "minimax": "minimax-cn",
+    "minimax": "minimax",
     "grok": "x-ai",
     "qwen": "qwen",
     "mimo": "xiaomi",
@@ -96,6 +96,7 @@ _MATCHING_PREFIX_STRIP_PROVIDERS: frozenset[str] = frozenset({
     "kimi-coding",
     "kimi-coding-cn",
     "minimax",
+    "minimax-oauth",
     "minimax-cn",
     "alibaba",
     "qwen-oauth",
@@ -133,8 +134,6 @@ _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-reasoner",   # R1-family reasoning model
     "deepseek-v4-pro",     # V4 Pro — first-class model ID
     "deepseek-v4-flash",   # V4 Flash — first-class model ID
-    "v4-flash",            # Alias for V4 Flash
-    "v4-pro",              # Alias for V4 Pro
 })
 
 # First-class V-series IDs (``deepseek-v4-pro``, ``deepseek-v4-flash``,
@@ -151,12 +150,12 @@ def _normalize_for_deepseek(model_name: str) -> str:
 
     Rules:
     - Already a known canonical (``deepseek-chat``/``deepseek-reasoner``/
-      ``deepseek-v4-pro``/``deepseek-v4-flash``/``v4-flash``/``v4-pro``) -> pass through.
+      ``deepseek-v4-pro``/``deepseek-v4-flash``) -> pass through.
     - Matches the V-series pattern ``deepseek-v<digit>...`` -> pass through
       (covers future ``deepseek-v5-*`` and dated variants without a release).
     - Contains a reasoner keyword (r1, think, reasoning, cot, reasoner)
       -> ``deepseek-reasoner``.
-    - Everything else -> ``deepseek-v4-pro`` (default chat model).
+    - Everything else -> ``deepseek-chat``.
 
     Args:
         model_name: The bare model name (vendor prefix already stripped).
@@ -178,6 +177,7 @@ def _normalize_for_deepseek(model_name: str) -> str:
         if keyword in bare:
             return "deepseek-reasoner"
 
+    # Default to v4-pro (V4 Pro) instead of deepseek-chat (V3)
     return "deepseek-v4-pro"
 
 

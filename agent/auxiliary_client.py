@@ -159,6 +159,9 @@ _PROVIDER_ALIASES = {
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
     "tencentmaas": "tencent-tokenhub",
+    "bailian": "zai",
+    "dashscope": "zai",
+    "aliyun": "zai",
 }
 
 
