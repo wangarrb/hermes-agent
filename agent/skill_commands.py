@@ -388,14 +388,20 @@ def build_skill_invocation_message(
     """
     commands = get_skill_commands()
     skill_info = commands.get(cmd_key)
-    if not skill_info:
-        return None
-
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
-    if not loaded:
-        return f"[Failed to load skill: {skill_info['name']}]"
-
-    loaded_skill, skill_dir, skill_name = loaded
+    
+    if skill_info:
+        # Standard path: skill found in slash command registry
+        loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+        if not loaded:
+            return f"[Failed to load skill: {skill_info['name']}]"
+        loaded_skill, skill_dir, skill_name = loaded
+    else:
+        # Fallback: direct load for skills with no_slash:true (e.g., /mycompress)
+        skill_name = cmd_key.lstrip("/")
+        loaded = _load_skill_payload(skill_name, task_id=task_id)
+        if not loaded:
+            return None
+        loaded_skill, skill_dir, skill_name = loaded
 
     # Track active usage for Curator lifecycle management (#17782)
     try:
