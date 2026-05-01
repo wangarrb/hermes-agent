@@ -144,6 +144,36 @@ class TestBuildApiKwargsOpenRouter:
         assert messages[1]["tool_calls"][0]["response_item_id"] == "fc_123"
         assert "codex_reasoning_items" in messages[1]
 
+    def test_gemini_native_passes_base_url_for_top_level_thinking_config(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            model="gemini-3-flash-preview",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["thinking_config"] == {
+            "includeThoughts": True,
+            "thinkingLevel": "high",
+        }
+        assert "extra_body" not in kwargs["extra_body"]
+
+    def test_gemini_openai_compat_passes_base_url_for_nested_google_thinking_config(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            model="gemini-3.1-pro-preview",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "thinking_config" not in kwargs["extra_body"]
+        assert kwargs["extra_body"]["extra_body"]["google"]["thinking_config"] == {
+            "include_thoughts": True,
+            "thinking_level": "high",
+        }
+
     def test_should_sanitize_tool_calls_codex_vs_chat(self, monkeypatch):
         """Codex API should NOT sanitize, all other APIs should sanitize."""
         # Codex mode should NOT need sanitization
@@ -247,6 +277,14 @@ class TestBuildApiKwargsChatCompletionsServiceTier:
         agent = _make_agent(monkeypatch, "openrouter")
         agent.model = "gpt-4.1"
         agent.request_overrides = {}
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert "service_tier" not in kwargs
+
+    def test_no_crash_when_request_overrides_is_none(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "gpt-4.1"
+        agent.request_overrides = None
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert "service_tier" not in kwargs
@@ -716,6 +754,103 @@ class TestNormalizeCodexResponse:
         assert len(msg.tool_calls) == 1
         assert msg.tool_calls[0].function.name == "web_search"
 
+    def test_message_items_captured_with_id_and_phase(self, monkeypatch):
+        """Exact message items (with id/phase) must be captured for cache replay."""
+        agent = self._make_codex_agent(monkeypatch)
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="message", status="completed", id="msg_abc",
+                    phase="commentary",
+                    content=[SimpleNamespace(type="output_text", text="Thinking...")],
+                ),
+                SimpleNamespace(
+                    type="message", status="completed", id="msg_def",
+                    phase="final_answer",
+                    content=[SimpleNamespace(type="output_text", text="Done!")],
+                ),
+            ],
+            status="completed",
+        )
+        msg, reason = _normalize_codex_response(response)
+        assert msg.codex_message_items is not None
+        assert len(msg.codex_message_items) == 2
+        assert msg.codex_message_items[0]["id"] == "msg_abc"
+        assert msg.codex_message_items[0]["phase"] == "commentary"
+        assert msg.codex_message_items[0]["content"][0]["text"] == "Thinking..."
+        assert msg.codex_message_items[1]["id"] == "msg_def"
+        assert msg.codex_message_items[1]["phase"] == "final_answer"
+        assert msg.codex_message_items[1]["content"][0]["text"] == "Done!"
+
+    def test_message_items_none_when_no_messages(self, monkeypatch):
+        """Only reasoning + tool calls should yield None codex_message_items."""
+        agent = self._make_codex_agent(monkeypatch)
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(type="function_call", status="completed",
+                    call_id="call_1", name="web_search", arguments='{}', id="fc_1"),
+            ],
+            status="completed",
+        )
+        msg, reason = _normalize_codex_response(response)
+        assert msg.codex_message_items is None
+
+
+class TestChatMessagesToResponsesInputMessageItems:
+    """Verify codex_message_items are replayed verbatim instead of reconstructed."""
+
+    def test_replays_exact_message_items(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Hello world",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "id": "msg_123",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "Hello world"}],
+                    },
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        msg_items = [i for i in items if i.get("type") == "message"]
+        assert len(msg_items) == 1
+        assert msg_items[0]["id"] == "msg_123"
+        assert msg_items[0]["phase"] == "final_answer"
+        assert msg_items[0]["content"][0]["text"] == "Hello world"
+
+    def test_fallback_to_plain_when_no_message_items(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [{"role": "assistant", "content": "Hello world"}]
+        items = _chat_messages_to_responses_input(messages)
+        assert items == [{"role": "assistant", "content": "Hello world"}]
+
+    def test_skips_invalid_message_items(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {
+                "role": "assistant",
+                "content": "fallback text",
+                "codex_message_items": [
+                    {"type": "function_call", "role": "assistant"},  # wrong type
+                    {"type": "message", "role": "user"},  # wrong role
+                    {"type": "message", "role": "assistant", "content": "not a list"},
+                ],
+            },
+        ]
+        items = _chat_messages_to_responses_input(messages)
+        # All invalid — falls back to plain text reconstruction
+        assert items == [{"role": "assistant", "content": "fallback text"}]
+
 
 # ── Chat completions response handling (OpenRouter/Nous) ─────────────────────
 
@@ -831,17 +966,25 @@ class TestAuxiliaryClientProviderPriority:
             client, model = get_text_auxiliary_client()
         assert mock.call_args.kwargs["base_url"] == "http://localhost:1234/v1"
 
-    def test_codex_fallback_last_resort(self, monkeypatch):
+    def test_codex_not_in_auto_fallback(self, monkeypatch):
+        """Codex is deliberately NOT part of the auto fallback chain.
+
+        ChatGPT-account Codex gates which models it accepts via an
+        undocumented, shifting allow-list, so falling through to Codex with
+        a hardcoded default model breaks silently whenever OpenAI rotates
+        the list.  When nothing else is available, ``get_text_auxiliary_client``
+        now returns (None, None) rather than guessing a Codex model.
+        """
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        from agent.auxiliary_client import get_text_auxiliary_client, CodexAuxiliaryClient
+        from agent.auxiliary_client import get_text_auxiliary_client
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
              patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-tok"), \
              patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client()
-        assert model == "gpt-5.2-codex"
-        assert isinstance(client, CodexAuxiliaryClient)
+        assert client is None
+        assert model is None
 
 
 # ── Provider routing tests ───────────────────────────────────────────────────

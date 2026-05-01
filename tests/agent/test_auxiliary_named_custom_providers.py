@@ -128,7 +128,7 @@ class TestResolveProviderClientNamedCustom:
         _write_config(tmp_path, {
             "model": {"default": "test-model"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "***"},
+                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
             ],
         })
         from agent.auxiliary_client import resolve_provider_client
@@ -136,19 +136,6 @@ class TestResolveProviderClientNamedCustom:
         assert client is not None
         assert model == "my-model"
         assert "beans.local" in str(client.base_url)
-
-    def test_named_custom_provider_beats_builtin_alias(self, tmp_path):
-        _write_config(tmp_path, {
-            "model": {"default": "glm-5", "provider": "bailian"},
-            "custom_providers": [
-                {"name": "bailian", "base_url": "http://bailian.local/v1", "api_key": "***", "model": "glm-5"},
-            ],
-        })
-        from agent.auxiliary_client import resolve_provider_client
-        client, model = resolve_provider_client("bailian", "glm-5")
-        assert client is not None
-        assert model == "glm-5"
-        assert "bailian.local" in str(client.base_url)
 
     def test_named_custom_provider_default_model(self, tmp_path):
         _write_config(tmp_path, {
@@ -270,29 +257,6 @@ class TestResolveVisionProviderClientModelNormalization:
 
 class TestVisionPathApiMode:
     """Vision path should propagate api_mode to _get_cached_client."""
-
-    def test_explicit_bailian_alias_preserves_raw_provider_for_cache_lookup(self, tmp_path):
-        _write_config(tmp_path, {
-            "model": {"default": "kimi-k2.5"},
-            "auxiliary": {"vision": {"api_mode": "chat_completions"}},
-        })
-        with patch("agent.auxiliary_client._get_cached_client") as mock_gcc:
-            mock_gcc.return_value = (MagicMock(), "kimi-k2.5")
-            from agent.auxiliary_client import resolve_vision_provider_client
-
-            provider, client, model = resolve_vision_provider_client(
-                provider="bailian",
-                model="kimi-k2.5",
-            )
-
-        mock_gcc.assert_called_once()
-        assert mock_gcc.call_args.args[0] == "bailian"
-        # Keep the explicit raw alias as the resolved provider label so named
-        # custom providers such as "bailian" are not collapsed to a built-in
-        # alias before cache/runtime lookup.
-        assert provider == "bailian"
-        assert client is not None
-        assert model == "kimi-k2.5"
 
     def test_explicit_provider_passes_api_mode(self, tmp_path):
         _write_config(tmp_path, {

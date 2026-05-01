@@ -35,8 +35,6 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process",
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
-    # Audio + video parsing
-    "audio_transcribe", "video_analyze",
     # Vision + image generation
     "vision_analyze", "image_generate",
     # Skills
@@ -79,24 +77,6 @@ TOOLSETS = {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
         "includes": []
-    },
-    
-    "audio": {
-        "description": "Audio transcription tools for local or remote media",
-        "tools": ["audio_transcribe"],
-        "includes": []
-    },
-    
-    "video": {
-        "description": "Video parsing tools for transcript extraction and optional frame analysis",
-        "tools": ["video_analyze"],
-        "includes": []
-    },
-    
-    "media": {
-        "description": "Combined audio and video parsing tools",
-        "tools": [],
-        "includes": ["audio", "video"]
     },
     
     "vision": {
@@ -234,6 +214,18 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "yuanbao": {
+        "description": "Yuanbao platform tools - group info, member queries, DM, stickers",
+        "tools": [
+            "yb_query_group_info",
+            "yb_query_group_members",
+            "yb_send_dm",
+            "yb_search_sticker",
+            "yb_send_sticker",
+        ],
+        "includes": []
+    },
+
     "feishu_doc": {
         "description": "Read Feishu/Lark document content",
         "tools": ["feishu_doc_read"],
@@ -308,8 +300,6 @@ TOOLSETS = {
             "terminal", "process",
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
-            # Audio + video parsing
-            "audio_transcribe", "video_analyze",
             # Vision + image generation
             "vision_analyze", "image_generate",
             # Skills
@@ -456,6 +446,19 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-yuanbao": {
+        "description": "Yuanbao Bot 元宝消息平台工具集 - 群信息、成员查询、私聊、贴纸表情",
+        "tools": _HERMES_CORE_TOOLS + [
+            "yb_query_group_info",
+            "yb_query_group_members",
+            "yb_send_dm",
+            "yb_search_sticker",
+            "yb_send_sticker",
+        ],
+        "module": "tools.yuanbao_tools",
+        "includes": []
+    },
+
     "hermes-sms": {
         "description": "SMS bot toolset - interact with Hermes via SMS (Twilio)",
         "tools": _HERMES_CORE_TOOLS,
@@ -471,7 +474,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao"]
     }
 }
 
@@ -561,6 +564,27 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
     # Get toolset definition
     toolset = get_toolset(name)
     if not toolset:
+        # Auto-generate a toolset for plugin platforms (hermes-<name>).
+        # Gives them _HERMES_CORE_TOOLS plus any tools the plugin registered
+        # into a toolset matching the platform name.
+        if name.startswith("hermes-"):
+            platform_name = name[len("hermes-"):]
+            try:
+                from gateway.platform_registry import platform_registry
+                if platform_registry.is_registered(platform_name):
+                    plugin_tools = set(_HERMES_CORE_TOOLS)
+                    try:
+                        from tools.registry import registry
+                        plugin_tools.update(
+                            e.name for e in registry._tools.values()
+                            if e.toolset == platform_name
+                        )
+                    except Exception:
+                        pass
+                    return list(plugin_tools)
+            except Exception:
+                pass
+
         return []
 
     # Collect direct tools

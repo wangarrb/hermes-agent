@@ -678,14 +678,7 @@ class KawaiiSpinner:
 
     @property
     def _is_tty(self) -> bool:
-        """Check if output is a real terminal, safe against closed streams.
-
-        ``HERMES_FORCE_SPINNER=1`` forces spinner rendering in pseudo-TTY
-        environments like Sunlogin/NoMachine where ``isatty()`` is false but
-        ANSI cursor movement still works.
-        """
-        if os.getenv("HERMES_FORCE_SPINNER") == "1":
-            return True
+        """Check if output is a real terminal, safe against closed streams."""
         try:
             return hasattr(self._out, 'isatty') and self._out.isatty()
         except (ValueError, OSError):
