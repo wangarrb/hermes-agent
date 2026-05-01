@@ -4748,13 +4748,18 @@ class HermesCLI:
         else:
             print("  Recent sessions:")
         print()
-        print(f"  {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-        print(f"  {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
+        print(f"  {'Title':<32} {'Msgs':>5} {'CTX':>9} {'Last Active':<13} {'ID'}")
+        print(f"  {'─' * 32} {'─' * 5} {'─' * 9} {'─' * 13} {'─' * 24}")
         for session in sessions:
             title = (session.get("title") or "—")[:30]
-            preview = (session.get("preview") or "")[:38]
+            msgs = session.get("message_count") or 0
+            input_tokens = session.get("input_tokens") or 0
+            output_tokens = session.get("output_tokens") or 0
+            cache_read_tokens = session.get("cache_read_tokens") or 0
+            cache_write_tokens = session.get("cache_write_tokens") or 0
+            ctx_tokens = input_tokens + output_tokens + cache_read_tokens + cache_write_tokens
             last_active = _relative_time(session.get("last_active"))
-            print(f"  {title:<32} {preview:<40} {last_active:<13} {session['id']}")
+            print(f"  {title:<32} {msgs:>5} {ctx_tokens:>9,} {last_active:<13} {session['id']}")
         print()
         print("  Use /resume <session id or title> to continue where you left off.")
         print()
