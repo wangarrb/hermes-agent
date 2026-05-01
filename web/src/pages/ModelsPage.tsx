@@ -20,11 +20,9 @@ import type {
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { formatTokenCount } from "@/lib/format";
-import { Button } from "@nous-research/ui/ui/components/button";
-import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { Stats } from "@nous-research/ui/ui/components/stats";
+import { Button, Spinner, Stats } from "@nous-research/ui";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@nous-research/ui/ui/components/badge";
+import { Badge } from "@nous-research/ui";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { PluginSlot } from "@/plugins";

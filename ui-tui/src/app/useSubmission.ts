@@ -126,9 +126,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return sys('session not ready yet')
       }
 
-      // Always ask the backend whether this looks like a file drop.
-      // The backend's _detect_file_drop handles paths with spaces, quotes,
-      // Windows drive letters, and escaped characters correctly.
+      // Plain prompts are the common path and should not pay an extra RPC
+      // before prompt.submit. File-drop detection still runs for absolute,
+      // tilde, file://, and explicit relative paths.
+      if (!looksLikeSlashCommand(text) && !/(?:^|\s)(?:file:\/\/|~\/|\.?\.\/|\/)[^\s]+/.test(text)) {
+        return startSubmit(text, expand(text), showUserMessage)
+      }
+
       gw.request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
         .then(r => {
           if (!r?.matched) {

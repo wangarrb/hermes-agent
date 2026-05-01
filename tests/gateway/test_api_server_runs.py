@@ -253,7 +253,10 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
+                # task_id stays "default" so the Runs API shares one sandbox
+                # container with CLI/gateway; session_id is surfaced in status
+                # for external UIs to correlate runs with their own session IDs.
+                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "default"
                 assert status["session_id"] == "space-session"
 
     @pytest.mark.asyncio

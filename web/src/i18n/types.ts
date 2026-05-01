@@ -75,7 +75,6 @@ export interface Translations {
       keys: string;
       logs: string;
       models: string;
-      profiles: string;
       sessions: string;
       skills: string;
     };
@@ -226,37 +225,6 @@ export interface Translations {
       slack: string;
       email: string;
     };
-  };
-
-  // ── Profiles page ──
-  profiles: {
-    newProfile: string;
-    name: string;
-    namePlaceholder: string;
-    nameRequired: string;
-    nameRule: string;
-    invalidName: string;
-    cloneFromDefault: string;
-    allProfiles: string;
-    noProfiles: string;
-    defaultBadge: string;
-    hasEnv: string;
-    model: string;
-    skills: string;
-    rename: string;
-    editSoul: string;
-    soulSection: string;
-    soulPlaceholder: string;
-    saveSoul: string;
-    soulSaved: string;
-    openInTerminal: string;
-    commandCopied: string;
-    copyFailed: string;
-    confirmDeleteTitle: string;
-    confirmDeleteMessage: string;
-    created: string;
-    deleted: string;
-    renamed: string;
   };
 
   // ── Skills page ──

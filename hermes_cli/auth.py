@@ -43,7 +43,7 @@ import yaml
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL
-from utils import atomic_replace, atomic_yaml_write, is_truthy_value
+from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
@@ -302,8 +302,8 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="minimax-cn",
         name="MiniMax (China)",
         auth_type="api_key",
-        inference_base_url="https://api.minimaxi.com/anthropic",
-        api_key_env_vars=("MINIMAX_CN_API_KEY",),
+        inference_base_url="https://api.minimaxi.com/anthropic/v1",
+        api_key_env_vars=("MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"),
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
     "deepseek": ProviderConfig(
@@ -1171,7 +1171,7 @@ def resolve_provider(
         "step": "stepfun", "stepfun-coding-plan": "stepfun",
         "arcee-ai": "arcee", "arceeai": "arcee",
         "gmi-cloud": "gmi", "gmicloud": "gmi",
-        "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
+        "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn", "minimax": "minimax-cn",
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
@@ -2480,8 +2480,8 @@ def _resolve_verify(
     tls_state = tls_state if isinstance(tls_state, dict) else {}
 
     effective_insecure = (
-        is_truthy_value(insecure, default=False) if insecure is not None
-        else is_truthy_value(tls_state.get("insecure", False), default=False)
+        bool(insecure) if insecure is not None
+        else bool(tls_state.get("insecure", False))
     )
     effective_ca = (
         ca_bundle
@@ -3653,7 +3653,7 @@ def _update_config_for_provider(
 
     config["model"] = model_cfg
 
-    atomic_yaml_write(config_path, config, sort_keys=False)
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     return config_path
 
 
@@ -3712,7 +3712,7 @@ def _reset_config_provider() -> Path:
         model["provider"] = "auto"
         if "base_url" in model:
             model["base_url"] = OPENROUTER_BASE_URL
-    atomic_yaml_write(config_path, config, sort_keys=False)
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     return config_path
 
 
