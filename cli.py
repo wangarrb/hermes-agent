@@ -7326,8 +7326,11 @@ class HermesCLI:
         
         # Load mycompress skill prompt as focus_topic
         from agent.skill_commands import build_skill_invocation_message
-        skill_msg = build_skill_invocation_message("mycompress", runtime_note="cli")
-        focus_topic = skill_msg.get("content", "")
+        skill_msg = build_skill_invocation_message("/mycompress", runtime_note="cli")
+        if not skill_msg:
+            print("  ❌ 无法加载 mycompress skill")
+            return
+        focus_topic = str(skill_msg)
         if remainder:
             focus_topic += f"\n用户补充要求：{remainder}"
         

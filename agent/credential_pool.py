@@ -1487,28 +1487,47 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
         def _is_suppressed(_p, _s):  # type: ignore[misc]
             return False
 
-    # Seed from the custom_providers config entry's api_key field
+    # Seed from the custom_providers config entry's api_key or key_env field
     cp_config = _get_custom_provider_config(pool_key)
     if cp_config:
-        api_key = str(cp_config.get("api_key") or "").strip()
         base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
         name = str(cp_config.get("name") or "").strip()
-        if api_key:
-            source = f"config:{name}"
-            if not _is_suppressed(pool_key, source):
-                active_sources.add(source)
-                changed |= _upsert_entry(
-                    entries,
-                    pool_key,
-                    source,
-                    {
-                        "source": source,
-                        "auth_type": AUTH_TYPE_API_KEY,
-                        "access_token": api_key,
-                        "base_url": base_url,
-                        "label": name or source,
-                    },
-                )
+        
+        # Resolve API key: prefer key_env -> api_key (same order as runtime_provider.py)
+        key_env = str(cp_config.get("key_env") or "").strip()
+        api_key = ""
+        source = ""
+        label = ""
+        if key_env:
+            try:
+                from hermes_cli.config import get_env_value
+                api_key = (get_env_value(key_env) or "").strip()
+            except ImportError:
+                import os
+                api_key = (os.getenv(key_env) or "").strip()
+            if api_key:
+                source = f"env:{key_env}"
+                label = key_env
+        if not api_key:
+            api_key = str(cp_config.get("api_key") or "").strip()
+            if api_key:
+                source = f"config:{name}"
+                label = name or source
+        
+        if api_key and not _is_suppressed(pool_key, source):
+            active_sources.add(source)
+            changed |= _upsert_entry(
+                entries,
+                pool_key,
+                source,
+                {
+                    "source": source,
+                    "auth_type": AUTH_TYPE_API_KEY,
+                    "access_token": api_key,
+                    "base_url": base_url,
+                    "label": label,
+                },
+            )
 
     # Seed from model.api_key if model.provider=='custom' and model.base_url matches
     try:
