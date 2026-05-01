@@ -8,7 +8,7 @@ streaming, or the _run_codex_stream() call path.
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
-from agent.transports.types import NormalizedResponse, ToolCall, Usage
+from agent.transports.types import NormalizedResponse, ToolCall
 
 
 class ResponsesApiTransport(ProviderTransport):
@@ -60,7 +60,6 @@ class ResponsesApiTransport(ProviderTransport):
             _chat_messages_to_responses_input,
             _responses_tools,
         )
-        from utils import base_url_host_matches
 
         from run_agent import DEFAULT_AGENT_IDENTITY
 
@@ -73,26 +72,9 @@ class ResponsesApiTransport(ProviderTransport):
         if not instructions:
             instructions = DEFAULT_AGENT_IDENTITY
 
-        provider = str(params.get("provider") or "").strip().lower()
-        base_url = str(params.get("base_url") or "").strip()
-        base_url_hostname = str(params.get("base_url_hostname") or "").strip().lower()
-
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
-        is_cch_responses = (
-            provider == "cch"
-            or base_url_hostname == "cch.jmadas.com"
-            or base_url_host_matches(base_url, "cch.jmadas.com")
-        )
-
-        # CCH-style Responses proxies may override/ignore the top-level
-        # instructions field and do not reliably support developer-role
-        # semantics. Preserve the system prompt by prepending it as a user
-        # message with a [SYSTEM]: prefix, then keep instructions minimal.
-        if is_cch_responses and instructions:
-            payload_messages = [{"role": "user", "content": f"[SYSTEM]: {instructions}"}] + list(payload_messages)
-            instructions = DEFAULT_AGENT_IDENTITY
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -138,6 +120,24 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        if is_codex_backend:
+            prompt_cache_key = kwargs.get("prompt_cache_key")
+            cache_scope_id = str(prompt_cache_key or session_id or "").strip()
+            if cache_scope_id:
+                existing_extra_headers = kwargs.get("extra_headers")
+                merged_extra_headers: Dict[str, str] = {}
+                if isinstance(existing_extra_headers, dict):
+                    merged_extra_headers.update(
+                        {
+                            str(key): str(value)
+                            for key, value in existing_extra_headers.items()
+                            if key and value is not None
+                        }
+                    )
+                merged_extra_headers["session_id"] = cache_scope_id
+                merged_extra_headers["x-client-request-id"] = cache_scope_id
+                kwargs["extra_headers"] = merged_extra_headers
+
         max_tokens = params.get("max_tokens")
         if max_tokens is not None and not is_codex_backend:
             kwargs["max_output_tokens"] = max_tokens
@@ -151,8 +151,6 @@ class ResponsesApiTransport(ProviderTransport):
         """Normalize Codex Responses API response to NormalizedResponse."""
         from agent.codex_responses_adapter import (
             _normalize_codex_response,
-            _extract_responses_message_text,
-            _extract_responses_reasoning_text,
         )
 
         # _normalize_codex_response returns (SimpleNamespace, finish_reason_str)
@@ -178,6 +176,8 @@ class ResponsesApiTransport(ProviderTransport):
         provider_data = {}
         if msg and hasattr(msg, "codex_reasoning_items") and msg.codex_reasoning_items:
             provider_data["codex_reasoning_items"] = msg.codex_reasoning_items
+        if msg and hasattr(msg, "codex_message_items") and msg.codex_message_items:
+            provider_data["codex_message_items"] = msg.codex_message_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
 

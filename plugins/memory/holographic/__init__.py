@@ -367,72 +367,55 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
         _CN_PREF_PATTERNS = [
-            re.compile(r'我(?:喜欢|偏好|习惯|常用|想要|需要|用)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'我的(?:默认|常用|偏好|首选)(?:\w+)?是(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'我(?:总是|从不|通常|一般)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'记住[：:]?\s*(.+)'),
-            re.compile(r'记得[：:]?\s*(.+)'),
-            re.compile(r'别忘了(.+)'),
-            re.compile(r'不要忘(.+)'),
-            re.compile(r'先记下[：:]?\s*(.+)'),
-            re.compile(r'记下来[：:]?\s*(.+)'),
-            re.compile(r'提醒我(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'以后(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'重要[：:]?\s*(.+)'),
-            re.compile(r'注意[：:]?\s*(.+)'),
-        ]
-        _CN_DECISION_PATTERNS = [
-            re.compile(r'(?:我们|项目|团队)(?:决定|选择|确定|约定)(?:了)?(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'项目(?:使用|需要|要求|采用)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'(?:最终|最终决定)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'我们约定(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'规定[：:]?\s*(.+)'),
-        ]
-        _CN_LEARNING_PATTERNS = [
-            re.compile(r'(?:发现|学到|经验|教训)[：:]?\s*(.+)'),
-            re.compile(r'(?:原来|其实)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'(?:问题|错误|坑|陷阱)[：:]?\s*(.+)'),
-            re.compile(r'纠正[：:]?\s*(.+)'),
-            re.compile(r'修改[为成](.+)'),
-            re.compile(r'(?:应该|必须|一定要)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'不(?:要|能|能再)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'(?:错误|不对)(.+?)(?:[，。！？\n]|$)'),
-        ]
-        _CN_ASSISTANT_CONFIRM_PATTERNS = [
-            re.compile(r'已(?:经)?(?:记住|记录|存储)[：:]?\s*(.+)'),
-            re.compile(r'(?:记下来了|记住了)[：:]?\s*(.+)'),
-            re.compile(r'保存到记忆[：:]?\s*(.+)'),
+            re.compile(r'记住(.+)'),
+            re.compile(r'以后(.+)这样'),
+            re.compile(r'以后不要(.+)'),
+            re.compile(r'以后都(.+)'),
+            re.compile(r'以后默认(.+)'),
+            re.compile(r'(.+)以后就(.+)'),
+            re.compile(r'(.+)记得(.+)'),
+            re.compile(r'(.+)习惯(.+)'),
+            re.compile(r'(.+)偏好(.+)'),
+            re.compile(r'(.+)风格(.+)'),
+            re.compile(r'(.+)方式(.+)'),
+            re.compile(r'(.+)\.com'),
         ]
 
-        def _match_any(text: str, patterns: list, category: str) -> bool:
-            for pattern in patterns:
-                if pattern.search(text):
-                    try:
-                        self._store.add_fact(text[:400], category=category)
-                        return True
-                    except Exception:
-                        pass
-            return False
 
         extracted = 0
         for msg in messages:
-            role = msg.get("role")
+            if msg.get("role") != "user":
+                continue
             content = msg.get("content", "")
             if not isinstance(content, str) or len(content) < 10:
                 continue
 
-            if role == "user":
-                if (
-                    _match_any(content, _PREF_PATTERNS, "user_pref")
-                    or _match_any(content, _CN_PREF_PATTERNS, "user_pref")
-                    or _match_any(content, _DECISION_PATTERNS, "project")
-                    or _match_any(content, _CN_DECISION_PATTERNS, "project")
-                    or _match_any(content, _CN_LEARNING_PATTERNS, "tool")
-                ):
-                    extracted += 1
-            elif role == "assistant":
-                if _match_any(content, _CN_ASSISTANT_CONFIRM_PATTERNS, "general"):
-                    extracted += 1
+            for pattern in _PREF_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="user_pref")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+
+            for pattern in _DECISION_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="project")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+            for pattern in _CN_PREF_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="user_pref")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)

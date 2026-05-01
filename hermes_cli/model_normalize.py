@@ -177,7 +177,6 @@ def _normalize_for_deepseek(model_name: str) -> str:
         if keyword in bare:
             return "deepseek-reasoner"
 
-    # Default to v4-pro (V4 Pro) instead of deepseek-chat (V3)
     return "deepseek-v4-pro"
 
 
