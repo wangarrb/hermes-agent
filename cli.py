@@ -7329,13 +7329,28 @@ class HermesCLI:
             print(f"  ❌ {e}")
             return
         
-        # Load mycompress skill prompt as focus_topic
-        from agent.skill_commands import build_skill_invocation_message
-        skill_msg = build_skill_invocation_message("/mycompress", runtime_note="cli")
-        if not skill_msg:
+        # Load mycompress skill body as focus_topic (not full activation message)
+        from pathlib import Path
+        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter
+        
+        # Find mycompress skill file
+        skill_file = SKILLS_DIR / "note-taking" / "mycompress" / "SKILL.md"
+        if not skill_file.exists():
+            # Try alternative locations
+            for subdir in SKILLS_DIR.iterdir():
+                if subdir.is_dir():
+                    candidate = subdir / "mycompress" / "SKILL.md"
+                    if candidate.exists():
+                        skill_file = candidate
+                        break
+        
+        if not skill_file.exists():
             print("  ❌ 无法加载 mycompress skill")
             return
-        focus_topic = str(skill_msg)
+        
+        content = skill_file.read_text(encoding="utf-8")
+        frontmatter, body = _parse_frontmatter(content)
+        focus_topic = body.strip()
         if remainder:
             focus_topic += f"\n用户补充要求：{remainder}"
         
