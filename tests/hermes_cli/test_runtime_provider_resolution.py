@@ -832,6 +832,47 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
     assert resolved["model"] == "acme-large"
 
 
+def test_named_custom_provider_skips_missing_key_env_for_unrelated_entries(monkeypatch):
+    """A missing env var on another provider must not break requested provider resolution."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "get_env_value",
+        lambda key: "cch-token" if key == "CCH_API_KEY" else None,
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "deepseek": {
+                    "base_url": "https://api.deepseek.com/v1",
+                    "key_env": "DEEPSEEK_API_KEY",
+                    "name": "DeepSeek",
+                },
+                "cch": {
+                    "base_url": "http://cch.jmadas.com/v1",
+                    "default_model": "gpt-5.5",
+                    "key_env": "CCH_API_KEY",
+                    "name": "CCH",
+                    "transport": "codex_responses",
+                },
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:cch")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "http://cch.jmadas.com/v1"
+    assert resolved["api_key"] == "cch-token"
+    assert resolved["requested_provider"] == "custom:cch"
+    assert resolved["source"] == "custom_provider:CCH"
+    assert resolved["model"] == "gpt-5.5"
+
+
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "env-openai-key")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
