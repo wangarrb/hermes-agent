@@ -641,6 +641,91 @@ class TestPrefetch:
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
 
+    def test_conditional_auto_recall_skips_non_trigger_query(self, provider_with_config):
+        p = provider_with_config(auto_recall_mode="conditional")
+
+        p.queue_prefetch("好的")
+
+        assert p._prefetch_thread is None
+        p._client.arecall.assert_not_called()
+
+    def test_conditional_auto_recall_triggers_on_history_keyword(self, provider_with_config):
+        p = provider_with_config(auto_recall_mode="conditional")
+
+        p.queue_prefetch("你还记得上次讨论的 Hindsight 配置吗")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        p._client.arecall.assert_called_once()
+        assert "Memory 1" in p._prefetch_result
+
+    def test_recall_cache_hit_reuses_cached_result_without_api_call(self, provider_with_config):
+        p = provider_with_config(
+            auto_recall_mode="conditional",
+            recall_cache_enabled=True,
+            recall_cache_ttl=15552000,
+        )
+        query = "你还记得上次讨论的 Hindsight 配置吗"
+
+        p.queue_prefetch(query)
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        assert p._client.arecall.call_count == 1
+
+        with p._prefetch_lock:
+            p._prefetch_result = ""
+        p.queue_prefetch(query)
+
+        assert p._prefetch_thread is None
+        assert p._client.arecall.call_count == 1
+        assert "Memory 1" in p._prefetch_result
+
+    def test_recall_cache_expires_old_entries(self, provider_with_config, monkeypatch):
+        p = provider_with_config(
+            auto_recall_mode="conditional",
+            recall_cache_enabled=True,
+            recall_cache_ttl=1,
+        )
+        query = "你还记得上次讨论的 Hindsight 配置吗"
+
+        p.queue_prefetch(query)
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        assert p._client.arecall.call_count == 1
+
+        original_time = p._time_fn
+        monkeypatch.setattr(p, "_time_fn", lambda: original_time() + 2)
+        with p._prefetch_lock:
+            p._prefetch_result = ""
+        p.queue_prefetch(query)
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        assert p._client.arecall.call_count == 2
+
+    def test_recall_cache_persists_across_provider_instances(self, provider_with_config):
+        query = "你还记得上次讨论的 Hindsight 配置吗"
+        p1 = provider_with_config(
+            auto_recall_mode="conditional",
+            recall_cache_enabled=True,
+            recall_cache_ttl=15552000,
+        )
+        p1.queue_prefetch(query)
+        if p1._prefetch_thread:
+            p1._prefetch_thread.join(timeout=5.0)
+        assert p1._client.arecall.call_count == 1
+
+        p2 = provider_with_config(
+            auto_recall_mode="conditional",
+            recall_cache_enabled=True,
+            recall_cache_ttl=15552000,
+        )
+        p2.queue_prefetch(query)
+
+        assert p2._prefetch_thread is None
+        p2._client.arecall.assert_not_called()
+        assert "Memory 1" in p2._prefetch_result
+
 
 # ---------------------------------------------------------------------------
 # sync_turn tests
@@ -979,6 +1064,26 @@ class TestSessionSwitchBufferFlush:
         provider._retain_queue.join()
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
+
+    def test_no_flush_when_auto_retain_disabled_even_if_buffer_stale(self, provider_with_config):
+        """Recall-only/local modes must not write one last conversation
+        retain during session switch, even if a stale buffer exists from a
+        previous auto-retain-enabled mode.
+        """
+        p = provider_with_config(auto_retain=False, retain_every_n_turns=3, retain_async=False)
+        old_doc = p._document_id
+        p._session_turns = [json.dumps([{"role": "user", "content": "stale turn"}])]
+        p._turn_counter = 1
+        p._turn_index = 1
+
+        p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
+        p._retain_queue.join()
+
+        p._client.aretain_batch.assert_not_called()
+        assert p._session_id == "new-sid"
+        assert p._session_turns == []
+        assert p._turn_counter == 0
+        assert p._document_id != old_doc
 
     def test_prefetch_result_cleared_on_switch(self, provider):
         """Stale recall text from the old session must not leak into the

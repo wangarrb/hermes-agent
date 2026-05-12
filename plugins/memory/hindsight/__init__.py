@@ -30,12 +30,15 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import importlib
 import json
 import logging
 import os
 import queue
+import re
 import threading
+import time
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -59,6 +62,15 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_VALID_AUTO_RECALL_MODES = {"always", "conditional"}
+_DEFAULT_RECALL_CACHE_TTL = 180 * 24 * 60 * 60  # 180 days
+_DEFAULT_RECALL_TRIGGER_KEYWORDS = [
+    "之前", "上次", "我跟你说过", "之前的", "你还记得", "上次的", "刚聊到", "刚才说", "前面说",
+    "remember", "previous", "last time", "earlier", "before", "what did we discuss",
+]
+_DEFAULT_RECALL_SKIP_PATTERNS = {
+    "", "好", "好的", "嗯", "嗯嗯", "收到", "继续", "可以", "行", "ok", "OK", "hi", "hello", "thanks", "谢谢",
+}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -81,6 +93,75 @@ def _parse_int_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
         return default
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Parse boolean-like config values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _normalize_string_list(value: Any, default: list[str] | None = None) -> list[str]:
+    """Normalize list/JSON/CSV config values into strings."""
+    if value is None:
+        return list(default or [])
+    raw_items: list[Any]
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return list(default or [])
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                raw_items = parsed if isinstance(parsed, list) else [text]
+            except Exception:
+                raw_items = [text]
+        else:
+            raw_items = text.split(",")
+    else:
+        raw_items = [value]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        out.append(text)
+        seen.add(key)
+    return out
+
+
+def _normalize_recall_cache_key(query: str, *, bank_id: str, budget: str, max_tokens: int, method: str) -> str:
+    """Build a stable cache key for auto-recall prefetch results."""
+    normalized_query = re.sub(r"\s+", " ", (query or "").strip().lower())
+    payload = json.dumps(
+        {
+            "bank_id": bank_id,
+            "budget": budget,
+            "max_tokens": max_tokens,
+            "method": method,
+            "query": normalized_query,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _check_local_runtime() -> tuple[bool, str | None]:
@@ -575,6 +656,15 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
+        self._auto_recall_mode = "always"
+        self._recall_trigger_keywords: list[str] = list(_DEFAULT_RECALL_TRIGGER_KEYWORDS)
+        self._recall_skip_short_inputs = True
+        self._recall_cache_enabled = False
+        self._recall_cache_ttl = _DEFAULT_RECALL_CACHE_TTL
+        self._recall_cache: dict[str, tuple[float, str]] = {}
+        self._recall_cache_lock = threading.Lock()
+        self._recall_cache_path = None
+        self._time_fn = time.time
         self._recall_max_tokens = 4096
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
@@ -854,6 +944,11 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "auto_recall_mode", "description": "Auto-recall trigger mode", "default": "always", "choices": ["always", "conditional"]},
+            {"key": "recall_trigger_keywords", "description": "Keywords that trigger conditional auto-recall (list or comma-separated)", "default": _DEFAULT_RECALL_TRIGGER_KEYWORDS},
+            {"key": "recall_skip_short_inputs", "description": "Skip trivial acknowledgements in conditional auto-recall", "default": True},
+            {"key": "recall_cache_enabled", "description": "Cache identical auto-recall prefetch queries", "default": False},
+            {"key": "recall_cache_ttl", "description": "Recall cache TTL in seconds", "default": _DEFAULT_RECALL_CACHE_TTL},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1175,7 +1270,22 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
 
         # Recall controls
-        self._auto_recall = self._config.get("auto_recall", True)
+        self._auto_recall = _as_bool(self._config.get("auto_recall", True), True)
+        auto_recall_mode = str(self._config.get("auto_recall_mode", "always")).strip().lower()
+        self._auto_recall_mode = auto_recall_mode if auto_recall_mode in _VALID_AUTO_RECALL_MODES else "always"
+        self._recall_trigger_keywords = _normalize_string_list(
+            self._config.get("recall_trigger_keywords"),
+            default=_DEFAULT_RECALL_TRIGGER_KEYWORDS,
+        )
+        self._recall_skip_short_inputs = _as_bool(self._config.get("recall_skip_short_inputs", True), True)
+        self._recall_cache_enabled = _as_bool(self._config.get("recall_cache_enabled", False), False)
+        self._recall_cache_ttl = max(
+            0,
+            _parse_int_setting(self._config.get("recall_cache_ttl"), _DEFAULT_RECALL_CACHE_TTL),
+        )
+        self._recall_cache_path = get_hermes_home() / "hindsight" / "recall_cache.json"
+        if self._recall_cache_enabled:
+            self._load_recall_cache_from_disk()
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
         self._recall_types = self._config.get("recall_types") or None
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
@@ -1286,6 +1396,86 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _should_auto_recall(self, query: str) -> bool:
+        """Return whether this query should trigger auto-recall prefetch."""
+        if self._auto_recall_mode == "always":
+            return True
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return False
+        if normalized.startswith("/"):
+            return False
+        if self._recall_skip_short_inputs and normalized in _DEFAULT_RECALL_SKIP_PATTERNS:
+            return False
+        lowered = normalized.lower()
+        return any(keyword.lower() in lowered for keyword in self._recall_trigger_keywords)
+
+    def _recall_cache_get(self, key: str) -> str | None:
+        if not self._recall_cache_enabled or self._recall_cache_ttl <= 0:
+            return None
+        now = self._time_fn()
+        expired = False
+        with self._recall_cache_lock:
+            entry = self._recall_cache.get(key)
+            if not entry:
+                return None
+            created_at, text = entry
+            if now - created_at > self._recall_cache_ttl:
+                self._recall_cache.pop(key, None)
+                expired = True
+                text = ""
+        if expired:
+            self._persist_recall_cache_to_disk()
+            return None
+        return text
+
+    def _load_recall_cache_from_disk(self) -> None:
+        path = self._recall_cache_path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            now = self._time_fn()
+            loaded: dict[str, tuple[float, str]] = {}
+            for key, item in raw.items():
+                if not isinstance(item, dict):
+                    continue
+                created_at = float(item.get("created_at", 0))
+                text = str(item.get("text", ""))
+                if not text or now - created_at > self._recall_cache_ttl:
+                    continue
+                loaded[str(key)] = (created_at, text)
+            with self._recall_cache_lock:
+                self._recall_cache = loaded
+        except Exception as exc:
+            logger.debug("Failed to load Hindsight recall cache: %s", exc, exc_info=True)
+
+    def _persist_recall_cache_to_disk(self) -> None:
+        path = self._recall_cache_path
+        if path is None:
+            return
+        try:
+            with self._recall_cache_lock:
+                data = {
+                    key: {"created_at": created_at, "text": text}
+                    for key, (created_at, text) in self._recall_cache.items()
+                }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(path)
+        except Exception as exc:
+            logger.debug("Failed to persist Hindsight recall cache: %s", exc, exc_info=True)
+
+    def _recall_cache_set(self, key: str, text: str) -> None:
+        if not self._recall_cache_enabled or self._recall_cache_ttl <= 0 or not text:
+            return
+        with self._recall_cache_lock:
+            self._recall_cache[key] = (self._time_fn(), text)
+        self._persist_recall_cache_to_disk()
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -1299,6 +1489,25 @@ class HindsightMemoryProvider(MemoryProvider):
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
+        if not self._should_auto_recall(query):
+            logger.debug("Prefetch: skipped (conditional auto_recall did not trigger)")
+            self._prefetch_thread = None
+            return
+
+        cache_key = _normalize_recall_cache_key(
+            query,
+            bank_id=self._bank_id,
+            budget=self._budget,
+            max_tokens=self._recall_max_tokens,
+            method=self._prefetch_method,
+        )
+        cached_text = self._recall_cache_get(cache_key)
+        if cached_text:
+            logger.debug("Prefetch: using cached result")
+            with self._prefetch_lock:
+                self._prefetch_result = cached_text
+            self._prefetch_thread = None
+            return
 
         def _run():
             try:
@@ -1323,6 +1532,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     logger.debug("Prefetch: recall returned %d results", num_results)
                     text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
                 if text:
+                    self._recall_cache_set(cache_key, text)
                     with self._prefetch_lock:
                         self._prefetch_result = text
             except Exception as e:
@@ -1578,11 +1788,14 @@ class HindsightMemoryProvider(MemoryProvider):
         batching must start from zero so an in-flight retain doesn't flush
         under the wrong ``_document_id``.
 
-        Before clearing, flush any buffered turns under the *old*
-        ``_document_id``. Users who set ``retain_every_n_turns > 1`` would
-        otherwise silently lose whatever's in ``_session_turns`` at the
-        moment of switch — the same data-loss class as the shutdown race,
-        just at a different lifecycle event.
+        Before clearing, if auto-retain is enabled, flush any buffered
+        turns under the *old* ``_document_id``. Users who set
+        ``retain_every_n_turns > 1`` would otherwise silently lose whatever's
+        in ``_session_turns`` at the moment of switch — the same data-loss
+        class as the shutdown race, just at a different lifecycle event.
+        When auto-retain is disabled, buffered turns are intentionally
+        discarded so recall-only/local modes cannot write one last
+        conversation retain during a session switch.
 
         Also wait for any in-flight prefetch from the old session and drop
         its cached result; otherwise the new session's first ``prefetch()``
@@ -1600,65 +1813,71 @@ class HindsightMemoryProvider(MemoryProvider):
         # everything before mutating self._* so metadata + tags + doc_id
         # all reference the old session consistently.
         if self._session_turns:
-            old_turns = list(self._session_turns)
-            old_session_id = self._session_id
-            old_parent_session_id = self._parent_session_id
-            old_turn_index = self._turn_index
-            old_metadata = self._build_metadata(
-                message_count=len(old_turns) * 2,
-                turn_index=old_turn_index,
-            )
-            old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
-            old_content = "[" + ",".join(old_turns) + "]"
-            # Resolve doc_id + update_mode against the OLD session BEFORE
-            # we rotate _session_id, so the flush lands in the old
-            # session's document either way (legacy: per-process unique;
-            # ≥0.5.0: stable session-scoped + append).
-            old_document_id, old_update_mode = self._resolve_retain_target(
-                self._document_id
-            )
+            if not self._auto_retain:
+                logger.debug(
+                    "Hindsight on_session_switch: dropping %d buffered turns (auto_retain disabled)",
+                    len(self._session_turns),
+                )
+            else:
+                old_turns = list(self._session_turns)
+                old_session_id = self._session_id
+                old_parent_session_id = self._parent_session_id
+                old_turn_index = self._turn_index
+                old_metadata = self._build_metadata(
+                    message_count=len(old_turns) * 2,
+                    turn_index=old_turn_index,
+                )
+                old_lineage_tags: list[str] = []
+                if old_session_id:
+                    old_lineage_tags.append(f"session:{old_session_id}")
+                if old_parent_session_id:
+                    old_lineage_tags.append(f"parent:{old_parent_session_id}")
+                old_content = "[" + ",".join(old_turns) + "]"
+                # Resolve doc_id + update_mode against the OLD session BEFORE
+                # we rotate _session_id, so the flush lands in the old
+                # session's document either way (legacy: per-process unique;
+                # ≥0.5.0: stable session-scoped + append).
+                old_document_id, old_update_mode = self._resolve_retain_target(
+                    self._document_id
+                )
 
-            def _flush():
-                try:
-                    item = self._build_retain_kwargs(
-                        old_content,
-                        context=self._retain_context,
-                        metadata=old_metadata,
-                        tags=old_lineage_tags or None,
-                    )
-                    item.pop("bank_id", None)
-                    item.pop("retain_async", None)
-                    if old_update_mode is not None:
-                        item["update_mode"] = old_update_mode
-                    logger.debug(
-                        "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
-                    )
-                    self._run_hindsight_operation(
-                        lambda client: client.aretain_batch(
-                            bank_id=self._bank_id,
-                            items=[item],
-                            document_id=old_document_id,
-                            retain_async=self._retain_async,
+                def _flush():
+                    try:
+                        item = self._build_retain_kwargs(
+                            old_content,
+                            context=self._retain_context,
+                            metadata=old_metadata,
+                            tags=old_lineage_tags or None,
                         )
-                    )
-                except Exception as e:
-                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
+                        item.pop("bank_id", None)
+                        item.pop("retain_async", None)
+                        if old_update_mode is not None:
+                            item["update_mode"] = old_update_mode
+                        logger.debug(
+                            "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
+                            self._bank_id, old_document_id, old_update_mode, len(old_turns),
+                        )
+                        self._run_hindsight_operation(
+                            lambda client: client.aretain_batch(
+                                bank_id=self._bank_id,
+                                items=[item],
+                                document_id=old_document_id,
+                                retain_async=self._retain_async,
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
 
-            # Route the flush through the same writer queue sync_turn
-            # uses. That serializes it behind any still-queued retains
-            # from the old session (FIFO by document_id), avoids racing
-            # two threads on aretain_batch against the same document, and
-            # keeps shutdown's drain semantics intact. Skip enqueue if
-            # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
-                self._ensure_writer()
-                self._register_atexit()
-                self._retain_queue.put(_flush)
+                # Route the flush through the same writer queue sync_turn
+                # uses. That serializes it behind any still-queued retains
+                # from the old session (FIFO by document_id), avoids racing
+                # two threads on aretain_batch against the same document, and
+                # keeps shutdown's drain semantics intact. Skip enqueue if
+                # shutdown has already fired — the writer is draining/gone.
+                if not self._shutting_down.is_set():
+                    self._ensure_writer()
+                    self._register_atexit()
+                    self._retain_queue.put(_flush)
 
         # 2. Drain any in-flight prefetch from the old session and drop
         # its cached result so the new session doesn't see stale recall.
