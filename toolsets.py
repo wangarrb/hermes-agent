@@ -46,8 +46,6 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
-    # Audio + video parsing (fork customization)
-    "audio_transcribe", "video_analyze",
     # Planning & memory
     "todo", "memory",
     # Session history search
@@ -89,6 +87,12 @@ TOOLSETS = {
     "vision": {
         "description": "Image analysis and vision tools",
         "tools": ["vision_analyze"],
+        "includes": []
+    },
+
+    "video": {
+        "description": "Video analysis and understanding tools (opt-in, not in default toolset)",
+        "tools": ["video_analyze"],
         "includes": []
     },
     
@@ -517,13 +521,18 @@ def get_toolset(name: str) -> Optional[Dict[str, Any]]:
         None: If toolset not found
     """
     toolset = TOOLSETS.get(name)
-    if toolset:
-        return toolset
 
     try:
         from tools.registry import registry
     except Exception:
-        return None
+        return toolset if toolset else None
+
+    if toolset:
+        merged_tools = sorted(
+            set(toolset.get("tools", []))
+            | set(registry.get_tool_names_for_toolset(name))
+        )
+        return {**toolset, "tools": merged_tools}
 
     registry_toolset = name
     description = f"Plugin toolset: {name}"

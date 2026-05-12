@@ -366,6 +366,7 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
+        # Chinese patterns for user preferences, decisions, and learnings
         _CN_PREF_PATTERNS = [
             re.compile(r'我(?:喜欢|偏好|习惯|常用|想要|需要|用)(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'我的(?:默认|常用|偏好|首选)(?:\w+)?是(.+?)(?:[，。！？\n]|$)'),
@@ -398,45 +399,60 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'不(?:要|能|能再)(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'(?:错误|不对)(.+?)(?:[，。！？\n]|$)'),
         ]
-        _CN_ASSISTANT_CONFIRM_PATTERNS = [
-            re.compile(r'已(?:经)?(?:记住|记录|存储)[：:]?\s*(.+)'),
-            re.compile(r'(?:记下来了|记住了)[：:]?\s*(.+)'),
-            re.compile(r'保存到记忆[：:]?\s*(.+)'),
-        ]
-
-        def _add_fact(content: str, category: str) -> bool:
-            try:
-                self._store.add_fact(content[:400], category=category)
-                return True
-            except Exception:
-                return False
-
-        def _match_any(content: str, patterns: list[re.Pattern[str]], category: str) -> bool:
-            for pattern in patterns:
-                if pattern.search(content):
-                    return _add_fact(content, category)
-            return False
 
         extracted = 0
         for msg in messages:
-            role = msg.get("role")
+            if msg.get("role") != "user":
+                continue
             content = msg.get("content", "")
             if not isinstance(content, str) or len(content) < 10:
                 continue
 
-            if role == "user":
-                if (
-                    _match_any(content, _PREF_PATTERNS, "user_pref")
-                    or _match_any(content, _CN_PREF_PATTERNS, "user_pref")
-                    or _match_any(content, _DECISION_PATTERNS, "project")
-                    or _match_any(content, _CN_DECISION_PATTERNS, "project")
-                    or _match_any(content, _LEARNING_PATTERNS, "tool")
-                    or _match_any(content, _CN_LEARNING_PATTERNS, "tool")
-                ):
-                    extracted += 1
-            elif role == "assistant":
-                if _match_any(content, _CN_ASSISTANT_CONFIRM_PATTERNS, "general"):
-                    extracted += 1
+            for pattern in _PREF_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="user_pref")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+
+            for pattern in _DECISION_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="project")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+
+            # Chinese pattern matching
+            for pattern in _CN_PREF_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="user_pref")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+
+            for pattern in _CN_DECISION_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="project")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
+
+            for pattern in _CN_LEARNING_PATTERNS:
+                if pattern.search(content):
+                    try:
+                        self._store.add_fact(content[:400], category="tool")
+                        extracted += 1
+                    except Exception:
+                        pass
+                    break
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)

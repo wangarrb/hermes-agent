@@ -27,7 +27,7 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import get_compatible_custom_providers, get_env_value, load_config
+from hermes_cli.config import get_compatible_custom_providers, load_config
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname
 
@@ -319,9 +319,10 @@ def _try_resolve_from_custom_pool(
     base_url: str,
     provider_label: str,
     api_mode_override: Optional[str] = None,
+    provider_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
-    pool_key = get_custom_provider_pool_key(base_url)
+    pool_key = get_custom_provider_pool_key(base_url, provider_name=provider_name)
     if not pool_key:
         return None
     try:
@@ -385,7 +386,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             name_norm = _normalize_custom_provider_name(ep_name)
             # Resolve the API key from the env var name stored in key_env
             key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = (get_env_value(key_env) or "").strip() if key_env else ""
+            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
                 resolved_api_key = str(entry.get("api_key", "") or "").strip()
@@ -521,7 +522,7 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -530,11 +531,10 @@ def _resolve_named_custom_runtime(
             pool_result["model"] = model_name
         return pool_result
 
-    key_env_name = str(custom_provider.get("key_env", "") or "").strip()
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
-        (get_env_value(key_env_name) or "").strip() if key_env_name else "",
+        os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
         os.getenv("OPENAI_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY", "").strip(),
     ]
@@ -641,8 +641,11 @@ def _resolve_openrouter_runtime(
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
+        # Pass requested_provider so pool lookup prefers name match over base_url,
+        # fixing credential mix-ups when multiple custom providers share a base_url.
         pool_result = _try_resolve_from_custom_pool(
             base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
+            provider_name=requested_provider if requested_norm != "custom" else None,
         )
         if pool_result:
             return pool_result
