@@ -12,6 +12,9 @@ __pycache__/
 .env.production.local
 .env.development
 .env.test
+
+# Local state database (session store)
+hermes_state.db
 export*
 __pycache__/model_tools.cpython-310.pyc
 __pycache__/web_tools.cpython-310.pyc

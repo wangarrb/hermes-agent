@@ -900,6 +900,13 @@ class SessionDB:
         delegate subagents or branch children, which can also have a
         ``parent_session_id`` but were created while the parent was still live.
 
+        The walk primarily follows children whose parent ended with
+        ``end_reason='compression'``.  It also tolerates legacy rows where a
+        compression child was created before the parent was later marked as
+        ``resumed_other``/``new_session``/``cli_close``; those broken boundary
+        rows otherwise make recent continuation sessions disappear from
+        ``/resume`` listings.
+
         Returns the session_id of the latest continuation in the chain, or the
         input ``session_id`` if it isn't part of a compression chain (or if the
         input itself doesn't exist).
@@ -910,13 +917,17 @@ class SessionDB:
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
+                    "SELECT c.id FROM sessions c "
+                    "JOIN sessions p ON p.id = ? "
+                    "WHERE c.parent_session_id = ? "
+                    "  AND ("
+                    "      (p.end_reason = 'compression' "
+                    "       AND p.ended_at IS NOT NULL "
+                    "       AND c.started_at >= p.ended_at) "
+                    "      OR (p.end_reason IN ('resumed_other', 'new_session', 'cli_close') "
+                    "          AND c.end_reason = 'compression')"
                     "  ) "
-                    "ORDER BY started_at DESC LIMIT 1",
+                    "ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
                     (current, current),
                 )
                 row = cursor.fetchone()
@@ -979,6 +990,14 @@ class SessionDB:
             params.extend(exclude_sources)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        # For projected compression chains, the visible row's activity comes
+        # from the continuation tip, not the root row.  Fetch all matching
+        # roots first, then project/sort/paginate in Python so a long-running
+        # compressed conversation whose root started hours ago still appears
+        # at the top of recent-session lists.
+        paginate_in_sql = not (project_compression_tips and not include_children)
+        order_sql = "ORDER BY last_active DESC, s.started_at DESC, s.id DESC"
+        limit_sql = "LIMIT ? OFFSET ?" if paginate_in_sql else ""
         query = f"""
             SELECT s.*,
                 COALESCE(
@@ -994,12 +1013,14 @@ class SessionDB:
                 ) AS last_active
             FROM sessions s
             {where_sql}
-            ORDER BY s.started_at DESC
-            LIMIT ? OFFSET ?
+            {order_sql}
+            {limit_sql}
         """
-        params.extend([limit, offset])
+        query_params = list(params)
+        if paginate_in_sql:
+            query_params.extend([limit, offset])
         with self._lock:
-            cursor = self._conn.execute(query, params)
+            cursor = self._conn.execute(query, query_params)
             rows = cursor.fetchall()
         sessions = []
         for row in rows:
@@ -1017,8 +1038,9 @@ class SessionDB:
         # end_reason is 'compression' has a continuation child; replace the
         # surfaced fields (id, message_count, title, last_active, ended_at,
         # end_reason, preview) with the tip's values so the list entry acts
-        # as the live conversation. Keep the root's started_at to preserve
-        # chronological ordering by original conversation start.
+        # as the live conversation. Keep the root's started_at for lineage
+        # context, then sort by the projected last_active so recent compressed
+        # conversations do not disappear behind newer short-lived roots.
         if project_compression_tips and not include_children:
             projected = []
             for s in sessions:
@@ -1033,7 +1055,7 @@ class SessionDB:
                 if not tip_row:
                     projected.append(s)
                     continue
-                # Preserve the root's started_at for stable sort order, but
+                # Preserve the root's started_at for lineage context, but
                 # surface the tip's identity and activity data.
                 merged = dict(s)
                 for key in (
@@ -1046,6 +1068,19 @@ class SessionDB:
                 merged["_lineage_root_id"] = s["id"]
                 projected.append(merged)
             sessions = projected
+            sessions.sort(
+                key=lambda item: (
+                    float(item.get("last_active") or 0),
+                    float(item.get("started_at") or 0),
+                    str(item.get("id") or ""),
+                ),
+                reverse=True,
+            )
+            start = max(offset or 0, 0)
+            if start:
+                sessions = sessions[start:]
+            if limit is not None and limit >= 0:
+                sessions = sessions[:limit]
 
         return sessions
 

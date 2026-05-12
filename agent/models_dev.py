@@ -210,6 +210,11 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     """Fetch models.dev registry. In-memory cache (1hr) + disk fallback.
 
     Returns the full registry dict keyed by provider ID, or empty dict on failure.
+    
+    Resolution order (offline-first):
+    1. In-memory cache (if fresh within TTL)
+    2. Disk cache (if exists, regardless of age — prefer speed over freshness)
+    3. Network fetch (background, only if disk cache missing or force_refresh)
     """
     global _models_dev_cache, _models_dev_cache_time
 
@@ -221,7 +226,16 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     ):
         return _models_dev_cache
 
-    # Try network fetch
+    # Check disk cache FIRST (offline-first for networks where models.dev unreachable)
+    if not force_refresh and not _models_dev_cache:
+        disk_cache = _load_disk_cache()
+        if disk_cache:
+            _models_dev_cache = disk_cache
+            _models_dev_cache_time = time.time()
+            logger.debug("Loaded models.dev from disk cache (%d providers)", len(disk_cache))
+            return disk_cache
+
+    # Try network fetch (only if no cache available or force_refresh)
     try:
         response = requests.get(MODELS_DEV_URL, timeout=15)
         response.raise_for_status()
@@ -239,14 +253,7 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
     except Exception as e:
         logger.debug("Failed to fetch models.dev: %s", e)
 
-    # Fall back to disk cache — use a short TTL (5 min) so we retry
-    # the network fetch soon instead of serving stale data for a full hour.
-    if not _models_dev_cache:
-        _models_dev_cache = _load_disk_cache()
-        if _models_dev_cache:
-            _models_dev_cache_time = time.time() - _MODELS_DEV_CACHE_TTL + 300
-            logger.debug("Loaded models.dev from disk cache (%d providers)", len(_models_dev_cache))
-
+    # Return whatever we have (disk cache already checked above)
     return _models_dev_cache
 
 
