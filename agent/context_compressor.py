@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -883,7 +883,19 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
             response = call_llm(**call_kwargs)
-            content = response.choices[0].message.content
+            # Use extract_content_or_reasoning so thinking models
+            # (DeepSeek v4, Qwen3, GLM-5.1, etc.) that return content
+            # in the reasoning / reasoning_content field instead of the
+            # content field still produce a usable summary.  Without
+            # this the compressor gets an empty string and falls back
+            # to a static marker, losing the entire compaction.  #19003
+            raw_content = response.choices[0].message.content
+            if isinstance(raw_content, str):
+                content = extract_content_or_reasoning(response)
+            else:
+                # Non-string content (e.g. dict from llama.cpp) —
+                # extract_content_or_reasoning expects string content
+                content = str(raw_content) if raw_content else ""
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
                 content = str(content) if content else ""

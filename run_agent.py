@@ -1854,6 +1854,19 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+        # Opt-in pruning of historical reasoning_content beyond N recent
+        # assistant turns.  Long sessions with thinking models (DeepSeek v4,
+        # Kimi, etc.) accumulate dense reasoning blocks that bias the model
+        # toward narrative continuation instead of fresh tool execution
+        # (IWE — Intention Without Execution, #22068).  Setting this to e.g.
+        # 7 keeps full reasoning on the last 7 assistant turns and replaces
+        # older ones with a space placeholder.  0 (default) = disabled.
+        try:
+            _raw_prune = _agent_section.get("prune_reasoning_turns", 0)
+            self._prune_reasoning_turns = max(0, int(_raw_prune))
+        except (TypeError, ValueError):
+            self._prune_reasoning_turns = 0
+
         # App-level API retry count (wraps each model API call).  Default 3,
         # overridable via agent.api_max_retries in config.yaml.  See #11616.
         try:
@@ -9186,6 +9199,15 @@ class AIAgent:
             provider == "deepseek"
             or "deepseek" in model
             or base_url_host_matches(self.base_url, "api.deepseek.com")
+            # OpenCode Go/Zen proxies (opencode.ai) may forward to DeepSeek
+            # with thinking mode enabled; without this detection the proxy
+            # can strip reasoning_content and cause HTTP 400 ("The
+            # reasoning_content in the thinking mode must be passed back
+            # to the API").  #18853
+            or (
+                base_url_host_matches(self.base_url, "opencode.ai")
+                and "deepseek" in model
+            )
         )
 
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
@@ -10583,9 +10605,16 @@ class AIAgent:
             # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
             _needs_sanitize = self._should_sanitize_tool_calls()
             api_messages = []
+            _prune_turns_2 = getattr(self, "_prune_reasoning_turns", 0)
+            _asst_count_2 = sum(1 for m in messages if m.get("role") == "assistant")
+            _asst_idx_2 = 0
             for msg in messages:
                 api_msg = msg.copy()
                 self._copy_reasoning_content_for_api(msg, api_msg)
+                if msg.get("role") == "assistant" and _prune_turns_2 > 0:
+                    _asst_idx_2 += 1
+                    if (_asst_count_2 - _asst_idx_2) >= _prune_turns_2:
+                        api_msg["reasoning_content"] = " "
                 for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
@@ -11290,6 +11319,16 @@ class AIAgent:
                 )
 
             api_messages = []
+            # Pre-scan for reasoning_content pruning (#22068):
+            # long sessions with thinking models accumulate dense
+            # reasoning blocks that bias the model toward narrative
+            # continuation (IWE — Intention Without Execution).
+            # When prune_reasoning_turns > 0, only the last N
+            # assistant messages keep full reasoning_content;
+            # older ones use a space placeholder.
+            _prune_turns = getattr(self, "_prune_reasoning_turns", 0)
+            _assistant_count = sum(1 for m in messages if m.get("role") == "assistant")
+            _asst_idx = 0
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
 
@@ -11314,6 +11353,15 @@ class AIAgent:
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
                 self._copy_reasoning_content_for_api(msg, api_msg)
+
+                # Apply reasoning_content pruning (#22068):
+                # when prune_reasoning_turns > 0, replace reasoning_content
+                # on older assistant turns with a space placeholder so the
+                # model isn't biased toward narrative continuation (IWE).
+                if msg.get("role") == "assistant" and _prune_turns > 0:
+                    _asst_idx += 1
+                    if (_assistant_count - _asst_idx) >= _prune_turns:
+                        api_msg["reasoning_content"] = " "
 
                 # Remove 'reasoning' field - it's for trajectory storage only
                 # We've copied it to 'reasoning_content' for the API above
@@ -13880,50 +13928,64 @@ class AIAgent:
                         # reasoning_content), so _has_structured below would
                         # miss it.  We check here so thinking-only responses
                         # after tool calls route to prefill instead of nudge.
-                        _has_inline_thinking = bool(
-                            re.search(
-                                r'<think>|<thinking>|<reasoning>',
-                                final_response or "",
-                                re.IGNORECASE,
-                            )
+                    _has_inline_thinking = bool(
+                        re.search(
+                            r'<think>|<thinking>|<reasoning>',
+                            final_response or "",
+                            re.IGNORECASE,
                         )
-                        if (
-                            _prior_was_tool
-                            and not getattr(self, "_post_tool_empty_retried", False)
-                            and not _has_inline_thinking  # thinking model still working — let prefill handle
-                        ):
-                            self._post_tool_empty_retried = True
-                            # Clear stale narration so it doesn't resurface
-                            # on a later empty response after the nudge.
-                            self._last_content_with_tools = None
-                            self._last_content_tools_all_housekeeping = False
-                            logger.info(
-                                "Empty response after tool calls — nudging model "
-                                "to continue processing"
-                            )
-                            self._emit_status(
-                                "⚠️ Model returned empty after tool calls — "
-                                "nudging to continue"
-                            )
-                            # Append the empty assistant message first so the
-                            # message sequence stays valid:
-                            #   tool(result) → assistant("(empty)") → user(nudge)
-                            # Without this, we'd have tool → user which most
-                            # APIs reject as an invalid sequence.
-                            _nudge_msg = self._build_assistant_message(assistant_message, finish_reason)
-                            _nudge_msg["content"] = "(empty)"
-                            _nudge_msg["_empty_recovery_synthetic"] = True
-                            messages.append(_nudge_msg)
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "You just executed tool calls but returned an "
-                                    "empty response. Please process the tool "
-                                    "results above and continue with the task."
-                                ),
-                                "_empty_recovery_synthetic": True,
-                            })
-                            continue
+                    )
+                    # Also check for structured reasoning fields
+                    # (DeepSeek v4/Kimi/Moonshot/GPT-5.x thinking).
+                    # These models separate thinking from content on the
+                    # wire — after tool calls they may return empty
+                    # content with populated reasoning_content/reasoning/
+                    # reasoning_details.  Without this check the post-tool
+                    # nudge fires needlessly, wasting a retry round-trip
+                    # and making the agent appear stuck.  #22685
+                    _has_separate_reasoning = bool(
+                        getattr(assistant_message, "reasoning_content", None)
+                        or getattr(assistant_message, "reasoning", None)
+                        or getattr(assistant_message, "reasoning_details", None)
+                    )
+                    if (
+                        _prior_was_tool
+                        and not getattr(self, "_post_tool_empty_retried", False)
+                        and not _has_inline_thinking  # thinking model still working — let prefill handle
+                        and not _has_separate_reasoning  # structured reasoning populated → skip nudge  #22685
+                    ):
+                        self._post_tool_empty_retried = True
+                        # Clear stale narration so it doesn't resurface
+                        # on a later empty response after the nudge.
+                        self._last_content_with_tools = None
+                        self._last_content_tools_all_housekeeping = False
+                        logger.info(
+                            "Empty response after tool calls — nudging model "
+                            "to continue processing"
+                        )
+                        self._emit_status(
+                            "⚠️ Model returned empty after tool calls — "
+                            "nudging to continue"
+                        )
+                        # Append the empty assistant message first so the
+                        # message sequence stays valid:
+                        #   tool(result) → assistant("(empty)") → user(nudge)
+                        # Without this, we'd have tool → user which most
+                        # APIs reject as an invalid sequence.
+                        _nudge_msg = self._build_assistant_message(assistant_message, finish_reason)
+                        _nudge_msg["content"] = "(empty)"
+                        _nudge_msg["_empty_recovery_synthetic"] = True
+                        messages.append(_nudge_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "You just executed tool calls but returned an "
+                                "empty response. Please process the tool "
+                                "results above and continue with the task."
+                            ),
+                            "_empty_recovery_synthetic": True,
+                        })
+                        continue
 
                         # ── Thinking-only prefill continuation ──────────
                         # The model produced structured reasoning (via API
