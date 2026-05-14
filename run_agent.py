@@ -1854,18 +1854,19 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
-        # Opt-in pruning of historical reasoning_content beyond N recent
+        # Pruning of historical reasoning_content beyond 10 recent
         # assistant turns.  Long sessions with thinking models (DeepSeek v4,
         # Kimi, etc.) accumulate dense reasoning blocks that bias the model
         # toward narrative continuation instead of fresh tool execution
-        # (IWE — Intention Without Execution, #22068).  Setting this to e.g.
-        # 7 keeps full reasoning on the last 7 assistant turns and replaces
-        # older ones with a space placeholder.  0 (default) = disabled.
+        # (IWE — Intention Without Execution, #22068).  Only the last 10
+        # assistant turns keep full reasoning_content; older ones use a
+        # space placeholder.  Only activates for thinking-mode providers
+        # (DeepSeek/Kimi) — harmless for others.  Set to 0 to disable.
         try:
-            _raw_prune = _agent_section.get("prune_reasoning_turns", 0)
+            _raw_prune = _agent_section.get("prune_reasoning_turns", 10)
             self._prune_reasoning_turns = max(0, int(_raw_prune))
         except (TypeError, ValueError):
-            self._prune_reasoning_turns = 0
+            self._prune_reasoning_turns = 10
 
         # App-level API retry count (wraps each model API call).  Default 3,
         # overridable via agent.api_max_retries in config.yaml.  See #11616.
