@@ -10611,7 +10611,7 @@ class AIAgent:
             for msg in messages:
                 api_msg = msg.copy()
                 self._copy_reasoning_content_for_api(msg, api_msg)
-                if msg.get("role") == "assistant" and _prune_turns_2 > 0:
+                if msg.get("role") == "assistant" and _prune_turns_2 > 0 and self._needs_thinking_reasoning_pad():
                     _asst_idx_2 += 1
                     if (_asst_count_2 - _asst_idx_2) >= _prune_turns_2:
                         api_msg["reasoning_content"] = " "
@@ -11358,7 +11358,15 @@ class AIAgent:
                 # when prune_reasoning_turns > 0, replace reasoning_content
                 # on older assistant turns with a space placeholder so the
                 # model isn't biased toward narrative continuation (IWE).
-                if msg.get("role") == "assistant" and _prune_turns > 0:
+                # Only active for thinking-mode providers (DeepSeek/Kimi)
+                # that require reasoning_content echo-back; injecting
+                # reasoning_content on non-thinking providers (e.g. GPT-5.x)
+                # would be unexpected payload.
+                if (
+                    msg.get("role") == "assistant"
+                    and _prune_turns > 0
+                    and self._needs_thinking_reasoning_pad()
+                ):
                     _asst_idx += 1
                     if (_assistant_count - _asst_idx) >= _prune_turns:
                         api_msg["reasoning_content"] = " "
