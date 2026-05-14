@@ -13864,6 +13864,7 @@ class AIAgent:
                     self._mute_post_response = False
                     
                     # Check if response only has think block with no actual content after it
+                    _prior_was_tool = False  # initialized here; set inside the block when empty
                     if not self._has_content_after_think_block(final_response):
                         # ── Partial stream recovery ─────────────────────
                         # If content was already streamed to the user before
