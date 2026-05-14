@@ -1458,11 +1458,6 @@ class AIAgent:
                     client_kwargs["default_headers"] = {
                         "User-Agent": "claude-code/0.1.0",
                     }
-                elif provider == "cch" or base_url_host_matches(effective_base, "cch.jmadas.com"):
-                    # CCH needs codex-style UA to avoid format_type_mismatch 503
-                    client_kwargs["default_headers"] = {
-                        "User-Agent": "openai-codex/0.121.0",
-                    }
                 elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                     client_kwargs["default_headers"] = _qwen_portal_headers()
                 elif base_url_host_matches(effective_base, "chatgpt.com"):

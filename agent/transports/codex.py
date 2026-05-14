@@ -76,22 +76,6 @@ class ResponsesApiTransport(ProviderTransport):
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
 
-        # CCH-style Responses proxies may override/ignore the top-level
-        # instructions field and do not reliably support developer-role
-        # semantics. Preserve the system prompt by prepending it as a user
-        # message with a [SYSTEM]: prefix, then keep instructions minimal.
-        provider = params.get("provider", "")
-        base_url_hostname = params.get("base_url_hostname", "")
-        base_url = params.get("base_url", "")
-        is_cch_responses = (
-            provider == "cch"
-            or base_url_hostname == "cch.jmadas.com"
-            or (base_url and "cch.jmadas.com" in str(base_url))
-        )
-        if is_cch_responses and instructions:
-            payload_messages = [{"role": "user", "content": f"[SYSTEM]: {instructions}"}] + list(payload_messages)
-            instructions = DEFAULT_AGENT_IDENTITY
-
         # Resolve reasoning effort
         reasoning_effort = "medium"
         reasoning_enabled = True
