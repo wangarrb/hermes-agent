@@ -190,6 +190,11 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  auto_archive:
+    enabled: true                  # default
+    done_after_days: 7             # done leaf tasks only
+    terminal_blocked_after_days: 14 # blocked leaf tasks with explicit terminal evidence
+    max_per_tick: 100
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -205,6 +210,13 @@ policy forbids long-lived services, etc.) a `--force` escape hatch keeps
 the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
+
+Automatic task archival is intentionally conservative. The dispatcher only
+archives old tasks that have no non-archived children. `done` tasks age out
+after `done_after_days`; `blocked` tasks age out only when their blocked run
+or event contains explicit terminal evidence such as `GOAL_UNACHIEVABLE`,
+`SUPERSEDED`, `WONTFIX`, or `DUPLICATE`. Fixable critic blocks stay visible
+for planner adjudication and revision routing.
 
 ### Idempotent create (for automation / webhooks)
 
@@ -225,6 +237,7 @@ in one command:
 ```bash
 hermes kanban complete t_abc t_def t_hij --result "batch wrap"
 hermes kanban archive  t_abc t_def t_hij
+hermes kanban archive --auto --dry-run --json
 hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
@@ -562,6 +575,10 @@ hermes kanban assign <id> <profile>                    # or 'none' to unassign
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
 hermes kanban claim <id> [--ttl SECONDS]
+hermes kanban next --profile <profile> --claim-assignees <csv> --workspace <path>
+        [--listener-kind <kind>] [--owner <pane-owner>] [--ttl SECONDS] [--json]
+hermes kanban reset-current --profile <profile> --claim-assignees <csv> --workspace <path>
+        [--listener-kind <kind>] [--owner <pane-owner>] [--json]
 hermes kanban comment <id> "<text>" [--author NAME]
 
 # Bulk verbs — accept multiple ids:
@@ -569,6 +586,7 @@ hermes kanban complete <id>... [--result "..."]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
+hermes kanban archive --auto [--done-after 7d] [--blocked-after 14d] [--dry-run] [--json]
 
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
@@ -591,6 +609,13 @@ hermes kanban context <id>                             # what a worker sees
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]
 ```
+
+Visible Codex/DeepSeek Kanban panes default to self-poll task delivery.  The
+launcher gives the TUI one startup instruction; after that the agent calls
+`hermes kanban next --json`, reads `context_path`, completes or blocks the
+task, and repeats.  This avoids per-task `KANBAN_TASK_BOUNDARY` injection into
+a busy TUI.  The old watcher mode is still available as
+`--task-delivery inject` for explicit rollback.
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
@@ -642,7 +667,7 @@ Gateway platforms have practical message-length caps. If `/kanban list`, `/kanba
 
 ### Autocomplete
 
-In the interactive CLI, typing `/kanban ` and hitting Tab cycles through the built-in subcommand list (`list`, `ls`, `show`, `create`, `assign`, `link`, `unlink`, `claim`, `comment`, `complete`, `block`, `unblock`, `archive`, `tail`, `dispatch`, `context`, `init`, `gc`). The remaining verbs listed in the CLI reference above (`watch`, `stats`, `runs`, `log`, `assignees`, `heartbeat`, `notify-subscribe`, `notify-list`, `notify-unsubscribe`, `daemon`) also work — they're just not in the autocomplete hint list yet.
+In the interactive CLI, typing `/kanban ` and hitting Tab cycles through the built-in subcommand list (`list`, `ls`, `show`, `create`, `assign`, `link`, `unlink`, `claim`, `next`, `reset-current`, `comment`, `complete`, `block`, `unblock`, `archive`, `tail`, `dispatch`, `context`, `init`, `gc`). The remaining verbs listed in the CLI reference above (`watch`, `stats`, `runs`, `log`, `assignees`, `heartbeat`, `notify-subscribe`, `notify-list`, `notify-unsubscribe`, `daemon`) also work — they're just not in the autocomplete hint list yet.
 
 ## Collaboration patterns
 

@@ -1254,6 +1254,15 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Safe retention for Kanban clutter. The dispatcher only archives
+        # old leaf tasks, so dependency chains and planner adjudication flows
+        # stay visible until their downstream cards have been closed.
+        "auto_archive": {
+            "enabled": True,
+            "done_after_days": 7,
+            "terminal_blocked_after_days": 14,
+            "max_per_tick": 100,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -2812,7 +2821,7 @@ def get_custom_provider_context_length(
       * ``AIAgent.switch_model`` (mid-session ``/model`` switch)
       * ``hermes_cli.model_switch.resolve_display_context_length`` (``/model`` confirmation display)
       * ``gateway.run._format_session_info`` (``/info`` display)
-      * ``agent.model_metadata.get_model_context_length`` (when custom_providers is threaded through)
+      * ``agent.model_metadata.get_model_context_length`` (including paths that only pass provider/base_url/model)
 
     Before this helper existed, the lookup was duplicated in ``run_agent.py``'s
     startup path only; every other path (notably ``/model`` switch) fell back

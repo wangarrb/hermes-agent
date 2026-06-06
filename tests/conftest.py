@@ -547,6 +547,11 @@ def _reset_tool_registry_caches():
     test keeps hermetic behavior.
     """
     try:
+        from tools.kanban_tools import set_listener_active
+        set_listener_active(False)
+    except ImportError:
+        pass
+    try:
         from tools.registry import invalidate_check_fn_cache
         invalidate_check_fn_cache()
     except ImportError:
@@ -557,3 +562,18 @@ def _reset_tool_registry_caches():
     except ImportError:
         pass
     yield
+    try:
+        from tools.kanban_tools import set_listener_active
+        set_listener_active(False)
+    except ImportError:
+        pass
+    try:
+        from tools.registry import invalidate_check_fn_cache
+        invalidate_check_fn_cache()
+    except ImportError:
+        pass
+    try:
+        from model_tools import _clear_tool_defs_cache
+        _clear_tool_defs_cache()
+    except ImportError:
+        pass

@@ -44,6 +44,7 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
         "prompt_toolkit.completion": MagicMock(),
         "prompt_toolkit.formatted_text": MagicMock(),
         "prompt_toolkit.auto_suggest": MagicMock(),
+        "fire": MagicMock(),
     }
     with patch.dict(sys.modules, prompt_toolkit_stubs), \
          patch.dict("os.environ", clean_env, clear=False):
@@ -200,6 +201,36 @@ class TestSingleQueryState:
         assert cli._voice_tts_done.is_set()
         assert hasattr(cli, "_interrupt_queue")
         assert hasattr(cli, "_pending_input")
+
+
+class TestKanbanAutoListenStartup:
+    def test_auto_listen_is_scheduled_after_run_queue_init(self):
+        """Regression: /listen-kanban auto-start must enqueue into run()'s live queue."""
+        cli_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "cli.py"))
+        with open(cli_py, "r", encoding="utf-8") as f:
+            source = f.read()
+
+        run_start = source.index("    def run(self):")
+        queue_init = source.index("self._pending_input = queue.Queue()     # For normal input", run_start)
+        auto_listen = source.index("_auto_listen = CLI_CONFIG.get", run_start)
+        plugin_ref = source.index("get_plugin_manager()._cli_ref = self", run_start)
+
+        assert run_start < queue_init < auto_listen < plugin_ref
+        assert 'self._pending_input.put("/listen-kanban")' in source[auto_listen:plugin_ref]
+
+
+class TestKanbanResetCommand:
+    def test_listen_kanban_reset_flag_routes_to_listener_reset(self):
+        cli = _make_cli()
+        with patch("hermes_cli.kanban_listener.reset_kanban_listener") as mock_reset:
+            cli.process_command("/listen-kanban --reset")
+        mock_reset.assert_called_once_with(cli)
+
+    def test_reset_kanban_command_routes_to_listener_reset(self):
+        cli = _make_cli()
+        with patch("hermes_cli.kanban_listener.reset_kanban_listener") as mock_reset:
+            cli.process_command("/reset-kanban")
+        mock_reset.assert_called_once_with(cli)
 
 
 class TestHistoryDisplay:

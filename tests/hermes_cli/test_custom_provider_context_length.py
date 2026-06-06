@@ -205,6 +205,42 @@ class TestGetModelContextLengthHonorsOverride:
         )
         assert ctx == 500_000
 
+    def test_named_providers_config_override_used_when_not_threaded(self):
+        """Named providers in config.yaml should be honored even when callers
+        do not pass the compatible custom_providers list explicitly.
+
+        This covers auxiliary/status paths that only know provider + base_url.
+        Without loading config.providers here, custom endpoints whose /models
+        metadata omits context_length fall back to DEFAULT_FALLBACK_CONTEXT.
+        """
+        from agent.model_metadata import get_model_context_length
+
+        cfg = {
+            "providers": {
+                "topenrouter": {
+                    "base_url": "https://tp-api.chinadatapay.com:8000/v1",
+                    "models": {
+                        "deepseek-v4-flash": {"context_length": 1_024_000}
+                    },
+                }
+            }
+        }
+        patches = self._mock_all_probes()
+        for p in patches:
+            p.start()
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            try:
+                ctx = get_model_context_length(
+                    "deepseek-v4-flash",
+                    base_url="https://tp-api.chinadatapay.com:8000/v1",
+                    provider="topenrouter",
+                    custom_providers=None,
+                )
+            finally:
+                for p in patches:
+                    p.stop()
+        assert ctx == 1_024_000
+
     def test_no_override_falls_through_to_default(self):
         """With custom_providers=None and all probes disabled, resolver
         returns DEFAULT_FALLBACK_CONTEXT (256K after the stepdown bump).

@@ -596,6 +596,149 @@ def test_gc_events_keeps_active_task_history(kanban_home):
         conn.close()
 
 
+def test_auto_archive_done_leaf_tasks_only(kanban_home):
+    """Auto-archive must not hide a done parent while children are visible."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="w")
+        child = kb.create_task(conn, title="child", assignee="w", parents=[parent])
+        leaf = kb.create_task(conn, title="leaf", assignee="w")
+        kb.complete_task(conn, parent)
+        kb.complete_task(conn, leaf)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at=?, created_at=? WHERE id IN (?, ?)",
+                (now - 90 * 24 * 3600, now - 90 * 24 * 3600, parent, leaf),
+            )
+
+        res = kb.auto_archive_tasks(conn, done_after_seconds=30 * 24 * 3600, now=now)
+
+        assert res.archived == [leaf]
+        assert kb.get_task(conn, leaf).status == "archived"
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status != "archived"
+
+
+def test_auto_archive_blocked_requires_terminal_evidence(kanban_home):
+    """Fixable blocked tasks stay visible; terminal blocked tasks can age out."""
+    now = int(time.time())
+    with kb.connect() as conn:
+        fixable = kb.create_task(conn, title="critic block", assignee="critic")
+        terminal = kb.create_task(conn, title="terminal block", assignee="critic")
+        kb.block_task(conn, fixable, reason="BLOCKED: fix report labels and rerun metrics")
+        kb.block_task(conn, terminal, reason="GOAL_UNACHIEVABLE: evidence disproves the hypothesis")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at=? WHERE task_id IN (?, ?)",
+                (now - 90 * 24 * 3600, fixable, terminal),
+            )
+            conn.execute(
+                "UPDATE task_runs SET ended_at=?, summary=? WHERE task_id=?",
+                (
+                    now - 90 * 24 * 3600,
+                    "GOAL_UNACHIEVABLE: evidence disproves the hypothesis",
+                    terminal,
+                ),
+            )
+
+        res = kb.auto_archive_tasks(
+            conn,
+            terminal_blocked_after_seconds=30 * 24 * 3600,
+            now=now,
+        )
+
+        assert res.archived == [terminal]
+        assert kb.get_task(conn, terminal).status == "archived"
+        assert kb.get_task(conn, fixable).status == "blocked"
+
+
+def test_cli_archive_auto_dry_run_json_does_not_mutate(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="done leaf", assignee="w")
+        kb.complete_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at=?, created_at=? WHERE id=?",
+                (now - 90 * 24 * 3600, now - 90 * 24 * 3600, tid),
+            )
+
+    out = run_slash("archive --auto --done-after 30d --dry-run --json")
+    data = json.loads(out)
+
+    assert data["dry_run"] is True
+    assert data["selected"] == [tid]
+    assert data["archived"] == []
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_dispatch_auto_archive_reports_archived_tasks(kanban_home):
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="done leaf", assignee="w")
+        kb.complete_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at=?, created_at=? WHERE id=?",
+                (now - 90 * 24 * 3600, now - 90 * 24 * 3600, tid),
+            )
+
+        res = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            auto_archive_done_after_seconds=30 * 24 * 3600,
+            auto_archive_now=now,
+        )
+
+        assert res.auto_archived == [tid]
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_cli_dispatch_honors_auto_archive_config(kanban_home, monkeypatch, capsys):
+    """`hermes kanban dispatch` should run the same retention path as the
+    embedded dispatcher so manual/scripted ticks do not leave old terminal
+    cards behind.
+    """
+    from hermes_cli import kanban as kb_cli
+
+    now = int(time.time())
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="done leaf", assignee="w")
+        kb.complete_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET completed_at=?, created_at=? WHERE id=?",
+                (now - 90 * 24 * 3600, now - 90 * 24 * 3600, tid),
+            )
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "auto_archive": {
+                    "enabled": True,
+                    "done_after_days": 30,
+                    "terminal_blocked_after_days": 30,
+                    "max_per_tick": 10,
+                }
+            }
+        },
+    )
+    args = argparse.Namespace(
+        dry_run=False,
+        max=None,
+        failure_limit=kb.DEFAULT_FAILURE_LIMIT,
+        json=True,
+    )
+
+    assert kb_cli._cmd_dispatch(args) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["auto_archived"] == [tid]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "archived"
+
+
 def test_gc_worker_logs_deletes_old_files(kanban_home):
     log_dir = kanban_home / "kanban" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -3056,6 +3199,10 @@ def test_config_default_dispatch_in_gateway_is_true():
     assert isinstance(interval, (int, float)) and interval >= 1, (
         f"dispatch_interval_seconds must be a positive number, got {interval!r}"
     )
+    auto_archive = kanban.get("auto_archive", {})
+    assert auto_archive.get("enabled") is True
+    assert auto_archive.get("done_after_days", 0) > 0
+    assert auto_archive.get("terminal_blocked_after_days", 0) > 0
 
 
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
@@ -3291,6 +3438,76 @@ def test_gateway_dispatcher_watcher_env_truthy_uses_config(monkeypatch):
             timeout=3.0,
         )
     )
+
+
+def test_gateway_dispatcher_watcher_threads_auto_archive_config(monkeypatch):
+    """Gateway-embedded dispatch ticks must pass auto-archive retention config
+    into dispatch_once; otherwise the default automation path never archives.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    from hermes_cli import kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "failure_limit": 4,
+                "auto_archive": {
+                    "enabled": True,
+                    "done_after_days": 3,
+                    "terminal_blocked_after_days": 5,
+                    "max_per_tick": 7,
+                },
+            }
+        },
+    )
+    monkeypatch.setattr(_kb, "list_boards", lambda include_archived=False: [{"slug": "default"}])
+    monkeypatch.setattr(_kb, "init_db", lambda board=None: None)
+    monkeypatch.setattr(_kb, "has_spawnable_ready", lambda conn: False)
+
+    class _Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(_kb, "connect", lambda board=None: _Conn())
+
+    def _dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        runner._running = False
+        return SimpleNamespace(
+            spawned=[],
+            auto_archived=["t_old"],
+            reclaimed=0,
+            crashed=[],
+            timed_out=[],
+            promoted=0,
+            auto_blocked=[],
+        )
+
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+
+    async def _sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+
+    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0))
+
+    assert captured["failure_limit"] == 4
+    assert captured["auto_archive_done_after_seconds"] == 3 * 24 * 3600
+    assert captured["auto_archive_terminal_blocked_after_seconds"] == 5 * 24 * 3600
+    assert captured["auto_archive_limit"] == 7
 
 
 # ---------------------------------------------------------------------------

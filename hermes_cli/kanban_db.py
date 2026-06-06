@@ -2503,7 +2503,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -2521,7 +2526,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        payload = {"reason": reason} if reason else None
+        _append_event(conn, task_id, "archived", payload, run_id=run_id)
         return True
 
 
@@ -2619,6 +2625,22 @@ DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 
+DEFAULT_AUTO_ARCHIVE_DONE_AFTER_SECONDS = 7 * 24 * 3600
+DEFAULT_AUTO_ARCHIVE_TERMINAL_BLOCKED_AFTER_SECONDS = 14 * 24 * 3600
+DEFAULT_AUTO_ARCHIVE_LIMIT = 100
+
+_TERMINAL_BLOCK_MARKERS = (
+    "GOAL_UNACHIEVABLE",
+    "TERMINAL_BLOCK",
+    "ARCHIVE_APPROVED",
+    "NO_REOPEN",
+    "WONTFIX",
+    "WON'T FIX",
+    "DUPLICATE",
+    "SUPERSEDED",
+    "superseded by",
+)
+
 
 @dataclass
 class DispatchResult:
@@ -2642,7 +2664,19 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    auto_archived: list[str] = field(default_factory=list)
+    """Task ids auto-archived by retention rules in this dispatch tick."""
     timed_out: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AutoArchiveResult:
+    """Outcome of applying safe Kanban auto-archive retention rules."""
+
+    selected: list[str] = field(default_factory=list)
+    archived: list[str] = field(default_factory=list)
+    dry_run: bool = False
+    skipped: dict[str, str] = field(default_factory=dict)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
 
 
@@ -3395,6 +3429,10 @@ def dispatch_once(
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     board: Optional[str] = None,
+    auto_archive_done_after_seconds: Optional[int] = None,
+    auto_archive_terminal_blocked_after_seconds: Optional[int] = None,
+    auto_archive_limit: Optional[int] = DEFAULT_AUTO_ARCHIVE_LIMIT,
+    auto_archive_now: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -3540,6 +3578,19 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+    if (
+        auto_archive_done_after_seconds is not None
+        or auto_archive_terminal_blocked_after_seconds is not None
+    ):
+        archived = auto_archive_tasks(
+            conn,
+            done_after_seconds=auto_archive_done_after_seconds,
+            terminal_blocked_after_seconds=auto_archive_terminal_blocked_after_seconds,
+            limit=auto_archive_limit,
+            dry_run=dry_run,
+            now=auto_archive_now,
+        )
+        result.auto_archived.extend(archived.archived if not dry_run else archived.selected)
     return result
 
 
@@ -4114,6 +4165,187 @@ def advance_notify_cursor(
 # ---------------------------------------------------------------------------
 # Retention + garbage collection
 # ---------------------------------------------------------------------------
+
+def _has_nonarchived_children(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM task_links l
+          JOIN tasks c ON c.id = l.child_id
+         WHERE l.parent_id = ?
+           AND c.status != 'archived'
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _terminal_block_evidence(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return an explicit terminal-block marker for a blocked task, if any.
+
+    Deliberately inspect only execution evidence (blocked event payloads and
+    run summaries), not the task body. Task bodies often contain instructions
+    like "write GOAL_UNACHIEVABLE if needed"; treating that as evidence would
+    hide fixable review blocks before planner adjudication.
+    """
+    texts: list[str] = []
+    rows = conn.execute(
+        """
+        SELECT payload
+          FROM task_events
+         WHERE task_id = ?
+           AND kind IN ('blocked', 'gave_up')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 5
+        """,
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        raw = row["payload"]
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("reason", "summary", "error", "last_error"):
+                val = payload.get(key)
+                if isinstance(val, str):
+                    texts.append(val)
+
+    run_rows = conn.execute(
+        """
+        SELECT summary, error
+          FROM task_runs
+         WHERE task_id = ?
+           AND outcome IN ('blocked', 'failed', 'timed_out', 'crashed')
+         ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+         LIMIT 5
+        """,
+        (task_id,),
+    ).fetchall()
+    for row in run_rows:
+        for key in ("summary", "error"):
+            val = row[key]
+            if isinstance(val, str):
+                texts.append(val)
+
+    for text in texts:
+        haystack = text.upper()
+        for marker in _TERMINAL_BLOCK_MARKERS:
+            if marker.upper() in haystack:
+                return marker
+    return None
+
+
+def auto_archive_tasks(
+    conn: sqlite3.Connection,
+    *,
+    done_after_seconds: Optional[int] = None,
+    terminal_blocked_after_seconds: Optional[int] = None,
+    limit: Optional[int] = DEFAULT_AUTO_ARCHIVE_LIMIT,
+    dry_run: bool = False,
+    now: Optional[int] = None,
+) -> AutoArchiveResult:
+    """Archive old, leaf-only terminal cards without breaking workflow links.
+
+    Safety rules:
+    * ``done`` cards are eligible only after the done-retention threshold and
+      only when every direct child is already archived.
+    * ``blocked`` cards are eligible only after the blocked-retention
+      threshold, only when every direct child is archived, and only when the
+      latest execution evidence contains an explicit terminal marker such as
+      ``GOAL_UNACHIEVABLE`` or ``SUPERSEDED``.
+
+    The direct-child guard is intentionally conservative because dependency
+    promotion treats ``done`` as the only satisfied parent state; archiving a
+    visible parent too early would strand downstream ``todo`` tasks.
+    """
+    now_i = int(time.time() if now is None else now)
+    result = AutoArchiveResult(dry_run=bool(dry_run))
+    candidates: list[tuple[int, str, str]] = []
+
+    if done_after_seconds is not None:
+        cutoff = now_i - max(0, int(done_after_seconds))
+        rows = conn.execute(
+            """
+            SELECT t.id, COALESCE(t.completed_at, t.created_at) AS terminal_at
+              FROM tasks t
+             WHERE t.status = 'done'
+               AND COALESCE(t.completed_at, t.created_at) <= ?
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM task_links l
+                     JOIN tasks c ON c.id = l.child_id
+                    WHERE l.parent_id = t.id
+                      AND c.status != 'archived'
+               )
+             ORDER BY terminal_at ASC, t.created_at ASC, t.id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            candidates.append(
+                (int(row["terminal_at"] or 0), row["id"], "done retention")
+            )
+
+    if terminal_blocked_after_seconds is not None:
+        cutoff = now_i - max(0, int(terminal_blocked_after_seconds))
+        rows = conn.execute(
+            """
+            SELECT t.id,
+                   COALESCE(MAX(e.created_at), t.completed_at, t.created_at) AS terminal_at
+              FROM tasks t
+              LEFT JOIN task_events e
+                ON e.task_id = t.id
+               AND e.kind IN ('blocked', 'gave_up')
+             WHERE t.status = 'blocked'
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM task_links l
+                     JOIN tasks c ON c.id = l.child_id
+                    WHERE l.parent_id = t.id
+                      AND c.status != 'archived'
+               )
+             GROUP BY t.id
+            HAVING terminal_at <= ?
+             ORDER BY terminal_at ASC, t.created_at ASC, t.id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            tid = row["id"]
+            marker = _terminal_block_evidence(conn, tid)
+            if not marker:
+                result.skipped[tid] = "blocked_without_terminal_marker"
+                continue
+            candidates.append(
+                (
+                    int(row["terminal_at"] or 0),
+                    tid,
+                    f"terminal blocked retention ({marker})",
+                )
+            )
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    if limit is not None:
+        candidates = candidates[:max(0, int(limit))]
+    result.selected = [tid for _, tid, _ in candidates]
+    if dry_run:
+        return result
+
+    for _, tid, reason in candidates:
+        if _has_nonarchived_children(conn, tid):
+            result.skipped[tid] = "has_nonarchived_children"
+            continue
+        if archive_task(conn, tid, reason=f"auto-archive: {reason}"):
+            result.archived.append(tid)
+        else:
+            result.skipped[tid] = "archive_failed"
+    return result
+
 
 def gc_events(
     conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,

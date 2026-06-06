@@ -282,6 +282,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                             if line and not line.startswith('#'):
                                 description = line[:80]
                                 break
+                    # no_slash: true — skill has a custom CommandDef handler,
+                    # skip slash-command registration to avoid duplicate
+                    # autocomplete entries.
+                    if frontmatter.get('no_slash', False):
+                        continue
                     seen_names.add(name)
                     # Normalize to hyphen-separated slug, stripping
                     # non-alnum chars (e.g. +, /) to avoid invalid
@@ -421,7 +426,25 @@ def build_skill_invocation_message(
     commands = get_skill_commands()
     skill_info = commands.get(cmd_key)
     if not skill_info:
-        return None
+        # Fallback: no_slash skills are not in _skill_commands.
+        # Try loading by skill name directly from disk.
+        skill_name = cmd_key.lstrip("/")
+        loaded = _load_skill_payload(skill_name, task_id=task_id)
+        if not loaded:
+            return None
+        loaded_skill, skill_dir, skill_name = loaded
+        activation_note = (
+            f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]"
+        )
+        return _build_skill_message(
+            loaded_skill,
+            skill_dir,
+            activation_note,
+            user_instruction=user_instruction,
+            runtime_note=runtime_note,
+            session_id=task_id,
+        )
 
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:

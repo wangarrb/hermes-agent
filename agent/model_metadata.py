@@ -1248,7 +1248,8 @@ def get_model_context_length(
     """Get the context length for a model.
 
     Resolution order:
-    0. Explicit config override (model.context_length or custom_providers per-model)
+    0. Explicit config override (model.context_length)
+    0b. Per-provider model override from custom_providers/providers config
     1. Persistent cache (previously discovered via probing)
     1b. AWS Bedrock static table (must precede custom-endpoint probe)
     2. Active endpoint metadata (/models for explicit custom endpoints)
@@ -1264,11 +1265,14 @@ def get_model_context_length(
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
 
-    # 0b. custom_providers per-model override — check before any probe.
-    # This closes the gap where /model switch and display paths used to fall
-    # back to 128K despite the user having a per-model context_length set.
-    # See #15779.
-    if custom_providers and base_url and model:
+    # 0b. Configured provider/custom-provider per-model override — check
+    # before any probe/cache.  Do this even when custom_providers was not
+    # explicitly threaded through: get_custom_provider_context_length() can
+    # derive the compatibility view from the active config.providers block.
+    # Without this, named OpenAI-compatible providers with /models metadata
+    # that omits context_length fall back to 256K despite config.yaml having
+    # providers.<name>.models.<model>.context_length set.
+    if base_url and model:
         try:
             from hermes_cli.config import get_custom_provider_context_length
             cp_ctx = get_custom_provider_context_length(

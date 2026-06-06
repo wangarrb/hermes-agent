@@ -28,14 +28,25 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # (useful for worktrees where we don't always duplicate the venv).
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  if [ ! -f "$candidate/bin/activate" ] || [ ! -x "$candidate/bin/python" ]; then
+    continue
+  fi
+  candidate_python="$candidate/bin/python"
+  # Some checkouts can have a placeholder/broken `.venv` (for example a
+  # symlinked interpreter without pip/pytest). Skip it instead of failing
+  # before reaching the shared fallback venv.
+  if "$candidate_python" -c "import pytest" 2>/dev/null && (
+    "$candidate_python" -c "import pytest_split" 2>/dev/null ||
+    "$candidate_python" -m pip --version >/dev/null 2>&1
+  ); then
     VENV="$candidate"
     break
   fi
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  echo "error: no usable virtualenv found in $REPO_ROOT/.venv, $REPO_ROOT/venv, or $HOME/.hermes/hermes-agent/venv" >&2
+  echo "       need pytest and either pytest-split or pip to install it" >&2
   exit 1
 fi
 
@@ -70,7 +81,12 @@ unset HERMES_YOLO_MODE HERMES_INTERACTIVE HERMES_QUIET HERMES_TOOL_PROGRESS \
       HERMES_PLATFORM HERMES_INFERENCE_PROVIDER HERMES_MANAGED HERMES_DEV \
       HERMES_CONTAINER HERMES_EPHEMERAL_SYSTEM_PROMPT HERMES_TIMEZONE \
       HERMES_REDACT_SECRETS HERMES_BACKGROUND_NOTIFICATIONS HERMES_EXEC_ASK \
-      HERMES_HOME_MODE 2>/dev/null || true
+      HERMES_HOME_MODE HERMES_KANBAN_ASSIST_CLAIM_DELAYS \
+      HERMES_KANBAN_ASSIST_CLAIM_DELAY_S HERMES_KANBAN_ASSIST_CLAIM_PROFILE_DELAYS \
+      HERMES_KANBAN_BOARD HERMES_KANBAN_CLAIM_ASSIGNEES HERMES_KANBAN_CLAIM_LOCK \
+      HERMES_KANBAN_DB HERMES_KANBAN_DISPATCH_IN_GATEWAY HERMES_KANBAN_HOME \
+      HERMES_KANBAN_PROFILE HERMES_KANBAN_RUN_ID HERMES_KANBAN_TASK \
+      HERMES_KANBAN_WORKSPACE HERMES_KANBAN_WORKSPACES_ROOT 2>/dev/null || true
 
 # Pin deterministic runtime.
 export TZ=UTC

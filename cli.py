@@ -1575,6 +1575,29 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
     return resolved
 
 
+def _print_listener_status(cli_ref: Any) -> None:
+    """Print listener status to the CLI."""
+    from hermes_cli.kanban_listener import listener_status
+    from hermes_cli.colors import Colors as _Colors
+    st = listener_status(cli_ref)
+    if not st.get("active"):
+        _cprint(f"  {_Colors.DIM}Kanban listener: not active{_Colors.RESET}")
+        _cprint(f"  {_Colors.DIM}Start with /listen-kanban [profile|--board <board> --assignee <name>]{_Colors.RESET}")
+        return
+    task = st.get("current_task_id", "")
+    paused = st.get("paused", False)
+    status = f"{'paused' if paused else 'running'}"
+    parts = [
+        f"  {_Colors.ACCENT}Kanban listener{_Colors.RESET}",
+        f"  Board: {st.get('board', '?')}",
+        f"  Assignee: {st.get('assignee', '?')}",
+        f"  Status: {status}",
+    ]
+    if task:
+        parts.append(f"  Current task: {task}")
+    _cprint(" | ".join(parts))
+
+
 def _format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -2289,7 +2312,16 @@ class HermesCLI:
                 self.max_turns = 90
         else:
             self.max_turns = 90
-        
+
+        # Max tokens: config.yaml model.max_tokens > env var > None (use API default)
+        _model_cfg = CLI_CONFIG.get("model", {})
+        _config_max_tokens = None
+        if isinstance(_model_cfg, dict):
+            _config_max_tokens = _model_cfg.get("max_tokens") or _model_cfg.get("max_output_tokens")
+        self.max_tokens = _config_max_tokens or os.getenv("HERMES_MAX_TOKENS") or None
+        if self.max_tokens is not None:
+            self.max_tokens = int(self.max_tokens)
+
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
         self.disabled_toolsets = CLI_CONFIG["agent"].get("disabled_toolsets") or []
@@ -3884,6 +3916,7 @@ class HermesCLI:
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
                 max_iterations=self.max_turns,
+                max_tokens=self.max_tokens,
                 enabled_toolsets=self.enabled_toolsets,
                 disabled_toolsets=self.disabled_toolsets,
                 verbose_logging=self.verbose,
@@ -6816,6 +6849,8 @@ class HermesCLI:
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "mycompress":
+            self._handle_mycompress_command(cmd_original)
         elif canonical == "usage":
             self._show_usage()
         elif canonical == "insights":
@@ -6918,6 +6953,11 @@ class HermesCLI:
             self._handle_voice_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
+        elif canonical == "listen-kanban":
+            self._handle_listen_kanban_command(cmd_original)
+        elif canonical == "reset-kanban":
+            from hermes_cli.kanban_listener import reset_kanban_listener
+            reset_kanban_listener(self)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -7075,6 +7115,7 @@ class HermesCLI:
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
                     max_iterations=self.max_turns,
+                    max_tokens=self.max_tokens,
                     enabled_toolsets=self.enabled_toolsets,
                     quiet_mode=True,
                     verbose_logging=False,
@@ -7851,6 +7892,75 @@ class HermesCLI:
         else:
             _cprint(f"  {_ACCENT}✓ {feature_name} set to {label} (session only){_RST}")
 
+    def _handle_listen_kanban_command(self, cmd_original: str) -> None:
+        """Handle /listen-kanban -- worker-loop in this CLI pane.
+
+        Usage:
+            /listen-kanban                      use current profile + board
+            /listen-kanban planner              set assignee=planner
+            /listen-kanban pause                pause polling
+            /listen-kanban resume               resume polling
+            /listen-kanban --reset              reclaim current task and go idle
+            /listen-kanban stop                 exit listener mode
+            /listen-kanban status               show listener state
+        """
+        from hermes_cli.kanban_listener import (
+            listener_status,
+            pause_listener,
+            reset_kanban_listener,
+            resume_listener,
+            start_listener,
+            stop_listener,
+        )
+        from hermes_cli.colors import Colors as _Colors
+
+        parts = cmd_original.strip().split(None, 1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        # Subcommand routing
+        sub_handlers = {
+            "pause": lambda: pause_listener(self),
+            "resume": lambda: resume_listener(self),
+            "--reset": lambda: reset_kanban_listener(self),
+            "--reset-kanban": lambda: reset_kanban_listener(self),
+            "stop": lambda: stop_listener(self),
+            "status": lambda: _print_listener_status(self),
+        }
+        if arg in sub_handlers:
+            sub_handlers[arg]()
+            return
+
+        # With args: could be a profile name or --flags
+        board_arg = ""
+        assignee_arg = ""
+
+        if arg and not arg.startswith("-"):
+            # Bare argument is the assignee/profile name
+            assignee_arg = arg
+        elif arg:
+            # Parse optional --board and --assignee flags
+            import shlex
+            try:
+                parsed = shlex.split(arg)
+                seen_board = False
+                seen_assignee = False
+                for i, p in enumerate(parsed):
+                    if p == "--board" and i + 1 < len(parsed):
+                        board_arg = parsed[i + 1]
+                        seen_board = True
+                    elif p == "--assignee" and i + 1 < len(parsed):
+                        assignee_arg = parsed[i + 1]
+                        seen_assignee = True
+            except Exception:
+                pass
+
+        # Start the listener
+        start_listener(
+            self,
+            board_arg=board_arg,
+            assignee_arg=assignee_arg,
+        )
+
     def _on_reasoning(self, reasoning_text: str):
         """Callback for intermediate reasoning display during tool-call loops."""
         if not reasoning_text:
@@ -7956,6 +8066,127 @@ class HermesCLI:
 
             except Exception as e:
                 print(f"  ❌ Compression failed: {e}")
+
+    # ── mycompress helper functions ──────────────────────────────
+
+    @staticmethod
+    def _parse_mycompress_args_cli(user_instruction: str):
+        """Parse -n N / --keep-last-rounds N from user instruction.
+        Returns (keep_last_rounds: Optional[int], remainder: str).
+        """
+        import shlex
+        keep_last_rounds = None
+        remainder_parts = []
+        tokens = shlex.split(user_instruction) if user_instruction else []
+        i = 0
+        while i < len(tokens):
+            if tokens[i] in ("-n", "--keep-last-rounds") and i + 1 < len(tokens):
+                try:
+                    keep_last_rounds = int(tokens[i + 1])
+                except ValueError:
+                    raise ValueError(f"Invalid value for {tokens[i]}: {tokens[i+1]}")
+                i += 2
+            else:
+                remainder_parts.append(tokens[i])
+                i += 1
+        return keep_last_rounds, " ".join(remainder_parts)
+
+    @staticmethod
+    def _load_mycompress_focus_topic(user_instruction: str = ""):
+        """Load mycompress skill content as focus_topic for compression.
+        Falls back to user_instruction if skill not found.
+        """
+        try:
+            from pathlib import Path
+            skill_dir = Path.home() / ".hermes" / "skills" / "mycompress"
+            skill_md = skill_dir / "SKILL.md"
+            if skill_md.exists():
+                content = skill_md.read_text()
+                # Extract the key compression guidance sections
+                lines = content.splitlines()
+                focus_lines = []
+                in_section = False
+                for line in lines:
+                    if line.startswith("## ") and any(kw in line.lower() for kw in ["compress", "focus", "priorit", "strategy", "guidance", "policy", "规则", "策略", "优先"]):
+                        in_section = True
+                    elif line.startswith("## ") and in_section:
+                        in_section = False
+                    elif in_section:
+                        focus_lines.append(line)
+                if focus_lines:
+                    return "mycompress skill guidance:\n" + "\n".join(focus_lines)
+                # If no specific section found, use first 50 non-empty lines
+                non_empty = [l for l in lines if l.strip() and not l.startswith("#!")][:50]
+                if non_empty:
+                    return "mycompress skill guidance:\n" + "\n".join(non_empty)
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _find_mycompress_tail_start_cli(conversation_history, keep_last_rounds: int):
+        """Find the index in conversation_history where the last N user turns begin.
+        Returns the start index so we can protect those turns from compression.
+        """
+        user_turn_indices = []
+        for i, msg in enumerate(conversation_history):
+            if msg.get("role") == "user":
+                user_turn_indices.append(i)
+        if not user_turn_indices or keep_last_rounds <= 0:
+            return 0
+        # Keep last N user turns (and everything after them)
+        protect_from = user_turn_indices[-keep_last_rounds] if keep_last_rounds <= len(user_turn_indices) else 0
+        return protect_from
+
+    def _handle_mycompress_command(self, cmd_original: str = ""):
+        """Handle /mycompress command -- skill-backed compression wrapper.
+
+        Supports:
+          -n N / --keep-last-rounds N  protect last N user turns verbatim
+        """
+        import shlex
+        from typing import Optional
+
+        user_instruction = ""
+        if cmd_original:
+            parts = cmd_original.strip().split(None, 1)
+            if len(parts) > 1:
+                user_instruction = parts[1]
+
+        # Parse arguments
+        try:
+            keep_last_rounds, remainder = HermesCLI._parse_mycompress_args_cli(user_instruction)
+        except ValueError as e:
+            print(f"  ❌ {e}")
+            return
+
+        # Load mycompress skill content as focus_topic
+        focus_topic = HermesCLI._load_mycompress_focus_topic(user_instruction)
+        if remainder:
+            focus_topic += f"\n用户补充要求：{remainder}"
+
+        # If keep_last_rounds specified, temporarily adjust protect_last_n
+        original_protect_last_n = None
+        if keep_last_rounds is not None and self.agent:
+            compressor = getattr(self.agent, "context_compressor", None)
+            if compressor:
+                original_protect_last_n = getattr(compressor, "protect_last_n", None)
+            if self.conversation_history:
+                tail_start = HermesCLI._find_mycompress_tail_start_cli(
+                    self.conversation_history, keep_last_rounds
+                )
+                if compressor:
+                    compressor.protect_last_n = len(self.conversation_history) - tail_start
+
+        # Call _manual_compress with computed focus_topic
+        compress_cmd = f"/compress {focus_topic}" if focus_topic else "/compress"
+        self._manual_compress(compress_cmd)
+
+        # Restore original protect_last_n
+        if original_protect_last_n is not None and self.agent:
+            compressor = getattr(self.agent, "context_compressor", None)
+            if compressor:
+                compressor.protect_last_n = original_protect_last_n
 
     def _handle_debug_command(self):
         """Handle /debug — upload debug report + logs and print paste URLs."""
@@ -10329,6 +10560,18 @@ class HermesCLI:
         self._should_exit = False
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
 
+        # Auto-start kanban listener if configured (must happen after queue init)
+        _auto_listen = CLI_CONFIG.get("kanban", {}).get("auto_listen", False)
+        if _auto_listen:
+            _cprint("  [kanban] /listen-kanban auto scheduled (3s delay)")
+            threading.Thread(
+                target=lambda: (
+                    time.sleep(3),
+                    self._pending_input.put("/listen-kanban"),
+                ),
+                daemon=True,
+            ).start()
+
         # Give plugin manager a CLI reference so plugins can inject messages
         from hermes_cli.plugins import get_plugin_manager
         get_plugin_manager()._cli_ref = self
@@ -10812,6 +11055,14 @@ class HermesCLI:
                 return
 
             if self._agent_running and self.agent:
+                # If kanban listener is active, reclaim the task on interrupt
+                listener = getattr(self, "_kanban_listener", None)
+                if listener and listener.current_task_id:
+                    try:
+                        from hermes_cli.kanban_listener import _reclaim_current_immediate
+                        _reclaim_current_immediate(self, listener)
+                    except Exception:
+                        pass
                 if now - self._last_ctrl_c_time < 2.0:
                     print("\n⚡ Force exiting...")
                     self._should_exit = True

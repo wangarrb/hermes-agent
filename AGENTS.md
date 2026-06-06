@@ -721,6 +721,12 @@ kanban task.
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via
   `kanban.dispatch_in_gateway: true`.
+- **Auto-archive:** the dispatcher can also archive old leaf terminal
+  cards via `kanban.auto_archive`. It must only use
+  `kanban_db.auto_archive_tasks()`; do not duplicate the safety logic in
+  callers. The DB helper refuses tasks with non-archived children and
+  requires explicit terminal evidence before archiving blocked tasks, so
+  fixable critic blocks still reach planner/review flows.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).

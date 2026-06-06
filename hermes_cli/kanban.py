@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import shlex
+import socket
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,11 @@ def _fmt_task_line(t: kb.Task) -> str:
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
+        # Back-compat alias for tool/skill examples and shell snippets that
+        # captured `json['task_id']`.  Keep `id` as the canonical field, but
+        # exposing both prevents fragile retry scripts from creating duplicate
+        # cards after a KeyError.
+        "task_id": t.id,
         "title": t.title,
         "body": t.body,
         "assignee": t.assignee,
@@ -386,6 +392,87 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
 
+    # --- next --- (machine-readable visible-worker claim interface)
+    p_next = sub.add_parser(
+        "next",
+        help="Claim the next ready task for a profile and write a worker context file",
+    )
+    p_next.add_argument("--profile", default=os.environ.get("HERMES_PROFILE") or "implementer")
+    p_next.add_argument(
+        "--claim-assignees",
+        default=os.environ.get("HERMES_KANBAN_CLAIM_ASSIGNEES"),
+        help="Comma-separated assignees this worker may claim, in priority order",
+    )
+    p_next.add_argument(
+        "--workspace",
+        default=os.getcwd(),
+        help="Workspace path to record on the claimed task and receive the context file",
+    )
+    p_next.add_argument("--ttl", type=int, default=3600, help="Claim TTL seconds")
+    p_next.add_argument(
+        "--listener-kind",
+        default="machine-worker",
+        help="Claim-lock suffix for diagnostics and reset filtering",
+    )
+    p_next.add_argument(
+        "--owner",
+        default=None,
+        help="Stable pane owner for self-poll current-claim matching (default: --profile)",
+    )
+    p_next.add_argument(
+        "--assist-claim-delay-s",
+        type=float,
+        default=float(os.environ.get("HERMES_KANBAN_ASSIST_CLAIM_DELAY_S") or 0.0),
+        help="Only claim non-primary assignees after their ready task has waited this many seconds",
+    )
+    p_next.add_argument(
+        "--assist-claim-delay-for",
+        action="append",
+        default=None,
+        metavar="ASSIGNEE=SECONDS",
+        help="Override assist delay for one assignee; repeatable",
+    )
+    p_next.add_argument(
+        "--assist-claim-profile-delay",
+        action="append",
+        default=None,
+        metavar="PROFILE:ASSIGNEE=SECONDS",
+        help="Profile-qualified assist delay; repeatable",
+    )
+    p_next.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    p_reset_current = sub.add_parser(
+        "reset-current",
+        help="Reclaim this self-poll worker's current running task",
+    )
+    p_reset_current.add_argument("--profile", default=os.environ.get("HERMES_PROFILE") or "implementer")
+    p_reset_current.add_argument(
+        "--claim-assignees",
+        default=os.environ.get("HERMES_KANBAN_CLAIM_ASSIGNEES"),
+        help="Comma-separated assignees this worker may claim",
+    )
+    p_reset_current.add_argument(
+        "--workspace",
+        default=os.getcwd(),
+        help="Workspace path used by this self-poll worker",
+    )
+    p_reset_current.add_argument(
+        "--listener-kind",
+        default="machine-worker",
+        help="Claim-lock suffix to reset, e.g. codex-self-poll",
+    )
+    p_reset_current.add_argument(
+        "--owner",
+        default=None,
+        help="Stable pane owner to reset (default: --profile)",
+    )
+    p_reset_current.add_argument(
+        "--reason",
+        default="operator reset-current",
+        help="Reason recorded on reclaimed event",
+    )
+    p_reset_current.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
     p_comment.add_argument("task_id")
@@ -435,7 +522,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unblock.add_argument("task_ids", nargs="+")
 
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
-    p_archive.add_argument("task_ids", nargs="+")
+    p_archive.add_argument("task_ids", nargs="*")
+    p_archive.add_argument(
+        "--auto",
+        action="store_true",
+        help="Apply safe retention rules instead of archiving explicit ids",
+    )
+    p_archive.add_argument(
+        "--done-after",
+        default="7d",
+        help="Auto-archive done leaf tasks older than this duration (default: 7d)",
+    )
+    p_archive.add_argument(
+        "--blocked-after",
+        default="14d",
+        help="Auto-archive terminal blocked leaf tasks older than this duration (default: 14d)",
+    )
+    p_archive.add_argument(
+        "--limit",
+        type=int,
+        default=kb.DEFAULT_AUTO_ARCHIVE_LIMIT,
+        help=f"Maximum auto-archive candidates per run (default: {kb.DEFAULT_AUTO_ARCHIVE_LIMIT})",
+    )
+    p_archive.add_argument("--dry-run", action="store_true")
+    p_archive.add_argument("--json", action="store_true")
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -665,6 +775,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
         "claim":    _cmd_claim,
+        "next":     _cmd_next,
+        "reset-current": _cmd_reset_current,
         "comment":  _cmd_comment,
         "complete": _cmd_complete,
         "edit":     _cmd_edit,
@@ -1451,6 +1563,177 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
+def _safe_path_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value or "default"))
+
+
+def _board_flag_for_command(board: str) -> str:
+    return "" if not board or board == kb.DEFAULT_BOARD else f"--board {shlex.quote(board)} "
+
+
+def _write_machine_worker_context(
+    *,
+    workspace: Path,
+    board: str,
+    profile: str,
+    task: kb.Task,
+    context: str,
+) -> Path:
+    safe_board = _safe_path_component(board)
+    safe_profile = _safe_path_component(profile)
+    out_dir = workspace / ".hermes-kanban" / safe_board / safe_profile
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{task.id}.md"
+    board_flag = _board_flag_for_command(board)
+    content = (
+        "# Hermes Kanban Task\n\n"
+        f"Task: {task.id}\n"
+        f"Board: {board or kb.DEFAULT_BOARD}\n"
+        f"Pane/profile: {profile}\n"
+        f"Task assignee/role: {task.assignee or '(unassigned)'}\n"
+        f"Run ID: {task.current_run_id or ''}\n\n"
+        "## Required closeout commands\n"
+        f"- Complete: `hermes kanban {board_flag}complete {task.id} --summary \"...\"`\n"
+        f"- Block: `hermes kanban {board_flag}block {task.id} <reason>`\n"
+        f"- Heartbeat: `hermes kanban {board_flag}heartbeat {task.id} --note \"...\"`\n\n"
+        "## Worker context\n"
+        f"{context}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _next_payload(
+    *,
+    status: str,
+    task: kb.Task,
+    workspace: Path,
+    board: str,
+    profile: str,
+    context: str,
+) -> dict[str, Any]:
+    context_path = _write_machine_worker_context(
+        workspace=workspace,
+        board=board,
+        profile=profile,
+        task=task,
+        context=context,
+    )
+    board_flag = _board_flag_for_command(board)
+    return {
+        "status": status,
+        "task": _task_to_dict(task),
+        "run_id": task.current_run_id,
+        "workspace": str(workspace),
+        "context_path": str(context_path),
+        "complete_command": f"hermes kanban {board_flag}complete {task.id} --summary ...",
+        "block_command": f"hermes kanban {board_flag}block {task.id} <reason>",
+        "heartbeat_command": f"hermes kanban {board_flag}heartbeat {task.id} --note ...",
+    }
+
+
+def _cmd_next(args: argparse.Namespace) -> int:
+    """Machine-readable claim interface for self-polling visible workers."""
+    from hermes_cli import kanban_worker_runtime as worker_runtime
+
+    board = kb.get_current_board()
+    workspace = Path(args.workspace).expanduser().resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    profile = str(args.profile or "implementer")
+    listener_kind = _safe_path_component(args.listener_kind or "machine-worker")
+    owner = _safe_path_component(args.owner or profile)
+    # ``next`` is a short-lived CLI process; putting its PID in claim_lock
+    # makes listener health checks think the worker died as soon as the command
+    # exits.  Self-poll claims are owned by a stable pane owner instead.
+    claimer = f"{socket.gethostname()}:selfpoll:{owner}:{listener_kind}"
+    policy = worker_runtime.claim_policy_from_args(args, default_profile=profile)
+
+    with kb.connect() as conn:
+        task = worker_runtime.find_current_claim(
+            conn,
+            policy=policy,
+            workspace=workspace,
+            listener_kind=listener_kind,
+            owner=owner,
+        )
+        payload_status = "current"
+        if task is not None:
+            task = worker_runtime.heartbeat_current_claim(
+                conn,
+                task=task,
+                ttl_seconds=int(args.ttl),
+            )
+        else:
+            task = worker_runtime.claim_ready_candidate(
+                conn,
+                policy=policy,
+                ttl_seconds=int(args.ttl),
+                claimer=claimer,
+            )
+            payload_status = "claimed"
+        if task is None:
+            payload = {"status": "idle", "task": None}
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False))
+            else:
+                print("No ready task")
+            return 0
+
+        kb.set_workspace_path(conn, task.id, str(workspace))
+        task = kb.get_task(conn, task.id) or task
+        context = kb.build_worker_context(conn, task.id)
+
+    payload = _next_payload(
+        status=payload_status,
+        task=task,
+        workspace=workspace,
+        board=board,
+        profile=profile,
+        context=context,
+    )
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(f"{'Current' if payload_status == 'current' else 'Claimed'} {task.id}")
+        print(f"Context: {payload['context_path']}")
+        print(f"Complete: {payload['complete_command']}")
+        print(f"Block: {payload['block_command']}")
+    return 0
+
+
+def _cmd_reset_current(args: argparse.Namespace) -> int:
+    """Reclaim running self-poll claims for this profile/workspace/kind."""
+    from hermes_cli import kanban_worker_runtime as worker_runtime
+
+    board = kb.get_current_board()
+    workspace = Path(args.workspace).expanduser().resolve()
+    profile = str(args.profile or "implementer")
+    listener_kind = _safe_path_component(args.listener_kind or "machine-worker")
+    owner = _safe_path_component(args.owner or profile)
+    policy = worker_runtime.claim_policy_from_args(args, default_profile=profile)
+    reset_ids = worker_runtime.reset_self_poll_claims(
+        board=board,
+        profile=profile,
+        claim_assignees=policy.claim_assignees,
+        workspace=workspace,
+        listener_kind=listener_kind,
+        owner=owner,
+        reason=args.reason,
+    )
+    payload = {
+        "status": "reset" if reset_ids else "idle",
+        "tasks": reset_ids,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        if reset_ids:
+            print(f"Reset current task(s): {', '.join(reset_ids)}")
+        else:
+            print("No matching current task")
+    return 0
+
+
 def _cmd_comment(args: argparse.Namespace) -> int:
     body = " ".join(args.text).strip()
     author = args.author or _profile_author()
@@ -1583,8 +1866,93 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _auto_archive_dispatch_kwargs() -> dict[str, int | None]:
+    """Return dispatch_once kwargs for config-driven safe auto-archive.
+
+    This is used by one-shot `hermes kanban dispatch`; the gateway watcher has
+    its own boot-time copy because it logs invalid long-lived config once.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    auto_cfg = kanban_cfg.get("auto_archive", {}) if isinstance(kanban_cfg, dict) else {}
+    if not isinstance(auto_cfg, dict) or not bool(auto_cfg.get("enabled", True)):
+        return {}
+
+    def _days_to_seconds(key: str, default_seconds: int) -> int | None:
+        raw = auto_cfg.get(key)
+        if raw is None:
+            return default_seconds
+        try:
+            days = float(raw)
+        except (TypeError, ValueError):
+            return default_seconds
+        if days < 0:
+            return None
+        return int(days * 24 * 3600)
+
+    try:
+        limit = int(auto_cfg.get("max_per_tick", kb.DEFAULT_AUTO_ARCHIVE_LIMIT))
+    except (TypeError, ValueError):
+        limit = kb.DEFAULT_AUTO_ARCHIVE_LIMIT
+
+    return {
+        "auto_archive_done_after_seconds": _days_to_seconds(
+            "done_after_days",
+            kb.DEFAULT_AUTO_ARCHIVE_DONE_AFTER_SECONDS,
+        ),
+        "auto_archive_terminal_blocked_after_seconds": _days_to_seconds(
+            "terminal_blocked_after_days",
+            kb.DEFAULT_AUTO_ARCHIVE_TERMINAL_BLOCKED_AFTER_SECONDS,
+        ),
+        "auto_archive_limit": limit,
+    }
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
+    if getattr(args, "auto", False):
+        if ids:
+            print("kanban: archive --auto does not accept explicit task ids", file=sys.stderr)
+            return 2
+        try:
+            done_after = _parse_duration(getattr(args, "done_after", None))
+            blocked_after = _parse_duration(getattr(args, "blocked_after", None))
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        with kb.connect() as conn:
+            res = kb.auto_archive_tasks(
+                conn,
+                done_after_seconds=done_after,
+                terminal_blocked_after_seconds=blocked_after,
+                limit=getattr(args, "limit", kb.DEFAULT_AUTO_ARCHIVE_LIMIT),
+                dry_run=getattr(args, "dry_run", False),
+            )
+        payload = {
+            "selected": res.selected,
+            "archived": res.archived,
+            "dry_run": res.dry_run,
+            "skipped": res.skipped,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        verb = "would archive" if res.dry_run else "archived"
+        print(
+            f"Auto-archive {verb} {len(res.archived if not res.dry_run else res.selected)} "
+            f"task(s); selected {len(res.selected)}, skipped {len(res.skipped)}"
+        )
+        for tid in (res.selected if res.dry_run else res.archived):
+            print(f"  - {tid}")
+        if res.skipped:
+            for tid, reason in sorted(res.skipped.items()):
+                print(f"  skipped {tid}: {reason}")
+        return 0
     if not ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
@@ -1624,6 +1992,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            **_auto_archive_dispatch_kwargs(),
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -1631,6 +2000,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "crashed": res.crashed,
             "timed_out": res.timed_out,
             "auto_blocked": res.auto_blocked,
+            "auto_archived": res.auto_archived,
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -1650,6 +2020,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Auto-archived:{len(res.auto_archived):2d}")
+    if res.auto_archived:
+        print(f"  {', '.join(res.auto_archived)}")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:

@@ -896,6 +896,28 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             break
                     continue  # Skip this run
 
+            # Skip if cooldown is active after a delivery rate-limit failure.
+            # Prevents hammering the iLink API while it is still throttling.
+            cooldown_minutes = job.get("cooldown_after_delivery_failure")
+            if cooldown_minutes and job.get("last_delivery_error"):
+                is_rate_limit = (
+                    "rate limited" in job["last_delivery_error"].lower()
+                    or "ret=-2" in job["last_delivery_error"]
+                )
+                if is_rate_limit:
+                    last_run_str = job.get("last_run_at")
+                    if last_run_str:
+                        last_run_dt = _ensure_aware(datetime.fromisoformat(last_run_str))
+                        cooldown_delta = timedelta(minutes=int(cooldown_minutes))
+                        if now < last_run_dt + cooldown_delta:
+                            logger.info(
+                                "Job '%s': delivery cooldown active (%.1f min left, last_run=%s) — skipping this tick",
+                                job.get("name", job["id"]),
+                                (last_run_dt + cooldown_delta - now).total_seconds() / 60,
+                                last_run_str,
+                            )
+                            continue
+
             due.append(job)
 
     if needs_save:

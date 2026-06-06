@@ -581,6 +581,20 @@ logger = logging.getLogger(__name__)
 # =========================================================================
 # mycompress helper functions — parse args and compute protect_last_n
 # =========================================================================
+def _load_gateway_mycompress_focus_topic() -> str:
+    """Load mycompress SKILL.md body, stripping YAML frontmatter, for focus_topic."""
+    import re
+
+    from agent.skill_commands import _load_skill_payload
+    loaded = _load_skill_payload("mycompress")
+    if not loaded:
+        return ""
+    content = (loaded[0].get("content") or "").strip()
+    # Strip YAML frontmatter (---...---)
+    body = re.sub(r"^---\n.*?\n---\n*", "", content, count=1, flags=re.DOTALL).strip()
+    return body
+
+
 def _parse_mycompress_args(text: str) -> tuple:
     """Parse /mycompress arguments: -n/--keep-last-rounds and focus topic.
     
@@ -3900,6 +3914,53 @@ class GatewayRunner:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
+        auto_archive_cfg = kanban_cfg.get("auto_archive", {})
+        if not isinstance(auto_archive_cfg, dict):
+            auto_archive_cfg = {}
+        auto_archive_enabled = bool(auto_archive_cfg.get("enabled", True))
+
+        def _archive_days_to_seconds(key: str, default_seconds: int) -> "Optional[int]":
+            raw = auto_archive_cfg.get(key)
+            if raw is None:
+                return default_seconds
+            try:
+                days = float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.auto_archive.%s=%r; using default",
+                    key,
+                    raw,
+                )
+                return default_seconds
+            if days < 0:
+                return None
+            return int(days * 24 * 3600)
+
+        if auto_archive_enabled:
+            auto_archive_done_after = _archive_days_to_seconds(
+                "done_after_days",
+                _kb.DEFAULT_AUTO_ARCHIVE_DONE_AFTER_SECONDS,
+            )
+            auto_archive_blocked_after = _archive_days_to_seconds(
+                "terminal_blocked_after_days",
+                _kb.DEFAULT_AUTO_ARCHIVE_TERMINAL_BLOCKED_AFTER_SECONDS,
+            )
+            try:
+                auto_archive_limit = int(
+                    auto_archive_cfg.get("max_per_tick", _kb.DEFAULT_AUTO_ARCHIVE_LIMIT)
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.auto_archive.max_per_tick=%r; using default %d",
+                    auto_archive_cfg.get("max_per_tick"),
+                    _kb.DEFAULT_AUTO_ARCHIVE_LIMIT,
+                )
+                auto_archive_limit = _kb.DEFAULT_AUTO_ARCHIVE_LIMIT
+        else:
+            auto_archive_done_after = None
+            auto_archive_blocked_after = None
+            auto_archive_limit = 0
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -3933,6 +3994,9 @@ class GatewayRunner:
                     board=slug,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    auto_archive_done_after_seconds=auto_archive_done_after,
+                    auto_archive_terminal_blocked_after_seconds=auto_archive_blocked_after,
+                    auto_archive_limit=auto_archive_limit,
                 )
             except Exception:
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
@@ -4004,11 +4068,16 @@ class GatewayRunner:
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
+                    if res is not None and (
+                        getattr(res, "spawned", None)
+                        or getattr(res, "auto_archived", None)
+                    ):
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent.
                         logger.info(
                             "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d "
+                            "auto_archived=%d",
                             slug,
                             len(res.spawned),
                             res.reclaimed,
@@ -4016,6 +4085,7 @@ class GatewayRunner:
                             len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                            len(res.auto_archived) if hasattr(res.auto_archived, "__len__") else 0,
                         )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
@@ -9880,19 +9950,25 @@ class GatewayRunner:
         """Handle /mycompress command — skill-guided compression wrapper.
         
         Parses -n/--keep-last-rounds argument and optional focus topic,
+        loads the mycompress skill body as the compression focus,
         then delegates to _handle_compress_command with computed parameters.
         """
         # Parse arguments from command text
         args_text = event.get_command_args() or ""
-        keep_last_rounds, focus_topic = _parse_mycompress_args(args_text)
+        keep_last_rounds, user_focus = _parse_mycompress_args(args_text)
         
-        # Create modified event with focus topic if provided
-        if focus_topic:
-            compress_event = dataclasses.replace(event, text=f"/mycompress {focus_topic}")
-            # Override get_command_args to return focus_topic for compress
-            compress_event.get_command_args = lambda: focus_topic
-        else:
-            compress_event = event
+        # Load mycompress skill content directly (raw body, not message-wrapped
+        # invocation which includes activation preamble and full frontmatter).
+        skill_body = _load_gateway_mycompress_focus_topic()
+        focus_parts = [p for p in [skill_body, user_focus] if p]
+        focus_topic = "\n\n".join(focus_parts) if focus_parts else ""
+        
+        # Build compress command text with focus topic
+        compress_text = f"/compress {focus_topic}" if focus_topic else "/compress"
+        
+        # Create modified event with focus topic for compress
+        compress_event = dataclasses.replace(event, text=compress_text)
+        compress_event.get_command_args = lambda: focus_topic
         
         # Delegate to compress handler
         result = await self._handle_compress_command(compress_event)

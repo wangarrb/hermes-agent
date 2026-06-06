@@ -39,6 +39,22 @@ logger = logging.getLogger(__name__)
 # Gating
 # ---------------------------------------------------------------------------
 
+# Module-level flag: set by /listen-kanban to enable kanban tools without
+# the HERMES_KANBAN_TASK env var (which requires an agent rebuild). The
+# check_fn is re-evaluated per tool-call turn in some code paths.
+_listener_active: bool = False  # noqa: F811
+
+def set_listener_active(active: bool) -> None:
+    """Enable kanban tools for /listen-kanban mode (no env var needed)."""
+    global _listener_active
+    _listener_active = active
+    try:
+        from tools.registry import invalidate_check_fn_cache
+        invalidate_check_fn_cache()
+    except Exception:
+        pass
+
+
 def _check_kanban_mode() -> bool:
     """Tools are available when:
 
@@ -52,6 +68,11 @@ def _check_kanban_mode() -> bool:
     toolset enabled see all seven.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+
+    # 3. Running under `/listen-kanban` (CLI pane listener mode).
+    global _listener_active
+    if _listener_active:
         return True
 
     # Check if the current profile has the kanban toolset enabled.

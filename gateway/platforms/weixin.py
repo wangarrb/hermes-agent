@@ -1619,16 +1619,29 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self.name, _safe_id(chat_id),
                             )
                             continue
-                        # Rate limit (-2) — backoff and retry
+                        # Rate limit (-2) — two strategies:
+                        #   1. If we still have a context_token, strip it and retry once
+                        #      (stale session can surface as -2 rather than -14).
+                        #   2. Otherwise backoff exponentially and retry up to max retries.
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE
                             or errcode == RATE_LIMIT_ERRCODE
                         )
                         if is_rate_limited:
                             errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
-                            # Record the error so we raise a descriptive
-                            # RuntimeError (instead of AssertionError) if the
-                            # loop exhausts with the server still rate-limiting.
+                            # Strategy 1: retry without context_token (may resolve stale-session -2)
+                            if context_token and not retried_without_token:
+                                retried_without_token = True
+                                context_token = None
+                                self._token_store._cache.pop(
+                                    self._token_store._key(self._account_id, chat_id), None
+                                )
+                                logger.warning(
+                                    "[%s] rate limit (-2) for %s; retrying without context_token",
+                                    self.name, _safe_id(chat_id),
+                                )
+                                continue
+                            # Strategy 2: backoff and retry
                             last_error = RuntimeError(
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
@@ -2094,6 +2107,7 @@ async def send_weixin_direct(
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
 
+    # Use the live adapter if available and sharing the same event loop
     live_adapter = _LIVE_ADAPTERS.get(resolved_token)
     send_session = getattr(live_adapter, '_send_session', None)
     if (live_adapter is not None and send_session is not None
@@ -2123,6 +2137,10 @@ async def send_weixin_direct(
             "context_token_used": bool(context_token),
         }
 
+    # Standalone path: create a transient adapter and send with rate-limit backoff.
+    standalone_retries = int(extra.get("standalone_send_retries", os.getenv("WEIXIN_STANDALONE_SEND_RETRIES", "4")))
+    standalone_backoff = float(extra.get("standalone_send_backoff_seconds", os.getenv("WEIXIN_STANDALONE_SEND_BACKOFF_SECONDS", "30")))
+
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
         adapter = WeixinAdapter(
             PlatformConfig(
@@ -2144,26 +2162,52 @@ async def send_weixin_direct(
         adapter._cdn_base_url = cdn_base_url
         adapter._token_store = token_store
 
-        last_result: Optional[SendResult] = None
-        cleaned = adapter.format_message(message)
-        if cleaned:
-            last_result = await adapter.send(chat_id, cleaned)
-            if not last_result.success:
-                return {"error": f"Weixin send failed: {last_result.error}"}
+        for attempt in range(standalone_retries + 1):
+            last_result: Optional[SendResult] = None
+            cleaned = adapter.format_message(message)
+            if cleaned:
+                try:
+                    last_result = await adapter.send(chat_id, cleaned)
+                except RuntimeError as exc:
+                    err_str = str(exc)
+                    is_rate_limit = "rate limited" in err_str.lower() or "ret=-2" in err_str
+                    if is_rate_limit and attempt < standalone_retries:
+                        wait = standalone_backoff * (attempt + 1)
+                        logger.warning(
+                            "[Weixin standalone] rate limit for %s (attempt %d/%d); backing off %.1fs before retry",
+                            account_id[-8:], attempt + 1, standalone_retries, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise
+                if not last_result.success:
+                    err_str = last_result.error or ""
+                    is_rate_limit = "rate limited" in err_str.lower() or "ret=-2" in err_str
+                    if is_rate_limit and attempt < standalone_retries:
+                        wait = standalone_backoff * (attempt + 1)
+                        logger.warning(
+                            "[Weixin standalone] rate limit for %s (attempt %d/%d); backing off %.1fs before retry",
+                            account_id[-8:], attempt + 1, standalone_retries, wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    return {"error": f"Weixin send failed: {last_result.error}"}
 
-        for media_path, _is_voice in media_files or []:
-            ext = Path(media_path).suffix.lower()
-            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                last_result = await adapter.send_image_file(chat_id, media_path)
-            else:
-                last_result = await adapter.send_document(chat_id, media_path)
-            if not last_result.success:
-                return {"error": f"Weixin media send failed: {last_result.error}"}
+            for media_path, _is_voice in media_files or []:
+                ext = Path(media_path).suffix.lower()
+                if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+                    last_result = await adapter.send_image_file(chat_id, media_path)
+                else:
+                    last_result = await adapter.send_document(chat_id, media_path)
+                if not last_result.success:
+                    return {"error": f"Weixin media send failed: {last_result.error}"}
 
-        return {
-            "success": True,
-            "platform": "weixin",
-            "chat_id": chat_id,
-            "message_id": last_result.message_id if last_result else None,
-            "context_token_used": bool(context_token),
-        }
+            return {
+                "success": True,
+                "platform": "weixin",
+                "chat_id": chat_id,
+                "message_id": last_result.message_id if last_result else None,
+                "context_token_used": bool(context_token),
+            }
+
+        return {"error": f"Weixin send failed after {standalone_retries} retries: rate limited"}

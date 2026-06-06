@@ -115,6 +115,7 @@ def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)
     assert payload["title"] == "jsontask"
+    assert payload["task_id"] == payload["id"]
     assert payload["assignee"] == "alice"
     assert payload["status"] == "ready"
 
@@ -135,6 +136,248 @@ def test_run_slash_context_output_format(kanban_home):
     assert "tech spec" in ctx
     assert "write an RFC" in ctx
     assert "performance section" in ctx
+
+
+def test_run_slash_next_claims_ready_task_and_writes_context_file(kanban_home, tmp_path):
+    out = kc.run_slash("create 'machine worker task' --assignee planner")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = json.loads(
+        kc.run_slash(f"next --profile planner --workspace {workspace} --json")
+    )
+
+    assert payload["status"] == "claimed"
+    assert payload["task"]["id"] == tid
+    assert payload["task"]["status"] == "running"
+    assert payload["run_id"]
+    assert payload["workspace"] == str(workspace)
+    context_path = Path(payload["context_path"])
+    assert context_path.exists()
+    context = context_path.read_text(encoding="utf-8")
+    assert "machine worker task" in context
+    assert "hermes kanban" in context
+    assert f"complete {tid}" in context
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert task.workspace_path == str(workspace)
+    assert ":selfpoll:planner:machine-worker" in task.claim_lock
+
+
+def test_self_poll_claim_is_not_reclaimed_as_dead_short_lived_next_process(kanban_home, tmp_path):
+    import re
+    from hermes_cli import kanban_listener
+
+    tid = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'survives health check' --assignee planner"),
+    ).group(1)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    payload = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --owner planner-pane-a --json"
+        )
+    )
+    assert payload["task"]["id"] == tid
+
+    kanban_listener._reclaim_orphan_running_tasks("default", "planner")
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert ":selfpoll:planner-pane-a:codex-self-poll" in task.claim_lock
+
+
+def test_run_slash_next_returns_idle_when_no_candidate(kanban_home, tmp_path):
+    payload = json.loads(
+        kc.run_slash(f"next --profile planner --workspace {tmp_path} --json")
+    )
+
+    assert payload == {"status": "idle", "task": None}
+
+
+def test_run_slash_next_returns_current_claim_before_claiming_another(kanban_home, tmp_path):
+    import re
+
+    first = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'first self-poll task' --assignee planner"),
+    ).group(1)
+    second = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'second self-poll task' --assignee planner"),
+    ).group(1)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    first_payload = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+    second_payload = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+
+    assert first_payload["status"] == "claimed"
+    assert first_payload["task"]["id"] == first
+    assert second_payload["status"] == "current"
+    assert second_payload["task"]["id"] == first
+    with kb.connect() as conn:
+        assert kb.get_task(conn, first).status == "running"
+        assert kb.get_task(conn, second).status == "ready"
+        heartbeats = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND kind='heartbeat'",
+            (first,),
+        ).fetchone()["n"]
+    assert heartbeats >= 1
+
+
+def test_run_slash_reset_current_reclaims_self_poll_claim(kanban_home, tmp_path):
+    import re
+
+    tid = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'reset me' --assignee planner"),
+    ).group(1)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    claimed = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+    reset = json.loads(
+        kc.run_slash(
+            f"reset-current --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+
+    assert claimed["task"]["id"] == tid
+    assert reset == {"status": "reset", "tasks": [tid]}
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "ready"
+    assert task.claim_lock is None
+
+
+def test_run_slash_next_does_not_adopt_other_self_poll_owner_current_claim(kanban_home, tmp_path):
+    import re
+
+    tid = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'owned by implementer' --assignee implementer"),
+    ).group(1)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    implementer = json.loads(
+        kc.run_slash(
+            f"next --profile implementer --owner implementer --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+    planner = json.loads(
+        kc.run_slash(
+            f"next --profile planner --owner planner --claim-assignees planner,implementer "
+            f"--workspace {workspace} --listener-kind codex-self-poll --json"
+        )
+    )
+
+    assert implementer["status"] == "claimed"
+    assert implementer["task"]["id"] == tid
+    assert planner == {"status": "idle", "task": None}
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "running"
+    assert ":implementer:codex-self-poll" in task.claim_lock
+
+
+def test_run_slash_next_same_profile_different_owners_claim_independently(kanban_home, tmp_path):
+    import re
+
+    first = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'same profile one' --assignee implementer"),
+    ).group(1)
+    second = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'same profile two' --assignee implementer"),
+    ).group(1)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    owner_a = json.loads(
+        kc.run_slash(
+            f"next --profile implementer --owner implementer-pane-a --workspace {workspace} "
+            "--listener-kind deepseek-self-poll --json"
+        )
+    )
+    owner_b = json.loads(
+        kc.run_slash(
+            f"next --profile implementer --owner implementer-pane-b --workspace {workspace} "
+            "--listener-kind deepseek-self-poll --json"
+        )
+    )
+
+    assert owner_a["status"] == "claimed"
+    assert owner_a["task"]["id"] == first
+    assert owner_b["status"] == "claimed"
+    assert owner_b["task"]["id"] == second
+
+
+def test_run_slash_self_poll_smoke_claim_complete_next(kanban_home, tmp_path):
+    import re
+
+    first = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'smoke one' --assignee planner"),
+    ).group(1)
+    second = re.search(
+        r"(t_[a-f0-9]+)",
+        kc.run_slash("create 'smoke two' --assignee planner"),
+    ).group(1)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    p1 = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+    current = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+    complete_out = kc.run_slash(f"complete {first} --summary done")
+    p2 = json.loads(
+        kc.run_slash(
+            f"next --profile planner --workspace {workspace} "
+            "--listener-kind codex-self-poll --json"
+        )
+    )
+
+    assert p1["status"] == "claimed"
+    assert p1["task"]["id"] == first
+    assert current["status"] == "current"
+    assert current["task"]["id"] == first
+    assert "Completed" in complete_out
+    assert p2["status"] == "claimed"
+    assert p2["task"]["id"] == second
 
 
 def test_run_slash_tenant_filter(kanban_home):
@@ -199,6 +442,8 @@ def test_kanban_in_autocomplete_table():
     subs = SUBCOMMANDS.get("/kanban") or []
     assert "create" in subs
     assert "dispatch" in subs
+    assert "next" in subs
+    assert "reset-current" in subs
 
 
 def test_kanban_not_gateway_only():
