@@ -58,13 +58,35 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
 
     try:
         from tools.skills_tool import SKILLS_DIR, skill_view
+        from agent.skill_utils import get_external_skills_dirs
 
         identifier_path = Path(raw_identifier).expanduser()
         if identifier_path.is_absolute():
+            normalized = None
+            trusted_roots = [SKILLS_DIR]
             try:
-                normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
+                trusted_roots.extend(get_external_skills_dirs())
             except Exception:
-                normalized = raw_identifier
+                pass
+
+            # Prefer the lexical path under a trusted skill root before
+            # resolving symlinks.  Slash-command discovery can legitimately
+            # find a skill via ~/.hermes/skills/<name> where <name> is a
+            # symlink to a checked-out skill elsewhere.  Resolving first turns
+            # that trusted visible path into an arbitrary absolute path that
+            # skill_view() refuses to load.
+            for root in trusted_roots:
+                try:
+                    normalized = str(identifier_path.relative_to(root))
+                    break
+                except ValueError:
+                    continue
+
+            if normalized is None:
+                try:
+                    normalized = str(identifier_path.resolve().relative_to(SKILLS_DIR.resolve()))
+                except Exception:
+                    normalized = raw_identifier
         else:
             normalized = raw_identifier.lstrip("/")
 
@@ -248,7 +270,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands_platform = _resolve_skill_commands_platform()
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
+        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
@@ -261,13 +283,17 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if any(part in ('.git', '.github', '.hub', '.archive') for part in skill_md.parts):
+                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')
                     frontmatter, body = _parse_frontmatter(content)
                     # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):
+                        continue
+                    # Skip skills not relevant to the current runtime env
+                    # (kanban/docker/s6). Offer-time only; explicit load bypasses.
+                    if not skill_matches_environment(frontmatter):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
@@ -282,11 +308,6 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                             if line and not line.startswith('#'):
                                 description = line[:80]
                                 break
-                    # no_slash: true — skill has a custom CommandDef handler,
-                    # skip slash-command registration to avoid duplicate
-                    # autocomplete entries.
-                    if frontmatter.get('no_slash', False):
-                        continue
                     seen_names.add(name)
                     # Normalize to hyphen-separated slug, stripping
                     # non-alnum chars (e.g. +, /) to avoid invalid
@@ -426,29 +447,11 @@ def build_skill_invocation_message(
     commands = get_skill_commands()
     skill_info = commands.get(cmd_key)
     if not skill_info:
-        # Fallback: no_slash skills are not in _skill_commands.
-        # Try loading by skill name directly from disk.
-        skill_name = cmd_key.lstrip("/")
-        loaded = _load_skill_payload(skill_name, task_id=task_id)
-        if not loaded:
-            return None
-        loaded_skill, skill_dir, skill_name = loaded
-        activation_note = (
-            f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
-            "you to follow its instructions. The full skill content is loaded below.]"
-        )
-        return _build_skill_message(
-            loaded_skill,
-            skill_dir,
-            activation_note,
-            user_instruction=user_instruction,
-            runtime_note=runtime_note,
-            session_id=task_id,
-        )
+        return None
 
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
-        return f"[Failed to load skill: {skill_info['name']}]"
+        return None
 
     loaded_skill, skill_dir, skill_name = loaded
 

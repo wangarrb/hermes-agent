@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ def kanban_home(tmp_path, monkeypatch):
     [
         ("scratch",              ("scratch", None)),
         ("worktree",              ("worktree", None)),
+        ("worktree:/tmp/wt",       ("worktree", "/tmp/wt")),
         ("dir:/tmp/work",         ("dir", "/tmp/work")),
     ],
 )
@@ -45,8 +47,12 @@ def test_parse_workspace_flag_expands_user():
     assert path.endswith("/vault")
     assert not path.startswith("~")
 
+    kind, path = kc._parse_workspace_flag("worktree:~/trees/t6-wire")
+    assert kind == "worktree"
+    assert path.endswith("/trees/t6-wire")
+    assert not path.startswith("~")
 
-@pytest.mark.parametrize("bad", ["cloud", "dir:", "", "worktree:/x"])
+@pytest.mark.parametrize("bad", ["cloud", "dir:", "worktree:", ""])
 def test_parse_workspace_flag_rejects(bad):
     if not bad:
         # Empty -> defaults; not an error.
@@ -54,6 +60,17 @@ def test_parse_workspace_flag_rejects(bad):
         return
     with pytest.raises(argparse.ArgumentTypeError):
         kc._parse_workspace_flag(bad)
+
+
+def test_parse_branch_flag_rejects_empty_and_option_like():
+    assert kc._parse_branch_flag(None) is None
+    assert kc._parse_branch_flag(" wt/t6-wire ") == "wt/t6-wire"
+    with pytest.raises(argparse.ArgumentTypeError):
+        kc._parse_branch_flag("   ")
+    with pytest.raises(argparse.ArgumentTypeError):
+        kc._parse_branch_flag("-bad")
+    with pytest.raises(argparse.ArgumentTypeError):
+        kc._parse_branch_flag("bad branch")
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +89,27 @@ def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("list")
     assert "ship feature" in out
     assert "alice" in out
+
+
+def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
+    target = tmp_path / ".worktrees" / "t6-wire"
+    target_arg = target.as_posix()
+    out = kc.run_slash(
+        f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire"
+    )
+    assert "Created" in out
+
+    with kb.connect() as conn:
+        tasks = kb.list_tasks(conn)
+    task = tasks[0]
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == target_arg
+    assert task.branch_name == "wt/t6-wire"
+
+
+def test_run_slash_rejects_branch_without_worktree(kanban_home):
+    out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
+    assert "--branch is only valid with --workspace worktree" in out
 
 
 def test_run_slash_create_with_parent_and_cascade(kanban_home):
@@ -96,9 +134,19 @@ def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
-    kc.run_slash(f"comment {tid} 'source is paywalled'")
+    kc.run_slash(f"comment {tid} 'remember to include performance section'")
     show = kc.run_slash(f"show {tid}")
-    assert "source is paywalled" in show
+    assert "performance section" in show
+
+
+def test_run_slash_comment_max_len_trims_long_body(kanban_home):
+    out = kc.run_slash("create 'x'")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    kc.run_slash(f"comment {tid} '{'x' * 30}' --max-len 20")
+    show = kc.run_slash(f"show {tid}")
+    assert "trimmed to 20 chars by --max-len" in show
+    assert "x" * 30 not in show
 
 
 def test_run_slash_block_unblock_cycle(kanban_home):
@@ -115,7 +163,6 @@ def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)
     assert payload["title"] == "jsontask"
-    assert payload["task_id"] == payload["id"]
     assert payload["assignee"] == "alice"
     assert payload["status"] == "ready"
 
@@ -138,248 +185,6 @@ def test_run_slash_context_output_format(kanban_home):
     assert "performance section" in ctx
 
 
-def test_run_slash_next_claims_ready_task_and_writes_context_file(kanban_home, tmp_path):
-    out = kc.run_slash("create 'machine worker task' --assignee planner")
-    import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
-
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    payload = json.loads(
-        kc.run_slash(f"next --profile planner --workspace {workspace} --json")
-    )
-
-    assert payload["status"] == "claimed"
-    assert payload["task"]["id"] == tid
-    assert payload["task"]["status"] == "running"
-    assert payload["run_id"]
-    assert payload["workspace"] == str(workspace)
-    context_path = Path(payload["context_path"])
-    assert context_path.exists()
-    context = context_path.read_text(encoding="utf-8")
-    assert "machine worker task" in context
-    assert "hermes kanban" in context
-    assert f"complete {tid}" in context
-    with kb.connect() as conn:
-        task = kb.get_task(conn, tid)
-    assert task.status == "running"
-    assert task.workspace_path == str(workspace)
-    assert ":selfpoll:planner:machine-worker" in task.claim_lock
-
-
-def test_self_poll_claim_is_not_reclaimed_as_dead_short_lived_next_process(kanban_home, tmp_path):
-    import re
-    from hermes_cli import kanban_listener
-
-    tid = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'survives health check' --assignee planner"),
-    ).group(1)
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    payload = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --owner planner-pane-a --json"
-        )
-    )
-    assert payload["task"]["id"] == tid
-
-    kanban_listener._reclaim_orphan_running_tasks("default", "planner")
-
-    with kb.connect() as conn:
-        task = kb.get_task(conn, tid)
-    assert task.status == "running"
-    assert ":selfpoll:planner-pane-a:codex-self-poll" in task.claim_lock
-
-
-def test_run_slash_next_returns_idle_when_no_candidate(kanban_home, tmp_path):
-    payload = json.loads(
-        kc.run_slash(f"next --profile planner --workspace {tmp_path} --json")
-    )
-
-    assert payload == {"status": "idle", "task": None}
-
-
-def test_run_slash_next_returns_current_claim_before_claiming_another(kanban_home, tmp_path):
-    import re
-
-    first = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'first self-poll task' --assignee planner"),
-    ).group(1)
-    second = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'second self-poll task' --assignee planner"),
-    ).group(1)
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-
-    first_payload = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-    second_payload = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-
-    assert first_payload["status"] == "claimed"
-    assert first_payload["task"]["id"] == first
-    assert second_payload["status"] == "current"
-    assert second_payload["task"]["id"] == first
-    with kb.connect() as conn:
-        assert kb.get_task(conn, first).status == "running"
-        assert kb.get_task(conn, second).status == "ready"
-        heartbeats = conn.execute(
-            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=? AND kind='heartbeat'",
-            (first,),
-        ).fetchone()["n"]
-    assert heartbeats >= 1
-
-
-def test_run_slash_reset_current_reclaims_self_poll_claim(kanban_home, tmp_path):
-    import re
-
-    tid = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'reset me' --assignee planner"),
-    ).group(1)
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    claimed = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-    reset = json.loads(
-        kc.run_slash(
-            f"reset-current --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-
-    assert claimed["task"]["id"] == tid
-    assert reset == {"status": "reset", "tasks": [tid]}
-    with kb.connect() as conn:
-        task = kb.get_task(conn, tid)
-    assert task.status == "ready"
-    assert task.claim_lock is None
-
-
-def test_run_slash_next_does_not_adopt_other_self_poll_owner_current_claim(kanban_home, tmp_path):
-    import re
-
-    tid = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'owned by implementer' --assignee implementer"),
-    ).group(1)
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-
-    implementer = json.loads(
-        kc.run_slash(
-            f"next --profile implementer --owner implementer --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-    planner = json.loads(
-        kc.run_slash(
-            f"next --profile planner --owner planner --claim-assignees planner,implementer "
-            f"--workspace {workspace} --listener-kind codex-self-poll --json"
-        )
-    )
-
-    assert implementer["status"] == "claimed"
-    assert implementer["task"]["id"] == tid
-    assert planner == {"status": "idle", "task": None}
-    with kb.connect() as conn:
-        task = kb.get_task(conn, tid)
-    assert task.status == "running"
-    assert ":implementer:codex-self-poll" in task.claim_lock
-
-
-def test_run_slash_next_same_profile_different_owners_claim_independently(kanban_home, tmp_path):
-    import re
-
-    first = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'same profile one' --assignee implementer"),
-    ).group(1)
-    second = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'same profile two' --assignee implementer"),
-    ).group(1)
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-
-    owner_a = json.loads(
-        kc.run_slash(
-            f"next --profile implementer --owner implementer-pane-a --workspace {workspace} "
-            "--listener-kind deepseek-self-poll --json"
-        )
-    )
-    owner_b = json.loads(
-        kc.run_slash(
-            f"next --profile implementer --owner implementer-pane-b --workspace {workspace} "
-            "--listener-kind deepseek-self-poll --json"
-        )
-    )
-
-    assert owner_a["status"] == "claimed"
-    assert owner_a["task"]["id"] == first
-    assert owner_b["status"] == "claimed"
-    assert owner_b["task"]["id"] == second
-
-
-def test_run_slash_self_poll_smoke_claim_complete_next(kanban_home, tmp_path):
-    import re
-
-    first = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'smoke one' --assignee planner"),
-    ).group(1)
-    second = re.search(
-        r"(t_[a-f0-9]+)",
-        kc.run_slash("create 'smoke two' --assignee planner"),
-    ).group(1)
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-
-    p1 = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-    current = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-    complete_out = kc.run_slash(f"complete {first} --summary done")
-    p2 = json.loads(
-        kc.run_slash(
-            f"next --profile planner --workspace {workspace} "
-            "--listener-kind codex-self-poll --json"
-        )
-    )
-
-    assert p1["status"] == "claimed"
-    assert p1["task"]["id"] == first
-    assert current["status"] == "current"
-    assert current["task"]["id"] == first
-    assert "Completed" in complete_out
-    assert p2["status"] == "claimed"
-    assert p2["task"]["id"] == second
-
-
 def test_run_slash_tenant_filter(kanban_home):
     kc.run_slash("create 'biz-a task' --tenant biz-a --assignee alice")
     kc.run_slash("create 'biz-b task' --tenant biz-b --assignee alice")
@@ -387,6 +192,48 @@ def test_run_slash_tenant_filter(kanban_home):
     b = kc.run_slash("list --tenant biz-b")
     assert "biz-a task" in a and "biz-b task" not in a
     assert "biz-b task" in b and "biz-a task" not in b
+
+
+def test_run_slash_session_filter(kanban_home):
+    """`hermes kanban list --session <id>` filters by the originating
+    chat session id stamped on tasks created from inside an ACP loop."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        kb.create_task(
+            conn, title="from sess-1 a", assignee="alice", session_id="sess-1"
+        )
+        kb.create_task(
+            conn, title="from sess-1 b", assignee="alice", session_id="sess-1"
+        )
+        kb.create_task(
+            conn, title="from sess-2", assignee="alice", session_id="sess-2"
+        )
+        kb.create_task(conn, title="cli only", assignee="alice")
+    out_1 = kc.run_slash("list --session sess-1")
+    out_2 = kc.run_slash("list --session sess-2")
+    assert "from sess-1 a" in out_1
+    assert "from sess-1 b" in out_1
+    assert "from sess-2" not in out_1
+    assert "cli only" not in out_1
+    assert "from sess-2" in out_2
+    assert "from sess-1 a" not in out_2
+
+
+def test_kanban_list_json_includes_session_id(kanban_home):
+    """JSON output exposes `session_id` so external clients (Scarf, web
+    dashboards) don't need a side query to filter by chat session."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        kb.create_task(
+            conn, title="acp task", assignee="alice", session_id="acp-x"
+        )
+    raw = kc.run_slash("list --json")
+    payload = json.loads(raw)
+    assert any(
+        row.get("title") == "acp task"
+        and row.get("session_id") == "acp-x"
+        for row in payload
+    )
 
 
 def test_run_slash_usage_error_returns_message(kanban_home):
@@ -417,6 +264,52 @@ def test_run_slash_link_unlink(kanban_home):
     assert "Unlinked" in kc.run_slash(f"unlink {ta} {tb}")
 
 
+def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    barrier = threading.Barrier(2)
+    original_init_db = kb.init_db
+
+    def slow_init_db(*args, **kwargs):
+        try:
+            barrier.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        return original_init_db(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "init_db", slow_init_db)
+
+    failures: list[str] = []
+
+    def worker(board: str, title: str) -> None:
+        args = parser.parse_args(["kanban", "--board", board, "create", title])
+        rc = kc.kanban_command(args)
+        if rc != 0:
+            failures.append(f"{board}:{rc}")
+
+    t1 = threading.Thread(target=worker, args=("alpha", "alpha-task"))
+    t2 = threading.Thread(target=worker, args=("beta", "beta-task"))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert failures == []
+
+    with kb.connect_closing(board="alpha") as conn:
+        alpha_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
+    with kb.connect_closing(board="beta") as conn:
+        beta_titles = [row.title for row in kb.list_tasks(conn, limit=100)]
+
+    assert alpha_titles == ["alpha-task"]
+    assert beta_titles == ["beta-task"]
+
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
@@ -442,8 +335,24 @@ def test_kanban_in_autocomplete_table():
     subs = SUBCOMMANDS.get("/kanban") or []
     assert "create" in subs
     assert "dispatch" in subs
-    assert "next" in subs
-    assert "reset-current" in subs
+
+
+def test_kanban_autocomplete_includes_live_subcommands():
+    from prompt_toolkit.document import Document
+
+    from hermes_cli.commands import SlashCommandCompleter
+
+    completer = SlashCommandCompleter()
+    doc = Document("/kanban sp", cursor_position=len("/kanban sp"))
+    texts = {c.text for c in completer.get_completions(doc, None)}
+
+    assert "specify" in texts
+
+    doc = Document("/kanban re", cursor_position=len("/kanban re"))
+    texts = {c.text for c in completer.get_completions(doc, None)}
+
+    assert "reclaim" in texts
+    assert "reassign" in texts
 
 
 def test_kanban_not_gateway_only():
@@ -531,3 +440,129 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     assert "Reassigned" in out, out
     out2 = kc.run_slash(f"show {tid}")
     assert "newbie" in out2
+
+
+# ---------------------------------------------------------------------------
+# /kanban specify — slash surface (same entry point CLI + gateway use)
+# ---------------------------------------------------------------------------
+
+def test_run_slash_specify_end_to_end(kanban_home, monkeypatch):
+    """The /kanban specify slash command routes through run_slash, which
+    both the interactive CLI and every gateway platform use. This test
+    covers both surfaces."""
+    from unittest.mock import MagicMock
+
+    # Create a triage task via the same slash surface.
+    create_out = kc.run_slash("create 'rough idea' --triage")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", create_out)
+    assert m, f"no task id in: {create_out!r}"
+    tid = m.group(1)
+
+    # Mock the auxiliary client so we don't hit a real provider.
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = (
+        '{"title": "Spec: rough idea", "body": "**Goal**\\nShip it."}'
+    )
+    fake_client = MagicMock()
+    fake_client.chat.completions.create = MagicMock(return_value=resp)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda *a, **kw: (fake_client, "test-model"),
+    )
+
+    # Specify via slash.
+    out = kc.run_slash(f"specify {tid}")
+    assert "Specified" in out
+    assert tid in out
+
+    # Task is promoted and retitled.
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status in {"todo", "ready"}
+    assert task.title == "Spec: rough idea"
+
+
+def test_run_slash_specify_help_is_reachable(kanban_home):
+    """`-h`/`--help` on a subcommand returns the actual help text — see
+    issue #21794. argparse writes help to stdout and exits 0; run_slash
+    must capture both streams and treat exit 0 as success, not error."""
+    out = kc.run_slash("specify --help")
+    assert "specify" in out.lower()
+    # Help dump should NOT come back wrapped as a usage error.
+    assert not out.startswith("⚠")
+
+
+# ---------------------------------------------------------------------------
+# /kanban help / no-args / unknown-action UX (issue #21794)
+# ---------------------------------------------------------------------------
+
+def test_run_slash_bare_returns_curated_help(kanban_home):
+    """Bare `/kanban` returns the curated short-help block — not a 5KB
+    argparse usage dump."""
+    out = kc.run_slash("")
+    assert "/kanban" in out
+    assert "list" in out
+    assert "show" in out
+    # Sanity: should be a chat-friendly size, not the raw usage tree.
+    assert len(out) < 2000
+    # Shouldn't surface argparse's usage-error sentinel.
+    assert "usage error" not in out.lower()
+
+
+@pytest.mark.parametrize("alias", ["help", "--help", "-h", "?"])
+def test_run_slash_help_aliases_match_bare(kanban_home, alias):
+    """Every documented help alias produces the same curated output."""
+    bare = kc.run_slash("")
+    out = kc.run_slash(alias)
+    assert out == bare
+
+
+def test_run_slash_subcommand_help_returns_help_text(kanban_home):
+    """`/kanban show -h` returns the actual subcommand help, not a
+    fake `(usage error: 0)` sentinel."""
+    out = kc.run_slash("show -h")
+    assert "task_id" in out
+    assert "/kanban show" in out
+    assert not out.startswith("⚠")
+
+
+def test_run_slash_unknown_action_friendly_error(kanban_home):
+    """Unknown subcommand surfaces a single-line usage error prefixed
+    with our marker — no `(usage error: 2)` wrapping, no doubled
+    `kanban kanban` prog string."""
+    out = kc.run_slash("frobnicate")
+    assert "/kanban" in out
+    assert "frobnicate" in out
+    assert "/kanban-wrap" not in out
+    assert "/kanban kanban" not in out
+    assert "(usage error: " not in out
+
+
+def test_run_slash_missing_required_arg_friendly_error(kanban_home):
+    """Missing positional argument shows the subcommand-scoped usage
+    line, not the top-level kanban tree."""
+    out = kc.run_slash("show")
+    assert "/kanban show" in out
+    assert "task_id" in out
+
+
+def test_run_slash_board_override_restores_prior_env(kanban_home, monkeypatch):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "beta")
+
+    kc.run_slash("--board alpha list")
+
+    assert os.environ.get("HERMES_KANBAN_BOARD") == "beta"
+
+
+def test_run_slash_board_override_does_not_change_boards_show_current(kanban_home):
+    kb.create_board("alpha")
+    kb.create_board("beta")
+    kb.set_current_board("alpha")
+
+    out = kc.run_slash("--board beta boards show")
+
+    assert "Current board: alpha" in out

@@ -101,7 +101,7 @@ def _load_plugin_config() -> dict:
         return {}
     try:
         import yaml
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8-sig") as f:
             all_config = yaml.safe_load(f) or {}
         return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
     except Exception:
@@ -136,11 +136,11 @@ class HolographicMemoryProvider(MemoryProvider):
             import yaml
             existing = {}
             if config_path.exists():
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8-sig") as f:
                     existing = yaml.safe_load(f) or {}
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w") as f:
+            with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(existing, f, default_flow_style=False)
         except Exception:
             pass
@@ -366,7 +366,8 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
-        # Chinese patterns for user preferences, decisions, and learnings
+
+        # Chinese pattern matching (fork customization)
         _CN_PREF_PATTERNS = [
             re.compile(r'我(?:喜欢|偏好|习惯|常用|想要|需要|用)(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'我的(?:默认|常用|偏好|首选)(?:\w+)?是(.+?)(?:[，。！？\n]|$)'),
@@ -426,7 +427,7 @@ class HolographicMemoryProvider(MemoryProvider):
                         pass
                     break
 
-            # Chinese pattern matching
+            # Chinese pattern matching (fork customization)
             for pattern in _CN_PREF_PATTERNS:
                 if pattern.search(content):
                     try:

@@ -6,7 +6,9 @@ turn counting, tags), and schema completeness.
 """
 
 import json
+import os
 import re
+import stat
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -197,9 +199,31 @@ class TestConfig:
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
         assert provider._recall_tags is None
+        # Default recall narrowed to observation-only; world/experience are
+        # aggregate facts that often crowd out concrete-event signal during
+        # auto-recall. Users opt back in via the recall_types config key.
+        assert provider._recall_types == ["observation"]
         assert provider._bank_mission == ""
         assert provider._bank_retain_mission is None
         assert provider._retain_context == "conversation between Hermes Agent and the User"
+
+    def test_recall_types_default_is_observation_only(self, provider):
+        """Auto-recall must filter to observation by default."""
+        assert provider._recall_types == ["observation"]
+
+    def test_recall_types_explicit_list_overrides_default(self, provider_with_config):
+        p = provider_with_config(recall_types=["world", "experience", "observation"])
+        assert p._recall_types == ["world", "experience", "observation"]
+
+    def test_recall_types_csv_string_accepted(self, provider_with_config):
+        """For parity with recall_tags, comma-separated strings work too."""
+        p = provider_with_config(recall_types="observation, world")
+        assert p._recall_types == ["observation", "world"]
+
+    def test_recall_types_empty_list_falls_back_to_default(self, provider_with_config):
+        """An empty list shouldn't disable the filter (would be wider than default)."""
+        p = provider_with_config(recall_types=[])
+        assert p._recall_types == ["observation"]
 
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
@@ -641,91 +665,6 @@ class TestPrefetch:
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
 
-    def test_conditional_auto_recall_skips_non_trigger_query(self, provider_with_config):
-        p = provider_with_config(auto_recall_mode="conditional")
-
-        p.queue_prefetch("好的")
-
-        assert p._prefetch_thread is None
-        p._client.arecall.assert_not_called()
-
-    def test_conditional_auto_recall_triggers_on_history_keyword(self, provider_with_config):
-        p = provider_with_config(auto_recall_mode="conditional")
-
-        p.queue_prefetch("你还记得上次讨论的 Hindsight 配置吗")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-
-        p._client.arecall.assert_called_once()
-        assert "Memory 1" in p._prefetch_result
-
-    def test_recall_cache_hit_reuses_cached_result_without_api_call(self, provider_with_config):
-        p = provider_with_config(
-            auto_recall_mode="conditional",
-            recall_cache_enabled=True,
-            recall_cache_ttl=15552000,
-        )
-        query = "你还记得上次讨论的 Hindsight 配置吗"
-
-        p.queue_prefetch(query)
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-        assert p._client.arecall.call_count == 1
-
-        with p._prefetch_lock:
-            p._prefetch_result = ""
-        p.queue_prefetch(query)
-
-        assert p._prefetch_thread is None
-        assert p._client.arecall.call_count == 1
-        assert "Memory 1" in p._prefetch_result
-
-    def test_recall_cache_expires_old_entries(self, provider_with_config, monkeypatch):
-        p = provider_with_config(
-            auto_recall_mode="conditional",
-            recall_cache_enabled=True,
-            recall_cache_ttl=1,
-        )
-        query = "你还记得上次讨论的 Hindsight 配置吗"
-
-        p.queue_prefetch(query)
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-        assert p._client.arecall.call_count == 1
-
-        original_time = p._time_fn
-        monkeypatch.setattr(p, "_time_fn", lambda: original_time() + 2)
-        with p._prefetch_lock:
-            p._prefetch_result = ""
-        p.queue_prefetch(query)
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-
-        assert p._client.arecall.call_count == 2
-
-    def test_recall_cache_persists_across_provider_instances(self, provider_with_config):
-        query = "你还记得上次讨论的 Hindsight 配置吗"
-        p1 = provider_with_config(
-            auto_recall_mode="conditional",
-            recall_cache_enabled=True,
-            recall_cache_ttl=15552000,
-        )
-        p1.queue_prefetch(query)
-        if p1._prefetch_thread:
-            p1._prefetch_thread.join(timeout=5.0)
-        assert p1._client.arecall.call_count == 1
-
-        p2 = provider_with_config(
-            auto_recall_mode="conditional",
-            recall_cache_enabled=True,
-            recall_cache_ttl=15552000,
-        )
-        p2.queue_prefetch(query)
-
-        assert p2._prefetch_thread is None
-        p2._client.arecall.assert_not_called()
-        assert "Memory 1" in p2._prefetch_result
-
 
 # ---------------------------------------------------------------------------
 # sync_turn tests
@@ -1065,26 +1004,6 @@ class TestSessionSwitchBufferFlush:
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
 
-    def test_no_flush_when_auto_retain_disabled_even_if_buffer_stale(self, provider_with_config):
-        """Recall-only/local modes must not write one last conversation
-        retain during session switch, even if a stale buffer exists from a
-        previous auto-retain-enabled mode.
-        """
-        p = provider_with_config(auto_retain=False, retain_every_n_turns=3, retain_async=False)
-        old_doc = p._document_id
-        p._session_turns = [json.dumps([{"role": "user", "content": "stale turn"}])]
-        p._turn_counter = 1
-        p._turn_index = 1
-
-        p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
-        p._retain_queue.join()
-
-        p._client.aretain_batch.assert_not_called()
-        assert p._session_id == "new-sid"
-        assert p._session_turns == []
-        assert p._turn_counter == 0
-        assert p._document_id != old_doc
-
     def test_prefetch_result_cleared_on_switch(self, provider):
         """Stale recall text from the old session must not leak into the
         next session's first prefetch read."""
@@ -1099,7 +1018,6 @@ class TestSessionSwitchBufferFlush:
         old session to settle before clearing _prefetch_result, otherwise
         the thread can race and re-populate the field after the clear."""
         import threading
-        import time as _time
 
         gate = threading.Event()
         finished = threading.Event()
@@ -1654,3 +1572,13 @@ class TestShutdown:
         assert embedded._client is None
         assert provider._client is None
 
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits not enforced on Windows")
+def test_save_config_sets_owner_only_permissions(tmp_path):
+    """hindsight/config.json must be written with 0o600 so API key is not world-readable."""
+    provider = HindsightMemoryProvider()
+    provider.save_config({"api_key": "hd-test-key"}, str(tmp_path))
+    config_file = tmp_path / "hindsight" / "config.json"
+    assert config_file.exists()
+    mode = stat.S_IMODE(config_file.stat().st_mode)
+    assert mode == 0o600, f"Expected 0o600 (owner-only), got {oct(mode)}"

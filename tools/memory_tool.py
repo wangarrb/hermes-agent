@@ -26,10 +26,9 @@ Design:
 import json
 import logging
 import os
-import re
 import tempfile
+import time
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -63,46 +62,52 @@ ENTRY_DELIMITER = "\n§\n"
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
+#
+# Patterns live in ``tools/threat_patterns.py`` — the single source of truth
+# shared with the context-file scanner and the tool-result delimiter system.
+# Memory uses the "strict" scope (broadest pattern set) because:
+#  - memory entries are user-curated; the user can rewrite a flagged entry
+#  - memory enters the system prompt as a FROZEN snapshot, so a poisoned
+#    entry persists for the entire session and across sessions until
+#    explicitly removed.
 # ---------------------------------------------------------------------------
 
-_MEMORY_THREAT_PATTERNS = [
-    # Prompt injection
-    (r'ignore\s+(previous|all|above|prior)\s+instructions', "prompt_injection"),
-    (r'you\s+are\s+now\s+', "role_hijack"),
-    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
-    (r'system\s+prompt\s+override', "sys_prompt_override"),
-    (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
-    (r'act\s+as\s+(if|though)\s+you\s+(have\s+no|don\'t\s+have)\s+(restrictions|limits|rules)', "bypass_restrictions"),
-    # Exfiltration via curl/wget with secrets
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
-    (r'wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_wget"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)', "read_secrets"),
-    # Persistence via shell rc
-    (r'authorized_keys', "ssh_backdoor"),
-    (r'\$HOME/\.ssh|\~/\.ssh', "ssh_access"),
-    (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env"),
-]
-
-# Subset of invisible chars for injection detection
-_INVISIBLE_CHARS = {
-    '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
-    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
-}
+from tools.threat_patterns import first_threat_message as _first_threat_message
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
-    # Check invisible unicode
-    for char in _INVISIBLE_CHARS:
-        if char in content:
-            return f"Blocked: content contains invisible unicode character U+{ord(char):04X} (possible injection)."
+    return _first_threat_message(content, scope="strict")
 
-    # Check threat patterns
-    for pattern, pid in _MEMORY_THREAT_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE):
-            return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
 
-    return None
+def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
+    """Build the error dict returned when external drift is detected.
+
+    The on-disk memory file contains content that wouldn't round-trip
+    through the tool's parser/serializer — flushing would discard the
+    appended/edited content from a patch tool, shell append, manual edit,
+    or sister-session write. We refuse the mutation, point the operator at
+    the .bak.<ts> snapshot we took, and tell them what to do next.
+    """
+    return {
+        "success": False,
+        "error": (
+            f"Refusing to write {path.name}: file on disk has content that "
+            f"wouldn't round-trip through the memory tool (likely added by "
+            f"the patch tool, a shell append, a manual edit, or a "
+            f"concurrent session). A snapshot was saved to {bak_path}. "
+            f"Resolve the drift first — either rewrite the file as a clean "
+            f"§-delimited list of entries, or move the extra content out — "
+            f"then retry. This guard exists to prevent silent data loss "
+            f"(issue #26045)."
+        ),
+        "drift_backup": bak_path,
+        "remediation": (
+            "Open the .bak file, integrate the missing entries into the "
+            "memory tool one at a time via memory(action=add, content=...), "
+            "then remove or rewrite the original file to a clean state."
+        ),
+    }
 
 
 class MemoryStore:
@@ -125,7 +130,23 @@ class MemoryStore:
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
+        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+
+        The frozen snapshot is what enters the system prompt. We scan each
+        entry for injection/promptware patterns at snapshot-build time —
+        ANY hit replaces the entry text in the snapshot with a placeholder
+        like ``[BLOCKED: …]``, so a poisoned-on-disk memory file (supply
+        chain, compromised tool, sister-session write) cannot inject into
+        the system prompt.
+
+        The live ``memory_entries`` / ``user_entries`` lists keep the
+        original text so the user can still SEE poisoned entries via
+        ``memory(action=read)`` and remove them — silently dropping them
+        would hide the attack from the user.
+
+        Scanning is deterministic from disk bytes, so the snapshot remains
+        stable for the entire session (prefix-cache invariant holds).
+        """
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -136,11 +157,53 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
+        # Sanitize entries for the system-prompt snapshot only.  Live state
+        # (memory_entries / user_entries) keeps the raw text so the user
+        # can see + remove poisoned entries via the memory tool.
+        sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
+        sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
-            "memory": self._render_block("memory", self.memory_entries),
-            "user": self._render_block("user", self.user_entries),
+            "memory": self._render_block("memory", sanitized_memory),
+            "user": self._render_block("user", sanitized_user),
         }
+
+    @staticmethod
+    def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
+        """Return ``entries`` with any threat-matching entry replaced by a placeholder.
+
+        Each entry is scanned with the shared threat-pattern library at the
+        ``"strict"`` scope (same as memory writes).  On match, the entry is
+        replaced in the returned list with ``"[BLOCKED: <filename> entry
+        contained threat pattern: <ids>. Removed from system prompt.]"`` —
+        the placeholder enters the snapshot, the original entry stays in
+        live state for the user to inspect and delete.
+
+        Empty or already-block-marker entries pass through unchanged.
+        """
+        from tools.threat_patterns import scan_for_threats
+
+        sanitized: List[str] = []
+        for entry in entries:
+            if not entry or entry.startswith("[BLOCKED:"):
+                sanitized.append(entry)
+                continue
+            findings = scan_for_threats(entry, scope="strict")
+            if findings:
+                logger.warning(
+                    "Memory entry from %s blocked at load time: %s",
+                    filename, ", ".join(findings),
+                )
+                sanitized.append(
+                    f"[BLOCKED: {filename} entry contained threat pattern(s): "
+                    f"{', '.join(findings)}. Removed from system prompt; "
+                    f"use memory(action=read) to inspect and memory(action=remove) "
+                    f"to delete the original.]"
+                )
+            else:
+                sanitized.append(entry)
+        return sanitized
 
     @staticmethod
     @contextmanager
@@ -157,10 +220,7 @@ class MemoryStore:
             yield
             return
 
-        if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
-            lock_path.write_text(" ", encoding="utf-8")
-
-        fd = open(lock_path, "r+" if msvcrt else "a+")
+        fd = open(lock_path, "a+", encoding="utf-8")
         try:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -170,7 +230,10 @@ class MemoryStore:
             yield
         finally:
             if fcntl:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
             elif msvcrt:
                 try:
                     fd.seek(0)
@@ -186,100 +249,28 @@ class MemoryStore:
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
-    def _reload_target(self, target: str):
+    def _reload_target(self, target: str) -> Optional[str]:
         """Re-read entries from disk into in-memory state.
 
         Called under file lock to get the latest state before mutating.
+        Returns the backup path if external drift was detected (the on-disk
+        file contains content that wouldn't round-trip through our
+        parser/serializer, OR an entry larger than the store's char limit).
+        When drift is detected the caller must abort the mutation —
+        flushing would discard the un-roundtrippable content.
+        Returns None on clean reload.
         """
-        fresh = self._read_file(self._path_for(target))
+        path = self._path_for(target)
+        bak = self._detect_external_drift(target)
+        fresh = self._read_file(path)
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
+        return bak
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
-
-    def _backup_failed_write(
-        self,
-        target: str,
-        reason: str,
-        content: str,
-        error: str,
-    ) -> Dict[str, str]:
-        """Best-effort backup for rejected memory/user writes.
-
-        Memory entries are injected into future prompts, so rejected content must
-        not be silently lost: store it under memories/failed-backups for manual
-        review. The backup directory is intentionally outside MEMORY.md/USER.md,
-        so even injection-blocked content is not auto-injected.
-        """
-        try:
-            backup_dir = get_memory_dir() / "failed-backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-
-            safe_reason = re.sub(r"[^a-zA-Z0-9_.-]+", "_", reason).strip("_") or "unknown"
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            stem = f"{timestamp}-{target}-{safe_reason}"
-            path = backup_dir / f"{stem}.md"
-            counter = 2
-            while path.exists():
-                path = backup_dir / f"{stem}-{counter}.md"
-                counter += 1
-
-            iso_ts = datetime.now().isoformat(timespec="seconds")
-            body = (
-                "# Failed memory write backup\n\n"
-                f"timestamp: {iso_ts}\n"
-                f"target: {target}\n"
-                f"reason: {safe_reason}\n"
-                f"error: {error}\n\n"
-                "## Original content\n\n"
-                f"{content}\n"
-            )
-            path.write_text(body, encoding="utf-8")
-            self._append_backup_index(backup_dir, path.name, iso_ts, target, safe_reason)
-            return {"backup_path": str(path)}
-        except Exception as exc:  # best-effort only; preserve the original error
-            logger.warning("Failed to back up rejected memory write: %s", exc)
-            return {"backup_error": str(exc)}
-
-    @staticmethod
-    def _append_backup_index(
-        backup_dir: Path,
-        filename: str,
-        timestamp: str,
-        target: str,
-        reason: str,
-    ) -> None:
-        """Append a compact row to failed-backups/INDEX.md."""
-        index_path = backup_dir / "INDEX.md"
-        if index_path.exists():
-            text = index_path.read_text(encoding="utf-8")
-        else:
-            text = (
-                "# Memory/User 写入失败备份索引\n\n"
-                "此目录存放 MEMORY.md / USER.md 写入失败时的备份内容。\n\n"
-                "## 索引\n"
-                "| 文件 | 时间 | Target | 原因 | 状态 |\n"
-                "|------|------|--------|------|------|\n"
-            )
-
-        row = f"| `{filename}` | {timestamp} | {target} | {reason} | pending |"
-
-        # Replace the original placeholder row on the first real backup, then
-        # append subsequent rows. Avoid duplicating the same row if a caller is
-        # retried after a partial write.
-        placeholder = "| （自动更新） | | | | |"
-        if row in text:
-            return
-        if placeholder in text:
-            text = text.replace(placeholder, row)
-        else:
-            if not text.endswith("\n"):
-                text += "\n"
-            text += row + "\n"
-        index_path.write_text(text, encoding="utf-8")
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -312,13 +303,16 @@ class MemoryStore:
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
-            result = {"success": False, "error": scan_error}
-            result.update(self._backup_failed_write(target, "injection", content, scan_error))
-            return result
+            return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
-            # Re-read from disk under lock to pick up writes from other sessions
-            self._reload_target(target)
+            # Re-read from disk under lock to pick up writes from other sessions.
+            # If external drift was detected, the file was backed up to .bak.<ts>
+            # — refuse the mutation so we don't clobber the un-roundtrippable
+            # content the patch tool / shell append / sister session wrote.
+            bak = self._reload_target(target)
+            if bak:
+                return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
             limit = self._char_limit(target)
@@ -333,7 +327,7 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
-                result = {
+                return {
                     "success": False,
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
@@ -343,25 +337,10 @@ class MemoryStore:
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
                 }
-                result.update(
-                    self._backup_failed_write(
-                        target,
-                        "char_limit",
-                        content,
-                        result["error"],
-                    )
-                )
-                return result
 
             entries.append(content)
             self._set_entries(target, entries)
-            try:
-                self.save_to_disk(target)
-            except RuntimeError as exc:
-                self._set_entries(target, entries[:-1])
-                result = {"success": False, "error": str(exc)}
-                result.update(self._backup_failed_write(target, "io_error", content, str(exc)))
-                return result
+            self.save_to_disk(target)
 
         return self._success_response(target, "Entry added.")
 
@@ -377,12 +356,12 @@ class MemoryStore:
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
         if scan_error:
-            result = {"success": False, "error": scan_error}
-            result.update(self._backup_failed_write(target, "injection", new_content, scan_error))
-            return result
+            return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
-            self._reload_target(target)
+            bak = self._reload_target(target)
+            if bak:
+                return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -392,7 +371,7 @@ class MemoryStore:
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), operate on the first one
-                unique_texts = set(e for _, e in matches)
+                unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
                     return {
@@ -411,33 +390,17 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
-                result = {
+                return {
                     "success": False,
                     "error": (
                         f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
                         f"Shorten the new content or remove other entries first."
                     ),
                 }
-                result.update(
-                    self._backup_failed_write(
-                        target,
-                        "char_limit",
-                        new_content,
-                        result["error"],
-                    )
-                )
-                return result
 
             entries[idx] = new_content
             self._set_entries(target, entries)
-            try:
-                self.save_to_disk(target)
-            except RuntimeError as exc:
-                entries[idx] = matches[0][1]
-                self._set_entries(target, entries)
-                result = {"success": False, "error": str(exc)}
-                result.update(self._backup_failed_write(target, "io_error", new_content, str(exc)))
-                return result
+            self.save_to_disk(target)
 
         return self._success_response(target, "Entry replaced.")
 
@@ -448,7 +411,9 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
 
         with self._file_lock(self._path_for(target)):
-            self._reload_target(target)
+            bak = self._reload_target(target)
+            if bak:
+                return _drift_error(self._path_for(target), bak)
 
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -458,7 +423,7 @@ class MemoryStore:
 
             if len(matches) > 1:
                 # If all matches are identical (exact duplicates), remove the first one
-                unique_texts = set(e for _, e in matches)
+                unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
                     return {
@@ -547,6 +512,61 @@ class MemoryStore:
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
         return [e for e in entries if e]
 
+    def _detect_external_drift(self, target: str) -> Optional[str]:
+        """Return a backup-path string if on-disk content shows external drift.
+
+        The memory file is supposed to be a list of small entries the tool
+        wrote, joined by §. Detect drift via two signals:
+
+        1. Round-trip mismatch — re-parsing and re-serializing the file
+           doesn't produce identical bytes (rare; would catch oddly-encoded
+           delimiters).
+        2. Entry-size overflow — any single parsed entry exceeds the
+           store's whole-file char limit. The tool budgets the ENTIRE store
+           against that limit; no single tool-written entry can exceed it.
+           When we see one entry larger than the limit, an external writer
+           (patch tool, shell append, manual edit, sister session) appended
+           free-form content into what the tool will treat as one entry.
+           Flushing would then truncate that entry to the model's new
+           content, discarding the appended bytes — issue #26045.
+
+        Returns the absolute path of the .bak file when drift was found and
+        backed up; returns None when the file looks tool-shaped.
+
+        Note: this is an INSTANCE method (not static) because we need the
+        per-target char_limit for signal #2.
+        """
+        path = self._path_for(target)
+        if not path.exists():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, IOError):
+            return None
+        if not raw.strip():
+            return None
+
+        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+        roundtrip = ENTRY_DELIMITER.join(parsed)
+
+        char_limit = self._char_limit(target)
+        max_entry_len = max((len(e) for e in parsed), default=0)
+
+        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        if not drift_detected:
+            return None
+
+        # Drift confirmed — snapshot the file so the operator can recover
+        # whatever the external writer added, then return the .bak path so
+        # the caller can refuse the mutation.
+        ts = int(time.time())
+        bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        try:
+            bak_path.write_text(raw, encoding="utf-8")
+        except (OSError, IOError):
+            return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
+        return str(bak_path)
+
     @staticmethod
     def _write_file(path: Path, entries: List[str]):
         """Write entries to a memory file using atomic temp-file + rename.
@@ -594,7 +614,7 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in ("memory", "user"):
+    if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
     if action == "add":

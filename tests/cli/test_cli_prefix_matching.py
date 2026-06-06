@@ -11,7 +11,6 @@ def _make_cli():
     cli_obj.conversation_history = []
     cli_obj.session_id = None
     cli_obj._pending_input = MagicMock()
-    cli_obj._kanban_listener = None
     return cli_obj
 
 
