@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh
-agent_env_disable_proxy
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 exec python3 "$SCRIPT_DIR/codex_kanban_listener.py" "$@"

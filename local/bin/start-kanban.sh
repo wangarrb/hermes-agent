@@ -6,10 +6,6 @@
 
 set -euo pipefail
 
-AGENT_ENV_SH="/home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh"
-source "$AGENT_ENV_SH"
-agent_env_disable_proxy
-
 # 坑63: Hermes profile 下 HOME 指向虚拟目录
 export REAL_HOME="/home/wyr"
 # 不要 export HOME=/home/wyr — zellij pane 启动的 hermes -p 需要 profile 的虚拟 HOME
@@ -107,10 +103,6 @@ agent_is_used() {
 
 shell_quote() {
     printf '%q' "$1"
-}
-
-agent_env_prefix() {
-    printf 'source %s && agent_env_disable_proxy' "$(shell_quote "$AGENT_ENV_SH")"
 }
 
 kdl_string() {
@@ -682,13 +674,12 @@ append_assist_delay_args() {
 build_role_command() {
     local role="$1"
     local agent="$2"
-    local board_q role_q workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item env_prefix
+    local board_q role_q workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item
     board_q="$(shell_quote "$BOARD")"
     role_q="$(shell_quote "$role")"
     workspace_q="$(shell_quote "$WORKSPACE")"
     codex_q="$(shell_quote "$CODEX_INTERACTIVE")"
     provider_q="$(shell_quote "$DEEPSEEK_PROVIDER")"
-    env_prefix="$(agent_env_prefix)"
 
     # Stagger delay: 各 pane 启动间隔 0.5s，避免同时抢 DB 导致 race
     local stagger_s=0
@@ -730,10 +721,10 @@ build_role_command() {
 
     case "$agent" in
         hermes)
-            printf 'sleep %s && %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s%s hermes -p %s --continue' "$stagger_s" "$env_prefix" "$workspace_q" "$board_q" "$claim_q" "$assist_delay_env" "$role_q"
+            printf 'sleep %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s%s hermes -p %s --continue' "$stagger_s" "$workspace_q" "$board_q" "$claim_q" "$assist_delay_env" "$role_q"
             ;;
         codex)
-            cmd="${env_prefix} && cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$CODEX_MODEL" ]; then
                 model_q="$(shell_quote "$CODEX_MODEL")"
@@ -750,7 +741,7 @@ build_role_command() {
             # 用 codewhale-kanban-interactive
             local cw_q
             cw_q="$(shell_quote "$CODEWHALE_INTERACTIVE")"
-            cmd="${env_prefix} && cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CODEWHALE_KANBAN_WORKSPACE=${workspace_q} DEEPSEEK_KANBAN_WORKSPACE=${workspace_q} ${cw_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CODEWHALE_KANBAN_WORKSPACE=${workspace_q} DEEPSEEK_KANBAN_WORKSPACE=${workspace_q} ${cw_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$DEEPSEEK_MODEL" ]; then
                 model_q="$(shell_quote "$DEEPSEEK_MODEL")"
@@ -770,7 +761,7 @@ build_role_command() {
             ;;
         deepseek-reasonix)
             reasonix_q="$(shell_quote "$REASONIX_INTERACTIVE")"
-            cmd="${env_prefix} && cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} ${reasonix_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} ${reasonix_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$DEEPSEEK_MODEL" ]; then
                 model_q="$(shell_quote "$DEEPSEEK_MODEL")"

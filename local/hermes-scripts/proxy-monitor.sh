@@ -984,20 +984,14 @@ if [ "$MODE" = "off" ]; then
   log "Hermes Proxy Monitor v4 — --off 模式"
   log "关闭代理"
   log "=========================================="
-  # 在 .env 中将代理设为空（覆盖或追加）
-  if grep -q '^https_proxy=' "$ENV_FILE" 2>/dev/null; then
-    sed -i 's|^https_proxy=.*|https_proxy=|' "$ENV_FILE"
-  else
-    echo 'https_proxy=' >> "$ENV_FILE"
-  fi
-  if grep -q '^http_proxy=' "$ENV_FILE" 2>/dev/null; then
-    sed -i 's|^http_proxy=.*|http_proxy=|' "$ENV_FILE"
-  else
-    echo 'http_proxy=' >> "$ENV_FILE"
-  fi
-  if grep -q '^ALL_PROXY=' "$ENV_FILE" 2>/dev/null; then
-    sed -i 's|^ALL_PROXY=.*|ALL_PROXY=|' "$ENV_FILE"
-  fi
+  # 在 .env 中将所有常见代理变量设为空（覆盖或追加）
+  for key in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+      sed -i "s|^${key}=.*|${key}=|" "$ENV_FILE"
+    else
+      echo "${key}=" >> "$ENV_FILE"
+    fi
+  done
   log "✓ 已清除 .env 代理设置"
   # 停掉 Clash
   if clash_is_alive; then
@@ -1016,7 +1010,7 @@ if [ "$MODE" = "off" ]; then
     log "  Clash 未在运行，无需停止"
   fi
   # 输出命令供调用者 eval：unset 代理，但保留 no_proxy（直连域名仍然不走代理）
-  echo "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY 2>/dev/null; export no_proxy=$NO_PROXY_BASE,$DIRECT_DOMAINS NO_PROXY=$NO_PROXY_BASE,$DIRECT_DOMAINS"
+  echo "unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY 2>/dev/null; export no_proxy=$NO_PROXY_BASE,$DIRECT_DOMAINS NO_PROXY=$NO_PROXY_BASE,$DIRECT_DOMAINS"
   # 关闭系统代理（GNOME）
   if command -v gsettings >/dev/null 2>&1; then
     gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null
