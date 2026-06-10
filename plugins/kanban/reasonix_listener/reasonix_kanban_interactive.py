@@ -30,11 +30,8 @@ if str(HERMES_REPO) not in sys.path:
     sys.path.insert(0, str(HERMES_REPO))
 
 from hermes_cli import kanban_db as kb  # noqa: E402
-from hermes_cli.agent_proxy_env import clear_agent_proxy_env, without_agent_proxy_env  # noqa: E402
 from hermes_cli import kanban_listener_policy as listener_policy  # noqa: E402
 from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
-
-clear_agent_proxy_env()
 
 _STOP = False
 
@@ -1764,7 +1761,7 @@ def launcher_main(args: argparse.Namespace) -> int:
     )
 
     def build_env() -> dict[str, str]:
-        env = without_agent_proxy_env()
+        env = os.environ.copy()
         env.update(
             {
                 "HERMES_KANBAN_BOARD": board,

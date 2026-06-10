@@ -27,11 +27,8 @@ if str(HERMES_REPO) not in sys.path:
     sys.path.insert(0, str(HERMES_REPO))
 
 from hermes_cli import kanban_db as kb  # noqa: E402
-from hermes_cli.agent_proxy_env import clear_agent_proxy_env, without_agent_proxy_env  # noqa: E402
 from hermes_cli import kanban_listener_policy as listener_policy  # noqa: E402
 from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
-
-clear_agent_proxy_env()
 
 
 class ListenerStopped(Exception):
@@ -356,7 +353,7 @@ def run_deepseek_for_task(
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
 
-    env = without_agent_proxy_env()
+    env = os.environ.copy()
     env.update({
         "HERMES_KANBAN_TASK": task.id,
         "HERMES_KANBAN_BOARD": board,
@@ -486,7 +483,7 @@ def handle_one_task(args: argparse.Namespace) -> bool:
             if args.model:
                 cmd.extend(["--model", args.model])
             cmd.extend(args.deepseek_arg or [])
-            env = without_agent_proxy_env()
+            env = os.environ.copy()
             env.update({"HERMES_KANBAN_BOARD": board, "HERMES_KANBAN_PROFILE": profile})
             args._tui_proc = subprocess.Popen(cmd, cwd=str(session_workspace), env=env)
             log(f"inject TUI {'restarted' if proc else 'launched'}")
