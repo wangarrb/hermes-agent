@@ -1,0 +1,20 @@
+layout {
+    pane split_direction="horizontal" {
+        pane split_direction="vertical" {
+            pane command="bash" cwd="/home/wyr/workspace" {
+                args "-c" "hermes -p coordinator --continue chat"
+            }
+            pane command="bash" cwd="/home/wyr/workspace" {
+                args "-c" "codex resume --last || codex"
+            }
+        }
+        pane split_direction="vertical" {
+            pane command="bash" cwd="/home/wyr/workspace" {
+                args "-c" "hermes -p implementer --continue chat"
+            }
+            pane command="bash" cwd="/home/wyr/workspace" {
+                args "-c" "hermes -p critic --continue chat"
+            }
+        }
+    }
+}

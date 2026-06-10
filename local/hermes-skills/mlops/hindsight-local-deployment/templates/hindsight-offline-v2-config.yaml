@@ -1,0 +1,68 @@
+paths:
+  hermes_home: ~/.hermes
+  script_dir: ~/.hermes/scripts
+  offline_root: ~/.hermes/hindsight/offline_reflect
+  cards_root: ~/.hermes/hindsight/offline_reflect/v2_cards
+  eval_root: ~/.hermes/hindsight/eval
+
+hindsight:
+  api_url: http://127.0.0.1:8888
+  bank_id: hermes
+  db_dsn: dbname=hindsight user=hindsight host=/tmp port=5432
+  canonical_prefix: hermes-offline-canonical::
+  local_card_prefix: offline-v2-card::
+  local_observation_prefix: offline-v2-observation::
+
+provider_profiles:
+  local_fallback:
+    llm_provider: ollama
+    llm_model: qwen3.5:9b-local
+    llm_base_url: http://127.0.0.1:11434/v1
+    llm_api_key_env: OLLAMA_API_KEY
+  paid_quality:
+    llm_provider: openai
+    llm_model: MiniMax-M2.7
+    llm_base_url: https://api.minimaxi.com/v1
+    llm_api_key_env: MINIMAX_API_KEY
+  custom:
+    llm_provider: custom
+    llm_model: <model>
+    llm_base_url: <url>
+    llm_api_key_env: <ENV_NAME>
+
+taxonomy:
+  observation_types:
+    - user_preference
+    - project_decision
+    - technical_lesson
+    - tooling_lesson
+    - risk
+    - open_question
+    - method_comparison
+    - system_rule
+  type_diversity_order:
+    - user_preference
+    - project_decision
+    - technical_lesson
+    - tooling_lesson
+    - risk
+    - open_question
+    - method_comparison
+    - system_rule
+
+benchmarks:
+  generic: ~/.hermes/hindsight/eval/benchmark_queries.jsonl
+  local: ~/.hermes/hindsight/eval/benchmark_queries.local.jsonl
+
+quality_gate:
+  min_pairs: 2
+  min_term_recall_delta: 0.001
+  min_layer_hit_delta: 0
+  max_case_term_regressions: 2
+  case_regression_tolerance: 0.05
+
+publish:
+  prefix_only_replace: true
+  require_backup: true
+  require_audit_after_publish: true
+  allow_forced_override: false

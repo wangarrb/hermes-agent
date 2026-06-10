@@ -78,6 +78,11 @@ web/public/ds-assets/
 .release_notes.md
 mini-swe-agent/
 
+# Local backup artifacts produced while patching personal Kanban/listener setups.
+*.bak
+*.bak-*
+*.bak.tar.gz
+
 # Nix
 .direnv/
 .nix-stamps/
