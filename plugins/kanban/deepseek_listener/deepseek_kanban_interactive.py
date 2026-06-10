@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -57,45 +58,8 @@ def log_line(log_path: Path, msg: str) -> None:
 def prompt_dir(workspace: Path, board: str, pane_profile: str) -> Path:
     safe_board = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in board)
     safe_profile = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in pane_profile)
-    return workspace / ".deepseek-kanban" / safe_board / safe_profile
+    return workspace / ".codewhale-kanban" / safe_board / safe_profile
 
-
-def self_poll_prompt_dir(workspace: Path, board: str, pane_profile: str) -> Path:
-    safe_board = worker_runtime.safe_path_component(board)
-    safe_profile = worker_runtime.safe_path_component(pane_profile)
-    return workspace / ".hermes-kanban" / safe_board / safe_profile
-
-
-def write_self_poll_startup_prompt(
-    *,
-    board: str,
-    profile: str,
-    claim_assignees: list[str],
-    workspace: Path,
-    ttl: int,
-    listener_kind: str,
-    pane_id: str | None = None,
-) -> tuple[Path, str]:
-    owner = worker_runtime.default_self_poll_owner(
-        profile=profile,
-        listener_kind=listener_kind,
-        pane_id=pane_id,
-    )
-    prompt = worker_runtime.build_self_poll_startup_prompt(
-        agent_label="interactive DeepSeek-TUI",
-        board=board,
-        profile=profile,
-        claim_assignees=claim_assignees,
-        workspace=workspace,
-        ttl=ttl,
-        listener_kind=listener_kind,
-        owner=owner,
-        role_guidance_text=role_guidance(profile),
-    )
-    path = self_poll_prompt_dir(workspace, board, profile) / "self-poll-startup.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(prompt, encoding="utf-8")
-    return path, prompt
 
 
 def claim_assignees(args: argparse.Namespace) -> list[str]:
@@ -119,21 +83,6 @@ def reset_kanban_claims(
             claim_assignees=claim_assignees,
             workspace=workspace,
             listener_kind="deepseek-interactive",
-            reason=reason,
-        )
-    )
-    owner = worker_runtime.default_self_poll_owner(
-        profile=profile,
-        listener_kind="deepseek-self-poll",
-    )
-    reset_ids.extend(
-        worker_runtime.reset_self_poll_claims(
-            board=board,
-            profile=profile,
-            claim_assignees=claim_assignees,
-            workspace=workspace,
-            listener_kind="deepseek-self-poll",
-            owner=owner,
             reason=reason,
         )
     )
@@ -409,13 +358,66 @@ _DEEPSEEK_BUSY_MARKERS = (
     "edit running",
     "live:",
     " active ·",
-    " active ctx",
+    "activity: thinking",
+    "steering current turn",  # codewhale v0.8+ interactive confirmation menu
+    "turn stalled",           # codewhale v0.8+ API turn timeout — pane cannot accept input
 )
 
 _DEEPSEEK_QUEUED_INPUT_MARKERS = (
     "pending inputs",
     "edit last queued message",
 )
+
+# ── Steering auto-dismiss for codewhale v0.8+ ──────────────────────────────
+# codewhale shows "Steering current turn..." + interactive menu (继续/拒绝)
+# after long LLM responses.  If the watcher doesn't dismiss it, codewhale
+# sits idle forever waiting for user confirmation.  We auto-send Tab+Enter
+# (select first option = "继续") to keep the task progressing.
+_STEERING_MARKER = "steering current turn"
+_STEERING_COOLDOWN_S = 30.0  # minimum seconds between auto-dismiss attempts
+_last_steering_dismiss_at: dict[str, float] = {}  # per-profile cooldown
+
+
+def _auto_dismiss_steering(
+    *,
+    session: str,
+    pane_id: str,
+    screen: str,
+    profile: str,
+    log_path: Path,
+) -> bool:
+    """If codewhale pane shows Steering menu, auto-dismiss with Tab+Enter.
+
+    Returns True if a dismiss was attempted, False if no steering detected.
+    """
+    global _last_steering_dismiss_at
+    screen_lower = screen.lower()
+    if _STEERING_MARKER not in screen_lower:
+        return False
+
+    # Cooldown: don't spam dismiss if the previous one was recent
+    now = time.time()
+    last = _last_steering_dismiss_at.get(profile, 0.0)
+    if now - last < _STEERING_COOLDOWN_S:
+        return False
+
+    log_line(log_path, "auto-dismissing codewhale Steering menu (Tab+Enter)")
+    try:
+        # Tab = 0x09 (select first option "继续"), Enter = 0x0d (confirm)
+        subprocess.run(
+            ["zellij", "--session", session, "action", "write", "-p", str(pane_id), "9", "13"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        _last_steering_dismiss_at[profile] = now
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        err = getattr(exc, "stderr", "") or str(exc)
+        log_line(log_path, f"auto-dismiss Steering failed: {err}")
+        return False
 
 
 def zellij_dump_screen(*, session: str, pane_id: str, log_path: Path) -> str | None:
@@ -446,13 +448,36 @@ def _looks_like_idle_deepseek_pane(text: str) -> bool:
 
     We only inspect the visible tail so old scrollback containing an idle prompt
     does not override current task output.
+
+    Special case: codewhale-tui often leaves "Activity: thinking" in the
+    status bar after the LLM response completes and the composer prompt
+    ("编写任务或使用 /") reappears.  When both an IDLE marker and
+    "activity: thinking" coexist, the pane is actually idle — the thinking
+    status is a ghost/stale indicator.  Only treat "activity: thinking" as
+    truly busy when no IDLE marker is present.
     """
     tail = "\n".join(_tail_nonempty_lines(text)).lower()
     if not tail:
         return False
-    if any(marker in tail for marker in (*_DEEPSEEK_BUSY_MARKERS, *_DEEPSEEK_QUEUED_INPUT_MARKERS)):
+    has_idle = any(marker in tail for marker in _DEEPSEEK_IDLE_MARKERS)
+    has_thinking = "activity: thinking" in tail
+    # Other busy markers (kanban_task_boundary, tool running, etc.) always
+    # override idle, regardless of thinking status.
+    other_busy = any(
+        marker in tail
+        for marker in _DEEPSEEK_BUSY_MARKERS
+        if marker != "activity: thinking"
+    )
+    has_queued = any(marker in tail for marker in _DEEPSEEK_QUEUED_INPUT_MARKERS)
+    if other_busy or has_queued:
         return False
-    return any(marker in tail for marker in _DEEPSEEK_IDLE_MARKERS)
+    # Ghost thinking: idle prompt visible + stale "activity: thinking" → idle
+    if has_idle and has_thinking:
+        return True
+    # True thinking (no idle prompt) → busy
+    if has_thinking:
+        return False
+    return has_idle
 
 
 def _looks_like_busy_deepseek_pane(text: str) -> bool:
@@ -674,7 +699,7 @@ def _deepseek_tui_pids_for_workspace(workspace: Path) -> list[int]:
         if not args:
             continue
         exe = Path(args[0]).name
-        if exe != "deepseek-tui" and not any("deepseek-tui" in part for part in args[:2]):
+        if exe not in ("codewhale", "codewhale-tui", "deepseek-tui") and not any(p in ("codewhale", "codewhale-tui", "deepseek-tui") for p in args[:2]):
             continue
         if _cmdline_workspace_matches(args, workspace):
             out.append(pid)
@@ -704,7 +729,9 @@ def _workspace_matches(row_workspace: str | None, workspace: Path) -> bool:
         return False
 
 
-def adopt_orphaned_running_task(args: argparse.Namespace, *, log_path: Path) -> tuple[str | None, int | None]:
+def adopt_orphaned_running_task(
+    args: argparse.Namespace, *, log_path: Path, conn: Any | None = None
+) -> tuple[str | None, int | None]:
     """Adopt a running task whose previous DeepSeek bridge died.
 
     This is intentionally conservative.  It only adopts tasks already claimed
@@ -723,7 +750,10 @@ def adopt_orphaned_running_task(args: argparse.Namespace, *, log_path: Path) -> 
     # Assisted assignees must be reclaimed to ready first, then claimed through
     # claim_and_inject_one so the assist pane gets a fresh prompt.
     assignees = [args.profile]
-    with kb.connect(board=board) as conn:
+    _owns_conn = conn is None
+    if _owns_conn:
+        conn = kb.connect(board=board)
+    try:
         rows = conn.execute(
             f"""
             SELECT id, current_run_id, claim_lock, claim_expires, worker_pid, workspace_path
@@ -750,16 +780,35 @@ def adopt_orphaned_running_task(args: argparse.Namespace, *, log_path: Path) -> 
             task_id = row["id"]
             run_id = int(row["current_run_id"]) if row["current_run_id"] else None
             if _pane_looks_idle(args, log_path=log_path):
-                if _reclaim_task_without_signaling_worker(
-                    conn,
-                    task_id,
-                    reason=(
-                        "deepseek-interactive startup found orphaned running task "
-                        "but target pane is idle; prompt was not active after restart"
-                    ),
-                ):
-                    log_line(log_path, f"reclaimed orphaned idle-pane task {task_id} old_pid={old_pid} run={run_id}")
-                return None, None
+                # ── Protection: if the run just started, give DeepSeek time to process ──
+                # Same grace-period logic as reasonix listener to avoid claim-reclaim loops.
+                run_started_at = None
+                if run_id is not None:
+                    run_row = conn.execute(
+                        "SELECT started_at FROM task_runs WHERE id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    if run_row:
+                        run_started_at = run_row["started_at"]
+                grace_period_s = 30  # seconds after run start before we trust idle detection
+                if run_started_at and (now - int(run_started_at)) < grace_period_s:
+                    log_line(
+                        log_path,
+                        f"orphaned task {task_id} run={run_id} pane idle but run started "
+                        f"{now - int(run_started_at)}s ago (< {grace_period_s}s); adopting instead of reclaiming",
+                    )
+                    # Fall through to the adopt path below
+                else:
+                    if _reclaim_task_without_signaling_worker(
+                        conn,
+                        task_id,
+                        reason=(
+                            "deepseek-interactive startup found orphaned running task "
+                            "but target pane is idle; prompt was not active after restart"
+                        ),
+                    ):
+                        log_line(log_path, f"reclaimed orphaned idle-pane task {task_id} old_pid={old_pid} run={run_id}")
+                    return None, None
             with kb.write_txn(conn):  # type: ignore[attr-defined]
                 cur = conn.execute(
                     """
@@ -807,6 +856,12 @@ def adopt_orphaned_running_task(args: argparse.Namespace, *, log_path: Path) -> 
             )
             log_line(log_path, f"adopted running task {task_id} old_pid={old_pid} run={run_id}")
             return task_id, run_id
+    finally:
+        if _owns_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return None, None
 
 
@@ -827,7 +882,7 @@ def _cleanup_active_claim(*, board: str, task_id: str | None, run_id: int | None
         log_line(log_path, f"cleanup active claim failed for {task_id}: {type(exc).__name__}: {exc}")
 
 
-def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[str | None, int | None]:
+def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path, conn: Any | None = None) -> tuple[str | None, int | None]:
     board = args.board or kb.get_current_board() or "default"
     workspace = Path(args.workspace).expanduser().resolve()
     pane_profile = args.profile
@@ -835,7 +890,16 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
     if screen is None or not _pane_can_accept_new_kanban_task(screen):
         log_line(log_path, "skip claim: DeepSeek pane is not explicitly idle/safe for Kanban injection")
         return None, None
-    with kb.connect(board=board) as conn:
+
+    # Reuse caller's connection or open a new one (Plan 2).
+    _owns_conn = conn is None
+    if _owns_conn:
+        try:
+            conn = kb.connect(board=board)
+        except Exception as exc:
+            log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
+            return None, None
+    try:
         kb.release_stale_claims(conn)
         kb.recompute_ready(conn)
         candidate = _select_ready_candidate(conn, args)
@@ -851,6 +915,9 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
         except Exception:
             pass
         context = kb.build_worker_context(conn, claimed.id)
+    except Exception as exc:
+        log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
+        return None, None
 
     prompt_path = write_task_prompt(
         workspace=workspace,
@@ -861,14 +928,38 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
     )
     screen = _pane_screen(args, log_path=log_path)
     if screen is None or not _pane_can_accept_new_kanban_task(screen):
-        with kb.connect(board=board) as conn:
+        try:
             _reclaim_task_without_signaling_worker(
                 conn,
                 claimed.id,
                 reason="deepseek-interactive pane became unsafe before prompt injection",
             )
+        except Exception as exc:
+            log_line(log_path, f"pre-inject reclaim DB error (non-fatal): {type(exc).__name__}: {exc}")
         log_line(log_path, f"reclaimed {claimed.id}: pane unsafe before injection")
         return None, None
+    # ── Idle confirmation: wait for the pane to stay idle for 2 consecutive
+    # checks (2 s apart) before injecting.  This prevents injecting while
+    # codewhale-tui is still streaming LLM output (Activity: thinking) which
+    # would buffer the injected chars and corrupt the input state once the
+    # composer re-enables.
+    IDLE_CONFIRM_ROUNDS = 2
+    IDLE_CONFIRM_INTERVAL_S = 1.0
+    for _round in range(IDLE_CONFIRM_ROUNDS):
+        time.sleep(IDLE_CONFIRM_INTERVAL_S)
+        _confirm_screen = _pane_screen(args, log_path=log_path)
+        if _confirm_screen is None or not _pane_can_accept_new_kanban_task(_confirm_screen):
+            log_line(log_path, f"idle confirmation failed on round {_round + 1}/{IDLE_CONFIRM_ROUNDS}; aborting injection")
+            try:
+                _reclaim_task_without_signaling_worker(
+                    conn,
+                    claimed.id,
+                    reason="deepseek-interactive pane not stably idle before injection",
+                )
+            except Exception as exc:
+                log_line(log_path, f"confirm-reclaim DB error (non-fatal): {type(exc).__name__}: {exc}")
+            return None, None
+
     task_assignee = getattr(claimed, "assignee", None) or pane_profile
     inject_text = (
         "KANBAN_TASK_BOUNDARY\n"
@@ -885,15 +976,18 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
         log_path=log_path,
     )
     if not ok:
-        with kb.connect(board=board) as conn:
+        try:
             _reclaim_task_without_signaling_worker(
                 conn,
                 claimed.id,
                 reason="deepseek-interactive zellij injection failed",
             )
+        except Exception as exc:
+            log_line(log_path, f"inject-fail reclaim DB error (non-fatal): {type(exc).__name__}: {exc}")
         return None, None
 
-    with kb.connect(board=board) as conn:
+    # Post-inject DB ops reuse the same connection.
+    try:
         kb.add_comment(
             conn,
             claimed.id,
@@ -906,6 +1000,15 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
             note=f"deepseek-interactive injected prompt: {prompt_path}",
             expected_run_id=claimed.current_run_id,
         )
+    except Exception as exc:
+        # Non-fatal: the prompt was already injected into the pane.
+        log_line(log_path, f"post-inject DB op failed (non-fatal): {type(exc).__name__}: {exc}")
+    finally:
+        if _owns_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
     zellij_rename_pane(
         session=args.zellij_session,
         pane_id=args.zellij_pane_id,
@@ -917,6 +1020,17 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
 
 
 def watcher_main(args: argparse.Namespace) -> int:
+    # Raise FD limit to prevent "disk I/O error" when SQLite can't open WAL/SHM
+    # files due to FD exhaustion (default soft limit 1024 is too low for
+    # long-lived watcher processes with persistent DB connections).
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < 4096:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (4096, hard))
+    except Exception:
+        pass
+
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
 
@@ -958,14 +1072,111 @@ def watcher_main(args: argparse.Namespace) -> int:
     active_run_id: int | None = None
     last_task_transition_at = 0.0
     last_hb = 0.0
+    # ── Persistent connection (Plan 2) ──────────────────────────────
+    MAX_CONSECUTIVE_DB_ERRORS = 5
+    consecutive_db_errors = 0
+    _CONN_RECYCLE_S = 60.0
+    _conn: Any = None
+    _conn_created_at: float = 0.0
+
+    def _ensure_conn() -> Any:
+        """Return a live DB connection, reconnecting if necessary."""
+        nonlocal _conn, _conn_created_at, consecutive_db_errors
+        import sqlite3
+
+        if _conn is not None and (time.time() - _conn_created_at) >= _CONN_RECYCLE_S:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            _conn = None
+
+        if _conn is not None:
+            try:
+                _conn.execute("SELECT 1")
+                return _conn
+            except sqlite3.OperationalError:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+
+        for attempt in range(3):
+            try:
+                _conn = kb.connect(board=board)
+                _conn_created_at = time.time()
+                consecutive_db_errors = 0
+                return _conn
+            except sqlite3.OperationalError as exc:
+                consecutive_db_errors += 1
+                delay = 2.0 * (2 ** attempt)
+                log_line(
+                    log_path,
+                    f"DB OperationalError (attempt {attempt+1}/3, "
+                    f"consecutive={consecutive_db_errors}): {exc}; "
+                    f"retrying in {delay:.0f}s",
+                )
+                time.sleep(delay)
+            except sqlite3.DatabaseError as exc:
+                # Index corruption ("database disk image is malformed") is
+                # recoverable via REINDEX.  OperationalError is handled above.
+                msg = str(exc).lower()
+                if "malformed" in msg or "corrupt" in msg:
+                    log_line(
+                        log_path,
+                        f"DB corruption detected: {exc}; attempting REINDEX repair",
+                    )
+                    try:
+                        repair_conn = sqlite3.connect(
+                            str(kb.kanban_db_path(board=board)),
+                            isolation_level=None,
+                            timeout=120.0,
+                        )
+                        repair_conn.execute("PRAGMA integrity_check")
+                        repair_conn.execute("REINDEX")
+                        repair_conn.execute("PRAGMA integrity_check")
+                        repair_conn.close()
+                        log_line(log_path, "REINDEX repair succeeded; retrying connect")
+                        _conn = kb.connect(board=board)
+                        _conn_created_at = time.time()
+                        consecutive_db_errors = 0
+                        return _conn
+                    except Exception as repair_exc:
+                        log_line(
+                            log_path,
+                            f"REINDEX repair failed: {type(repair_exc).__name__}: {repair_exc}",
+                        )
+                consecutive_db_errors += 1
+                delay = 2.0 * (2 ** attempt)
+                log_line(
+                    log_path,
+                    f"DB DatabaseError (attempt {attempt+1}/3, "
+                    f"consecutive={consecutive_db_errors}): {exc}; "
+                    f"retrying in {delay:.0f}s",
+                )
+                time.sleep(delay)
+
+        if consecutive_db_errors >= MAX_CONSECUTIVE_DB_ERRORS:
+            log_line(
+                log_path,
+                f"DB error limit ({MAX_CONSECUTIVE_DB_ERRORS}) exceeded. Exiting watcher.",
+            )
+            raise SystemExit(2)
+        return None
+
     try:
         while not _STOP:
             now = time.time()
             if active_task:
-                with kb.connect(board=board) as conn:
+                conn = _ensure_conn()
+                if conn is None:
+                    time.sleep(min(poll_s, 5.0))
+                    continue
+                try:
                     status, current_run_id = _task_status(conn, active_task)
                     if status == "running" and (active_run_id is None or current_run_id == active_run_id):
-                        # ── liveness check: if deepseek-tui is producing output,
+                        # ── liveness check: if codewhale is producing output,
                         #     reset the inactivity timer ──
                         if now - last_liveness_check >= 30.0:
                             latest_mtime = _sessions_latest_mtime()
@@ -977,6 +1188,23 @@ def watcher_main(args: argparse.Namespace) -> int:
                                 last_activity_at = now
                             if idle_pane_reclaim_s > 0:
                                 screen = _pane_screen(args, log_path=log_path)
+
+                                # Auto-dismiss Steering before idle detection
+                                if screen is not None:
+                                    dismissed = _auto_dismiss_steering(
+                                        session=str(args.zellij_session),
+                                        pane_id=str(args.zellij_pane_id),
+                                        screen=screen,
+                                        profile=args.profile,
+                                        log_path=log_path,
+                                    )
+                                    # If Steering was dismissed, pane is NOT idle — reset idle timer
+                                    if dismissed:
+                                        idle_pane_seen_at = None
+                                        # Re-read screen after dismiss to get fresh state
+                                        time.sleep(2.0)
+                                        screen = _pane_screen(args, log_path=log_path)
+
                                 if screen is not None and _looks_like_idle_deepseek_pane(screen):
                                     if idle_pane_seen_at is None:
                                         idle_pane_seen_at = now
@@ -1071,6 +1299,55 @@ def watcher_main(args: argparse.Namespace) -> int:
                         name=f"{args.profile}-deepseek listening",
                         log_path=log_path,
                     )
+                except Exception as exc:
+                    import sqlite3
+                    if isinstance(exc, sqlite3.OperationalError):
+                        consecutive_db_errors += 1
+                        log_line(
+                            log_path,
+                            f"DB error in active-task loop (consecutive={consecutive_db_errors}): {exc}",
+                        )
+                        if consecutive_db_errors >= MAX_CONSECUTIVE_DB_ERRORS:
+                            log_line(log_path, f"DB error limit exceeded. Exiting watcher.")
+                            raise SystemExit(2)
+                        try:
+                            _conn.close()
+                        except Exception:
+                            pass
+                        _conn = None
+                        time.sleep(min(poll_s, 5.0))
+                        continue
+                    if isinstance(exc, sqlite3.DatabaseError):
+                        consecutive_db_errors += 1
+                        log_line(
+                            log_path,
+                            f"DB DatabaseError in active-task loop (consecutive={consecutive_db_errors}): {exc}",
+                        )
+                        msg = str(exc).lower()
+                        if "malformed" in msg or "corrupt" in msg:
+                            try:
+                                repair_conn = sqlite3.connect(
+                                    str(kb.kanban_db_path(board=board)),
+                                    isolation_level=None,
+                                    timeout=120.0,
+                                )
+                                repair_conn.execute("REINDEX")
+                                repair_conn.close()
+                                log_line(log_path, "REINDEX repair in active-task loop succeeded")
+                                consecutive_db_errors = 0
+                            except Exception as repair_exc:
+                                log_line(
+                                    log_path,
+                                    f"REINDEX repair in active-task loop failed: {type(repair_exc).__name__}: {repair_exc}",
+                                )
+                        try:
+                            _conn.close()
+                        except Exception:
+                            pass
+                        _conn = None
+                        time.sleep(min(poll_s, 5.0))
+                        continue
+                    raise
 
             remaining_delay = _claim_delay_remaining(
                 last_transition_at=last_task_transition_at,
@@ -1082,15 +1359,28 @@ def watcher_main(args: argparse.Namespace) -> int:
                 continue
 
             screen = _pane_screen(args, log_path=log_path)
+
+            # Auto-dismiss codewhale Steering menu if present (even while idle)
+            if screen is not None:
+                _auto_dismiss_steering(
+                    session=str(args.zellij_session),
+                    pane_id=str(args.zellij_pane_id),
+                    screen=screen,
+                    profile=args.profile,
+                    log_path=log_path,
+                )
+
             if screen is not None and not _pane_can_accept_new_kanban_task(screen):
                 log_line(
                     log_path,
                     "skip claim: DeepSeek pane still shows an active/pending Kanban prompt",
                 )
-                time.sleep(min(poll_s, 5.0))
+                # Use full poll_s, not min(poll_s, 5.0) — frequent dump-screen
+                # calls interfere with codewhale PTY keyboard input.
+                time.sleep(poll_s)
                 continue
 
-            active_task, active_run_id = adopt_orphaned_running_task(args, log_path=log_path)
+            active_task, active_run_id = adopt_orphaned_running_task(args, log_path=log_path, conn=_conn)
             if active_task:
                 last_activity_at = time.time()
                 last_liveness_check = time.time()
@@ -1099,7 +1389,7 @@ def watcher_main(args: argparse.Namespace) -> int:
                 last_hb = 0.0
                 continue
 
-            active_task, active_run_id = claim_and_inject_one(args, log_path=log_path)
+            active_task, active_run_id = claim_and_inject_one(args, log_path=log_path, conn=_conn)
             if active_task:
                 last_activity_at = time.time()
                 last_liveness_check = time.time()
@@ -1115,15 +1405,23 @@ def watcher_main(args: argparse.Namespace) -> int:
                 time.sleep(poll_s)
     finally:
         _cleanup_active_claim(board=board, task_id=active_task, run_id=active_run_id, log_path=log_path)
+        # Close persistent connection
+        if _conn is not None:
+            try:
+                _conn.close()
+            except Exception:
+                pass
     log_line(log_path, "interactive watcher stopped")
     return 0
 
 
 def has_saved_sessions(workspace: Path) -> bool:
-    """Check if deepseek-tui has any saved sessions for this workspace."""
+    """Check if codewhale / codewhale-tui / deepseek-tui has any saved sessions for this workspace."""
+    # Try codewhale (dispatcher) first, then codewhale-tui (runtime), then deepseek-tui (legacy)
+    tui_bin = shutil.which("codewhale") or shutil.which("codewhale-tui") or "deepseek-tui"
     try:
         result = subprocess.run(
-            ["deepseek-tui", "sessions"],
+            [tui_bin, "sessions"],
             capture_output=True, text=True, cwd=str(workspace), timeout=10,
         )
         # "No sessions found." means no sessions; any real session output
@@ -1157,8 +1455,8 @@ def _same_workspace_arg(parts: list[str], workspace: Path) -> bool:
 def other_continue_deepseek_active(workspace: Path) -> bool:
     """Return True when another TUI already owns workspace-level --continue.
 
-    DeepSeek-TUI stores sessions by workspace, not by Kanban profile/pane.
-    Two simultaneous ``deepseek-tui --continue`` processes in one workspace can
+    DeepSeek-TUI / CodeWhale stores sessions by workspace, not by Kanban profile/pane.
+    Two simultaneous ``codewhale --continue`` processes in one workspace can
     resume the same conversation, so prompt boundaries become queued in shared
     state.  The listener uses this as a last-resort guard when callers forgot to
     pass ``--no-continue`` for secondary panes.
@@ -1175,7 +1473,7 @@ def other_continue_deepseek_active(workspace: Path) -> bool:
         if not parts:
             continue
         exe_names = {Path(part).name for part in parts[:2]}
-        if "deepseek-tui" not in exe_names:
+        if not exe_names & {"codewhale", "codewhale-tui", "deepseek-tui"}:
             continue
         if "--continue" not in parts and "-c" not in parts:
             continue
@@ -1204,8 +1502,11 @@ def normalize_provider(provider: str | None) -> tuple[str, str]:
 
     DeepSeek-TUI does not expose an `opencode-go` provider id.  We route the
     OpenCode Go OpenAI-compatible endpoint through provider=openai.
+    When provider is None/empty, return ("", "") so caller can skip env override.
     """
-    raw = (provider or "openrouter").strip().lower()
+    raw = ((provider or "").strip().lower())
+    if not raw:
+        return "", ""
     if raw in {"opencode-go", "opencode_go", "opencode", "openai-opencode-go"}:
         return "openai", "opencode-go"
     if raw in {"openrouter", "topenrouter", "tp-openrouter"}:
@@ -1219,26 +1520,49 @@ def default_model_for_provider(friendly_provider: str) -> str:
     return "deepseek-v4-flash"
 
 
-def build_deepseek_cmd(args: argparse.Namespace) -> list[str]:
+def build_deepseek_cmd(args: argparse.Namespace, *, log_path: Path | None = None) -> list[str]:
     base_workspace = str(Path(args.workspace).expanduser().resolve())
     profile = args.profile or "implementer"
     # Use per-profile workspace so --continue resumes the correct role's session.
     # The profile-specific .deepseek/instructions.md injects role definition.
     session_workspace = str(Path(base_workspace) / ".ds-sessions" / profile)
     Path(session_workspace).mkdir(parents=True, exist_ok=True)
-    # Use deepseek-tui binary directly (not the `deepseek` dispatcher).
-    # Current deepseek-tui supports --workspace/--continue/--yolo globally.
-    # Provider/model are supplied via DEEPSEEK_PROVIDER / DEEPSEEK_MODEL env vars
-    # in launcher_main; deepseek-tui itself has no global --provider flag.
-    cmd = [args.deepseek_tui_bin, "--workspace", session_workspace]
+
+    # Decide whether we need --continue BEFORE choosing binary.
+    workspace_path = Path(session_workspace)
+    other_active = other_continue_deepseek_active(workspace_path)
+    has_sessions = has_saved_sessions(workspace_path)
+    want_continue = args.continue_session and not other_active and has_sessions
+    if log_path:
+        log_line(
+            log_path,
+            f"[build_deepseek_cmd] continue_session={args.continue_session} "
+            f"other_continue_active={other_active} has_saved_sessions={has_sessions} "
+            f"want_continue={want_continue} workspace={workspace_path}",
+        )
+
+    # Binary selection:
+    # - When --continue is needed, use codewhale-tui (runtime) directly.
+    #   The codewhale dispatcher converts --continue to --session <id>, but
+    #   codewhale-tui's --session code path does NOT trigger find_last_session(),
+    #   so the session is not properly resumed.  Direct codewhale-tui preserves
+    #   --continue as a boolean flag, which correctly triggers find_last_session().
+    # - When --fresh (no resume), use 'codewhale run' (dispatcher).  This avoids
+    #   the dispatcher's mandatory --prompt requirement when invoked bare.
+    if want_continue:
+        # Resolve runtime binary: try codewhale-tui first, then fall back.
+        runtime_bin = shutil.which("codewhale-tui") or args.deepseek_tui_bin
+        cmd = [runtime_bin, "--workspace", session_workspace]
+    else:
+        cmd = [args.deepseek_tui_bin, "run", "--workspace", session_workspace]
+
     if args.yolo:
         cmd.append("--yolo")
-    workspace_path = Path(session_workspace)
-    if args.continue_session and other_continue_deepseek_active(workspace_path):
+    if args.continue_session and other_active:
         cmd.append("--fresh")
-    elif args.continue_session and has_saved_sessions(workspace_path):
+    elif want_continue:
         cmd.append("--continue")
-    elif not args.continue_session:
+    else:
         cmd.append("--fresh")
     for extra in args.deepseek_arg or []:
         cmd.append(extra)
@@ -1271,16 +1595,18 @@ def launcher_main(args: argparse.Namespace) -> int:
                 "HERMES_KANBAN_PROFILE": args.profile,
                 "HERMES_KANBAN_CLAIM_ASSIGNEES": ",".join(claim_assignees(args)),
                 "HERMES_KANBAN_WORKSPACE": str(workspace),
-                "HERMES_KANBAN_TASK_DELIVERY": task_delivery,
-                # Force DeepSeek-TUI route. This prevents resumed/runtime state from
-                # silently overriding config.toml. OpenCode Go is routed through
-                # DeepSeek-TUI's OpenAI-compatible provider id: openai.
-                "DEEPSEEK_PROVIDER": deepseek_provider,
-                "DEEPSEEK_MODEL": deepseek_model,
-                "OPENROUTER_BASE_URL": "https://tp-api.chinadatapay.com:8000/v1",
-                "OPENAI_BASE_URL": "https://opencode.ai/zen/go/v1",
             }
         )
+        # Only override provider/model when explicitly passed; otherwise
+        # codewhale reads from its own config file.
+        if deepseek_provider:
+            env["DEEPSEEK_PROVIDER"] = deepseek_provider
+            if provider_label == "openrouter":
+                env["OPENROUTER_BASE_URL"] = "https://tp-api.chinadatapay.com:8000/v1"
+            elif provider_label == "opencode-go":
+                env["OPENAI_BASE_URL"] = "https://opencode.ai/zen/go/v1"
+        if args.model:
+            env["DEEPSEEK_MODEL"] = deepseek_model
         topenrouter_key = env.get("TOPENROUTER_API_KEY") or _read_hermes_dotenv_key("TOPENROUTER_API_KEY")
         opencode_key = env.get("OPENCODE_GO_API_KEY") or _read_hermes_dotenv_key("OPENCODE_GO_API_KEY")
         if topenrouter_key:
@@ -1292,51 +1618,6 @@ def launcher_main(args: argparse.Namespace) -> int:
         return env
 
     delivery = getattr(args, "task_delivery", "inject")
-    if delivery == "self-poll":
-        prompt_path, startup_prompt = write_self_poll_startup_prompt(
-            board=board,
-            profile=args.profile,
-            claim_assignees=claim_assignees(args),
-            workspace=workspace,
-            ttl=args.ttl,
-            listener_kind="deepseek-self-poll",
-            pane_id=zellij_pane_id,
-        )
-        print("DeepSeek-TUI self-poll kanban mode")
-        print(f"  board:          {board}")
-        print(f"  profile:        {args.profile}")
-        print(f"  claims:         {', '.join(claim_assignees(args))}")
-        print(f"  workspace:      {workspace}")
-        print(f"  pane:           {zellij_session}:{zellij_pane_id}")
-        print(f"  provider:       {provider_label} ({deepseek_provider})")
-        print(f"  model:          {deepseek_model}")
-        print(f"  startup prompt: {prompt_path}")
-        env = build_env(task_delivery="self-poll")
-        env["HERMES_KANBAN_SELF_POLL_PROMPT"] = str(prompt_path)
-        env["HERMES_KANBAN_SELF_POLL_OWNER"] = worker_runtime.default_self_poll_owner(
-            profile=args.profile,
-            listener_kind="deepseek-self-poll",
-            pane_id=zellij_pane_id,
-        )
-        if args.watch_only:
-            ok = zellij_inject(
-                session=zellij_session,
-                pane_id=zellij_pane_id,
-                text=startup_prompt,
-                log_path=log_path,
-            )
-            return 0 if ok else 1
-        deepseek_cmd = build_deepseek_cmd(args)
-        log_line(log_path, f"launcher starting deepseek self-poll: {' '.join(deepseek_cmd)}")
-        proc = subprocess.Popen(deepseek_cmd, cwd=str(workspace), env=env)
-        time.sleep(max(0.0, float(args.startup_delay_s or 0.0)))
-        zellij_inject(
-            session=zellij_session,
-            pane_id=zellij_pane_id,
-            text=startup_prompt,
-            log_path=log_path,
-        )
-        return int(proc.wait())
 
     watcher_cmd = [
         sys.executable,
@@ -1377,28 +1658,28 @@ def launcher_main(args: argparse.Namespace) -> int:
     poll_s = float(args.poll if args.poll is not None else listener_policy.poll_seconds())
     poll_label = f"{poll_s:g}s" + (" override" if args.poll is not None else " shared-policy")
 
-    print("DeepSeek-TUI interactive kanban mode")
-    print(f"  board:     {board}")
-    print(f"  profile:   {args.profile}")
-    print(f"  claims:    {', '.join(claim_assignees(args))}")
-    print(f"  workspace: {workspace}")
-    print(f"  pane:      {zellij_session}:{zellij_pane_id}")
-    print(f"  log:       {log_path}")
-    print(f"  provider:  {provider_label} ({deepseek_provider})")
-    print(f"  model:     {deepseek_model}")
-    print("")
-    print(f"按 Enter 进入 interactive DeepSeek-TUI；后台 listener 会按优先级 claim {', '.join(claim_assignees(args))} ready 任务并注入到当前 DeepSeek。")
-    print("退出 DeepSeek 后 listener 会一起停止；如果任务未 complete/block，会自动 reclaim。")
-    print(f"deepseek-kanban listener armed: profile={args.profile} board={board} poll={poll_label} workspace={workspace} provider={provider_label} model={deepseek_model}")
+    log_line(log_path, "DeepSeek-TUI interactive kanban mode")
+    log_line(log_path, f"  board:     {board}")
+    log_line(log_path, f"  profile:   {args.profile}")
+    log_line(log_path, f"  claims:    {', '.join(claim_assignees(args))}")
+    log_line(log_path, f"  workspace: {workspace}")
+    log_line(log_path, f"  pane:      {zellij_session}:{zellij_pane_id}")
+    log_line(log_path, f"  log:       {log_path}")
+    log_line(log_path, f"  provider:  {provider_label} ({deepseek_provider})")
+    log_line(log_path, f"  model:     {deepseek_model}")
+    log_line(log_path, f"按 Enter 进入 interactive DeepSeek-TUI；后台 listener 会按优先级 claim {', '.join(claim_assignees(args))} ready 任务并注入到当前 DeepSeek。")
+    log_line(log_path, "退出 DeepSeek 后 listener 会一起停止；如果任务未 complete/block，会自动 reclaim。")
+    log_line(log_path, f"codewhale-kanban listener armed: profile={args.profile} board={board} poll={poll_label} workspace={workspace} provider={provider_label} model={deepseek_model}")
 
     if args.watch_only:
-        print("listener-only 模式：不会启动 DeepSeek-TUI，只运行后台 listener 并向指定 Zellij pane 注入任务。")
+        log_line(log_path, "listener-only 模式：不会启动 DeepSeek-TUI，只运行后台 listener 并向指定 Zellij pane 注入任务。")
         return watcher_main(args)
 
-    try:
-        input()
-    except EOFError:
-        pass
+    if not args.auto_start:
+        try:
+            input()
+        except EOFError:
+            pass
 
     env = build_env(task_delivery="inject")
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1417,17 +1698,18 @@ def launcher_main(args: argparse.Namespace) -> int:
             env=env,
             start_new_session=True,
         )
-        print(
-            f"deepseek-kanban listener started: pid={proc.pid} profile={args.profile} "
+        log_line(
+            log_path,
+            f"codewhale-kanban listener started: pid={proc.pid} profile={args.profile} "
             f"board={board} poll={poll_label} pane={zellij_session}:{zellij_pane_id} log={log_path}",
-            flush=True,
         )
         return proc
 
     watcher = start_watcher()
-    deepseek_cmd = build_deepseek_cmd(args)
+    deepseek_cmd = build_deepseek_cmd(args, log_path=log_path)
     log_line(log_path, f"launcher starting deepseek: {' '.join(deepseek_cmd)}")
     rc = 0
+    MAX_WATCHER_RESTARTS = 10
     try:
         deepseek_proc = subprocess.Popen(deepseek_cmd, cwd=str(workspace), env=env)
         watcher_restart_count = 0
@@ -1435,6 +1717,23 @@ def launcher_main(args: argparse.Namespace) -> int:
             deepseek_rc = deepseek_proc.poll()
             if deepseek_rc is not None:
                 rc = int(deepseek_rc)
+                break
+
+            # Protection: detect dead deepseek process via /proc.
+            # When deepseek exits but zellij pane still shows old content,
+            # the watcher keeps "skip claim" looping forever.
+            if not _pid_alive(deepseek_proc.pid):
+                second_poll = deepseek_proc.poll()
+                if second_poll is not None:
+                    rc = int(second_poll)
+                    break
+                time.sleep(1.0)
+                third_poll = deepseek_proc.poll()
+                if third_poll is not None:
+                    rc = int(third_poll)
+                    break
+                log_line(log_path, f"deepseek pid {deepseek_proc.pid} is dead but poll() hasn't returned; forcing break")
+                rc = -1
                 break
 
             if watcher is not None:
@@ -1448,6 +1747,15 @@ def launcher_main(args: argparse.Namespace) -> int:
                         watcher = None
                         continue
                     watcher_restart_count += 1
+                    # Protection: cap watcher restarts to prevent infinite crash-loop
+                    if watcher_restart_count > MAX_WATCHER_RESTARTS:
+                        log_line(
+                            log_path,
+                            f"watcher restart limit ({MAX_WATCHER_RESTARTS}) exceeded; "
+                            f"last rc={watcher_rc}. Stopping restart loop.",
+                        )
+                        watcher = None
+                        continue
                     log_line(
                         log_path,
                         f"watcher exited unexpectedly rc={watcher_rc} while DeepSeek is still running; "
@@ -1479,15 +1787,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", default=os.environ.get("HERMES_PROFILE") or "implementer", help="Kanban assignee/profile to claim (default: implementer)")
     parser.add_argument("--claim-assignees", default=os.environ.get("HERMES_KANBAN_CLAIM_ASSIGNEES"), help="Comma-separated Kanban assignees this pane may claim, in priority order; defaults to --profile")
     parser.add_argument("--board", default=os.environ.get("HERMES_KANBAN_BOARD"), help="Board slug; defaults to Hermes current board")
-    parser.add_argument("--workspace", default=os.environ.get("DEEPSEEK_KANBAN_WORKSPACE") or os.getcwd(), help="DeepSeek workspace/git repo root")
+    parser.add_argument("--workspace", default=os.environ.get("CODEWHALE_KANBAN_WORKSPACE") or os.environ.get("DEEPSEEK_KANBAN_WORKSPACE") or os.getcwd(), help="CodeWhale workspace/git repo root")
     parser.add_argument("--poll", type=float, default=None, help="Ready-task poll interval override")
     parser.add_argument("--ttl", type=int, default=listener_policy.LISTENER_HEALTH_CLAIM_TTL_SECONDS, help="Claim TTL seconds")
     parser.add_argument("--startup-delay-s", type=float, default=8.0, help="Delay after DeepSeek launch before injecting first task")
     parser.add_argument(
         "--task-delivery",
-        choices=("inject", "self-poll"),
-        default=os.environ.get("HERMES_KANBAN_TASK_DELIVERY") or "self-poll",
-        help="Task delivery mode: one-time self-poll startup prompt, or legacy per-task zellij injection.",
+        choices=("inject",),
+        default="inject",
+        help="Task delivery mode: per-task zellij injection (inject).",
     )
     parser.add_argument("--task-boundary-delay-s", type=float, default=8.0, help="Delay after a task leaves running state before claiming/injecting the next task")
     parser.add_argument("--task-timeout-s", type=float, default=listener_policy.INTERACTIVE_TASK_TIMEOUT_SECONDS, help="Dynamic idle timeout: reclaim task after this many seconds of continuous TUI inactivity (session files not updating). Reset on each TUI output. 0 to disable.")
@@ -1511,13 +1819,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=None, help="Optional DeepSeek model override (e.g. deepseek-v4-pro, deepseek-v4-flash)")
     parser.add_argument("--yolo", action="store_true", default=True, help="Auto-approve all tools in DeepSeek (default: True)")
     parser.add_argument("--no-yolo", dest="yolo", action="store_false", help="Disable YOLO mode (require approval for tool calls)")
-    parser.add_argument("--deepseek-tui-bin", default="deepseek-tui", help="deepseek-tui binary path/name (default: deepseek-tui)")
+    parser.add_argument("--deepseek-tui-bin", default="codewhale", help="CodeWhale dispatcher binary path/name (default: codewhale). The listener invokes 'codewhale run ...' to launch the TUI runtime.")
     parser.add_argument("--deepseek-arg", action="append", default=[], help="Extra raw arg passed to deepseek; repeatable")
     parser.add_argument("--continue", dest="continue_session", action="store_true", default=True, help="Resume most recent session for workspace (default: True)")
     parser.add_argument("--no-continue", dest="continue_session", action="store_false", help="Start a new session instead of resuming")
     parser.add_argument("--zellij-session", default=os.environ.get("ZELLIJ_SESSION_NAME"), help="Target Zellij session for task injection")
     parser.add_argument("--zellij-pane-id", default=os.environ.get("ZELLIJ_PANE_ID"), help="Target Zellij pane id for task injection")
     parser.add_argument("--watch-only", action="store_true", help="Only run the background listener; do not launch interactive DeepSeek-TUI")
+    parser.add_argument("--auto-start", action="store_true", help="Skip the 'press Enter' prompt and start immediately (for scripted/automated launches)")
     parser.add_argument("--watch-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reset-kanban", action="store_true", help="Reclaim this profile/pane's running interactive Kanban task(s) and exit")
     parser.add_argument("--once", action="store_true", help="Watcher child: process at most one task")

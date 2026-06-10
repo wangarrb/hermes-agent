@@ -1545,16 +1545,62 @@ class TestSummaryTargetRatio:
     """Verify that summary_target_ratio properly scales budgets with context window."""
 
     def test_tail_budget_scales_with_context(self):
-        """Tail token budget should be threshold_tokens * summary_target_ratio."""
+        """Fallback tail token budget scales with context_length."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K * 0.50 threshold * 0.40 ratio = 40K
-        assert c.tail_token_budget == 40_000
+        assert c.tail_token_budget == 80_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 1M * 0.50 threshold * 0.40 ratio = 200K
-        assert c.tail_token_budget == 200_000
+        assert c.tail_token_budget == 400_000
+
+    def test_compression_target_ratio_uses_current_context_not_threshold(self):
+        """Per-pass compression target should be current_tokens * target_ratio."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                threshold_percent=0.90,
+                summary_target_ratio=0.20,
+            )
+        assert c.threshold_tokens == 180_000
+        assert c._tail_budget_for_current_context(150_000) == 28_000
+        assert c._tail_budget_for_current_context(190_000) == 36_000
+
+    def test_compression_target_ratio_subtracts_fixed_context(self):
+        """Tail budget is what remains after fixed prompt/head/summary costs."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                threshold_percent=0.90,
+                summary_target_ratio=0.20,
+            )
+        # Desired total after compression: 180K * 20% = 36K.
+        # Fixed system/tools: 20K, protected head: 2K, summary reserve: 4K.
+        # The tail gets the remaining 10K.
+        assert c._tail_budget_for_current_context(
+            180_000,
+            fixed_context_tokens=20_000,
+            head_tokens=2_000,
+            summary_reserve_tokens=4_000,
+        ) == 10_000
+
+    def test_compression_target_ratio_returns_minimal_tail_when_fixed_floor_exceeds_target(self):
+        """If fixed prompt/tools already exceed target, do not inflate tail."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                threshold_percent=0.90,
+                summary_target_ratio=0.20,
+            )
+        assert c._tail_budget_for_current_context(
+            180_000,
+            fixed_context_tokens=50_000,
+            head_tokens=2_000,
+            summary_reserve_tokens=4_000,
+        ) == 1
 
     def test_summary_cap_scales_with_context(self):
         """Max summary tokens should be 5% of context, capped at 12K."""
@@ -1798,6 +1844,101 @@ class TestTokenBudgetTailProtection:
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
+    def test_last_user_early_does_not_force_huge_tail(self, budget_compressor):
+        """Keep the active user request without protecting all later tool work.
+
+        A long agent turn can have the latest user message near the start,
+        followed by dozens of assistant/tool messages. The compressor must not
+        keep that whole suffix just to keep the user request live.
+        """
+        c = budget_compressor
+        messages = [
+            {"role": "user", "content": "Start task"},
+            {"role": "assistant", "content": "On it"},
+            {"role": "user", "content": "Investigate the stuck pane"},
+        ]
+        for i in range(30):
+            messages.append({
+                "role": "assistant",
+                "content": f"tool call {i}",
+                "tool_calls": [{"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": "x" * 3000,
+            })
+        messages.append({"role": "assistant", "content": "Still investigating"})
+
+        with patch.object(c, "_generate_summary", return_value="Summary of tool work"):
+            result = c.compress(messages, current_tokens=180_000)
+
+        assert len(result) < 15
+        user_messages = [m for m in result if m.get("role") == "user"]
+        assert any("Investigate the stuck pane" in (m.get("content") or "") for m in user_messages)
+
+    def test_compress_uses_total_context_target_after_fixed_overhead(self, budget_compressor):
+        """Fixed system/tool overhead reduces tail budget for the 20% target."""
+        c = budget_compressor
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Start task"},
+            {"role": "assistant", "content": "On it"},
+            {"role": "user", "content": "Investigate the stuck pane"},
+        ]
+        for i in range(20):
+            messages.append({
+                "role": "assistant",
+                "content": f"tool call {i}",
+                "tool_calls": [{"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": "x" * 3000,
+            })
+        messages.append({"role": "assistant", "content": "short tail C"})
+
+        with patch.object(c, "_generate_summary", return_value="Summary of tool work"):
+            result = c.compress(messages, current_tokens=180_000, fixed_context_tokens=35_000)
+
+        # 180K * 20% = 36K. With 35K fixed overhead plus head/summary reserve,
+        # the tail budget is minimal, so the long tool chain is summarized away.
+        assert len(result) < 12
+        assert any("Investigate the stuck pane" in (m.get("content") or "") for m in result)
+
+    def test_latest_user_anchor_in_summary_keeps_correct_marker(self, budget_compressor):
+        """When anchor is merged into a user-role summary, do not point below."""
+        c = budget_compressor
+        messages = [
+            {"role": "user", "content": "Start task"},
+            {"role": "assistant", "content": "On it"},
+            {"role": "user", "content": "Investigate the stuck pane"},
+        ]
+        for i in range(30):
+            messages.append({
+                "role": "assistant",
+                "content": f"tool call {i}",
+                "tool_calls": [{"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"call_{i}",
+                "content": "x" * 3000,
+            })
+        messages.append({"role": "assistant", "content": "Still investigating"})
+
+        with patch.object(c, "_generate_summary", return_value="Summary of tool work"):
+            result = c.compress(messages, current_tokens=180_000)
+
+        contents = [m.get("content") or "" for m in result]
+        anchor_message = next(
+            content for content in contents
+            if "Investigate the stuck pane" in content
+        )
+        assert "respond to the preserved latest user request below" in anchor_message
+        assert "respond to the message below, not the summary above" not in anchor_message
+
     def test_prune_with_token_budget(self, budget_compressor):
         """_prune_old_tool_results with protect_tail_tokens respects the budget."""
         c = budget_compressor
@@ -2021,7 +2162,8 @@ class TestUpdateModelBudgets:
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
-        assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
+        assert comp.threshold_tokens == 64_000
+        assert comp.tail_token_budget == int(10_000 * comp.summary_target_ratio)
         assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
 
 

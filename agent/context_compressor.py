@@ -575,7 +575,7 @@ class ContextCompressor(ContextEngine):
         )
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        target_tokens = int(context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -628,8 +628,11 @@ class ContextCompressor(ContextEngine):
         )
         self.compression_count = 0
 
-        # Derive token budgets: ratio is relative to the threshold, not total context
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
+        # Fallback budget for paths that do not provide a per-pass token
+        # estimate. Normal compression uses _tail_budget_for_current_context()
+        # so target_ratio is relative to the current context, not the trigger
+        # threshold.
+        target_tokens = int(self.context_length * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
             int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
@@ -746,6 +749,53 @@ class ContextCompressor(ContextEngine):
                 )
             return False
         return True
+
+    def _tail_budget_for_current_context(
+        self,
+        current_tokens: int | None = None,
+        *,
+        fixed_context_tokens: int = 0,
+        head_tokens: int = 0,
+        summary_reserve_tokens: int | None = None,
+    ) -> int:
+        """Return this compression pass's tail budget.
+
+        ``summary_target_ratio`` is a compression target: when a pass starts
+        from ~N tokens, the post-compression request should aim at roughly
+        ``N * summary_target_ratio`` tokens.  The recent tail budget therefore
+        subtracts non-compressible fixed context (system prompt, tool schemas),
+        protected head, and a summary reserve from that target.  It must not
+        scale from ``threshold_tokens``; otherwise raising the trigger threshold
+        also makes every compression less aggressive.
+        """
+        if current_tokens and current_tokens > 0:
+            target_tokens = max(1, int(current_tokens * self.summary_target_ratio))
+            if summary_reserve_tokens is None:
+                summary_reserve_tokens = _MIN_SUMMARY_TOKENS
+            available = target_tokens - max(0, fixed_context_tokens) - max(0, head_tokens) - max(0, summary_reserve_tokens)
+            if available > 0:
+                return available
+            # The fixed prompt/tool/head floor already exceeds the desired
+            # total target. Keep a minimal tail so compression can still run,
+            # but do not inflate the target by falling back to threshold/window
+            # based budgets.
+            return 1
+        return self.tail_token_budget
+
+    @staticmethod
+    def _build_latest_user_anchor(user_msg: Dict[str, Any]) -> str:
+        """Create a compact live user-request anchor after the summary."""
+        text = redact_sensitive_text(_content_text_for_contains(user_msg.get("content")))
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 2_000:
+            text = text[:1_500].rstrip() + " ...[truncated]... " + text[-400:].lstrip()
+        if not text:
+            text = "(latest user request had no text content)"
+        return (
+            "[Latest user request preserved from before compaction. "
+            "This is the active request to answer now.]\n"
+            f"{text}"
+        )
 
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
@@ -1745,6 +1795,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
+        ensure_last_user: bool = True,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.
@@ -1759,8 +1810,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         read, etc.).  If even the minimum 3 messages exceed 1.5x the budget
         the cut is placed right after the head so compression still runs.
 
-        Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        Never cuts inside a tool_call/result group.  By default, ensures the
+        most recent user message is in the tail (see
+        ``_ensure_last_user_message_in_tail``).  ``compress()`` can disable
+        that and insert a compact live user-request anchor instead, which
+        avoids preserving an entire long tool chain after an early user turn.
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -1799,9 +1853,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        if ensure_last_user:
+            # Ensure the most recent user message is always in the tail so the
+            # active task is never lost to compression (fixes #10896).
+            cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
 
         return max(cut_idx, head_end + 1)
 
@@ -1824,7 +1879,14 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        fixed_context_tokens: int = 0,
+        focus_topic: str = None,
+        force: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1871,7 +1933,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
             return messages
 
-        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+        messages_only_tokens = estimate_messages_tokens_rough(messages)
+        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or messages_only_tokens
+        if fixed_context_tokens <= 0 and display_tokens > messages_only_tokens:
+            fixed_context_tokens = display_tokens - messages_only_tokens
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
@@ -1884,12 +1949,44 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 2: Determine boundaries
         compress_start = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
+        head_tokens = estimate_messages_tokens_rough(messages[:compress_start])
+        summary_reserve_tokens = max(
+            _MIN_SUMMARY_TOKENS,
+            min(int(display_tokens * self.summary_target_ratio * _SUMMARY_RATIO), self.max_summary_tokens),
+        )
+        tail_token_budget = self._tail_budget_for_current_context(
+            display_tokens,
+            fixed_context_tokens=fixed_context_tokens,
+            head_tokens=head_tokens,
+            summary_reserve_tokens=summary_reserve_tokens,
+        )
 
-        # Use token-budget tail protection instead of fixed message count
-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        # Tighten old tool-result pruning now that the full-request target
+        # budget is known. The first pass used the fallback context-window
+        # budget to avoid pruning too aggressively before head/summary
+        # reserves were computed.
+        messages, extra_pruned_count = self._prune_old_tool_results(
+            messages, protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=tail_token_budget,
+        )
+        if extra_pruned_count and not self.quiet_mode:
+            logger.info("Pre-compression: pruned %d additional old tool result(s)", extra_pruned_count)
+
+        # Use token-budget tail protection instead of fixed message count.
+        compress_end = self._find_tail_cut_by_tokens(
+            messages,
+            compress_start,
+            token_budget=tail_token_budget,
+            ensure_last_user=False,
+        )
 
         if compress_start >= compress_end:
             return messages
+
+        latest_user_anchor: str | None = None
+        latest_user_idx = self._find_last_user_message_idx(messages, compress_start)
+        if compress_start <= latest_user_idx < compress_end:
+            latest_user_anchor = self._build_latest_user_anchor(messages[latest_user_idx])
 
         turns_to_summarize = messages[compress_start:compress_end]
         # A persisted handoff summary can sit in the protected head after a
@@ -1990,33 +2087,52 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         _merge_summary_into_tail = False
+        _summary_includes_latest_user_anchor = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
         first_tail_role = messages[compress_end].get("role", "user") if compress_end < n_messages else "user"
-        # Pick a role that avoids consecutive same-role with both neighbors.
-        # Priority: avoid colliding with head (already committed), then tail.
-        if last_head_role in {"assistant", "tool"}:
-            summary_role = "user"
-        else:
-            summary_role = "assistant"
-        # If the chosen role collides with the tail AND flipping wouldn't
-        # collide with the head, flip it.
-        if summary_role == first_tail_role:
-            flipped = "assistant" if summary_role == "user" else "user"
-            if flipped != last_head_role:
-                summary_role = flipped
+        if latest_user_anchor:
+            if last_head_role in {"assistant", "tool"}:
+                summary_role = "user"
+                summary = (
+                    summary
+                    + "\n\n--- END OF CONTEXT SUMMARY — "
+                    "respond to the preserved latest user request below ---\n\n"
+                    + latest_user_anchor
+                )
+                _summary_includes_latest_user_anchor = True
+                latest_user_anchor = None
             else:
-                # Both roles would create consecutive same-role messages
-                # (e.g. head=assistant, tail=user — neither role works).
-                # Merge the summary into the first tail message instead
-                # of inserting a standalone message that breaks alternation.
-                _merge_summary_into_tail = True
+                summary_role = "assistant"
+        else:
+            # Pick a role that avoids consecutive same-role with both neighbors.
+            # Priority: avoid colliding with head (already committed), then tail.
+            if last_head_role in {"assistant", "tool"}:
+                summary_role = "user"
+            else:
+                summary_role = "assistant"
+            # If the chosen role collides with the tail AND flipping wouldn't
+            # collide with the head, flip it.
+            if summary_role == first_tail_role:
+                flipped = "assistant" if summary_role == "user" else "user"
+                if flipped != last_head_role:
+                    summary_role = flipped
+                else:
+                    # Both roles would create consecutive same-role messages
+                    # (e.g. head=assistant, tail=user — neither role works).
+                    # Merge the summary into the first tail message instead
+                    # of inserting a standalone message that breaks alternation.
+                    _merge_summary_into_tail = True
 
         # When the summary lands as a standalone role="user" message,
         # weak models read the verbatim "## Active Task" quote of a past
         # user request as fresh input (#11475, #14521). Append the explicit
         # end marker — the same one used in the merge-into-tail path — so
         # the model has a clear "summary above, not new input" signal.
-        if not _merge_summary_into_tail and summary_role == "user":
+        if (
+            not _merge_summary_into_tail
+            and summary_role == "user"
+            and not _summary_includes_latest_user_anchor
+        ):
             summary = (
                 summary
                 + "\n\n--- END OF CONTEXT SUMMARY — "
@@ -2025,6 +2141,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         if not _merge_summary_into_tail:
             compressed.append({"role": summary_role, "content": summary})
+        if latest_user_anchor:
+            compressed.append({"role": "user", "content": latest_user_anchor})
 
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
@@ -2054,7 +2172,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Port of Kilo-Org/kilocode#9434.
         compressed = _strip_historical_media(compressed)
 
-        new_estimate = estimate_messages_tokens_rough(compressed)
+        new_estimate = max(0, fixed_context_tokens) + estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate
 
         # Anti-thrashing: track compression effectiveness

@@ -1460,8 +1460,23 @@ def connect(
                 # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
                 # falls back to DELETE with one WARNING so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                # Kanban DB: force DELETE mode instead of WAL (see below).
+                # WAL mode causes repeated "database disk image is malformed"
+                # corruption under multi-process concurrent writes (multiple
+                # watchers + gateway all writing the same kanban.db).  DELETE
+                # mode serialises writes via SQLite's rollback journal, which
+                # is slower but far more robust for this workload.
+                # See: watcher logs 2026-06-07 19:41-19:42, three .corrupt.*.bak files.
+                _force_delete = os.environ.get("HERMES_KANBAN_FORCE_DELETE_JOURNAL", "1").strip()
+                if _force_delete not in ("0", "false"):
+                    # If on-disk is already WAL, switch to DELETE + checkpoint.
+                    mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+                    if mode_row and mode_row[0] == "wal":
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        conn.execute("PRAGMA journal_mode=DELETE")
+                else:
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
@@ -2287,6 +2302,159 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def update_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    priority: Optional[int] = None,
+    assignee: Optional[str] = None,
+    reopen: bool = False,
+) -> bool:
+    """Update mutable fields of a non-archived task.
+
+    Returns True if the task was found and updatable, False otherwise.
+    Only provided (non-None) fields are updated; omitted fields are left
+    unchanged.  Refuses to update tasks in ``archived`` status and logs a
+    warning instead.
+
+    When ``reopen=True``, a task in ``done`` status is transitioned back
+    to ``ready`` (with ``claim_lock``/``claim_expires``/``worker_pid``
+    cleared and ``consecutive_failures`` reset).  A ``reopened`` event is
+    appended for audit trail.  This enables the review-reject-rerework
+    workflow: critic/planner can reopen a done task, update its body with
+    rework requirements, and let the original (or new) assignee re-claim
+    it.
+
+    An ``updated`` event is appended so the change is visible in the
+    task's event history.
+    """
+    row = conn.execute(
+        "SELECT id, status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row:
+        return False
+
+    current_status = row["status"]
+    if current_status == "archived":
+        import logging
+        logging.warning(
+            "update_task: refusing to update archived task %s",
+            task_id,
+        )
+        return False
+
+    if current_status == "done" and not reopen:
+        import logging
+        logging.warning(
+            "update_task: refusing to update done task %s (reopen=False)",
+            task_id,
+        )
+        return False
+
+    # --- Reopen path: done -> ready ---
+    if current_status == "done" and reopen:
+        now = int(time.time())
+        with write_txn(conn):
+            # Close any dangling run from the previous completion.
+            # A done task may still have a running run row if the
+            # worker completed via an out-of-band path (e.g. interactive
+            # listener) that bypassed _end_run.  Find the latest
+            # still-open run for this task and close it as "reopened".
+            dangling = conn.execute(
+                """
+                SELECT id FROM task_runs
+                 WHERE task_id = ? AND ended_at IS NULL
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            closed_run_id: Optional[int] = None
+            if dangling:
+                closed_run_id = int(dangling["id"])
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status = 'reopened',
+                           outcome = 'reopened',
+                           summary = 'run closed by task reopen',
+                           ended_at = ?,
+                           claim_lock = NULL,
+                           claim_expires = NULL,
+                           worker_pid = NULL
+                     WHERE id = ? AND ended_at IS NULL
+                    """,
+                    (now, closed_run_id),
+                )
+
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'ready',
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       current_run_id = NULL,
+                       consecutive_failures = 0,
+                       last_failure_error = NULL,
+                       completed_at = NULL
+                 WHERE id = ? AND status = 'done'
+                """,
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                return False
+            payload: dict = {
+                "from_status": "done",
+                "to_status": "ready",
+                "reason": "manual_reopen_via_update",
+            }
+            if closed_run_id:
+                payload["closed_run_id"] = closed_run_id
+            _append_event(
+                conn, task_id, "reopened",
+                payload,
+            )
+
+    # --- Apply field updates ---
+    updates: list[str] = []
+    params: list[Any] = []
+
+    if title is not None:
+        updates.append("title = ?")
+        params.append(title)
+    if body is not None:
+        updates.append("body = ?")
+        params.append(body)
+    if priority is not None:
+        updates.append("priority = ?")
+        params.append(priority)
+    if assignee is not None:
+        updates.append("assignee = ?")
+        params.append(_canonical_assignee(assignee))
+
+    if updates:
+        params.append(task_id)
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "updated",
+            {
+                "changed_fields": [u.split(" = ")[0].strip() for u in updates],
+                "title": title,
+                "body_snippet": (body[:120] + "...") if body and len(body) > 120 else body,
+                "priority": priority,
+                "assignee": _canonical_assignee(assignee) if assignee else None,
+            },
+        )
+    return True
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:

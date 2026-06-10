@@ -26,9 +26,11 @@ Design:
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -272,6 +274,84 @@ class MemoryStore:
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
+    def _backup_failed_write(
+        self,
+        target: str,
+        reason: str,
+        content: str,
+        error: str,
+    ) -> Dict[str, str]:
+        """Best-effort backup for rejected memory/user writes.
+
+        Memory entries are injected into future prompts, so rejected content must
+        not be silently lost: store it under memories/failed-backups for manual
+        review. The backup directory is intentionally outside MEMORY.md/USER.md,
+        so even injection-blocked content is not auto-injected.
+        """
+        try:
+            backup_dir = get_memory_dir() / "failed-backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+
+            safe_reason = re.sub(r"[^a-zA-Z0-9_.-]+", "_", reason).strip("_") or "unknown"
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            stem = f"{timestamp}-{target}-{safe_reason}"
+            path = backup_dir / f"{stem}.md"
+            counter = 2
+            while path.exists():
+                path = backup_dir / f"{stem}-{counter}.md"
+                counter += 1
+
+            iso_ts = datetime.now().isoformat(timespec="seconds")
+            body = (
+                "# Failed memory write backup\n\n"
+                f"timestamp: {iso_ts}\n"
+                f"target: {target}\n"
+                f"reason: {safe_reason}\n"
+                f"error: {error}\n\n"
+                "## Original content\n\n"
+                f"{content}\n"
+            )
+            path.write_text(body, encoding="utf-8")
+            self._append_backup_index(backup_dir, path.name, iso_ts, target, safe_reason)
+            return {"backup_path": str(path)}
+        except Exception as exc:  # best-effort only; preserve the original error
+            logger.warning("Failed to back up rejected memory write: %s", exc)
+            return {"backup_error": str(exc)}
+
+    @staticmethod
+    def _append_backup_index(
+        backup_dir: Path,
+        filename: str,
+        timestamp: str,
+        target: str,
+        reason: str,
+    ) -> None:
+        """Append a compact row to failed-backups/INDEX.md."""
+        index_path = backup_dir / "INDEX.md"
+        if index_path.exists():
+            text = index_path.read_text(encoding="utf-8")
+        else:
+            text = (
+                "# Memory/User 写入失败备份索引\n\n"
+                "此目录存放 MEMORY.md / USER.md 写入失败时的备份内容。\n\n"
+                "## 索引\n"
+                "| 文件 | 时间 | Target | 原因 | 状态 |\n"
+                "|------|------|--------|------|------|\n"
+            )
+
+        row = f"| `{filename}` | {timestamp} | {target} | {reason} | pending |"
+
+        placeholder = "| （自动更新） | | | | |"
+        if row in text:
+            return
+        if placeholder in text:
+            text = text.replace(placeholder, row)
+        else:
+            if not text.endswith("\n"):
+                text += "\n"
+            text += row + "\n"
+        index_path.write_text(text, encoding="utf-8")
+
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
@@ -303,7 +383,9 @@ class MemoryStore:
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
         if scan_error:
-            return {"success": False, "error": scan_error}
+            result = {"success": False, "error": scan_error}
+            result.update(self._backup_failed_write(target, "injection", content, scan_error))
+            return result
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions.
@@ -327,7 +409,7 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
-                return {
+                result = {
                     "success": False,
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
@@ -337,6 +419,15 @@ class MemoryStore:
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
                 }
+                result.update(
+                    self._backup_failed_write(
+                        target,
+                        "char_limit",
+                        content,
+                        f"would exceed {limit:,} chars",
+                    )
+                )
+                return result
 
             entries.append(content)
             self._set_entries(target, entries)
@@ -356,7 +447,9 @@ class MemoryStore:
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
         if scan_error:
-            return {"success": False, "error": scan_error}
+            result = {"success": False, "error": scan_error}
+            result.update(self._backup_failed_write(target, "injection", new_content, scan_error))
+            return result
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -390,13 +483,22 @@ class MemoryStore:
             new_total = len(ENTRY_DELIMITER.join(test_entries))
 
             if new_total > limit:
-                return {
+                result = {
                     "success": False,
                     "error": (
                         f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
                         f"Shorten the new content or remove other entries first."
                     ),
                 }
+                result.update(
+                    self._backup_failed_write(
+                        target,
+                        "char_limit",
+                        new_content,
+                        f"would exceed {limit:,} chars",
+                    )
+                )
+                return result
 
             entries[idx] = new_content
             self._set_entries(target, entries)

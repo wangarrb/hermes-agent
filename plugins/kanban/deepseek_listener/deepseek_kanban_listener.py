@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""DeepSeek-TUI exec backed Hermes Kanban listener.
+"""CodeWhale backed Hermes Kanban listener.
 
 This listener is the non-interactive alternative to the visible
-``deepseek-kanban-interactive`` bridge.  It polls Kanban locally, claims one
-ready task, runs ``deepseek-tui exec`` for that task, and then completes or
+``codewhale-kanban-interactive`` bridge.  It polls Kanban locally, claims one
+ready task, runs ``codewhale --yolo --continue`` for that task, and then completes or
 blocks the Kanban task from the final structured result.
 """
 from __future__ import annotations
@@ -330,7 +330,7 @@ def run_deepseek_for_task(
     auto: bool,
     poll_s: float,
     ttl_s: int,
-    task_delivery: str,  # "inject" or "self-poll"
+    task_delivery: str,  # "inject"
 ) -> tuple[int, dict[str, Any], Path]:
     prompt = build_prompt(
         board=board,
@@ -341,10 +341,10 @@ def run_deepseek_for_task(
         workspace=workspace,
     )
     log_path = task_log_path(task.id, board)
-    startup_file = workspace / ".deepseek-kanban-startup.md"
+    startup_file = workspace / ".codewhale-kanban-startup.md"
     startup_file.write_text(prompt, encoding="utf-8")
 
-    base_ws = Path(os.environ.get("DEEPSEEK_KANBAN_WORKSPACE", str(workspace)))
+    base_ws = Path(os.environ.get("CODEWHALE_KANBAN_WORKSPACE", os.environ.get("DEEPSEEK_KANBAN_WORKSPACE", str(workspace))))
     session_workspace = base_ws / ".ds-sessions" / profile
     session_workspace.mkdir(parents=True, exist_ok=True)
 
@@ -362,9 +362,9 @@ def run_deepseek_for_task(
         "HERMES_KANBAN_WORKSPACE": str(base_ws),
     })
 
-    log(f"launch DeepSeek ({task_delivery}) for {task.id}: deepseek-tui -w {session_workspace}")
+    log(f"launch CodeWhale ({task_delivery}) for {task.id}: {deepseek_bin} -w {session_workspace}")
     with open(log_path, "ab") as log_f:
-        log_f.write(f"\n=== deepseek-kanban {task_delivery} start {time.strftime('%Y-%m-%d %H:%M:%S')} task={task.id} ===\n".encode())
+        log_f.write(f"\n=== codewhale-kanban {task_delivery} start {time.strftime('%Y-%m-%d %H:%M:%S')} task={task.id} ===\n".encode())
         log_f.flush()
 
     proc = subprocess.Popen(cmd, cwd=str(session_workspace), env=env)
@@ -403,7 +403,7 @@ def run_deepseek_for_task(
         if now - last_hb >= max(30.0, min(float(ttl_s) / 3.0, 120.0)):
             with kb.connect(board=board) as conn:
                 kb.heartbeat_claim(conn, task.id, ttl_seconds=ttl_s, claimer=claim_lock())
-                kb.heartbeat_worker(conn, task.id, note="deepseek-tui interactive running", expected_run_id=task.current_run_id)
+                kb.heartbeat_worker(conn, task.id, note="codewhale interactive running", expected_run_id=task.current_run_id)
             last_hb = now
         # Check if agent already completed/blocked via kanban CLI while TUI still runs.
         if now - last_status_check >= 10.0:
@@ -412,7 +412,7 @@ def run_deepseek_for_task(
                     "SELECT status FROM tasks WHERE id=?", (task.id,)
                 ).fetchone()
                 if row and row["status"] in ("done", "blocked"):
-                    log(f"task {task.id} transitioned to {row['status']} while deepseek-tui still running; waiting for TUI to exit")
+                    log(f"task {task.id} transitioned to {row['status']} while codewhale still running; waiting for TUI to exit")
             last_status_check = now
 
     # DeepSeek TUI exited — check if the agent already completed/blocked via kanban CLI.
@@ -430,15 +430,15 @@ def run_deepseek_for_task(
             }
             if row["status"] == "blocked":
                 result["block_reason"] = row["result"] or "agent blocked via kanban CLI"
-            log(f"deepseek-tui exited rc={rc}; task already {row['status']} in DB")
+            log(f"codewhale exited rc={rc}; task already {row['status']} in DB")
             with open(log_path, "ab") as log_f:
-                log_f.write(f"\n=== deepseek-kanban interactive exit rc={rc} task_status={row['status']} at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
+                log_f.write(f"\n=== codewhale-kanban interactive exit rc={rc} task_status={row['status']} at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
             return int(rc), sanitize_result(result), log_path
 
         # Agent didn't call kanban complete/block — treat as failure.
         with open(log_path, "ab") as log_f:
-            log_f.write(f"\n=== deepseek-kanban interactive exit rc={rc} task_still_running at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-        log(f"deepseek-tui exited rc={rc} but task {task.id} still running (agent may have forgotten kanban complete)")
+            log_f.write(f"\n=== codewhale-kanban interactive exit rc={rc} task_still_running at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
+        log(f"codewhale exited rc={rc} but task {task.id} still running (agent may have forgotten kanban complete)")
         result = {
             "status": "done" if rc == 0 else "blocked",
             "summary": f"DeepSeek TUI exited with rc={rc}" if rc != 0 else "DeepSeek completed without calling kanban complete",
@@ -449,49 +449,9 @@ def run_deepseek_for_task(
         return int(rc), sanitize_result(result), log_path
 
 
-def _start_self_poll_deepseek(args: argparse.Namespace) -> subprocess.Popen | None:
-    """Start a persistent self-poll DeepSeek TUI. Agent polls board itself."""
-    board = args.board or kb.get_current_board()
-    profile = args.profile
-    base_ws = Path(os.environ.get("DEEPSEEK_KANBAN_WORKSPACE", "/home/wyr/code/Egomotion4D"))
-    session_workspace = base_ws / ".ds-sessions" / profile
-    session_workspace.mkdir(parents=True, exist_ok=True)
-
-    prompt = (
-        f"You are a kanban self-poll worker for board={board} profile={profile}.\n"
-        f"1. Poll: hermes kanban --board {board} list --status ready --assignee {profile}\n"
-        f"2. Claim: hermes kanban --board {board} claim <task_id>\n"
-        f"3. Show: hermes kanban --board {board} show <task_id>\n"
-        f"4. Work → Complete: hermes kanban --board {board} complete <task_id> --summary '...'\n"
-        f"5. Or block: hermes kanban --board {board} block <task_id> --reason '...'\n"
-        f"6. Repeat. Stay alive across tasks. Do NOT /exit.\n"
-    )
-    startup_file = session_workspace / ".deepseek-self-poll-startup.md"
-    startup_file.write_text(prompt, encoding="utf-8")
-
-    cmd = [args.deepseek_bin, "--yolo", "--continue", "-w", str(session_workspace)]
-    if args.model:
-        cmd.extend(["--model", args.model])
-    cmd.extend(args.deepseek_arg or [])
-    env = os.environ.copy()
-    env.update({"HERMES_KANBAN_BOARD": board, "HERMES_KANBAN_PROFILE": profile})
-    log(f"self-poll DeepSeek: {' '.join(cmd[:4])}")
-    return subprocess.Popen(cmd, cwd=str(session_workspace), env=env)
-
-
 def handle_one_task(args: argparse.Namespace) -> bool:
     board = args.board or kb.get_current_board()
     profile = args.profile
-
-    # --- self-poll: start TUI once, never claim ---
-    if args.task_delivery == "self-poll":
-        if getattr(args, "_self_poll_proc", None) is not None:
-            return False
-        proc = _start_self_poll_deepseek(args)
-        if proc is None:
-            return False
-        args._self_poll_proc = proc
-        return True
 
     # --- Inject mode: keep TUI always visible ---
     if args.task_delivery == "inject":
@@ -516,7 +476,7 @@ def handle_one_task(args: argparse.Namespace) -> bool:
                         args._cooldown_until = 0
 
             # ALWAYS restart TUI immediately
-            base_ws = Path(os.environ.get("DEEPSEEK_KANBAN_WORKSPACE", "/home/wyr/code/Egomotion4D"))
+            base_ws = Path(os.environ.get("CODEWHALE_KANBAN_WORKSPACE", os.environ.get("DEEPSEEK_KANBAN_WORKSPACE", "/home/wyr/code/Egomotion4D")))
             session_workspace = base_ws / ".ds-sessions" / profile
             session_workspace.mkdir(parents=True, exist_ok=True)
             cmd = [args.deepseek_bin, "--yolo", "--continue", "-w", str(session_workspace)]
@@ -631,18 +591,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="Process at most one ready task then exit")
     parser.add_argument("--idle-exit-s", type=int, default=0, help="Exit after this many idle seconds (0 = never)")
     parser.add_argument("--model", default=None, help="Optional DeepSeek model override")
-    parser.add_argument("--deepseek-bin", default="deepseek-tui", help="DeepSeek executable path/name (default: deepseek-tui)")
-    parser.add_argument("--deepseek-arg", action="append", default=[], help="Extra raw arg passed to deepseek-tui exec; repeatable")
-    parser.add_argument("--no-auto", dest="auto", action="store_false", help="Disable deepseek-tui exec --auto")
-    parser.add_argument("--task-delivery", default=os.environ.get("HERMES_KANBAN_TASK_DELIVERY") or "inject",
-                        choices=["inject", "self-poll", "worker"],  # worker = deprecated alias for inject
-                        help="inject=keep TUI visible + inject tasks; self-poll=TUI polls board itself")
+    parser.add_argument("--deepseek-bin", default="codewhale", help="CodeWhale executable path/name (default: codewhale)")
+    parser.add_argument("--deepseek-arg", action="append", default=[], help="Extra raw arg passed to codewhale; repeatable")
+    parser.add_argument("--no-auto", dest="auto", action="store_false", help="Disable codewhale --auto")
+    parser.add_argument("--task-delivery", default="inject",
+                        choices=["inject"],
+                        help="inject=keep TUI visible + inject tasks")
     parser.set_defaults(auto=True)
     args = parser.parse_args(argv)
-
-    # Backward compat: "worker" → "inject"
-    if args.task_delivery == "worker":
-        args.task_delivery = "inject"
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
@@ -650,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     board = args.board or kb.get_current_board()
     initial_poll = float(args.poll if args.poll is not None else listener_policy.poll_seconds())
     poll_label = f"{initial_poll:g}s" + (" override" if args.poll is not None else " shared-policy")
-    log(f"deepseek-kanban listener started: profile={args.profile} claims={','.join(claim_assignees(args))} board={board} delivery={args.task_delivery} poll={poll_label}")
+    log(f"codewhale-kanban listener started: profile={args.profile} claims={','.join(claim_assignees(args))} board={board} delivery={args.task_delivery} poll={poll_label}")
     idle_since = time.time()
     try:
         while not _STOP:
@@ -659,15 +615,6 @@ def main(argv: list[str] | None = None) -> int:
                 idle_since = time.time()
                 if args.once:
                     return 0
-                # self-poll: TUI is running, monitor it
-                if args.task_delivery == "self-poll":
-                    proc = getattr(args, "_self_poll_proc", None)
-                    if proc is not None:
-                        if proc.poll() is not None:
-                            log(f"self-poll deepseek-tui exited rc={proc.returncode}, restarting in next tick")
-                            args._self_poll_proc = None
-                    time.sleep(max(5.0, float(args.poll if args.poll is not None else 30)))
-                    continue
             else:
                 if args.once:
                     log("no ready task; exiting --once")

@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -59,42 +60,6 @@ def prompt_dir(workspace: Path, board: str, pane_profile: str) -> Path:
     return workspace / ".codex-kanban" / safe_board / safe_profile
 
 
-def self_poll_prompt_dir(workspace: Path, board: str, pane_profile: str) -> Path:
-    safe_board = worker_runtime.safe_path_component(board)
-    safe_profile = worker_runtime.safe_path_component(pane_profile)
-    return workspace / ".hermes-kanban" / safe_board / safe_profile
-
-
-def write_self_poll_startup_prompt(
-    *,
-    board: str,
-    profile: str,
-    claim_assignees: list[str],
-    workspace: Path,
-    ttl: int,
-    listener_kind: str,
-) -> tuple[Path, str]:
-    owner = worker_runtime.default_self_poll_owner(
-        profile=profile,
-        listener_kind=listener_kind,
-    )
-    prompt = worker_runtime.build_self_poll_startup_prompt(
-        agent_label="interactive Codex",
-        board=board,
-        profile=profile,
-        claim_assignees=claim_assignees,
-        workspace=workspace,
-        ttl=ttl,
-        listener_kind=listener_kind,
-        owner=owner,
-        role_guidance_text=role_guidance(profile),
-    )
-    path = self_poll_prompt_dir(workspace, board, profile) / "self-poll-startup.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(prompt, encoding="utf-8")
-    return path, prompt
-
-
 def claim_assignees(args: argparse.Namespace) -> list[str]:
     """Return assignees this single pane may claim, in priority order."""
     return worker_runtime.claim_assignees_from_args(args, default_profile="planner")
@@ -108,31 +73,13 @@ def reset_kanban_claims(
     workspace: Path,
     reason: str = "operator reset-kanban",
 ) -> list[str]:
-    reset_ids: list[str] = []
-    reset_ids.extend(
-        worker_runtime.reset_interactive_claims(
-            board=board,
-            profile=profile,
-            claim_assignees=claim_assignees,
-            workspace=workspace,
-            listener_kind="codex-interactive",
-            reason=reason,
-        )
-    )
-    owner = worker_runtime.default_self_poll_owner(
+    reset_ids = worker_runtime.reset_interactive_claims(
+        board=board,
         profile=profile,
-        listener_kind="codex-self-poll",
-    )
-    reset_ids.extend(
-        worker_runtime.reset_self_poll_claims(
-            board=board,
-            profile=profile,
-            claim_assignees=claim_assignees,
-            workspace=workspace,
-            listener_kind="codex-self-poll",
-            owner=owner,
-            reason=reason,
-        )
+        claim_assignees=claim_assignees,
+        workspace=workspace,
+        listener_kind="codex-interactive",
+        reason=reason,
     )
     return list(dict.fromkeys(reset_ids))
 
@@ -420,7 +367,7 @@ def _reclaim_task_without_signaling_worker(conn, task_id: str, *, reason: str) -
     return kb.reclaim_task(conn, task_id, reason=reason, signal_fn=_skip_reclaim_signal)
 
 
-def reclaim_orphaned_running_task(args: argparse.Namespace, *, log_path: Path) -> bool:
+def reclaim_orphaned_running_task(args: argparse.Namespace, *, log_path: Path, conn: Any = None) -> bool:
     """Requeue this pane's stale running Codex task so it can receive a fresh prompt.
 
     Interactive Codex cannot safely resume a prompt that was injected into a
@@ -430,41 +377,42 @@ def reclaim_orphaned_running_task(args: argparse.Namespace, *, log_path: Path) -
     board = args.board or kb.get_current_board() or "default"
     workspace = Path(args.workspace).expanduser().resolve()
     host = socket.gethostname()
-    with kb.connect(board=board) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, claim_lock, worker_pid, workspace_path
-              FROM tasks
-             WHERE assignee = ?
-               AND status = 'running'
-               AND claim_lock IS NOT NULL
-             ORDER BY started_at ASC, id ASC
-            """,
-            (args.profile,),
-        ).fetchall()
-        for row in rows:
-            old_lock = row["claim_lock"] or ""
-            if not old_lock.endswith(":codex-interactive"):
-                continue
-            lock_host = old_lock.split(":", 1)[0] if ":" in old_lock else ""
-            if lock_host != host:
-                continue
-            if not _workspace_matches(row["workspace_path"], workspace):
-                continue
-            old_pid = int(row["worker_pid"]) if row["worker_pid"] else None
-            if _pid_alive(old_pid):
-                continue
-            task_id = row["id"]
-            if _reclaim_task_without_signaling_worker(
-                conn,
-                task_id,
-                reason=(
-                    "codex-interactive startup found orphaned running task; "
-                    "requeueing for fresh prompt after watcher/session restart"
-                ),
-            ):
-                log_line(log_path, f"reclaimed orphaned running task {task_id} old_pid={old_pid}")
-                return True
+    if conn is None:
+        conn = kb.connect(board=board)
+    rows = conn.execute(
+        """
+        SELECT id, claim_lock, worker_pid, workspace_path
+          FROM tasks
+         WHERE assignee = ?
+           AND status = 'running'
+           AND claim_lock IS NOT NULL
+         ORDER BY started_at ASC, id ASC
+        """,
+        (args.profile,),
+    ).fetchall()
+    for row in rows:
+        old_lock = row["claim_lock"] or ""
+        if not old_lock.endswith(":codex-interactive"):
+            continue
+        lock_host = old_lock.split(":", 1)[0] if ":" in old_lock else ""
+        if lock_host != host:
+            continue
+        if not _workspace_matches(row["workspace_path"], workspace):
+            continue
+        old_pid = int(row["worker_pid"]) if row["worker_pid"] else None
+        if _pid_alive(old_pid):
+            continue
+        task_id = row["id"]
+        if _reclaim_task_without_signaling_worker(
+            conn,
+            task_id,
+            reason=(
+                "codex-interactive startup found orphaned running task; "
+                "requeueing for fresh prompt after watcher/session restart"
+            ),
+        ):
+            log_line(log_path, f"reclaimed orphaned running task {task_id} old_pid={old_pid}")
+            return True
     return False
 
 
@@ -485,28 +433,30 @@ def _cleanup_active_claim(*, board: str, task_id: str | None, run_id: int | None
         log_line(log_path, f"cleanup active claim failed for {task_id}: {type(exc).__name__}: {exc}")
 
 
-def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[str | None, int | None]:
+def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path, conn: Any = None) -> tuple[str | None, int | None]:
     board = args.board or kb.get_current_board() or "default"
     workspace = Path(args.workspace).expanduser().resolve()
     pane_profile = args.profile
-    with kb.connect(board=board) as conn:
-        kb.release_stale_claims(conn)
-        kb.recompute_ready(conn)
-        candidate = _select_ready_candidate(conn, args)
-        if candidate is None:
-            return None, None
-        claimed = kb.claim_task(conn, candidate.id, ttl_seconds=args.ttl, claimer=claim_lock())
-        if claimed is None:
-            return None, None
-        # Interactive Codex runs in a stable project root.  Persist that root as
-        # the task workspace so humans and downstream tools see the same path.
-        kb.set_workspace_path(conn, claimed.id, workspace)
-        claimed = kb.get_task(conn, claimed.id) or claimed
-        try:
-            kb._set_worker_pid(conn, claimed.id, os.getpid())  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        context = kb.build_worker_context(conn, claimed.id)
+    # Reuse caller's connection or open a new one (Plan 2).
+    if conn is None:
+        conn = kb.connect(board=board)
+    kb.release_stale_claims(conn)
+    kb.recompute_ready(conn)
+    candidate = _select_ready_candidate(conn, args)
+    if candidate is None:
+        return None, None
+    claimed = kb.claim_task(conn, candidate.id, ttl_seconds=args.ttl, claimer=claim_lock())
+    if claimed is None:
+        return None, None
+    # Interactive Codex runs in a stable project root.  Persist that root as
+    # the task workspace so humans and downstream tools see the same path.
+    kb.set_workspace_path(conn, claimed.id, workspace)
+    claimed = kb.get_task(conn, claimed.id) or claimed
+    try:
+        kb._set_worker_pid(conn, claimed.id, os.getpid())  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    context = kb.build_worker_context(conn, claimed.id)
 
     prompt_path = write_task_prompt(
         workspace=workspace,
@@ -530,27 +480,26 @@ def claim_and_inject_one(args: argparse.Namespace, *, log_path: Path) -> tuple[s
         log_path=log_path,
     )
     if not ok:
-        with kb.connect(board=board) as conn:
-            _reclaim_task_without_signaling_worker(
-                conn,
-                claimed.id,
-                reason="codex-interactive zellij injection failed",
-            )
+        _reclaim_task_without_signaling_worker(
+            conn,
+            claimed.id,
+            reason="codex-interactive zellij injection failed",
+        )
         return None, None
 
-    with kb.connect(board=board) as conn:
-        kb.add_comment(
-            conn,
-            claimed.id,
-            "codex-interactive-listener",
-            f"Injected into Zellij pane {args.zellij_pane_id}; prompt file: {prompt_path}",
-        )
-        kb.heartbeat_worker(
-            conn,
-            claimed.id,
-            note=f"codex-interactive injected prompt: {prompt_path}",
-            expected_run_id=claimed.current_run_id,
-        )
+    # Post-inject DB ops reuse the same connection.
+    kb.add_comment(
+        conn,
+        claimed.id,
+        "codex-interactive-listener",
+        f"Injected into Zellij pane {args.zellij_pane_id}; prompt file: {prompt_path}",
+    )
+    kb.heartbeat_worker(
+        conn,
+        claimed.id,
+        note=f"codex-interactive injected prompt: {prompt_path}",
+        expected_run_id=claimed.current_run_id,
+    )
     zellij_rename_pane(
         session=args.zellij_session,
         pane_id=args.zellij_pane_id,
@@ -590,17 +539,114 @@ def watcher_main(args: argparse.Namespace) -> int:
     if args.startup_delay_s > 0:
         time.sleep(args.startup_delay_s)
 
+    # ── Persistent connection (Plan 2) ──────────────────────────────
+    # Instead of opening a new connection on every loop iteration (which
+    # causes repeated PRAGMA setup, WAL lock churn, and FD leaks because
+    # ``with kb.connect()`` only commits but never closes), we keep one
+    # connection open for the lifetime of the watcher and reconnect
+    # periodically or on error.
+    MAX_CONSECUTIVE_DB_ERRORS = 5
+    consecutive_db_errors = 0
+    _CONN_RECYCLE_S = 60.0  # reconnect every 60 s to release WAL locks
+    _conn: Any = None
+    _conn_created_at: float = 0.0
+
+    def _ensure_conn() -> Any:
+        """Return a live DB connection, reconnecting if necessary."""
+        nonlocal _conn, _conn_created_at, consecutive_db_errors
+
+        # Recycle stale connection
+        if _conn is not None and (time.time() - _conn_created_at) >= _CONN_RECYCLE_S:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            _conn = None
+
+        if _conn is not None:
+            # Quick liveness probe
+            try:
+                _conn.execute("SELECT 1")
+                return _conn
+            except sqlite3.OperationalError:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+
+        # Open a new connection with retry
+        for attempt in range(3):
+            try:
+                _conn = kb.connect(board=board)
+                _conn_created_at = time.time()
+                consecutive_db_errors = 0
+                return _conn
+            except sqlite3.OperationalError as exc:
+                consecutive_db_errors += 1
+                delay = 2.0 * (2 ** attempt)
+                log_line(
+                    log_path,
+                    f"DB OperationalError (attempt {attempt+1}/3, "
+                    f"consecutive={consecutive_db_errors}): {exc}; "
+                    f"retrying in {delay:.0f}s",
+                )
+                time.sleep(delay)
+            except sqlite3.DatabaseError as exc:
+                # Index corruption ("database disk image is malformed") is
+                # recoverable via REINDEX.  OperationalError is handled above.
+                msg = str(exc).lower()
+                if "malformed" in msg or "corrupt" in msg:
+                    log_line(
+                        log_path,
+                        f"DB corruption detected: {exc}; attempting REINDEX repair",
+                    )
+                    try:
+                        repair_conn = sqlite3.connect(
+                            str(kb.kanban_db_path(board=board)),
+                            timeout=120.0,
+                        )
+                        repair_conn.execute("PRAGMA integrity_check")
+                        repair_conn.execute("REINDEX")
+                        repair_conn.close()
+                        log_line(log_path, "REINDEX repair succeeded; retrying connect")
+                    except Exception as repair_exc:
+                        log_line(log_path, f"REINDEX repair failed: {repair_exc}")
+                consecutive_db_errors += 1
+                time.sleep(4.0)
+            except Exception as exc:
+                consecutive_db_errors += 1
+                log_line(log_path, f"DB connect error: {type(exc).__name__}: {exc}")
+                time.sleep(4.0)
+
+        # All retries exhausted — return None, caller will skip this tick
+        return None
+
     active_task: str | None = None
     active_run_id: int | None = None
     last_hb = 0.0
     try:
         while not _STOP:
             now = time.time()
+            conn = _ensure_conn()
+            if conn is None:
+                if consecutive_db_errors >= MAX_CONSECUTIVE_DB_ERRORS:
+                    log_line(log_path, f"too many consecutive DB errors ({consecutive_db_errors}); stopping watcher")
+                    break
+                time.sleep(poll_s)
+                continue
             if active_task:
-                with kb.connect(board=board) as conn:
+                try:
                     status, current_run_id = _task_status(conn, active_task)
-                    if status == "running" and (active_run_id is None or current_run_id == active_run_id):
-                        if now - last_hb >= max(15.0, min(float(args.ttl) / 3.0, 120.0)):
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                    consecutive_db_errors += 1
+                    log_line(log_path, f"DB error checking task status: {exc}; will retry")
+                    time.sleep(min(poll_s, 5.0))
+                    continue
+                consecutive_db_errors = 0
+                if status == "running" and (active_run_id is None or current_run_id == active_run_id):
+                    if now - last_hb >= max(15.0, min(float(args.ttl) / 3.0, 120.0)):
+                        try:
                             kb.heartbeat_claim(conn, active_task, ttl_seconds=args.ttl, claimer=claim_lock())
                             kb.heartbeat_worker(
                                 conn,
@@ -608,23 +654,28 @@ def watcher_main(args: argparse.Namespace) -> int:
                                 note="codex-interactive waiting for complete/block from Codex TUI",
                                 expected_run_id=active_run_id,
                             )
+                        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                            consecutive_db_errors += 1
+                            log_line(log_path, f"DB error on heartbeat: {exc}")
+                        else:
                             last_hb = now
-                        time.sleep(min(poll_s, 5.0))
-                        continue
-                    log_line(log_path, f"active task left running state: {active_task} status={status} run={current_run_id}")
-                    active_task = None
-                    active_run_id = None
-                    last_hb = 0.0
-                    zellij_rename_pane(
-                        session=args.zellij_session,
-                        pane_id=args.zellij_pane_id,
-                        name=f"{args.profile}-codex listening",
-                        log_path=log_path,
-                    )
+                    time.sleep(min(poll_s, 5.0))
+                    continue
+                log_line(log_path, f"active task left running state: {active_task} status={status} run={current_run_id}")
+                active_task = None
+                active_run_id = None
+                last_hb = 0.0
+                zellij_rename_pane(
+                    session=args.zellij_session,
+                    pane_id=args.zellij_pane_id,
+                    name=f"{args.profile}-codex listening",
+                    log_path=log_path,
+                )
 
-            reclaim_orphaned_running_task(args, log_path=log_path)
-            active_task, active_run_id = claim_and_inject_one(args, log_path=log_path)
+            reclaim_orphaned_running_task(args, log_path=log_path, conn=conn)
+            active_task, active_run_id = claim_and_inject_one(args, log_path=log_path, conn=conn)
             if active_task:
+                consecutive_db_errors = 0
                 last_hb = 0.0
                 if args.once:
                     # Keep heartbeating the claimed task until it is completed or blocked.
@@ -635,6 +686,11 @@ def watcher_main(args: argparse.Namespace) -> int:
                     return 0
                 time.sleep(poll_s)
     finally:
+        if _conn is not None:
+            try:
+                _conn.close()
+            except Exception:
+                pass
         _cleanup_active_claim(board=board, task_id=active_task, run_id=active_run_id, log_path=log_path)
     log_line(log_path, "interactive watcher stopped")
     return 0
@@ -698,59 +754,6 @@ def launcher_main(args: argparse.Namespace) -> int:
     if not (workspace / ".git").exists():
         print(f"警告: {workspace} 看起来不是 git repo；Codex 交互模式可能拒绝执行。", file=sys.stderr)
 
-    delivery = getattr(args, "task_delivery", "inject")
-    if delivery == "self-poll":
-        prompt_path, startup_prompt = write_self_poll_startup_prompt(
-            board=board,
-            profile=args.profile,
-            claim_assignees=claim_assignees(args),
-            workspace=workspace,
-            ttl=args.ttl,
-            listener_kind="codex-self-poll",
-        )
-        print("Codex self-poll kanban mode")
-        print(f"  board:          {board}")
-        print(f"  profile:        {args.profile}")
-        print(f"  claims:         {', '.join(claim_assignees(args))}")
-        print(f"  workspace:      {workspace}")
-        print(f"  startup prompt: {prompt_path}")
-        if args.watch_only:
-            print("self-poll watch-only: startup prompt written; no watcher started.")
-            return 0
-        env = os.environ.copy()
-        env.update(
-            {
-                "HERMES_KANBAN_BOARD": board,
-                "HERMES_KANBAN_PROFILE": args.profile,
-                "HERMES_KANBAN_CLAIM_ASSIGNEES": ",".join(claim_assignees(args)),
-                "HERMES_KANBAN_WORKSPACE": str(workspace),
-                "HERMES_KANBAN_TASK_DELIVERY": "self-poll",
-                "HERMES_KANBAN_SELF_POLL_PROMPT": str(prompt_path),
-                "HERMES_KANBAN_SELF_POLL_OWNER": worker_runtime.default_self_poll_owner(
-                    profile=args.profile,
-                    listener_kind="codex-self-poll",
-                ),
-            }
-        )
-        args.startup_prompt = startup_prompt
-        codex_cmd = build_codex_cmd(args)
-        log_path = kb.worker_logs_dir(board=board) / f"codex-self-poll-{args.profile}.log"
-        log_line(log_path, f"launcher starting codex self-poll: {' '.join(codex_cmd)}")
-
-# For resume: all kanban context is in env vars (HERMES_KANBAN_*).
-        # For fresh: startup_prompt is already in codex_cmd as positional arg.
-        # cwd= ensures Codex runs in the right workspace even without --cd.
-        # Some zellij/bash -lc configurations make sys.stdin.isatty() return
-        # False even when a real terminal is available via /dev/tty.
-        if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
-            return int(subprocess.call(codex_cmd, cwd=str(workspace), env=env))
-        try:
-            with open("/dev/tty", "rb") as tty_stdin:
-                return int(subprocess.call(codex_cmd, cwd=str(workspace), env=env, stdin=tty_stdin))
-        except OSError:
-            pass
-        return int(subprocess.call(codex_cmd, cwd=str(workspace), env=env, stdin=sys.stdin))
-
     zellij_session = args.zellij_session or os.environ.get("ZELLIJ_SESSION_NAME")
     zellij_pane_id = args.zellij_pane_id or os.environ.get("ZELLIJ_PANE_ID")
     if not zellij_session or not zellij_pane_id:
@@ -808,10 +811,11 @@ def launcher_main(args: argparse.Namespace) -> int:
         print("listener-only 模式：不会启动 Codex TUI，只运行后台 listener 并向指定 Zellij pane 注入任务。")
         return watcher_main(args)
 
-    try:
-        input()
-    except EOFError:
-        pass
+    if not args.auto_start:
+        try:
+            input()
+        except EOFError:
+            pass
 
     env = os.environ.copy()
     env.update(
@@ -868,12 +872,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll", type=float, default=None, help="Ready-task poll interval override; default uses shared Hermes listener policy")
     parser.add_argument("--ttl", type=int, default=listener_policy.LISTENER_HEALTH_CLAIM_TTL_SECONDS, help="Claim TTL seconds")
     parser.add_argument("--startup-delay-s", type=float, default=8.0, help="Delay after Codex launch before injecting first task")
-    parser.add_argument(
-        "--task-delivery",
-        choices=("inject", "self-poll"),
-        default=os.environ.get("HERMES_KANBAN_TASK_DELIVERY") or "self-poll",
-        help="Task delivery mode: one-time self-poll startup prompt, or legacy per-task zellij injection.",
-    )
     parser.add_argument("--assist-claim-delay-s", type=float, default=float(os.environ.get("HERMES_KANBAN_ASSIST_CLAIM_DELAY_S") or 0.0), help="Only claim non-primary assist assignees after their ready task has waited this many seconds. 0 disables the delay.")
     parser.add_argument(
         "--assist-claim-delay-for",
@@ -898,6 +896,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--zellij-session", default=os.environ.get("ZELLIJ_SESSION_NAME"), help="Target Zellij session for task injection")
     parser.add_argument("--zellij-pane-id", default=os.environ.get("ZELLIJ_PANE_ID"), help="Target Zellij pane id for task injection")
     parser.add_argument("--watch-only", action="store_true", help="Only run the background listener; do not launch interactive Codex TUI")
+    parser.add_argument("--auto-start", action="store_true", help="Skip the 'press Enter' prompt and start immediately (for scripted/automated launches)")
     parser.add_argument("--watch-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reset-kanban", action="store_true", help="Reclaim this profile/pane's running interactive Kanban task(s) and exit")
     parser.add_argument("--once", action="store_true", help="Watcher child: process at most one task")

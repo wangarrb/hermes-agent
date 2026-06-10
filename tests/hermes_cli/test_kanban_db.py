@@ -2579,6 +2579,9 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Production defaults to DELETE journal for visible multi-process Kanban
+    # workers. This test intentionally exercises the legacy WAL fallback path.
+    monkeypatch.setenv("HERMES_KANBAN_FORCE_DELETE_JOURNAL", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     # Clear module cache so a fresh connect() is attempted

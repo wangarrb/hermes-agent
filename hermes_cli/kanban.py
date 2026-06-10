@@ -549,6 +549,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
+    p_update = sub.add_parser(
+        "update",
+        help="Update title/body/priority/assignee of a task; use --reopen to reopen a done task",
+    )
+    p_update.add_argument("task_id", help="Task id to update")
+    p_update.add_argument("--title", default=None, help="New title")
+    p_update.add_argument("--body", default=None, help="New body text")
+    p_update.add_argument("--body-file", default=None,
+                          help="Read new body from this file (use - for stdin)")
+    p_update.add_argument("--priority", type=int, default=None, help="New priority")
+    p_update.add_argument("--assignee", default=None, help="New assignee profile")
+    p_update.add_argument("--reopen", action="store_true",
+                          help="Reopen a done task (status done -> ready) so it can be re-claimed. "
+                               "Archived tasks cannot be reopened.")
+    p_update.add_argument("--json", action="store_true", dest="json_output",
+                          help="Output result as JSON")
+
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -938,6 +955,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
+            "update":   _cmd_update,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -1933,6 +1951,49 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    body = getattr(args, "body", None)
+    body_file = getattr(args, "body_file", None)
+    if body and body_file:
+        print("kanban: --body and --body-file are mutually exclusive", file=sys.stderr)
+        return 2
+    if body_file:
+        if body_file == "-":
+            body = sys.stdin.read()
+        else:
+            from pathlib import Path
+            body = Path(body_file).read_text()
+
+    reopen = getattr(args, "reopen", False)
+
+    with kb.connect_closing() as conn:
+        ok = kb.update_task(
+            conn,
+            args.task_id,
+            title=getattr(args, "title", None),
+            body=body,
+            priority=getattr(args, "priority", None),
+            assignee=getattr(args, "assignee", None),
+            reopen=reopen,
+        )
+        if not ok:
+            print(
+                f"cannot update {args.task_id} (unknown id or task is done/archived; "
+                f"use --reopen to reopen a done task)",
+                file=sys.stderr,
+            )
+            return 1
+
+    if getattr(args, "json_output", False):
+        print(json.dumps({"task_id": args.task_id, "status": "updated"}))
+    else:
+        msg = f"Updated {args.task_id}"
+        if reopen:
+            msg += " (reopened: done -> ready)"
+        print(msg)
     return 0
 
 

@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from agent.model_metadata import estimate_request_tokens_rough
+from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
@@ -432,11 +432,31 @@ def compress_context(
         except Exception:
             pass
 
+    messages_only_tokens = estimate_messages_tokens_rough(messages)
+    full_request_tokens = approx_tokens
+    if not full_request_tokens:
+        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_prompt:
+            existing_prompt = agent._build_system_prompt(system_message)
+        full_request_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=existing_prompt or "",
+            tools=agent.tools or None,
+        )
+    fixed_context_tokens = max(0, int(full_request_tokens or 0) - messages_only_tokens)
+
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        compressed = agent.context_compressor.compress(
+            messages,
+            current_tokens=full_request_tokens,
+            fixed_context_tokens=fixed_context_tokens,
+            focus_topic=focus_topic,
+            force=force,
+        )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
-        # focus_topic / force — fall back to calling without them.
+        # fixed_context_tokens / focus_topic / force — fall back to calling
+        # without them.
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
     except BaseException:
         # ANY exception during compress() must release the lock so the

@@ -410,7 +410,7 @@ def run_codex_for_task(
     extra_args: list[str],
     poll_s: float,
     ttl_s: int,
-    task_delivery: str,  # "inject" or "self-poll"
+    task_delivery: str,  # "inject" only
 ) -> tuple[int, dict[str, Any], Path]:
     prompt = build_prompt(
         board=board,
@@ -537,183 +537,134 @@ def run_codex_for_task(
         return int(rc), sanitize_result(result), log_path
 
 
-def _start_self_poll_codex(args: argparse.Namespace) -> subprocess.Popen | None:
-    """Start a persistent self-poll Codex TUI. Agent polls board itself."""
-    board = args.board or kb.get_current_board()
-    profile = args.profile
-    session_workspace = Path(os.environ.get("CODEX_KANBAN_WORKSPACE", "/home/wyr/code/Egomotion4D"))
-    
-    prompt = (
-        f"You are a kanban self-poll worker for board={board} profile={profile}.\n"
-        f"1. Poll: hermes kanban --board {board} list --status ready --assignee {profile}\n"
-        f"2. Claim: hermes kanban --board {board} claim <task_id>\n"
-        f"3. Show: hermes kanban --board {board} show <task_id>\n"
-        f"4. Work → Complete: hermes kanban --board {board} complete <task_id> --summary '...'\n"
-        f"5. Or block: hermes kanban --board {board} block <task_id> --reason '...'\n"
-        f"6. Repeat. Stay alive across tasks. Do NOT /exit.\n"
-    )
-    startup_file = session_workspace / ".codex-self-poll-startup.md"
-    startup_file.write_text(prompt, encoding="utf-8")
-
-    has_session = has_saved_codex_sessions(session_workspace)
-    if has_session:
-        cmd = [args.codex_bin, "resume", "--last", "--dangerously-bypass-approvals-and-sandbox"]
-    else:
-        cmd = [args.codex_bin, "--dangerously-bypass-approvals-and-sandbox", "--cd", str(session_workspace), str(startup_file)]
-        if args.sandbox:
-            cmd.insert(1, "--sandbox")
-            cmd.insert(2, args.sandbox)
-    if args.model:
-        cmd.extend(["--model", args.model])
-    cmd.extend(args.codex_arg or [])
-    env = os.environ.copy()
-    env.update({"HERMES_KANBAN_BOARD": board, "HERMES_KANBAN_PROFILE": profile})
-    log(f"self-poll Codex: {'resume' if has_session else 'fresh'}: {' '.join(cmd[:4])}")
-    return subprocess.Popen(cmd, cwd=str(session_workspace), env=env)
-
-
 def handle_one_task(args: argparse.Namespace) -> bool:
     board = args.board or kb.get_current_board()
     profile = args.profile
 
-    # --- self-poll: start TUI once, never claim ---
-    if args.task_delivery == "self-poll":
-        if getattr(args, "_self_poll_proc", None) is not None:
-            return False
-        proc = _start_self_poll_codex(args)
-        if proc is None:
-            return False
-        args._self_poll_proc = proc
-        return True
-
     # --- Inject mode: keep TUI always visible ---
-    if args.task_delivery == "inject":
-        # Step 1: TUI always kept alive (restart immediately if dead)
-        proc = getattr(args, "_tui_proc", None)
-        if proc is None or proc.poll() is not None:
-            # TUI exited — if task was active, enter cooldown (non-blocking)
-            active_task_id = getattr(args, "_active_task_id", None)
-            if active_task_id is not None and proc is not None:
-                with kb.connect(board=board) as conn:
-                    row = conn.execute(
-                        "SELECT status, current_run_id FROM tasks WHERE id=?",
-                        (active_task_id,),
-                    ).fetchone()
-                    if row and row["status"] == "running":
-                        if not getattr(args, "_cooldown_until", 0):
-                            log(f"TUI exited with active task {active_task_id} — start 10min cooldown")
-                            args._cooldown_until = time.time() + 600
-                    else:
-                        log(f"task {active_task_id} already {row['status'] if row else 'gone'}, clearing")
-                        args._active_task_id = None
-                        args._cooldown_until = 0
-
-            # ALWAYS restart TUI immediately
-            session_workspace = Path(os.environ.get("CODEX_KANBAN_WORKSPACE", "/home/wyr/code/Egomotion4D"))
-            has_session = has_saved_codex_sessions(session_workspace)
-            if has_session:
-                cmd = [args.codex_bin, "resume", "--last", "--dangerously-bypass-approvals-and-sandbox"]
-            else:
-                cmd = [args.codex_bin, "--dangerously-bypass-approvals-and-sandbox", "--cd", str(session_workspace)]
-                if args.sandbox:
-                    cmd.insert(1, "--sandbox")
-                    cmd.insert(2, args.sandbox)
-            if args.model:
-                cmd.extend(["--model", args.model])
-            cmd.extend(args.codex_arg or [])
-            env = os.environ.copy()
-            env.update({"HERMES_KANBAN_BOARD": board, "HERMES_KANBAN_PROFILE": profile})
-            args._tui_proc = subprocess.Popen(cmd, cwd=str(session_workspace), env=env)
-            log(f"inject TUI {'restarted' if proc else 'launched'}: {'resume' if has_session else 'fresh'}")
-            time.sleep(2.0)
-
-        # Step 2: handle cooldown state
-        cooldown_until = getattr(args, "_cooldown_until", 0)
-        if cooldown_until:
-            active_id = args._active_task_id
-            if not active_id:
-                args._cooldown_until = 0  # shouldn't happen, but clean up
-            elif time.time() >= cooldown_until:
-                # Cooldown expired — requeue task for retry
-                with kb.connect(board=board) as conn:
-                    row = conn.execute(
-                        "SELECT status, current_run_id, max_retries, consecutive_failures FROM tasks WHERE id=?",
-                        (active_id,),
-                    ).fetchone()
-                    if row and row["status"] == "running":
-                        configured_max = row["max_retries"] if row["max_retries"] is not None else 10
-                        max_retries = max(int(configured_max), listener_policy.MIN_PROVIDER_FAILURE_SILENT_RETRIES)
-                        consecutive = int(row["consecutive_failures"] or 0) + 1
-                        if consecutive > max_retries + 1:
-                            kb.block_task(conn, active_id,
-                                          reason=f"provider failure retries exhausted ({consecutive}/{max_retries})",
-                                          expected_run_id=row["current_run_id"])
-                            conn.execute("UPDATE tasks SET consecutive_failures=?, last_failure_error=? WHERE id=?",
-                                         (consecutive, "cooldown retries exhausted", active_id))
-                            log(f"blocked {active_id}: retries exhausted")
-                        else:
-                            kb.reclaim_task(conn, active_id,
-                                            reason=f"cooldown expired, requeue for retry {consecutive}/{max_retries}",
-                                            signal_fn=_noop_signal)
-                            conn.execute("UPDATE tasks SET consecutive_failures=?, last_failure_error=? WHERE id=?",
-                                         (consecutive, "cooldown retry", active_id))
-                            log(f"requeued {active_id}: cooldown retry {consecutive}/{max_retries}")
+    # Step 1: TUI always kept alive (restart immediately if dead)
+    proc = getattr(args, "_tui_proc", None)
+    if proc is None or proc.poll() is not None:
+        # TUI exited — if task was active, enter cooldown (non-blocking)
+        active_task_id = getattr(args, "_active_task_id", None)
+        if active_task_id is not None and proc is not None:
+            with kb.connect(board=board) as conn:
+                row = conn.execute(
+                    "SELECT status, current_run_id FROM tasks WHERE id=?",
+                    (active_task_id,),
+                ).fetchone()
+                if row and row["status"] == "running":
+                    if not getattr(args, "_cooldown_until", 0):
+                        log(f"TUI exited with active task {active_task_id} — start 10min cooldown")
+                        args._cooldown_until = time.time() + 600
+                else:
+                    log(f"task {active_task_id} already {row['status'] if row else 'gone'}, clearing")
                     args._active_task_id = None
                     args._cooldown_until = 0
-            else:
-                # Still in cooldown — check if task completed via TUI
-                with kb.connect(board=board) as conn:
-                    row = conn.execute("SELECT status FROM tasks WHERE id=?", (active_id,)).fetchone()
-                    if row and row["status"] in ("done", "blocked"):
-                        log(f"task {active_id} completed during cooldown — clearing")
-                        args._active_task_id = None
-                        args._cooldown_until = 0
-            return False  # Don't claim during cooldown
 
-        # Step 3: try to claim a task and inject
-        policy = worker_runtime.claim_policy_from_args(args, default_profile="planner")
-        with kb.connect(board=board) as conn:
-            kb.release_stale_claims(conn)
-            kb.recompute_ready(conn)
-            claimed = worker_runtime.claim_ready_candidate(conn, policy=policy, ttl_seconds=args.ttl, claimer=claim_lock())
-        if claimed is not None:
-            args._active_task_id = claimed.id
-            log(f"inject claimed {claimed.id}: {claimed.title}")
-            raw_pane = os.environ.get("ZELLIJ_PANE_ID", "")
-            if raw_pane:
-                pane_id = f"terminal_{raw_pane}" if raw_pane.isdigit() else raw_pane
-                # Wait for agent to be idle before injecting
-                tui_proc = getattr(args, "_tui_proc", None)
-                if tui_proc is not None and tui_proc.pid is not None:
-                    if not _wait_agent_idle(tui_proc.pid, task_id=claimed.id, board=board):
-                        # Agent was busy too long — task already reclaimed
-                        args._active_task_id = None
-                        return True  # did work (released), don't count as idle
-                subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Ctrl", "u"], timeout=5, check=False)
-                time.sleep(0.2)
-                inject = (
-                    f"Please work on kanban task {claimed.id} on board {board}. "
-                    f"Use `hermes kanban --board {board} show {claimed.id}` to read it. "
-                    f"When done: `hermes kanban --board {board} complete {claimed.id} --summary '...'`"
-                )
-                subprocess.run(["zellij", "action", "write-chars", "-p", pane_id, inject], timeout=5, check=False)
-                time.sleep(0.3)
-                subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Enter"], timeout=5, check=False)
-            return True
+        # ALWAYS restart TUI immediately
+        session_workspace = Path(os.environ.get("CODEX_KANBAN_WORKSPACE", "/home/wyr/code/Egomotion4D"))
+        has_session = has_saved_codex_sessions(session_workspace)
+        if has_session:
+            cmd = [args.codex_bin, "resume", "--last", "--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            cmd = [args.codex_bin, "--dangerously-bypass-approvals-and-sandbox", "--cd", str(session_workspace)]
+            if args.sandbox:
+                cmd.insert(1, "--sandbox")
+                cmd.insert(2, args.sandbox)
+        if args.model:
+            cmd.extend(["--model", args.model])
+        cmd.extend(args.codex_arg or [])
+        env = os.environ.copy()
+        env.update({"HERMES_KANBAN_BOARD": board, "HERMES_KANBAN_PROFILE": profile})
+        args._tui_proc = subprocess.Popen(cmd, cwd=str(session_workspace), env=env)
+        log(f"inject TUI {'restarted' if proc else 'launched'}: {'resume' if has_session else 'fresh'}")
+        time.sleep(2.0)
 
-        # No task claimed — check if active task completed via DB, TUI stays alive
-        active_id = getattr(args, "_active_task_id", None)
-        if active_id:
+    # Step 2: handle cooldown state
+    cooldown_until = getattr(args, "_cooldown_until", 0)
+    if cooldown_until:
+        active_id = args._active_task_id
+        if not active_id:
+            args._cooldown_until = 0  # shouldn't happen, but clean up
+        elif time.time() >= cooldown_until:
+            # Cooldown expired — requeue task for retry
+            with kb.connect(board=board) as conn:
+                row = conn.execute(
+                    "SELECT status, current_run_id, max_retries, consecutive_failures FROM tasks WHERE id=?",
+                    (active_id,),
+                ).fetchone()
+                if row and row["status"] == "running":
+                    configured_max = row["max_retries"] if row["max_retries"] is not None else 10
+                    max_retries = max(int(configured_max), listener_policy.MIN_PROVIDER_FAILURE_SILENT_RETRIES)
+                    consecutive = int(row["consecutive_failures"] or 0) + 1
+                    if consecutive > max_retries + 1:
+                        kb.block_task(conn, active_id,
+                                      reason=f"provider failure retries exhausted ({consecutive}/{max_retries})",
+                                      expected_run_id=row["current_run_id"])
+                        conn.execute("UPDATE tasks SET consecutive_failures=?, last_failure_error=? WHERE id=?",
+                                     (consecutive, "cooldown retries exhausted", active_id))
+                        log(f"blocked {active_id}: retries exhausted")
+                    else:
+                        kb.reclaim_task(conn, active_id,
+                                        reason=f"cooldown expired, requeue for retry {consecutive}/{max_retries}",
+                                        signal_fn=_noop_signal)
+                        conn.execute("UPDATE tasks SET consecutive_failures=?, last_failure_error=? WHERE id=?",
+                                     (consecutive, "cooldown retry", active_id))
+                        log(f"requeued {active_id}: cooldown retry {consecutive}/{max_retries}")
+                args._active_task_id = None
+                args._cooldown_until = 0
+        else:
+            # Still in cooldown — check if task completed via TUI
             with kb.connect(board=board) as conn:
                 row = conn.execute("SELECT status FROM tasks WHERE id=?", (active_id,)).fetchone()
                 if row and row["status"] in ("done", "blocked"):
-                    log(f"active task {active_id} completed: {row['status']}")
+                    log(f"task {active_id} completed during cooldown — clearing")
                     args._active_task_id = None
-        return False
+                    args._cooldown_until = 0
+        return False  # Don't claim during cooldown
 
-    # --- Unknown task_delivery, should not happen ---
-    log(f"unknown task_delivery={args.task_delivery}, doing nothing")
+    # Step 3: try to claim a task and inject
+    policy = worker_runtime.claim_policy_from_args(args, default_profile="planner")
+    with kb.connect(board=board) as conn:
+        kb.release_stale_claims(conn)
+        kb.recompute_ready(conn)
+        claimed = worker_runtime.claim_ready_candidate(conn, policy=policy, ttl_seconds=args.ttl, claimer=claim_lock())
+    if claimed is not None:
+        args._active_task_id = claimed.id
+        log(f"inject claimed {claimed.id}: {claimed.title}")
+        raw_pane = os.environ.get("ZELLIJ_PANE_ID", "")
+        if raw_pane:
+            pane_id = f"terminal_{raw_pane}" if raw_pane.isdigit() else raw_pane
+            # Wait for agent to be idle before injecting
+            tui_proc = getattr(args, "_tui_proc", None)
+            if tui_proc is not None and tui_proc.pid is not None:
+                if not _wait_agent_idle(tui_proc.pid, task_id=claimed.id, board=board):
+                    # Agent was busy too long — task already reclaimed
+                    args._active_task_id = None
+                    return True  # did work (released), don't count as idle
+            subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Ctrl", "u"], timeout=5, check=False)
+            time.sleep(0.2)
+            inject = (
+                f"Please work on kanban task {claimed.id} on board {board}. "
+                f"Use `hermes kanban --board {board} show {claimed.id}` to read it. "
+                f"When done: `hermes kanban --board {board} complete {claimed.id} --summary '...'`"
+            )
+            subprocess.run(["zellij", "action", "write-chars", "-p", pane_id, inject], timeout=5, check=False)
+            time.sleep(0.3)
+            subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Enter"], timeout=5, check=False)
+        return True
+
+    # No task claimed — check if active task completed via DB, TUI stays alive
+    active_id = getattr(args, "_active_task_id", None)
+    if active_id:
+        with kb.connect(board=board) as conn:
+            row = conn.execute("SELECT status FROM tasks WHERE id=?", (active_id,)).fetchone()
+            if row and row["status"] in ("done", "blocked"):
+                log(f"active task {active_id} completed: {row['status']}")
+                args._active_task_id = None
     return False
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -732,14 +683,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=None, help="Optional codex model override")
     parser.add_argument("--codex-bin", default="codex", help="Codex executable path/name (default: codex)")
     parser.add_argument("--codex-arg", action="append", default=[], help="Extra raw arg passed to codex exec; repeatable")
-    parser.add_argument("--task-delivery", default=os.environ.get("HERMES_KANBAN_TASK_DELIVERY") or "inject",
-                        choices=["inject", "self-poll", "worker"],  # worker = deprecated alias for inject
-                        help="inject=keep TUI visible + inject tasks; self-poll=TUI polls board itself")
+    parser.add_argument("--task-delivery", default="inject",
+                        choices=["inject"],
+                        help="inject=keep TUI visible + inject tasks")
     args = parser.parse_args(argv)
 
-    # Backward compat: "worker" → "inject"
-    if args.task_delivery == "worker":
-        args.task_delivery = "inject"
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
@@ -756,15 +704,6 @@ def main(argv: list[str] | None = None) -> int:
                 idle_since = time.time()
                 if args.once:
                     return 0
-                # self-poll: TUI is running, monitor it
-                if args.task_delivery == "self-poll":
-                    proc = getattr(args, "_self_poll_proc", None)
-                    if proc is not None:
-                        if proc.poll() is not None:
-                            log(f"self-poll codex exited rc={proc.returncode}, restarting in next tick")
-                            args._self_poll_proc = None
-                    time.sleep(max(5.0, float(args.poll if args.poll is not None else 30)))
-                    continue
             else:
                 if args.once:
                     log("no ready task; exiting --once")

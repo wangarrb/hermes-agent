@@ -656,12 +656,32 @@ def run_conversation(
             # context windows (each pass summarises the middle N turns).
             for _pass in range(3):
                 _orig_len = len(messages)
+                _orig_preflight_tokens = _preflight_tokens
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                # Check if compression actually reduced something.
+                # Message count reduction is the primary signal, but
+                # compression can also succeed by shrinking tool-result
+                # content without removing message rows — so re-estimate
+                # tokens and treat a material token reduction as success
+                # too (mirrors the context_overflow recovery path).
                 if len(messages) >= _orig_len:
-                    break  # Cannot compress further
+                    _preflight_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
+                    )
+                    if _preflight_tokens >= _orig_preflight_tokens:
+                        break  # Cannot compress further
+                    logger.info(
+                        "%sPreflight compression: message count unchanged (%d) "
+                        "but tokens reduced ~%s → ~%s — continuing",
+                        agent.log_prefix, len(messages),
+                        f"{_orig_preflight_tokens:,}",
+                        f"{_preflight_tokens:,}",
+                    )
                 # Compression created a new session — clear the history
                 # reference so _flush_messages_to_session_db writes ALL
                 # compressed messages to the new session's SQLite, not

@@ -451,7 +451,7 @@ class HermesACPAgent(acp.Agent):
         "tools": "List available tools",
         "context": "Show conversation context info",
         "reset": "Clear conversation history",
-        "compact": "Compress conversation context",
+        "compress": "Compress conversation context (use: /compress [<focus>] | /compress here [N])",
         "steer": "Inject guidance into the currently running agent turn",
         "queue": "Queue a prompt to run after the current turn finishes",
         "version": "Show Hermes version",
@@ -1642,7 +1642,8 @@ class HermesACPAgent(acp.Agent):
             "tools": self._cmd_tools,
             "context": self._cmd_context,
             "reset": self._cmd_reset,
-            "compact": self._cmd_compact,
+            "compress": self._cmd_compress,
+            "compact": self._cmd_compress,
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,
             "version": self._cmd_version,
@@ -1793,17 +1794,25 @@ class HermesACPAgent(acp.Agent):
         self.session_manager.save_session(state.session_id)
         return "Conversation history cleared."
 
-    def _cmd_compact(self, args: str, state: SessionState) -> str:
+    def _cmd_compress(self, args: str, state: SessionState) -> str:
         if not state.history:
             return "Nothing to compress — conversation is empty."
         try:
+            from hermes_cli.partial_compress import (
+                parse_partial_compress_args,
+                rejoin_compressed_head_and_tail,
+                split_history_for_partial_compress,
+            )
+            from agent.model_metadata import estimate_request_tokens_rough
+
             agent = state.agent
             if not getattr(agent, "compression_enabled", True):
                 return "Context compression is disabled for this agent."
             if not hasattr(agent, "_compress_context"):
                 return "Context compression not available for this agent."
 
-            from agent.model_metadata import estimate_request_tokens_rough
+            partial, keep_last, focus_topic = parse_partial_compress_args(args.strip())
+            focus_topic = focus_topic or ""
 
             original_count = len(state.history)
             # Include system prompt + tool schemas so the figure reflects real
@@ -1816,19 +1825,30 @@ class HermesACPAgent(acp.Agent):
             original_session_db = getattr(agent, "_session_db", None)
 
             try:
-                # ACP sessions must keep a stable session id, so avoid the
-                # SQLite session-splitting side effect inside _compress_context.
                 agent._session_db = None
-                compressed, _ = agent._compress_context(
-                    state.history,
-                    getattr(agent, "_cached_system_prompt", "") or "",
-                    approx_tokens=approx_tokens,
-                    task_id=state.session_id,
-                )
+
+                if partial:
+                    # Boundary-aware partial compression
+                    head, tail = split_history_for_partial_compress(state.history, keep_last)
+                    compressed_head, _ = agent._compress_context(
+                        head,
+                        getattr(agent, "_cached_system_prompt", "") or "",
+                        approx_tokens=approx_tokens,
+                        task_id=state.session_id,
+                    )
+                    state.history = rejoin_compressed_head_and_tail(compressed_head, tail)
+                else:
+                    compressed, _ = agent._compress_context(
+                        state.history,
+                        getattr(agent, "_cached_system_prompt", "") or "",
+                        approx_tokens=approx_tokens,
+                        task_id=state.session_id,
+                        focus_topic=focus_topic or None,
+                    )
+                    state.history = compressed
             finally:
                 agent._session_db = original_session_db
 
-            state.history = compressed
             self.session_manager.save_session(state.session_id)
 
             new_count = len(state.history)
@@ -1839,8 +1859,11 @@ class HermesACPAgent(acp.Agent):
                 system_prompt=_sys_prompt_after,
                 tools=_tools_after,
             )
+
+            mode_desc = f"focus=\"{focus_topic}\"" if focus_topic else \
+                        f"keep_last={keep_last}" if partial else "full"
             return (
-                f"Context compressed: {original_count} -> {new_count} messages\n"
+                f"Context compressed ({mode_desc}): {original_count} -> {new_count} messages\n"
                 f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"
             )
         except Exception as e:
