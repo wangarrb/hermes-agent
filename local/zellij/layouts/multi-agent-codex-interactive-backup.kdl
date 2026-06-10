@@ -2,18 +2,18 @@ layout {
     pane split_direction="horizontal" {
         pane split_direction="vertical" {
             pane command="bash" cwd="/home/wyr/workspace" {
-                args "-c" "hermes -p coordinator --continue chat"
+                args "-c" "source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && hermes -p coordinator --continue chat"
             }
             pane command="bash" cwd="/home/wyr/workspace" {
-                args "-c" "codex resume --last || codex"
+                args "-c" "source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && codex resume --last || codex"
             }
         }
         pane split_direction="vertical" {
             pane command="bash" cwd="/home/wyr/workspace" {
-                args "-c" "hermes -p implementer --continue chat"
+                args "-c" "source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && hermes -p implementer --continue chat"
             }
             pane command="bash" cwd="/home/wyr/workspace" {
-                args "-c" "hermes -p critic --continue chat"
+                args "-c" "source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && hermes -p critic --continue chat"
             }
         }
     }

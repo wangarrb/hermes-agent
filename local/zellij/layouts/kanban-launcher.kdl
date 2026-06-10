@@ -2,18 +2,18 @@ layout {
     pane split_direction="horizontal" {
         pane split_direction="vertical" {
             pane name="coordinator-hermes" command="bash" cwd="/home/wyr/code/Egomotion4D" {
-                args "-lc" "sleep 0 && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d HERMES_KANBAN_CLAIM_ASSIGNEES=coordinator hermes -p coordinator --continue"
+                args "-lc" "sleep 0 && source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d HERMES_KANBAN_CLAIM_ASSIGNEES=coordinator hermes -p coordinator --continue"
             }
             pane name="planner-codex" command="bash" cwd="/home/wyr/code/Egomotion4D" {
-                args "-lc" "sleep 0.5 && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d CODEX_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D /home/wyr/.local/bin/codex-kanban-interactive --profile planner --claim-assignees planner --board egomotion4d --workspace /home/wyr/code/Egomotion4D --sandbox danger-full-access --auto-start"
+                args "-lc" "sleep 0.5 && source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d CODEX_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D /home/wyr/.local/bin/codex-kanban-interactive --profile planner --claim-assignees planner --board egomotion4d --workspace /home/wyr/code/Egomotion4D --sandbox danger-full-access --auto-start"
             }
         }
         pane split_direction="vertical" {
             pane name="implementer-codewhale" command="bash" cwd="/home/wyr/code/Egomotion4D" {
-                args "-lc" "sleep 1.0 && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d CODEWHALE_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D DEEPSEEK_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D /home/wyr/.local/bin/codewhale-kanban-interactive --profile implementer --claim-assignees implementer --board egomotion4d --workspace /home/wyr/code/Egomotion4D --no-continue --auto-start"
+                args "-lc" "sleep 1.0 && source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d CODEWHALE_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D DEEPSEEK_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D /home/wyr/.local/bin/codewhale-kanban-interactive --profile implementer --claim-assignees implementer --board egomotion4d --workspace /home/wyr/code/Egomotion4D --no-continue --auto-start"
             }
             pane name="critic-codewhale" command="bash" cwd="/home/wyr/code/Egomotion4D" {
-                args "-lc" "sleep 1.5 && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d CODEWHALE_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D DEEPSEEK_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D /home/wyr/.local/bin/codewhale-kanban-interactive --profile critic --claim-assignees critic --board egomotion4d --workspace /home/wyr/code/Egomotion4D --continue --auto-start"
+                args "-lc" "sleep 1.5 && source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh && agent_env_disable_proxy && cd /home/wyr/code/Egomotion4D && HERMES_KANBAN_BOARD=egomotion4d CODEWHALE_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D DEEPSEEK_KANBAN_WORKSPACE=/home/wyr/code/Egomotion4D /home/wyr/.local/bin/codewhale-kanban-interactive --profile critic --claim-assignees critic --board egomotion4d --workspace /home/wyr/code/Egomotion4D --continue --auto-start"
             }
         }
     }

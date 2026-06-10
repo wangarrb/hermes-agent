@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh
+agent_env_disable_proxy
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+
+for candidate in \
+    /home/wyr/.nvm/versions/node/v22.22.2/bin/codex \
+    /home/wyr/.npm-global/bin/codex
+do
+    if [[ -x "$candidate" && "$(readlink -f "$candidate")" != "$self" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+IFS=':' read -ra path_parts <<< "$PATH"
+for dir in "${path_parts[@]}"; do
+    candidate="${dir%/}/codex"
+    if [[ -x "$candidate" && "$(readlink -f "$candidate")" != "$self" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+echo "codex shim: real codex executable not found" >&2
+exit 127

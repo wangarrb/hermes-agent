@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /home/wyr/.hermes/hermes-agent/local/bin/agent-env.sh
+agent_env_disable_proxy
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+
+for candidate in /usr/local/bin/zellij /usr/bin/zellij; do
+    if [[ -x "$candidate" && "$(readlink -f "$candidate")" != "$self" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+IFS=':' read -ra path_parts <<< "$PATH"
+for dir in "${path_parts[@]}"; do
+    candidate="${dir%/}/zellij"
+    if [[ -x "$candidate" && "$(readlink -f "$candidate")" != "$self" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+echo "zellij shim: real zellij executable not found" >&2
+exit 127

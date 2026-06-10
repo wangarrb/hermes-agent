@@ -89,6 +89,8 @@ link_path "$repo_root/local/bin/start-kanban.sh" /home/wyr/bin/start-kanban.sh
 link_path "$repo_root/local/bin/stop-kanban.sh" /home/wyr/bin/stop-kanban.sh
 link_path "$repo_root/local/bin/listen-kanban" /home/wyr/bin/listen-kanban
 link_path "$repo_root/local/bin/reset-kanban" /home/wyr/bin/reset-kanban
+link_path "$repo_root/local/bin/codex" /home/wyr/.local/bin/codex
+link_path "$repo_root/local/bin/zellij" /home/wyr/.local/bin/zellij
 
 link_path "$repo_root/local/zellij/config.kdl" /home/wyr/.config/zellij/config.kdl
 link_path "$repo_root/local/zellij/layouts/hermes.kdl" /home/wyr/.config/zellij/layouts/hermes.kdl
