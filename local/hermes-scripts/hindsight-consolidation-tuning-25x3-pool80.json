@@ -1,7 +1,0 @@
-{
-  "consolidation_batch_size": 25,
-  "consolidation_llm_batch_size": 25,
-  "max_memories_per_job": 75,
-  "parallel_batches": 3,
-  "note": "2026-05-12 user-requested speed profile: DB pool will be raised to 80 and recall fanout target is 25 memories per scope pass * 3 concurrent scope/batch passes = ~75 concurrent recall/search calls. PostgreSQL max_connections=100, so this leaves ~20 non-Hindsight connections. Watch for Failed to search memories / asyncpg TimeoutError and too many clients."
-}

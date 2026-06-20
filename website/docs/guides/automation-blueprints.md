@@ -6,11 +6,7 @@ description: "Ready-to-use automation blueprints — scheduled tasks, GitHub eve
 
 # Automation Blueprints
 
-<<<<<<< HEAD:website/docs/guides/automation-templates.md
-Copy-paste recipes for common automation patterns. Each template uses Hermes's built-in [cron scheduler](/user-guide/features/cron) for time-based triggers and [webhook platform](/user-guide/messaging/webhooks) for event-driven triggers.
-=======
 Copy-paste blueprints for common automation patterns. Each blueprint uses Hermes's built-in [cron scheduler](/user-guide/features/cron) for time-based triggers and [webhook platform](/user-guide/messaging/webhooks) for event-driven triggers.
->>>>>>> v2026.6.19:website/docs/guides/automation-blueprints.md
 
 Every blueprint works with **any model** — not locked to a single provider.
 

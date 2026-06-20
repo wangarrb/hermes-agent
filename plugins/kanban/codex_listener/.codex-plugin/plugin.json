@@ -1,6 +1,0 @@
-{
-  "name": "codex-kanban",
-  "version": "0.1.0",
-  "description": "Expose Hermes Kanban listen-kanban workflow to Codex CLI as a planner/worker profile.",
-  "skills": "./skills/"
-}

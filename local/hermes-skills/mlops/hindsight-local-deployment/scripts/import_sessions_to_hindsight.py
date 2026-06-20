@@ -1,1 +1,0 @@
-../../../../hermes-scripts/import_sessions_to_hindsight.py

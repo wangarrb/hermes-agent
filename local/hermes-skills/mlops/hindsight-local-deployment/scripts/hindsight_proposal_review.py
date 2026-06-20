@@ -1,1 +1,0 @@
-../../../../hermes-scripts/hindsight_proposal_review.py

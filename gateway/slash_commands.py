@@ -2678,6 +2678,55 @@ class GatewaySlashCommandsMixin:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
+    # ── Fork customization: /mycompress ────────────────────────────
+    async def _handle_mycompress_command(self, event: MessageEvent) -> str:
+        """Handle /mycompress — skill-guided compression wrapper.
+
+        Loads the ``mycompress`` skill body as focus guidance, then delegates
+        to ``/compress`` with an optional ``-n N`` (keep last N user rounds)
+        converted to the boundary-aware ``here`` form.
+        """
+        import re as _re
+        _raw_args = (event.get_command_args() or "").strip()
+
+        # Parse -n N / --keep-last-rounds N
+        keep_rounds = None
+        _n_match = _re.match(r'(?:-n\s+|--keep-last-rounds\s+)(\d+)', _raw_args)
+        if _n_match:
+            keep_rounds = int(_n_match.group(1))
+            _raw_args = _raw_args[_n_match.end():].strip()
+
+        # Load skill body as focus topic
+        focus_topic = _raw_args
+        try:
+            from agent.skill_commands import build_skill_invocation_message
+            skill_msg = build_skill_invocation_message("mycompress")
+            if skill_msg and isinstance(skill_msg, str):
+                # Extract just the skill body content (after [SKILL BODY] marker)
+                body_marker = "[SKILL BODY]"
+                if body_marker in skill_msg:
+                    focus_topic = skill_msg.split(body_marker, 1)[1].strip()
+                else:
+                    focus_topic = skill_msg.strip()
+                if _raw_args:
+                    focus_topic = f"{focus_topic}\nAdditional focus: {_raw_args}"
+        except Exception as e:
+            logger.debug("mycompress: could not load skill body: %s", e)
+
+        # Convert -n N user rounds to "here N" exchanges (1 user round ≈ 2 exchanges)
+        if keep_rounds is not None and keep_rounds > 0:
+            from dataclasses import replace
+            compress_text = f"/compress here {keep_rounds * 2}"
+            if focus_topic:
+                compress_text += f" {focus_topic}"
+            compress_event = replace(event, text=compress_text)
+        else:
+            from dataclasses import replace
+            compress_text = f"/compress {focus_topic}" if focus_topic else "/compress"
+            compress_event = replace(event, text=compress_text)
+
+        return await self._handle_compress_command(compress_event)
+
     async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
         """Handle /topic for Telegram DM user-managed topic sessions."""
         source = event.source

@@ -1,9 +1,0 @@
---- run_hindsight_weekly_detached.sh
-+++ run_hindsight_weekly_detached.sh
-@@ -5,5 +5,5 @@ cd /home/wyr
- unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
- HOME=/home/wyr HERMES_HOME=/home/wyr/.hermes \
- python3 /home/wyr/.hermes/scripts/hindsight_memory_pipeline.py \
-   weekly \
--  --execute --confirm run-hindsight-weekly-pipeline \
-+  --execute --confirm run-hindsight-pipeline \

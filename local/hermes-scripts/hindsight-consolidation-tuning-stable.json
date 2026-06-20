@@ -1,7 +1,0 @@
-{
-  "consolidation_batch_size": 50,
-  "consolidation_llm_batch_size": 50,
-  "max_memories_per_job": 50,
-  "parallel_batches": 1,
-  "note": "2026-05-12 fallback: MiniMax switch exposed DB retrieval saturation at 200-memory/8-batch topology (asyncpg search timeout, pool in_use up to 60). Keep per-call LLM density 50, but process one 50-memory job at a time for stable backlog drain. parallel_batches is documented here; current patched code reads HINDSIGHT_API_CONSOLIDATION_PARALLEL_BATCHES/default, so limiting max_memories_per_job to 50 is the effective throttle without container env changes."
-}

@@ -3,7 +3,11 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import (
+    ContextCompressor,
+    HISTORICAL_TASK_HEADING,
+    SUMMARY_PREFIX,
+)
 
 
 @pytest.fixture()
@@ -157,7 +161,7 @@ class TestCompress:
             result = c.compress(msgs)
 
         combined = "\n".join(str(m.get("content", "")) for m in result)
-        assert "## Active Task" in combined
+        assert HISTORICAL_TASK_HEADING in combined
         assert "Please fix the compression summary failure" in combined
         assert "read_file" in combined
         assert "agent/context_compressor.py" in combined
@@ -1213,7 +1217,8 @@ class TestCompressWithClient:
         """When the summary lands as standalone role='user' (e.g. head ends
         with assistant/tool), the message body must include the explicit
         '--- END OF CONTEXT SUMMARY ---' marker. Without it, weak models
-        read the verbatim past user request quoted in '## Active Task' as
+        read the verbatim past user request quoted in the historical task
+        snapshot as
         fresh input (#11475, #14521).
         """
         mock_response = MagicMock()
@@ -1242,6 +1247,48 @@ class TestCompressWithClient:
             m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
         )
         assert summary_msg["role"] == "user"
+        assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
+        assert summary_msg["content"].rstrip().endswith(
+            "respond to the message below, not the summary above ---"
+        )
+
+    def test_assistant_role_summary_carries_end_marker(self):
+        """When the summary lands as standalone role='assistant' (head ends
+        with user), the message body must include the explicit
+        '--- END OF CONTEXT SUMMARY ---' marker. Without it, models may
+        regurgitate the summary text as their own output (#33256).
+        """
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[CONTEXT SUMMARY]: stuff happened"
+        mock_client.chat.completions.create.return_value = mock_response
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+
+        # head_last=user → summary_role="assistant" (same setup as
+        # test_summary_role_avoids_consecutive_user_when_head_ends_with_user).
+        # With min_tail=3, tail = last 3 messages (indices 5-7).
+        # head_last=user, tail_first=user → the assistant-role summary does
+        # not collide with either neighbor and should be inserted standalone.
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "user", "content": "msg 2"},  # last head — user
+            {"role": "assistant", "content": "msg 3"},
+            {"role": "user", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+        ]
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        summary_msg = next(
+            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        )
+        assert summary_msg["role"] == "assistant"
         assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
         assert summary_msg["content"].rstrip().endswith(
             "respond to the message below, not the summary above ---"
@@ -1545,62 +1592,16 @@ class TestSummaryTargetRatio:
     """Verify that summary_target_ratio properly scales budgets with context window."""
 
     def test_tail_budget_scales_with_context(self):
-        """Fallback tail token budget scales with context_length."""
+        """Tail token budget should be threshold_tokens * summary_target_ratio."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        assert c.tail_token_budget == 80_000
+        # 200K * 0.50 threshold * 0.40 ratio = 40K
+        assert c.tail_token_budget == 40_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        assert c.tail_token_budget == 400_000
-
-    def test_compression_target_ratio_uses_current_context_not_threshold(self):
-        """Per-pass compression target should be current_tokens * target_ratio."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-            c = ContextCompressor(
-                model="test",
-                quiet_mode=True,
-                threshold_percent=0.90,
-                summary_target_ratio=0.20,
-            )
-        assert c.threshold_tokens == 180_000
-        assert c._tail_budget_for_current_context(150_000) == 28_000
-        assert c._tail_budget_for_current_context(190_000) == 36_000
-
-    def test_compression_target_ratio_subtracts_fixed_context(self):
-        """Tail budget is what remains after fixed prompt/head/summary costs."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-            c = ContextCompressor(
-                model="test",
-                quiet_mode=True,
-                threshold_percent=0.90,
-                summary_target_ratio=0.20,
-            )
-        # Desired total after compression: 180K * 20% = 36K.
-        # Fixed system/tools: 20K, protected head: 2K, summary reserve: 4K.
-        # The tail gets the remaining 10K.
-        assert c._tail_budget_for_current_context(
-            180_000,
-            fixed_context_tokens=20_000,
-            head_tokens=2_000,
-            summary_reserve_tokens=4_000,
-        ) == 10_000
-
-    def test_compression_target_ratio_returns_minimal_tail_when_fixed_floor_exceeds_target(self):
-        """If fixed prompt/tools already exceed target, do not inflate tail."""
-        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
-            c = ContextCompressor(
-                model="test",
-                quiet_mode=True,
-                threshold_percent=0.90,
-                summary_target_ratio=0.20,
-            )
-        assert c._tail_budget_for_current_context(
-            180_000,
-            fixed_context_tokens=50_000,
-            head_tokens=2_000,
-            summary_reserve_tokens=4_000,
-        ) == 1
+        # 1M * 0.50 threshold * 0.40 ratio = 200K
+        assert c.tail_token_budget == 200_000
 
     def test_summary_cap_scales_with_context(self):
         """Max summary tokens should be 5% of context, capped at 12K."""
@@ -1803,6 +1804,40 @@ class TestTokenBudgetTailProtection:
         tail_size = len(messages) - cut
         assert tail_size >= 3, f"Tail is only {tail_size} messages, min should be 3"
 
+    def test_tiny_budget_preserves_bounded_recent_turns(self, budget_compressor):
+        """A token-exhausted tail must preserve more than just the latest ask.
+
+        Regression for #9413: the previous hard-coded 3-message floor could
+        leave the latest user message live while summarizing the assistant/tool
+        context immediately before it, which made the post-compression turn feel
+        like a fresh conversation.
+        """
+        c = budget_compressor
+        c.tail_token_budget = 10
+        c.protect_last_n = 20
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old start"},
+            {"role": "assistant", "content": "old ack"},
+            {"role": "user", "content": "middle work"},
+            {"role": "assistant", "content": "middle ack"},
+            {"role": "user", "content": "middle ask 2"},
+            {"role": "assistant", "content": "middle answer 2"},
+            {"role": "user", "content": "middle ask 3"},
+            {"role": "assistant", "content": "middle answer 3"},
+            {"role": "user", "content": "recent ask 1"},
+            {"role": "assistant", "content": "recent answer 1"},
+            {"role": "user", "content": "recent ask 2"},
+            {"role": "assistant", "content": "recent answer 2"},
+            {"role": "user", "content": "latest ask"},
+        ]
+
+        cut = c._find_tail_cut_by_tokens(messages, head_end=1)
+
+        assert len(messages) - cut >= 8
+        assert messages[cut]["content"] == "middle answer 2"
+        assert messages[-1]["content"] == "latest ask"
+
     def test_soft_ceiling_allows_oversized_message(self, budget_compressor):
         """The 1.5x soft ceiling allows an oversized message to be included
         rather than splitting it."""
@@ -1843,101 +1878,6 @@ class TestTokenBudgetTailProtection:
             result = c.compress(messages, current_tokens=90_000)
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
-
-    def test_last_user_early_does_not_force_huge_tail(self, budget_compressor):
-        """Keep the active user request without protecting all later tool work.
-
-        A long agent turn can have the latest user message near the start,
-        followed by dozens of assistant/tool messages. The compressor must not
-        keep that whole suffix just to keep the user request live.
-        """
-        c = budget_compressor
-        messages = [
-            {"role": "user", "content": "Start task"},
-            {"role": "assistant", "content": "On it"},
-            {"role": "user", "content": "Investigate the stuck pane"},
-        ]
-        for i in range(30):
-            messages.append({
-                "role": "assistant",
-                "content": f"tool call {i}",
-                "tool_calls": [{"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": f"call_{i}",
-                "content": "x" * 3000,
-            })
-        messages.append({"role": "assistant", "content": "Still investigating"})
-
-        with patch.object(c, "_generate_summary", return_value="Summary of tool work"):
-            result = c.compress(messages, current_tokens=180_000)
-
-        assert len(result) < 15
-        user_messages = [m for m in result if m.get("role") == "user"]
-        assert any("Investigate the stuck pane" in (m.get("content") or "") for m in user_messages)
-
-    def test_compress_uses_total_context_target_after_fixed_overhead(self, budget_compressor):
-        """Fixed system/tool overhead reduces tail budget for the 20% target."""
-        c = budget_compressor
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "Start task"},
-            {"role": "assistant", "content": "On it"},
-            {"role": "user", "content": "Investigate the stuck pane"},
-        ]
-        for i in range(20):
-            messages.append({
-                "role": "assistant",
-                "content": f"tool call {i}",
-                "tool_calls": [{"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": f"call_{i}",
-                "content": "x" * 3000,
-            })
-        messages.append({"role": "assistant", "content": "short tail C"})
-
-        with patch.object(c, "_generate_summary", return_value="Summary of tool work"):
-            result = c.compress(messages, current_tokens=180_000, fixed_context_tokens=35_000)
-
-        # 180K * 20% = 36K. With 35K fixed overhead plus head/summary reserve,
-        # the tail budget is minimal, so the long tool chain is summarized away.
-        assert len(result) < 12
-        assert any("Investigate the stuck pane" in (m.get("content") or "") for m in result)
-
-    def test_latest_user_anchor_in_summary_keeps_correct_marker(self, budget_compressor):
-        """When anchor is merged into a user-role summary, do not point below."""
-        c = budget_compressor
-        messages = [
-            {"role": "user", "content": "Start task"},
-            {"role": "assistant", "content": "On it"},
-            {"role": "user", "content": "Investigate the stuck pane"},
-        ]
-        for i in range(30):
-            messages.append({
-                "role": "assistant",
-                "content": f"tool call {i}",
-                "tool_calls": [{"id": f"call_{i}", "function": {"name": "terminal", "arguments": "{}"}}],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": f"call_{i}",
-                "content": "x" * 3000,
-            })
-        messages.append({"role": "assistant", "content": "Still investigating"})
-
-        with patch.object(c, "_generate_summary", return_value="Summary of tool work"):
-            result = c.compress(messages, current_tokens=180_000)
-
-        contents = [m.get("content") or "" for m in result]
-        anchor_message = next(
-            content for content in contents
-            if "Investigate the stuck pane" in content
-        )
-        assert "respond to the preserved latest user request below" in anchor_message
-        assert "respond to the message below, not the summary above" not in anchor_message
 
     def test_prune_with_token_budget(self, budget_compressor):
         """_prune_old_tool_results with protect_tail_tokens respects the budget."""
@@ -2162,8 +2102,7 @@ class TestUpdateModelBudgets:
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
-        assert comp.threshold_tokens == 64_000
-        assert comp.tail_token_budget == int(10_000 * comp.summary_target_ratio)
+        assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
         assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
 
 
@@ -2289,3 +2228,39 @@ class TestTruncateToolCallArgsJson:
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
         assert parsed["content"].endswith("...[truncated]")
+
+
+class TestPreflightSentinelGuard:
+    """Regression for #36718: the preflight token-display seed in
+    run_conversation must NOT overwrite the -1 sentinel that
+    compress_context() sets immediately after compression.
+
+    The old guard `_preflight_tokens > (last_prompt_tokens or 0)` evaluated
+    `(-1 or 0)` -> -1 (truthy), so any positive preflight estimate was > -1
+    and clobbered the sentinel with a schema-inflated rough count, re-firing
+    compression on the next turn. The fix treats any negative value as
+    "no real usage yet" and skips the seed.
+    """
+
+    def _seed(self, last_prompt_tokens, preflight_tokens):
+        # Mirror the exact guard in agent/conversation_loop.py run_conversation.
+        _last = last_prompt_tokens
+        if _last >= 0 and preflight_tokens > _last:
+            return preflight_tokens  # would overwrite
+        return last_prompt_tokens   # preserved
+
+    def test_sentinel_preserved_after_compression(self, compressor):
+        compressor.last_prompt_tokens = -1
+        # A large schema-inflated preflight estimate must NOT overwrite -1.
+        result = self._seed(compressor.last_prompt_tokens, 250_000)
+        assert result == -1
+
+    def test_real_value_still_revises_upward(self, compressor):
+        compressor.last_prompt_tokens = 10_000
+        result = self._seed(compressor.last_prompt_tokens, 50_000)
+        assert result == 50_000
+
+    def test_real_value_not_revised_downward(self, compressor):
+        compressor.last_prompt_tokens = 50_000
+        result = self._seed(compressor.last_prompt_tokens, 10_000)
+        assert result == 50_000

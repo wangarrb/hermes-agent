@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
+from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
@@ -91,6 +92,7 @@ AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
 
 SOURCE_MANUAL = "manual"
+SOURCE_MANUAL_DEVICE_CODE = f"{SOURCE_MANUAL}:device_code"
 
 STRATEGY_FILL_FIRST = "fill_first"
 STRATEGY_ROUND_ROBIN = "round_robin"
@@ -374,7 +376,7 @@ def _iter_custom_providers(config: Optional[dict] = None):
         yield _normalize_custom_pool_name(name), entry
 
 
-def get_custom_provider_pool_key(base_url: str, provider_name: Optional[str] = None) -> Optional[str]:
+def get_custom_provider_pool_key(base_url: Optional[str], provider_name: Optional[str] = None) -> Optional[str]:
     """Look up the custom_providers list in config.yaml and return 'custom:<name>' for a matching base_url.
 
     When provider_name is given, prefer matching by name first (solving the case where
@@ -1665,7 +1667,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         _env_file = load_env()
 
         def _env_val(key: str) -> str:
-            return (_env_file.get(key) or os.environ.get(key) or "").strip()
+            return (_env_file.get(key) or _get_secret(key, "") or "").strip()
 
         anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
         anthropic_oauth_env = (
@@ -1951,7 +1953,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
-        val = env_file.get(key) or os.environ.get(key) or ""
+        val = env_file.get(key) or _get_secret(key, "") or ""
         return val.strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
@@ -2095,11 +2097,27 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     # Seed from the custom_providers config entry's api_key field
     cp_config = _get_custom_provider_config(pool_key)
     if cp_config:
-        api_key = str(cp_config.get("api_key") or "").strip()
-        base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
+        # Resolve API key: prefer key_env -> api_key (same order as runtime_provider.py)
         name = str(cp_config.get("name") or "").strip()
+        key_env = str(cp_config.get("key_env") or "").strip()
+        api_key = ""
+        source = ""
+        label = ""
+        if key_env:
+            api_key = (_get_secret(key_env, "") or "").strip()
+            if api_key:
+                source = f"env:{key_env}"
+                label = key_env
+        if not api_key:
+            api_key = str(cp_config.get("api_key") or "").strip()
+            if api_key:
+                source = f"config:{name}"
+                label = name or source
+        base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
         if api_key:
-            source = f"config:{name}"
+            if not source:
+                source = f"config:{name}"
+                label = name or source
             if not _is_suppressed(pool_key, source):
                 active_sources.add(source)
                 changed |= _upsert_entry(
@@ -2111,7 +2129,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
                         "auth_type": AUTH_TYPE_API_KEY,
                         "access_token": api_key,
                         "base_url": base_url,
-                        "label": name or source,
+                        "label": label or name or source,
                     },
                 )
 

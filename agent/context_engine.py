@@ -88,7 +88,6 @@ class ContextEngine(ABC):
         self,
         messages: List[Dict[str, Any]],
         current_tokens: int = None,
-        fixed_context_tokens: int = 0,
         focus_topic: str = None,
     ) -> List[Dict[str, Any]]:
         """Compact the message list and return the new message list.
@@ -100,11 +99,6 @@ class ContextEngine(ABC):
         OpenAI-format message sequence.
 
         Args:
-            current_tokens: Rough token count for the full request that caused
-                compression, when available.
-            fixed_context_tokens: Rough tokens outside ``messages`` that will
-                still be present after compression, such as system prompt and
-                tool schemas. Engines that do not use it may ignore it.
             focus_topic: Optional topic string from manual ``/compress <focus>``.
                 Engines that support guided compression should prioritise
                 preserving information related to this topic.  Engines that

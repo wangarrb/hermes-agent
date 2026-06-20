@@ -1,7 +1,0 @@
-{
-  "consolidation_batch_size": 25,
-  "consolidation_llm_batch_size": 25,
-  "max_memories_per_job": 50,
-  "parallel_batches": 2,
-  "note": "2026-05-12 balanced speed profile after source review: upstream already parallelizes recall per memory inside one _process_memory_batch. Therefore safe throughput should cap recall fanout as batch_size * parallel_batches. Use 25 * 2 ~= 50 concurrent recall/search calls (below DB pool 60) while allowing two scope/batch LLM passes concurrently. This should be faster than pure serial scope passes but avoid the earlier 50 * 6 ~= 300 recall fanout that caused asyncpg search timeouts."
-}
