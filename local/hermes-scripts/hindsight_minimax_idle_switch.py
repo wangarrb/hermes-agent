@@ -13,6 +13,7 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -249,6 +250,13 @@ def apply_hot_patches_and_restart() -> None:
         run(["docker", "cp", str(src), f"hindsight:{dst}"], timeout=120)
         log(f"copied patch {src} -> {dst}")
     run(["docker", "exec", "hindsight", "python3", "-m", "py_compile", CONSOLIDATOR_CONT, CONFIG_CONT], timeout=120)
+    # Apply idempotent LLM token-log patch (logs every call, not just slow ones)
+    llm_patch = Path("/home/wyr/.hermes/scripts/patch_hindsight_llm_token_log.py")
+    if llm_patch.exists():
+        r = run([sys.executable, str(llm_patch)], timeout=60)
+        log(f"llm_token_log_patch: {r.strip()}")
+    else:
+        log(f"WARN llm_token_log_patch missing: {llm_patch}")
     log("restarting container to load copied patches")
     run(["docker", "restart", "-t", "30", "hindsight"], timeout=180)
     wait_health()

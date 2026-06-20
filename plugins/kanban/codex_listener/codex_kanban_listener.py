@@ -463,13 +463,18 @@ def run_codex_for_task(
             pass
 
     # --- Inject mode: send task_id to TUI ---
+    # IMPORTANT: inject text must NOT contain \n (LF).
+    # In PTY raw mode, LF (0x0A) != Enter (CR, 0x0D).
+    # LF only inserts a newline in the input buffer without submitting.
     if task_delivery == "inject":
         raw_pane = os.environ.get("ZELLIJ_PANE_ID", "")
         if raw_pane:
             pane_id = f"terminal_{raw_pane}" if raw_pane.isdigit() else raw_pane
             time.sleep(2.0)
-            inject = f"work on kanban task {task.id}\n"
+            inject = f"work on kanban task {task.id}"
             subprocess.run(["zellij", "action", "write-chars", "-p", pane_id, inject], timeout=5, check=False)
+            time.sleep(0.8)
+            subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Enter"], timeout=5, check=False)
             log(f"injected to {pane_id}: {inject.strip()}")
 
     last_hb = 0.0
@@ -643,15 +648,19 @@ def handle_one_task(args: argparse.Namespace) -> bool:
                     # Agent was busy too long — task already reclaimed
                     args._active_task_id = None
                     return True  # did work (released), don't count as idle
-            subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Ctrl", "u"], timeout=5, check=False)
-            time.sleep(0.2)
+            # Clear input line: "Ctrl u" must be a single argument for zellij send-keys
+            subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Ctrl u"], timeout=5, check=False)
+            time.sleep(0.3)
+            # IMPORTANT: inject text must NOT contain \n (LF).
+            # In PTY raw mode, LF (0x0A) != Enter (CR, 0x0D).
+            # LF only inserts a newline without submitting.
             inject = (
                 f"Please work on kanban task {claimed.id} on board {board}. "
                 f"Use `hermes kanban --board {board} show {claimed.id}` to read it. "
                 f"When done: `hermes kanban --board {board} complete {claimed.id} --summary '...'`"
             )
             subprocess.run(["zellij", "action", "write-chars", "-p", pane_id, inject], timeout=5, check=False)
-            time.sleep(0.3)
+            time.sleep(0.8)
             subprocess.run(["zellij", "action", "send-keys", "-p", pane_id, "Enter"], timeout=5, check=False)
         return True
 

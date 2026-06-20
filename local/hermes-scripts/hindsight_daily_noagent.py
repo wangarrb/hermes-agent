@@ -12,6 +12,12 @@ import os
 import pwd
 import subprocess
 import sys
+
+# Ensure localhost API calls bypass any HTTP proxy (e.g. 127.0.0.1:7890)
+_no_proxy = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+if "127.0.0.1" not in _no_proxy and "localhost" not in _no_proxy:
+    os.environ["no_proxy"] = f"127.0.0.1,localhost,{_no_proxy}".rstrip(",")
+    os.environ["NO_PROXY"] = os.environ["no_proxy"]
 import time
 from pathlib import Path
 
@@ -92,12 +98,12 @@ def _get_hindsight_llm_config() -> dict:
     if not model:
         model = os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL")
     if not api_key:
-        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "TOPENROUTER_API_KEY")
+        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "OPENCODE_GO_API_KEY")
         api_key = os.environ.get(key_env)
 
-    # 3. Final defaults
+    # 3. Final defaults (opencode-go is the working provider; tp-api returns 401)
     return {
-        "base_url": base_url or "https://tp-api.chinadatapay.com:8000/v1",
+        "base_url": base_url or "https://opencode.ai/zen/go/v1",
         "model": model or "deepseek-v4-flash",
         "api_key": api_key,
         "provider": provider or "openai",
@@ -459,7 +465,7 @@ def main() -> int:
             [
                 sys.executable, "-u",
                 str(PIPELINE_SCRIPT),
-                "full",
+                "daily",
                 "--execute",
                 "--confirm",
                 "run-hindsight-pipeline",
@@ -504,6 +510,21 @@ def main() -> int:
     summary_rc = run_research_summary(proc.returncode, before, after)
     if summary_rc != 0:
         print(f"Research summary failed with code {summary_rc} (pipeline data OK)")
+
+    # Generate Hindsight status report for wiki
+    try:
+        import subprocess as _sp
+        report = _sp.run(
+            [sys.executable, str(Path.home() / ".hermes" / "scripts" / "generate_hindsight_status_report.py")],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "HOME": str(Path.home())},
+        )
+        if report.returncode == 0:
+            print(f"HINDSIGHT_STATUS_REPORT {report.stdout.strip()}")
+        else:
+            print(f"Status report generation failed: {report.stderr[:200]}")
+    except Exception as e:
+        print(f"Status report generation skipped: {e}")
 
     # Return pipeline exit code (not summary exit code) as primary status
     return proc.returncode

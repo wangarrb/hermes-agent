@@ -947,7 +947,7 @@ def call_llm(
             {"role": "user", "content": user_prompt_for(unit, emit_observations=emit_observations, output_language=output_language)},
         ],
         "temperature": 0.1,
-        "max_tokens": 6000,
+        "max_tokens": 65536,
     }
     if response_format:
         payload["response_format"] = {"type": "json_object"}
@@ -1274,9 +1274,11 @@ def unit_cache_payload(unit: ReflectUnit, args: argparse.Namespace | None = None
         "source_ids": sorted(str(x) for x in unit.source_ids),
         "source_count": unit.source_count,
         "stable_content_hash": short_hash(stable_unit_content(unit), 24),
-        "llm_model": getattr(args, "llm_model", MINIMAX_MODEL),
-        "llm_label": getattr(args, "llm_label", DEFAULT_LLM_LABEL),
-        "llm_base_url": getattr(args, "llm_base_url", MINIMAX_BASE_URL),
+        # LLM fields excluded from cache key: changing endpoint/model should NOT
+        # invalidate the cache.  Only prompt/schema/input changes require recompute.
+        # "llm_model": getattr(args, "llm_model", MINIMAX_MODEL),
+        # "llm_label": getattr(args, "llm_label", DEFAULT_LLM_LABEL),
+        # "llm_base_url": getattr(args, "llm_base_url", MINIMAX_BASE_URL),
         "response_format": not bool(getattr(args, "no_response_format", False)),
         "emit_observations": bool(getattr(args, "emit_observations", True)),
         "output_language": getattr(args, "output_language", "zh"),
@@ -1479,6 +1481,14 @@ def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
             save_progress(progress, processed_docs, processed_units)
             continue
         pending.append((i, unit, key))
+
+    # Submit-mode budget cap: if too many pending units, truncate to limit
+    # burst damage from cache invalidation or bulk imports.
+    _max_pending = int(getattr(args, "budget_max_pending_units", -1))
+    if args.mode == "submit" and _max_pending > 0 and len(pending) > _max_pending:
+        skipped = len(pending) - _max_pending
+        print(f"Submit budget cap: {len(pending)} pending > max {_max_pending}, truncating ({skipped} units deferred to next run)")
+        pending = pending[:_max_pending]
 
     print(f"Adaptive LLM concurrency: start={current_concurrency} min={min_concurrency} 429_backoff={args.rate_limit_backoff_seconds}s units={len(pending)}/{len(units)}")
 
@@ -1697,6 +1707,12 @@ def resolve_missing_daily_args(args: argparse.Namespace) -> None:
     print(f"Weekly {period}: backfilling missing/incomplete daily outputs before weekly: {', '.join(missing)}")
     setattr(args, "_budget_missing_daily", missing)
     setattr(args, "_budget_missing_daily_details", missing_details)
+    # Rate-limit backfill: only process N missing days per run.
+    _max_days = int(getattr(args, "backfill_max_days", 0))
+    if _max_days > 0 and len(missing) > _max_days:
+        deferred = missing[_max_days:]
+        missing = missing[:_max_days]
+        print(f"Backfill rate limit: processing {len(missing)} of {len(missing) + len(deferred)} missing days ({len(deferred)} deferred to next run)")
     original_scope = args.scope
     original_date = args.date
     original_daily_source = args.daily_source
@@ -1735,6 +1751,7 @@ def main() -> None:
     parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly 默认 all-history，刷新整个 Hindsight 高层知识；week 仅整合 --week 指定 ISO 周")
     parser.add_argument("--weekly-group-by", choices=["all", "topic"], default="topic", help="V2 默认 topic：先做 topic history reduce；global canonical cards 由 v2 reducer 再统一生成。all 仅用于诊断或兼容旧 cross-topic chunk")
     parser.add_argument("--backfill-missing-daily", action="store_true", help="weekly-source=daily 时，先对缺失 daily 输出的 retained 日期做 processed-facts daily consolidation，再执行 weekly/global")
+    parser.add_argument("--backfill-max-days", type=int, default=10, help="每次运行最多补填的 daily 缺失天数（0=不限，默认10）。防止单次 catchup 爆发。")
     parser.add_argument("--mode", choices=["dry-run", "submit"], default="dry-run")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--api", default=DEFAULT_API)
@@ -1746,7 +1763,8 @@ def main() -> None:
     parser.add_argument("--max-input-chars", type=int, default=60000, help="单次 LLM reflect 输入字符上限，按 record/daily md 边界切分")
     parser.add_argument("--llm-model", default=MINIMAX_MODEL, help="OpenAI-compatible chat/completions model name")
     parser.add_argument("--llm-base-url", default=MINIMAX_BASE_URL, help="OpenAI-compatible base URL, e.g. https://api.minimaxi.com/v1")
-    parser.add_argument("--llm-api-key-env", default="MINIMAX_API_KEY", help="API key env var name; value is read from env or ~/.hermes/.env")
+    _default_api_key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "") or read_dotenv().get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "OPENCODE_GO_API_KEY")
+    parser.add_argument("--llm-api-key-env", default=_default_api_key_env, help="API key env var name; value is read from env or ~/.hermes/.env (default: from HINDSIGHT_OFFLINE_LLM_API_KEY_ENV or OPENCODE_GO_API_KEY)")
     parser.add_argument("--llm-label", default=DEFAULT_LLM_LABEL, help="Short label used in logs/tags, e.g. minimax/glm/deepseek")
     parser.add_argument("--emit-observations", dest="emit_observations", action="store_true", default=True, help="V2 默认开启：在 LLM 输出 schema 中包含 canonical_observations")
     parser.add_argument("--no-emit-observations", dest="emit_observations", action="store_false", help="兼容旧版输出：不要求 canonical_observations")

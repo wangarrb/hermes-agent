@@ -26,7 +26,7 @@ HERMES_HOME = HOME / ".hermes"
 DEFAULT_WIKI = Path(os.environ.get("WIKI_PATH", str(HOME / "wiki"))).expanduser()
 DEFAULT_MEMORIES = HERMES_HOME / "memories"
 DEFAULT_HINDSIGHT = HERMES_HOME / "hindsight" / "offline_reflect"
-DEFAULT_OUTPUT_SUBDIR = "auto-maintenance"
+DEFAULT_OUTPUT_SUBDIR = "auto-maintenance/reports"
 LOCK_PATH = HERMES_HOME / "hindsight" / "wiki_auto_maintenance.lock"
 HINDSIGHT_PIPELINE_LOCK = HERMES_HOME / "hindsight" / "offline_pipeline.lock"
 HINDSIGHT_WRAPPER = HERMES_HOME / "scripts" / "hindsight_minimax_import.py"
@@ -522,7 +522,7 @@ def main() -> None:
 
     out_dir = wiki / args.output_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"wiki-auto-maintenance-{now_stamp()}.md"
+    out_path = out_dir / f"wiki-maintenance-{now_stamp()}.md"
     report = render_report(
         wiki=wiki,
         pages=pages,
@@ -535,12 +535,9 @@ def main() -> None:
         args=args,
     )
     out_path.write_text(report, encoding="utf-8")
-    latest = out_dir / "latest.md"
-    latest.write_text(report, encoding="utf-8")
     print(json.dumps({
         "ok": True,
         "report": str(out_path),
-        "latest": str(latest),
         "pages_scanned": len(pages),
         "issue_counts": {k: len(v) for k, v in issues.items()},
         "source_candidates": len(source_candidates),

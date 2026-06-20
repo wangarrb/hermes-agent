@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cron-safe Hindsight offline pipeline runner.
 
-Daily: SQLite incremental retain -> processed-facts daily consolidation.
+Daily: session manifest build -> session-manifest-retain -> processed-facts daily consolidation.
 Weekly: global refresh from all historical daily outputs (cross-topic + cross-period).
 
 The paid LLM is profile-based (minimax/glm/deepseek/custom) and resolved by
@@ -23,11 +23,24 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
-HOME = Path.home()
-HERMES_HOME = HOME / ".hermes"
+HOME = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+# When run under a Hermes profile, HERMES_HOME points to the profile dir
+# but our scripts live in the real ~/.hermes/scripts/.  Explicitly
+# resolve to the real location so child commands work regardless of
+# which profile spawned this runner.
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", HOME / ".hermes")).expanduser()
+# Detect profile override: if HERMES_HOME != ~/.hermes, force real path
+_real_home = Path("/home/wyr")
+if HERMES_HOME != _real_home / ".hermes":
+    HERMES_HOME = _real_home / ".hermes"
+    HOME = _real_home
 SCRIPT = HERMES_HOME / "scripts" / "hindsight_minimax_import.py"
+MANIFEST_SCRIPT = HERMES_HOME / "scripts" / "hindsight_session_manifest.py"
 OFFLINE_REFLECT_SCRIPT = HERMES_HOME / "scripts" / "offline_hindsight_reflect_consolidate.py"
 V2_REBUILD_SCRIPT = HERMES_HOME / "scripts" / "hindsight_offline_v2_rebuild.py"
+DEFAULT_MANIFEST_DIR = HERMES_HOME / "hindsight" / "session_ingest" / "manifests"
+DEFAULT_SCAN_STATE = HERMES_HOME / "hindsight" / "session_ingest" / "manifest_scan_state.json"
+DEFAULT_SUBMIT_STATE = HERMES_HOME / "hindsight" / "session_ingest" / "submit_state.json"
 V2_PUBLISH_CONFIRM = "publish-hindsight-v2-canonical"
 LOG_DIR = HERMES_HOME / "logs" / "hindsight-offline-pipeline"
 SUMMARY_DIR = LOG_DIR / "summaries"
@@ -130,7 +143,12 @@ def run_capture_json(cmd: list[str], log_fh) -> dict[str, object]:
     header = f"\n[{iso_now()}] RUN_JSON {printable}\n"
     print(header, end="", flush=True)
     log_fh.write(header); log_fh.flush()
-    proc = subprocess.run(cmd, text=True, capture_output=True)
+    # Same HOME/HERMES_HOME override as run()
+    real_home = Path("/home/wyr")
+    effective_env = dict(os.environ)
+    effective_env["HOME"] = str(real_home)
+    effective_env["HERMES_HOME"] = str(real_home / ".hermes")
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=effective_env)
     if proc.stdout:
         print(proc.stdout, end="", flush=True)
         log_fh.write(proc.stdout)
@@ -165,13 +183,23 @@ def run(cmd: list[str], log_fh, *, env: dict[str, str] | None = None) -> None:
     log_fh.write(header)
     log_fh.flush()
 
+    # Force real HOME so child scripts (hindsight_minimax_import.py etc.)
+    # resolve Path.home() to /home/wyr, not the profile virtual HOME.
+    # Also override HERMES_HOME so those scripts don't follow the profile dir.
+    real_home = Path("/home/wyr")
+    effective_env = dict(os.environ)
+    if env:
+        effective_env.update(env)
+    effective_env["HOME"] = str(real_home)
+    effective_env["HERMES_HOME"] = str(real_home / ".hermes")
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        env=env,
+        env=effective_env,
     )
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -238,7 +266,9 @@ def status(log_fh) -> None:
 
 
 def weekly_budget_cmd(args: argparse.Namespace, week: str) -> list[str]:
-    return [
+    weekly_window = getattr(args, "weekly_window", "all-history")
+    no_backfill = getattr(args, "no_backfill_missing_daily", False)
+    cmd = [
         sys.executable,
         str(OFFLINE_REFLECT_SCRIPT),
         "--scope",
@@ -246,12 +276,15 @@ def weekly_budget_cmd(args: argparse.Namespace, week: str) -> list[str]:
         "--week",
         week,
         "--weekly-window",
-        "all-history",
+        weekly_window,
         "--weekly-source",
         "daily",
         "--weekly-group-by",
         "topic",
-        "--backfill-missing-daily",
+    ]
+    if not no_backfill:
+        cmd.append("--backfill-missing-daily")
+    cmd += [
         "--mode",
         "dry-run",
         "--prefilter",
@@ -263,10 +296,13 @@ def weekly_budget_cmd(args: argparse.Namespace, week: str) -> list[str]:
         str(args.weekly_budget_max_pending_chars),
         *offline_reflect_llm_args(args),
     ]
+    return cmd
 
 
 def weekly_submit_cmd(args: argparse.Namespace, week: str) -> list[str]:
-    return [
+    weekly_window = getattr(args, "weekly_window", "all-history")
+    no_backfill = getattr(args, "no_backfill_missing_daily", False)
+    cmd = [
         sys.executable,
         str(SCRIPT),
         "offline-reflect-llm",
@@ -277,18 +313,22 @@ def weekly_submit_cmd(args: argparse.Namespace, week: str) -> list[str]:
         "--week",
         week,
         "--weekly-window",
-        "all-history",
+        weekly_window,
         "--weekly-source",
         "daily",
         "--weekly-group-by",
         "topic",
-        "--backfill-missing-daily",
+    ]
+    if not no_backfill:
+        cmd.append("--backfill-missing-daily")
+    cmd += [
         "--mode",
         "submit",
         "--prefilter",
         args.prefilter,
         *offline_reflect_llm_args(args),
     ]
+    return cmd
 
 
 def refresh_v2_cards(log_fh) -> None:
@@ -317,27 +357,53 @@ def refresh_v2_cards(log_fh) -> None:
 
 def daily(args: argparse.Namespace, log_fh) -> str:
     day = resolve_daily_date(args.date_mode)
-    print(f"[{iso_now()}] DAILY target_date={day} profile={args.llm_profile or 'default'}", flush=True)
-    log_fh.write(f"[{iso_now()}] DAILY target_date={day} profile={args.llm_profile or 'default'}\n")
+    print(f"[{iso_now()}] DAILY target_date={day} profile={args.llm_profile or 'opencode-go-deepseek-v4-flash'}", flush=True)
+    log_fh.write(f"[{iso_now()}] DAILY target_date={day} profile={args.llm_profile or 'opencode-go-deepseek-v4-flash'}\n")
     log_fh.flush()
 
     status(log_fh)
-    run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "sqlite-import-llm",
-            *common_wrapper_args(args),
-            "--",
-            "--mode",
-            "submit",
-            "--group-by",
-            "day-topic",
-            "--prefilter",
-            args.prefilter,
-        ],
-        log_fh,
-    )
+
+    # Step 1: build session manifest (non-mutating, scans Hermes/Codex/DeepSeek sessions)
+    manifest_dir = DEFAULT_MANIFEST_DIR
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_cmd = [
+        sys.executable,
+        str(MANIFEST_SCRIPT),
+        "--output-dir", str(manifest_dir),
+        "--scan-state", str(DEFAULT_SCAN_STATE),
+        "--json",
+    ]
+    # Propagate optional overrides
+    if getattr(args, "limit", None) is not None:
+        manifest_cmd += ["--limit", str(args.limit)]
+    run(manifest_cmd, log_fh)
+
+    # Step 2: retain from the latest manifest via session-manifest-retain-llm
+    # Find the most recent manifest JSONL in manifest_dir
+    # Manifest files are named YYYYMMDD-HHMMSS-session-manifest.jsonl
+    manifest_files = sorted(manifest_dir.glob("*-session-manifest.jsonl"), reverse=True)
+    if not manifest_files:
+        log_fh.write(f"[{iso_now()}] WARN no manifest files found in {manifest_dir}; skipping retain\n")
+    else:
+        latest_manifest = manifest_files[0]
+        run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "session-manifest-retain-llm",
+                *common_wrapper_args(args),
+                "--manifest", str(latest_manifest),
+                "--bank", "hermes_v3",
+                "--scan-state", str(DEFAULT_SCAN_STATE),
+                "--submit-state", str(DEFAULT_SUBMIT_STATE),
+                "--wait-timeout-s", "1800",
+                "--poll-s", "5",
+                "--execute",
+                "--confirm", "retain-hindsight-session-manifest",
+            ],
+            log_fh,
+        )
+
     run(
         [
             sys.executable,
@@ -365,8 +431,8 @@ def daily(args: argparse.Namespace, log_fh) -> str:
 
 def weekly(args: argparse.Namespace, log_fh) -> str:
     week = resolve_week(args.week_mode)
-    print(f"[{iso_now()}] WEEKLY target_week={week} profile={args.llm_profile or 'default'}", flush=True)
-    log_fh.write(f"[{iso_now()}] WEEKLY target_week={week} profile={args.llm_profile or 'default'}\n")
+    print(f"[{iso_now()}] WEEKLY target_week={week} profile={args.llm_profile or 'opencode-go-deepseek-v4-flash'}", flush=True)
+    log_fh.write(f"[{iso_now()}] WEEKLY target_week={week} profile={args.llm_profile or 'opencode-go-deepseek-v4-flash'}\n")
     log_fh.flush()
 
     status(log_fh)
@@ -388,14 +454,16 @@ def weekly(args: argparse.Namespace, log_fh) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Hindsight offline daily/weekly pipeline with a lock and logs")
     parser.add_argument("task", choices=["daily", "weekly", "both"])
-    parser.add_argument("--llm-profile", help="minimax/glm/deepseek/custom; default from HINDSIGHT_OFFLINE_LLM_PROFILE or minimax")
+    parser.add_argument("--llm-profile", default=os.environ.get("HINDSIGHT_OFFLINE_LLM_PROFILE", "opencode-go-deepseek-v4-flash"), help="opencode-go-deepseek-v4-flash/deepseek-v4-flash/minimax/glm/custom; default from HINDSIGHT_OFFLINE_LLM_PROFILE or opencode-go-deepseek-v4-flash")
     parser.add_argument("--date-mode", default="auto", help="auto/today/yesterday/YYYY-MM-DD; auto=yesterday before 06:00 else today")
     parser.add_argument("--week-mode", default="current", help="current/previous/YYYY-Www; Sunday schedule uses current ISO week")
     parser.add_argument("--prefilter", default="safe", choices=["safe", "balanced", "strict"])
     parser.add_argument("--poll", type=int, default=60)
     parser.add_argument("--timeout", type=int, default=0, help="0 means no timeout")
-    parser.add_argument("--weekly-budget-max-pending-units", type=int, default=12, help="Fail closed before paid LLM if regular weekly would process more pending units")
-    parser.add_argument("--weekly-budget-max-pending-chars", type=int, default=500000, help="Fail closed before paid LLM if regular weekly pending chars exceeds this")
+    parser.add_argument("--weekly-budget-max-pending-units", type=int, default=200, help="Fail closed before paid LLM if regular weekly would process more pending units")
+    parser.add_argument("--weekly-budget-max-pending-chars", type=int, default=10000000, help="Fail closed before paid LLM if regular weekly pending chars exceeds this")
+    parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly scope: all-history=full history with backfill (default); week=current ISO week only")
+    parser.add_argument("--no-backfill-missing-daily", action="store_true", help="Skip backfilling missing daily outputs before weekly")
     parser.add_argument("--dry-run-budget-only", action="store_true", help="For weekly/both: run read-only weekly budget check and skip paid LLM submit/V2 publish")
     parser.add_argument("--lock-timeout", type=int, default=21600, help="seconds to wait for pipeline lock")
     args = parser.parse_args()
@@ -424,7 +492,7 @@ def main() -> None:
             "started_at": iso_now(),
             "task": args.task,
             "log_path": str(log_path),
-            "llm_profile": args.llm_profile or "default",
+            "llm_profile": args.llm_profile or "opencode-go-deepseek-v4-flash",
             "prefilter": args.prefilter,
             "poll": args.poll,
             "timeout": args.timeout,

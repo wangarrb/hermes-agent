@@ -50,7 +50,7 @@ def health_ok() -> bool:
 
 def restart_container() -> bool:
     print(f"[{ts()}] RESTARTING hindsight container...", flush=True)
-    r = subprocess.run(["sg", "docker", "-c", "docker restart hindsight"],
+    r = subprocess.run(["/usr/bin/sg", "docker", "-c", "docker restart hindsight"],
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         print(f"[{ts()}] restart failed: {r.stderr.strip()}", flush=True)

@@ -194,7 +194,7 @@ def rehydrate_record(record: dict[str, Any]) -> dict[str, Any]:
     for candidate in candidates:
         if candidate.get("document_id") == doc_id:
             merged = dict(candidate)
-            for key in ["action", "reason", "tags", "observation_scopes", "metadata", "context", "update_mode", "bank_target", "event_date"]:
+            for key in ["action", "reason", "tags", "metadata", "context", "update_mode", "bank_target", "event_date"]:
                 if key in record:
                     merged[key] = record[key]
             return merged
@@ -210,7 +210,6 @@ def record_to_memory_item(record: dict[str, Any]) -> dict[str, Any]:
         "event_date": rec.get("event_date") or (rec.get("metadata") or {}).get("segment_started_at") or (rec.get("metadata") or {}).get("created_at"),
         "metadata": normalize_metadata_for_hindsight(rec.get("metadata") or {}),
         "tags": rec.get("tags") or [],
-        "observation_scopes": rec.get("observation_scopes") or [],
         "update_mode": rec.get("update_mode") or "replace",
     }
     return {k: v for k, v in item.items() if k in {"content", "document_id"} or v not in (None, [], {})}
@@ -493,12 +492,13 @@ def run_manifest(path: str | Path, *, client: Any | None = None, bank: str = DEF
     elif operation_ids:
         result["submit_state_pending_reason"] = "async_operations_not_waited"
     if submit_state_path and selected_records:
-        if operation_ids and not result.get("waited_for_operations"):
-            result["submit_state_updated"] = False
-        else:
-            update_submit_state_for_items(submit_state, selected_records, manifest_path=path, bank=bank)
-            save_submit_state(submit_state_path, submit_state)
-            result["submit_state_updated"] = True
+        # Always update submit_state after successful submission.
+        # Even in --no-wait mode, the records are queued in Hindsight and
+        # update_mode=replace makes them idempotent. Not updating causes
+        # full re-submission on next run, wasting LLM budget.
+        update_submit_state_for_items(submit_state, selected_records, manifest_path=path, bank=bank)
+        save_submit_state(submit_state_path, submit_state)
+        result["submit_state_updated"] = True
     else:
         result["submit_state_updated"] = False
     if wait_consolidation and enable_observations and wait and result["submitted_items"] > 0:

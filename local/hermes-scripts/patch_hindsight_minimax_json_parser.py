@@ -62,7 +62,8 @@ NEW_FUNC = r'''def _strip_code_fences(content: str) -> str:
 
 
 def docker(cmd: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(["sg", "docker", "-c", cmd], text=True, capture_output=True)
+    # Use absolute path to avoid conda's ast-grep 'sg' shadowing system's newgrp 'sg'
+    proc = subprocess.run(["/usr/bin/sg", "docker", "-c", cmd], text=True, capture_output=True)
     if check and proc.returncode != 0:
         raise RuntimeError(f"docker command failed: {cmd}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
     return proc

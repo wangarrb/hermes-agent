@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
@@ -144,6 +145,13 @@ def copy_patches_and_restart() -> None:
         else:
             log(f"WARN source missing: {src}")
     run(["docker", "exec", "hindsight", "python3", "-m", "py_compile", CONSOLIDATOR_CONT, CONFIG_CONT], timeout=120)
+    # Apply idempotent LLM token-log patch (logs every call, not just slow ones)
+    llm_patch = Path("/home/wyr/.hermes/scripts/patch_hindsight_llm_token_log.py")
+    if llm_patch.exists():
+        r = run([sys.executable, str(llm_patch)], timeout=60)
+        log(f"llm_token_log_patch: {r.strip()}")
+    else:
+        log(f"WARN llm_token_log_patch missing: {llm_patch}")
     run(["docker", "restart", "-t", "30", "hindsight"], timeout=180)
     if not health_ok():
         raise RuntimeError("health failed after patch restart")

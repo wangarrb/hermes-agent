@@ -282,11 +282,16 @@ def total_change(prev_total: Any, current_total: Any) -> int | None:
     return _safe_int(current_total) - _safe_int(prev_total)
 
 
-def fmt_maybe_delta(n: Any) -> str:
+def fmt_maybe_delta(n: Any, base: Any = None) -> str:
+    """Format a delta with optional percentage. base=previous total for pct calc."""
     if n is None:
         return "n/a"
     try:
-        return f"{int(n):+d}"
+        val = int(n)
+        if base is not None and _safe_int(base) > 0:
+            pct = val / _safe_int(base) * 100
+            return f"{val:+,} ({pct:+.1f}%)"
+        return f"{val:+,}"
     except Exception:
         return str(n)
 
@@ -462,6 +467,77 @@ def parse_hindsight_llm_logs(log_text: str) -> tuple[list[dict[str, Any]], dict[
     return sorted(usage.values(), key=lambda r: (str(r["scope"]), str(r["model"]))), batch_stats
 
 
+# ── Prometheus /metrics LLM usage ───────────────────────────────
+
+
+def parse_hindsight_llm_prometheus() -> list[dict[str, Any]]:
+    """Parse LLM token usage from Hindsight Prometheus /metrics endpoint.
+
+    Returns list of dicts matching parse_hindsight_llm_logs format:
+    [{model, scope, calls, input_tokens, output_tokens, total_tokens, seconds}]
+    """
+    import urllib.request
+    # Bypass HTTP proxy for localhost
+    _np = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+    if "127.0.0.1" not in _np and "localhost" not in _np:
+        os.environ["no_proxy"] = f"127.0.0.1,localhost,{_np}".rstrip(",")
+        os.environ["NO_PROXY"] = os.environ["no_proxy"]
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8888/metrics")
+        resp = urllib.request.urlopen(req, timeout=10)
+        text = resp.read().decode()
+    except Exception:
+        return []
+
+    input_tokens: dict[tuple[str, str], int] = defaultdict(int)
+    output_tokens: dict[tuple[str, str], int] = defaultdict(int)
+    calls: dict[tuple[str, str], int] = defaultdict(int)
+    duration: dict[tuple[str, str], float] = defaultdict(float)
+
+    for line in text.split("\n"):
+        if line.startswith("#") or not line.strip():
+            continue
+        m = re.match(r'(\w+)(?:\{([^}]+)\})?\s+([\d.e+-]+)', line)
+        if not m:
+            continue
+        name, labels_str, value_str = m.group(1), m.group(2) or "", m.group(3)
+        val = float(value_str)
+        labels: dict[str, str] = {}
+        for part in labels_str.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                labels[k.strip()] = v.strip('"')
+        scope = labels.get("scope", "")
+        model = labels.get("model", "")
+        if not scope or not model:
+            continue
+        key = (scope, model)
+        if name == "hindsight_llm_calls_total":
+            calls[key] += int(val)
+        elif name == "hindsight_llm_tokens_input_tokens_total":
+            input_tokens[key] += int(val)
+        elif name == "hindsight_llm_tokens_output_tokens_total":
+            output_tokens[key] += int(val)
+        elif name == "hindsight_llm_duration_seconds_sum":
+            duration[key] += val
+
+    result: list[dict[str, Any]] = []
+    for key in sorted(calls.keys()):
+        scope, model = key
+        inp = input_tokens.get(key, 0)
+        out = output_tokens.get(key, 0)
+        result.append({
+            "model": model,
+            "scope": scope,
+            "calls": calls[key],
+            "input_tokens": inp,
+            "output_tokens": out,
+            "total_tokens": inp + out,
+            "seconds": duration.get(key, 0.0),
+        })
+    return result
+
+
 # ── snapshot for deltas ───────────────────────────────────────
 
 
@@ -559,19 +635,34 @@ def _main() -> int:
     lines.append(f"统计窗口: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {today_str} {now.tzname()}")
     lines.append("")
 
+    # Helper for Δ with percentage
+    def fmt_delta_pct(val: int, prev: int) -> str:
+        if prev > 0:
+            pct = val / prev * 100
+            return f"{val:+,} ({pct:+.1f}%)"
+        return f"{val:+,}"
+
     lines.append("## 概要")
     if hs_ok:
         lines.append(
-            f"Documents: {fmt_num(display_total_documents)} (Δ{delta_docs:+d}), "
-            f"Observations: {fmt_num(display_total_observations)} (Δ{delta_obs:+d})"
+            f"Documents: {fmt_num(display_total_documents)} (Δ{fmt_delta_pct(delta_docs, _safe_int(prev.get('total_documents', 0)))}), "
+            f"Observations: {fmt_num(display_total_observations)} (Δ{fmt_delta_pct(delta_obs, _safe_int(prev.get('total_observations', 0)))})"
         )
         lines.append(
-            f"Nodes: {fmt_num(api_stats.get('total_nodes', 0))} (Δ{delta_nodes:+d}), "
-            f"Links: {fmt_num(api_stats.get('total_links', 0))} (Δ{delta_links:+d})"
+            f"Nodes: {fmt_num(api_stats.get('total_nodes', 0))} (Δ{fmt_delta_pct(delta_nodes, _safe_int(prev.get('total_nodes', 0)))}), "
+            f"Links: {fmt_num(api_stats.get('total_links', 0))} (Δ{fmt_delta_pct(delta_links, _safe_int(prev.get('total_links', 0)))})"
         )
         last_cons = api_stats.get("last_consolidated_at", "")
         if last_cons:
             lines.append(f"Last consolidation: {last_cons}")
+        # Annotate large swings (>10% change) in the summary
+        notable = []
+        if abs(delta_obs) > _safe_int(prev.get("total_observations", 0)) * 0.1:
+            notable.append(f"observations {fmt_delta_pct(delta_obs, _safe_int(prev.get('total_observations', 0)))}")
+        if abs(delta_nodes) > _safe_int(prev.get("total_nodes", 0)) * 0.1:
+            notable.append(f"nodes {fmt_delta_pct(delta_nodes, _safe_int(prev.get('total_nodes', 0)))}")
+        if notable:
+            lines.append(f"⚠️ 大幅变动: {', '.join(notable)} — 可能因 v2 rebuild/conflict 清理或批量导入")
     else:
         lines.append(f"Hindsight API 不可用: {(api_stats or {}).get('_error', '?')}")
     lines.append("")
@@ -670,8 +761,9 @@ def _main() -> int:
         lines.append("无 Hermes / profile 会话记录。")
     lines.append("")
 
-    lines.append("## Hindsight LLM 用量（docker logs 可见精确值）")
+    lines.append("## Hindsight LLM 用量")
     if llm_usage:
+        lines.append("数据源: docker logs（精确值）")
         lines.append(
             make_table(
                 ["模型", "scope", "调用", "输入", "输出", "总tokens", "耗时"],
@@ -690,7 +782,29 @@ def _main() -> int:
             )
         )
     else:
-        lines.append("未从当前容器日志捕获 Hindsight LLM token 记录；容器重启/日志轮转前的用量可能不可回溯。")
+        # Fallback: try Prometheus /metrics
+        prom_llm = parse_hindsight_llm_prometheus()
+        if prom_llm:
+            lines.append("数据源: Prometheus /metrics（容器重启后 counters 归零，仅反映当前容器生命周期）")
+            lines.append(
+                make_table(
+                    ["模型", "scope", "调用", "输入", "输出", "总tokens", "耗时"],
+                    [
+                        [
+                            str(r["model"]),
+                            str(r["scope"]),
+                            fmt_num(r["calls"]),
+                            fmt_tok(r["input_tokens"]),
+                            fmt_tok(r["output_tokens"]),
+                            fmt_tok(r["total_tokens"]),
+                            f"{float(r['seconds']) / 60:.1f}min",
+                        ]
+                        for r in prom_llm
+                    ],
+                )
+            )
+        else:
+            lines.append("未从当前容器日志捕获 Hindsight LLM token 记录；容器重启/日志轮转前的用量可能不可回溯。")
     if batch_logs.get("batches"):
         lines.append(
             f"consolidation batch 日志: {batch_logs['batches']}批 / {batch_logs['memories']} memories / "
@@ -774,9 +888,13 @@ def _main() -> int:
     lines.append("## Hindsight 工作量 / 数据修改")
     if hs_ok:
         cfg = (config or {}).get("config", {}) if isinstance(config, dict) else {}
+        _unconsol = _safe_int(api_stats.get("pending_consolidation", 0))
+        _consol_total = _safe_int(api_stats.get("total_nodes", 0)) - _safe_int(api_stats.get("total_observations", 0))
+        _unconsol_pct = f"{_unconsol / max(1, _consol_total) * 100:.1f}%" if _consol_total > 0 else "?"
         lines.append(
             f"状态: healthy；enable_observations={cfg.get('enable_observations', '?')}；"
-            f"pending_consolidation={api_stats.get('pending_consolidation', 0)}；failed_consolidation={api_stats.get('failed_consolidation', 0)}"
+            f"待整合={_unconsol} ({_unconsol_pct})；"
+            f"failed={api_stats.get('failed_consolidation', 0)}"
         )
         ops_rows = db.get("ops") or []
         if ops_rows:
@@ -790,10 +908,10 @@ def _main() -> int:
         lines.append("核心修改统计（窗口内 DB 修改）:")
         lines.append(
             make_table(
-                ["对象", "新增", "更新(既有)"],
+                ["对象", "新增", "更新(既有)", "净变化"],
                 [
-                    ["documents", fmt_num(docs[0]), fmt_num(docs[1])],
-                    ["observations", fmt_num(cons[4]), fmt_num(cons[5])],
+                    ["documents", fmt_num(docs[0]), fmt_num(docs[1]), fmt_maybe_delta(int(docs[0]) - int(docs[1]), base=docs[2])],
+                    ["observations", fmt_num(cons[4]), fmt_num(cons[5]), fmt_maybe_delta(int(cons[4]) - int(cons[5]), base=cons[3])],
                 ],
             )
         )
@@ -815,7 +933,7 @@ def _main() -> int:
                     name,
                     fmt_num(prev_value) if prev_value is not None else "n/a",
                     fmt_num(current_value),
-                    fmt_maybe_delta(total_change(prev_value, current_value)),
+                    fmt_maybe_delta(total_change(prev_value, current_value), base=prev_value),
                 ]
             )
 
@@ -863,7 +981,7 @@ def _main() -> int:
                     ["Pending operations", fmt_num(api_stats.get("pending_operations", 0))],
                     ["Failed operations", fmt_num(api_stats.get("failed_operations", 0))],
                     ["Completed operations", fmt_num(ops_by_status.get("completed", 0))],
-                    ["Pending consolidation", fmt_num(api_stats.get("pending_consolidation", 0))],
+                    ["待整合 base units", f"{fmt_num(api_stats.get('pending_consolidation', 0))} ({_unconsol_pct})"],
                 ],
             )
         )
@@ -950,7 +1068,7 @@ def _main() -> int:
         print("【Hindsight】")
         print(f"  Documents: {fmt_num(display_total_documents)} (较快照 {fmt_maybe_delta(db.get('docs_total_change'))}; 新增{docs[0]} / 更新{docs[1]})")
         print(f"  Observations: {fmt_num(display_total_observations)} (较快照 {fmt_maybe_delta((db.get('units_total_change_by_type') or {}).get('observation'))}; 新增{cons[4]} / 更新{cons[5]})")
-        print(f"  Nodes: {fmt_num(api_stats.get('total_nodes',0))} (Δ{delta_nodes:+d})  Links: {fmt_num(api_stats.get('total_links',0))} (Δ{delta_links:+d})")
+        print(f"  Nodes: {fmt_num(api_stats.get('total_nodes',0))} (Δ{fmt_delta_pct(delta_nodes, _safe_int(prev.get('total_nodes', 0)))})  Links: {fmt_num(api_stats.get('total_links',0))} (Δ{fmt_delta_pct(delta_links, _safe_int(prev.get('total_links', 0)))})")
         if failed_count:
             print(f"  ⚠️ Failed ops: {failed_count}")
         else:

@@ -58,7 +58,7 @@ API = "http://127.0.0.1:8888"
 BANK = "hermes"
 # Pin the default to the verified v0.6.1 image. Relying on :latest caused
 # accidental rollback to v0.5.2 when wrapper-driven container recreates happened.
-IMAGE = os.environ.get("HINDSIGHT_IMAGE", "ghcr.io/vectorize-io/hindsight:0.6.1")
+IMAGE = os.environ.get("HINDSIGHT_IMAGE", "ghcr.io/vectorize-io/hindsight:0.8.2-patched")
 PG0_INSTANCE = Path(
     os.environ.get(
         "HINDSIGHT_PG0_INSTANCE",
@@ -133,7 +133,7 @@ MINIMAX_MODEL = "MiniMax-M2.7"
 # Precision-first default: keep Hindsight on the configured remote LLM instead
 # of restoring to a cheap/local model after offline jobs.
 # User-selected production default: MiniMax provider with MiniMax-M2.7.
-DEFAULT_OFFLINE_LLM_PROFILE = "minimax"
+DEFAULT_OFFLINE_LLM_PROFILE = "opencode-go-deepseek-v4-flash"
 DEFAULT_PAID_LLM_CONCURRENCY = 8
 
 
@@ -185,8 +185,8 @@ BUILTIN_LLM_PROFILES: dict[str, dict[str, Any]] = {
         "label": "deepseek-v4-flash",
         "hindsight_provider": "openai",
         "model": "deepseek-v4-flash",
-        "base_url": "https://api.deepseek.com/v1",
-        "api_key_envs": ["DEEPSEEK_API_KEY"],
+        "base_url": "https://tp-api.chinadatapay.com:8000/v1",
+        "api_key_envs": ["TOPENROUTER_API_KEY"],
         "response_format": True,
         "strict_schema": False,
     },
@@ -194,8 +194,8 @@ BUILTIN_LLM_PROFILES: dict[str, dict[str, Any]] = {
         "label": "deepseek-v4-pro",
         "hindsight_provider": "openai",
         "model": "deepseek-v4-pro",
-        "base_url": "https://api.deepseek.com/v1",
-        "api_key_envs": ["DEEPSEEK_API_KEY"],
+        "base_url": "https://tp-api.chinadatapay.com:8000/v1",
+        "api_key_envs": ["TOPENROUTER_API_KEY"],
         "response_format": True,
         "strict_schema": False,
     },
@@ -308,7 +308,8 @@ def get_minimax_key() -> str:
 
 def docker_shell(command: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
     """Run docker through sg docker because this login shell lacks active docker group."""
-    proc = subprocess.run(["sg", "docker", "-c", command], text=True, capture_output=True)
+    # Use absolute path to avoid conda's ast-grep 'sg' shadowing system's newgrp 'sg'
+    proc = subprocess.run(["/usr/bin/sg", "docker", "-c", command], text=True, capture_output=True)
     if check and proc.returncode != 0:
         raise RuntimeError(f"docker command failed: {command}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
     return proc

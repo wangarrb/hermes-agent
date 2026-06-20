@@ -61,7 +61,7 @@ TAG_RULES: list[tuple[str, list[str], list[str]]] = [
     ("project:openclaw", ["openclaw", "clawhub", "approval", "gateway probe"], []),
     ("domain:hindsight", ["hindsight", "memory provider", "memory bank", "observations", "consolidation", "recall", "reflect", "retain", "memory_units", "记忆", "召回"], []),
     ("topic:memory-management", ["hindsight", "memory", "记忆", "recall", "retain", "consolidation", "observations", "reflect", "bank", "discard", "quarantine"], []),
-    ("topic:native-consolidation", ["native consolidation", "observations", "consolidation", "observation_scopes", "enable_observations"], ["domain:hindsight"]),
+    ("topic:native-consolidation", ["native consolidation", "observations", "consolidation", "enable_observations"], ["domain:hindsight"]),
     ("topic:recall-cache", ["recall cache", "auto_recall", "conditional recall", "recall_cache"], ["domain:hindsight"]),
     ("domain:patent", ["patent", "oa1", "office action", "专利", "审查意见", "权利要求"], []),
     ("domain:paper", ["paper", "论文", "arxiv", "citation", "abstract"], []),
@@ -415,14 +415,6 @@ def propose_tags(text: str, session_data: dict[str, Any] | None = None) -> list[
     return sorted(t for t in tags if t not in SYSTEM_LABELS)
 
 
-def observation_scopes_for_tags(tags: Iterable[str]) -> list[list[str]]:
-    scopes: list[list[str]] = []
-    for tag in tags:
-        if tag.startswith(("domain:", "project:", "topic:")):
-            scopes.append([tag])
-    return scopes
-
-
 def is_bootstrap_or_environment_diagnostic(text: str, tags: list[str]) -> bool:
     hay = (text or "").lower()
     if not BOOTSTRAP_DIAGNOSTIC_RE.search(hay):
@@ -561,7 +553,6 @@ def record_for_chunk(*, session_path: Path, session_data: dict[str, Any], clean_
         "estimated_retain_chunks": max(1, math.ceil(len(chunk_text) / max(1, retain_chunk_size))),
         "event_date": session_event_date(session_data),
         "tags": tags,
-        "observation_scopes": observation_scopes_for_tags(tags),
         "metadata": metadata,
         "context": "hermes_session",
         "update_mode": "replace",
@@ -598,7 +589,6 @@ def records_from_json_file(
             "estimated_retain_chunks": 0,
             "event_date": session_event_date(session_data),
             "tags": profile_tags(source_profile),
-            "observation_scopes": [],
             "metadata": {
                 "source_kind": "hermes_json",
                 "source_label": profile_source_label(source_profile),
@@ -947,7 +937,6 @@ def record_from_kanban_prompt_markdown(
             "estimated_retain_chunks": max(1, math.ceil(len(content) / max(1, retain_chunk_size))) if content else 0,
             "event_date": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
             "tags": tags,
-            "observation_scopes": observation_scopes_for_tags(tags),
             "metadata": metadata,
             "context": "kanban_prompt_markdown",
             "update_mode": "replace",
@@ -1087,7 +1076,6 @@ def _kanban_comment_record_from_row(
         "estimated_retain_chunks": max(1, math.ceil(len(full_text) / max(1, retain_chunk_size))) if full_text else 0,
         "event_date": datetime.fromtimestamp(created_at, timezone.utc).isoformat() if created_at else None,
         "tags": tags,
-        "observation_scopes": observation_scopes_for_tags(tags),
         "metadata": metadata,
         "context": "kanban_comment",
         "update_mode": "replace",
@@ -1288,7 +1276,6 @@ def record_from_codex_markdown_artifact(
             "estimated_retain_chunks": max(1, math.ceil(len(content) / max(1, retain_chunk_size))) if content else 0,
             "event_date": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
             "tags": tags,
-            "observation_scopes": observation_scopes_for_tags(tags),
             "metadata": metadata,
             "context": context,
             "update_mode": "replace",
@@ -1502,7 +1489,6 @@ def records_from_codex_rollout_file(
                 "estimated_retain_chunks": max(1, math.ceil(len(chunk) / max(1, retain_chunk_size))),
                 "event_date": meta.get("timestamp"),
                 "tags": tags,
-                "observation_scopes": observation_scopes_for_tags(tags),
                 "metadata": metadata,
                 "context": "codex_session",
                 "update_mode": "replace",
@@ -1584,7 +1570,6 @@ def build_manifest_from_codex_dir(
                 "content_chars": 0,
                 "estimated_retain_chunks": 0,
                 "tags": ["source:codex-session"],
-                "observation_scopes": [],
                 "metadata": {"source_kind": "codex_rollout_jsonl", "source_label": "codex", "jsonl_path": str(path), "schema_version": SCHEMA_VERSION, "cleaning_version": CLEANING_VERSION, "candidate_filter_version": CANDIDATE_FILTER_VERSION, "source_profile": "codex"},
                 "context": "codex_session",
                 "update_mode": "replace",
@@ -1773,7 +1758,6 @@ def records_from_deepseek_session_file(
                 "estimated_retain_chunks": max(1, math.ceil(len(chunk) / max(1, retain_chunk_size))),
                 "event_date": metadata.get("created_at"),
                 "tags": tags,
-                "observation_scopes": observation_scopes_for_tags(tags),
                 "metadata": rec_metadata,
                 "context": "deepseek_session",
                 "update_mode": "replace",
@@ -1871,7 +1855,6 @@ def build_manifest_from_deepseek_dir(
                 "content_chars": 0,
                 "estimated_retain_chunks": 0,
                 "tags": ["source:deepseek-session"],
-                "observation_scopes": [],
                 "metadata": {
                     "source_kind": "deepseek_session_json",
                     "source_label": "deepseek-tui",
@@ -1935,7 +1918,6 @@ def build_manifest_from_json_dir(*, sessions_dir: Path = DEFAULT_SESSIONS_DIR, b
                 "content_chars": 0,
                 "estimated_retain_chunks": 0,
                 "tags": profile_tags(source_profile),
-                "observation_scopes": [],
                 "metadata": {"source_kind": "hermes_json", "source_label": profile_source_label(source_profile), "source_profile": source_profile_segment, "json_path": str(path), "schema_version": SCHEMA_VERSION, "cleaning_version": CLEANING_VERSION, "candidate_filter_version": CANDIDATE_FILTER_VERSION},
                 "context": "hermes_session",
                 "update_mode": "replace",

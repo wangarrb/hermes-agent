@@ -11,12 +11,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Bypass HTTP proxy for localhost API calls
+_np = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+if "127.0.0.1" not in _np and "localhost" not in _np:
+    os.environ["no_proxy"] = f"127.0.0.1,localhost,{_np}".rstrip(",")
+    os.environ["NO_PROXY"] = os.environ["no_proxy"]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -155,7 +162,7 @@ def rehydrate_record(record: dict[str, Any]) -> dict[str, Any]:
         merged = dict(candidate)
         # Keep reviewed manifest decisions/tags/scopes rather than recomputing
         # blindly, but use freshly rebuilt content from source.
-        for key in ["action", "reason", "tags", "observation_scopes", "metadata", "context", "update_mode", "bank_target", "event_date"]:
+        for key in ["action", "reason", "tags", "metadata", "context", "update_mode", "bank_target", "event_date"]:
             if key in record:
                 merged[key] = record[key]
         return merged
@@ -314,7 +321,6 @@ def record_to_memory_item(record: dict[str, Any]) -> dict[str, Any] | None:
         "event_date": rec.get("event_date") or (rec.get("metadata") or {}).get("event_date") or (rec.get("metadata") or {}).get("started_at"),
         "metadata": normalize_metadata_for_hindsight(rec.get("metadata") or {}),
         "tags": rec.get("tags") or [],
-        "observation_scopes": rec.get("observation_scopes") or [],
         "update_mode": rec.get("update_mode") or "replace",
     }
     # Drop empty optional fields conservatively except content/document_id.
@@ -461,12 +467,10 @@ def run_manifest(path: str | Path, *, client: Any | None = None, bank: str = "he
     elif operation_ids:
         result["submit_state_pending_reason"] = "async_operations_not_waited"
     if submit_state_path and selected_records:
-        if operation_ids and not result.get("waited_for_operations"):
-            result["submit_state_updated"] = False
-        else:
-            update_submit_state_for_items(submit_state, selected_records, manifest_path=path, bank=bank)
-            save_submit_state(submit_state_path, submit_state)
-            result["submit_state_updated"] = True
+        # Always update submit_state after successful submission (same fix as external runner).
+        update_submit_state_for_items(submit_state, selected_records, manifest_path=path, bank=bank)
+        save_submit_state(submit_state_path, submit_state)
+        result["submit_state_updated"] = True
     else:
         result["submit_state_updated"] = False
     if scan_state_path:

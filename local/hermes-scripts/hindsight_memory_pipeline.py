@@ -16,6 +16,13 @@ import json
 import os
 import shlex
 import subprocess
+
+# Ensure localhost API calls bypass any HTTP proxy (e.g. 127.0.0.1:7890)
+# Must be set before any urllib/requests calls in this process or child processes.
+_no_proxy = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+if "127.0.0.1" not in _no_proxy and "localhost" not in _no_proxy:
+    os.environ["no_proxy"] = f"127.0.0.1,localhost,{_no_proxy}".rstrip(",")
+    os.environ["NO_PROXY"] = os.environ["no_proxy"]
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -152,6 +159,17 @@ def preflight_step(args: argparse.Namespace) -> Step:
         command=cmd,
         mutating=False,
         writes_local=True,
+    )
+
+
+def apply_patches_step(args: argparse.Namespace) -> Step:
+    """Apply idempotent Hindsight container patches (LLM token log, minimax parser, etc.)."""
+    return Step(
+        name="apply_hindsight_patches",
+        description="Apply idempotent patches to Hindsight container: LLM token logging for every call (not just slow ones). Skips already-patched files.",
+        command=[sys.executable, py("patch_hindsight_llm_token_log.py", args)],
+        mutating=True,
+        writes_local=False,
     )
 
 
@@ -539,7 +557,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if not getattr(args, "bank", None):
         args.bank = str(cfg.get("bank") or DEFAULT_BANK)
     if not getattr(args, "llm_profile", None):
-        args.llm_profile = str(cfg.get("llm_profile") or os.environ.get("HINDSIGHT_OFFLINE_LLM_PROFILE", "minimax"))
+        args.llm_profile = str(cfg.get("llm_profile") or os.environ.get("HINDSIGHT_OFFLINE_LLM_PROFILE", "opencode-go-deepseek-v4-flash"))
     if getattr(args, "output_root", None) is None:
         args.output_root = DEFAULT_PROPOSAL_ROOT
     if getattr(args, "skip_daily", False) and args.mode != "full":
@@ -547,7 +565,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "native_consolidation_poll", None) is None:
         args.native_consolidation_poll = int(getattr(args, "poll", 60) or 60)
     require_confirm(args)
-    steps: list[Step] = [preflight_step(args)]
+    steps: list[Step] = [preflight_step(args), apply_patches_step(args)]
     wait_native_consolidation = not bool(getattr(args, "no_wait_native_consolidation", False))
     if args.mode != "preflight":
         steps.append(status_step(args))
@@ -732,7 +750,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-include-deepseek", dest="include_deepseek", action="store_false", help="Disable DeepSeek-TUI session scanning for this pipeline run")
     ap.add_argument("--include-kanban", dest="include_kanban", action="store_true", default=os.environ.get("HINDSIGHT_INCLUDE_KANBAN", "1").lower() not in {"0", "false", "no", "off"}, help="Include Kanban prompt markdown and task comments in the daily manifest build (default on)")
     ap.add_argument("--no-include-kanban", dest="include_kanban", action="store_false", help="Disable Kanban prompt/comment scanning for this pipeline run")
-    ap.add_argument("--weekly-budget-max-pending-units", type=int, default=12)
+    ap.add_argument("--weekly-budget-max-pending-units", type=int, default=200)
     ap.add_argument("--weekly-budget-max-pending-chars", type=int, default=500000)
     ap.add_argument("--include-wiki", action="store_true", help="For full mode, include long-cycle wiki candidate maintenance")
     ap.add_argument("--skip-daily", action="store_true", help="For full mode resume runs, skip session manifest/retain, daily reflect, and the daily V2 rebuild gate")

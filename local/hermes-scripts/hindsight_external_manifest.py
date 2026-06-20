@@ -327,9 +327,9 @@ def external_action_for_content(text: str, tags: list[str]) -> tuple[str, str]:
 
 
 def observation_scopes_for_tags(tags: Iterable[str], include: bool = True) -> list[list[str]]:
-    if not include:
-        return []
-    return session_manifest.observation_scopes_for_tags(tags)
+    """Stub: observation_scopes removed from Hindsight API v0.7.1 (422 on retain).
+    Return empty list to avoid AttributeError from session_manifest.observation_scopes_for_tags."""
+    return []
 
 
 def render_conversation_content(*, title: str | None, platform: str, url: str | None, created_at: str | None, source: str, messages: list[Message]) -> str:
@@ -1096,7 +1096,7 @@ def records_from_markdown_file(
     bank_target: str = DEFAULT_MIXED_BANK,
     retain_chunk_size: int = DEFAULT_RETAIN_CHUNK_SIZE,
     include_observation_scopes: bool = True,
-    max_section_chars: int = 16_000,
+    max_section_chars: int = 64_000,
     record_granularity: str = "items",
 ) -> list[dict[str, Any]]:
     path = Path(path).expanduser()
@@ -2030,7 +2030,7 @@ def _unique_manifest_paths(output_dir: Path, stamp: str) -> tuple[Path, Path]:
     raise RuntimeError(f"could not allocate unique manifest path under {output_dir}")
 
 
-def write_manifest(records: list[dict[str, Any]], output_dir: Path, *, include_content: bool = False) -> dict[str, Path]:
+def write_manifest(records: list[dict[str, Any]], output_dir: Path, *, include_content: bool = True) -> dict[str, Path]:
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2073,7 +2073,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db", type=Path, default=DEFAULT_OPENCLAW_DB, help="For --source openclaw-lcm: path to lcm.db")
     ap.add_argument("--bank-target", default=None)
     ap.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    ap.add_argument("--include-content", action="store_true", help="Write cleaned content into manifest JSONL. Default omits content and keeps source pointers/hashes.")
+    ap.add_argument("--include-content", dest="include_content", action="store_true", default=True, help="Write cleaned content into manifest JSONL. Default True since rehydration via document_id matching is fragile. Use --no-include-content to omit content and rely on rehydration.")
+    ap.add_argument("--no-include-content", dest="include_content", action="store_false", help="Omit content from manifest, keep only source pointers/hashes. Requires rehydration at retain time.")
     ap.add_argument("--include-observation-scopes", dest="include_observation_scopes", action="store_true", default=True, help="Include semantic observation scopes in manifest (default: enabled).")
     ap.add_argument("--no-observation-scopes", dest="include_observation_scopes", action="store_false", help="Disable observation scopes for raw/manual low-cost imports.")
     ap.add_argument("--min-file-age-seconds", type=int, default=DEFAULT_MIN_AGE_SECONDS)

@@ -73,6 +73,25 @@ def scan_log_anomalies(log_path: Path, *, limit: int = 30) -> list[dict[str, obj
     return findings[-limit:]
 
 
+def generate_hindsight_status_report() -> Path | None:
+    """Generate a Hindsight pipeline status report via standalone script."""
+    import subprocess as _sp
+    script = HERMES_HOME / "scripts" / "generate_hindsight_status_report.py"
+    if not script.exists():
+        return None
+    try:
+        r = _sp.run(
+            [sys.executable, str(script)],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "HOME": str(HOME)},
+        )
+        if r.returncode == 0:
+            return Path(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
 def finalize_summary(summary: dict[str, object], *, log_path: Path) -> Path:
     anomalies = scan_log_anomalies(log_path)
     summary["log_path"] = str(log_path)
@@ -140,6 +159,11 @@ def main() -> None:
             print(msg, end=""); print(f"summary_path={summary_path}")
             log_fh.write(msg); log_fh.write(f"summary_path={summary_path}\n")
             raise SystemExit(code)
+        # Generate Hindsight pipeline status report
+        report_path = generate_hindsight_status_report()
+        if report_path:
+            print(f"HINDSIGHT_STATUS_REPORT {report_path}")
+            log_fh.write(f"HINDSIGHT_STATUS_REPORT {report_path}\n")
         summary.update({"status": "ok", "finished_at": datetime.now().isoformat(timespec="seconds")})
         summary_path = finalize_summary(summary, log_path=log_path)
         msg = "SUMMARY " + json.dumps(summary, ensure_ascii=False) + "\n"

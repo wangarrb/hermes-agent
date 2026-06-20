@@ -114,7 +114,7 @@ def main() -> int:
         time.sleep(30)
 
     log("idle_reached_restart_container")
-    subprocess.run(["sg", "docker", "-c", f"docker restart -t 30 {CONTAINER}"], check=True)
+    subprocess.run(["/usr/bin/sg", "docker", "-c", f"docker restart -t 30 {CONTAINER}"], check=True)
     wait_health()
     log("restart_done_exec_drain", drain=DRAIN)
     os.execvp("python3", ["python3", DRAIN])

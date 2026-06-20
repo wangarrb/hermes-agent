@@ -17,9 +17,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
 
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
+
+# Ensure localhost API calls bypass any HTTP proxy (e.g. 127.0.0.1:7890)
+# Must be set before any urllib calls, including in imported modules.
+import os as _os
+_no_proxy = _os.environ.get("no_proxy", _os.environ.get("NO_PROXY", ""))
+if "127.0.0.1" not in _no_proxy and "localhost" not in _no_proxy:
+    _os.environ["no_proxy"] = f"127.0.0.1,localhost,{_no_proxy}".rstrip(",")
+    _os.environ["NO_PROXY"] = _os.environ["no_proxy"]
 DEFAULT_BENCH = HERMES_HOME / "hindsight" / "eval" / "benchmark_queries.jsonl"
 DEFAULT_OUT = HERMES_HOME / "hindsight" / "eval" / "runs"
 DEFAULT_CARDS_ROOT = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
@@ -214,6 +224,23 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def wait_hindsight_api(api: str, timeout: int = 120, poll: int = 3) -> None:
+    """Wait for Hindsight API to become healthy (handles container recreate)."""
+    import time
+    health_url = f"{api.rstrip('/')}/health"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(health_url, timeout=5) as resp:
+                data = json.loads(resp.read())
+                if data.get("status") == "healthy" and data.get("database") == "connected":
+                    return
+        except (URLError, ConnectionError, OSError, json.JSONDecodeError):
+            pass
+        time.sleep(poll)
+    raise RuntimeError(f"Hindsight API not healthy after {timeout}s: {api}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Evaluate Hindsight recall quality")
     ap.add_argument("--benchmark", default=str(DEFAULT_BENCH))
@@ -229,7 +256,10 @@ def main() -> None:
     ap.add_argument("--local-sidecar-limit", type=int, default=None, help="Extra local_canonical sidecar results appended after non-local limit")
     ap.add_argument("--output-dir", default=str(DEFAULT_OUT))
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--api-wait-timeout", type=int, default=120, help="Seconds to wait for Hindsight API health after container recreate (default 120)")
     args = ap.parse_args()
+    # Wait for API to be healthy before running eval (handles container recreate)
+    wait_hindsight_api(args.api, timeout=args.api_wait_timeout)
     bench = Path(args.benchmark).expanduser()
     if not bench.exists():
         raise SystemExit(f"benchmark file not found: {bench}")

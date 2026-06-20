@@ -388,6 +388,7 @@ async def run_consolidation_job(
     bank_id: str,
     request_context: "RequestContext",
     operation_id: str | None = None,
+    observation_scopes: str | list | None = None,
 ) -> dict[str, Any]:
     """
     Run consolidation job for a bank.

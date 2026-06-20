@@ -12,12 +12,25 @@ confirm tokens and support dry-run previews.
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator
+
+# Bypass HTTP proxy for localhost API calls.
+# Unset ALL proxy env vars to prevent broken proxies (e.g. dead clash on :7890)
+# from causing 502 Bad Gateway on Hindsight localhost calls.
+# no_proxy/NO_PROXY alone is insufficient when the proxy itself returns errors.
+for _proxy_var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+    os.environ.pop(_proxy_var, None)
+# Also ensure no_proxy covers localhost as a safety net for any re-set vars
+_np = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+if "127.0.0.1" not in _np and "localhost" not in _np:
+    os.environ["no_proxy"] = f"127.0.0.1,localhost,{_np}".rstrip(",")
+    os.environ["NO_PROXY"] = os.environ["no_proxy"]
 
 DEFAULT_API = "http://127.0.0.1:8888"
 DEFAULT_BANK = "hermes"
