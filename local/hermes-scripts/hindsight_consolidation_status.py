@@ -1,0 +1,1 @@
+/home/wyr/.hermes/skills/bundles/hindsight-skill-bundle-20260514/hindsight-local-deployment/scripts/hindsight_consolidation_status.py

@@ -1,0 +1,16 @@
+keybinds {
+    normal {
+        // Ctrl+Shift+C to copy selection to clipboard
+        bind "Ctrl Shift c" { Copy; }
+    }
+    locked {
+        bind "Ctrl g" { SwitchToMode "Normal"; }
+    }
+    pane {
+        bind "Alt n" { NewPane; }
+        bind "Alt x" { CloseFocus; }
+    }
+}
+
+// Use xclip for copying text instead of OSC 52
+copy_command "xclip -selection clipboard"

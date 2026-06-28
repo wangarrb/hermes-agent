@@ -1,0 +1,1 @@
+/home/wyr/.hermes/skills/bundles/hindsight-skill-bundle-20260514/hindsight-local-deployment/scripts/patch_hindsight_retain_temporal_fk_guard.py

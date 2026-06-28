@@ -549,6 +549,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
+    p_update = sub.add_parser(
+        "update",
+        help="Update mutable fields (title/body/priority/assignee) on a task; --reopen for done tasks",
+    )
+    p_update.add_argument("task_id")
+    p_update.add_argument("--title", default=None, help="New task title")
+    p_update.add_argument("--body", default=None, help="New task body (replaces entirely)")
+    p_update.add_argument("--priority", type=int, default=None, help="New priority tiebreaker")
+    p_update.add_argument("--assignee", default=None, help="Reassign to a different profile")
+    p_update.add_argument(
+        "--reopen",
+        action="store_true",
+        default=False,
+        help="Transition a done task back to ready (clears claim lock, appends reopened event)",
+    )
+
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -938,6 +954,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
+            "update":   _cmd_update,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -1933,6 +1950,41 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    """Update mutable fields on a task; --reopen transitions done→ready."""
+    # At least one field or --reopen must be specified
+    if not any([
+        args.title, args.body, args.priority is not None,
+        args.assignee, args.reopen,
+    ]):
+        print("kanban update: specify at least one of --title --body --priority --assignee or --reopen", file=sys.stderr)
+        return 2
+
+    with kb.connect_closing() as conn:
+        ok = kb.update_task(
+            conn,
+            args.task_id,
+            title=args.title,
+            body=args.body,
+            priority=args.priority,
+            assignee=args.assignee,
+            reopen=args.reopen,
+        )
+        if not ok:
+            print(f"cannot update {args.task_id} (unknown id, archived, or done without --reopen)", file=sys.stderr)
+            return 1
+
+    parts = []
+    if args.title:    parts.append("title")
+    if args.body:     parts.append("body")
+    if args.priority is not None: parts.append(f"priority={args.priority}")
+    if args.assignee: parts.append(f"assignee={args.assignee}")
+    if args.reopen:   parts.append("reopened")
+    desc = ", ".join(parts) or "no-op"
+    print(f"Updated {args.task_id}: {desc}")
     return 0
 
 
