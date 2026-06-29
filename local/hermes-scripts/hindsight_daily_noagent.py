@@ -81,6 +81,7 @@ def _get_hindsight_llm_config() -> dict:
     _DEAD_BASE_URLS = {
         "https://opencode.ai/zen/v1",
         "https://opencode.ai/zen/go/v1",
+        "https://api.minimaxi.com/v1",
     }
 
     # 1. Try reading from Hindsight container env vars
@@ -149,7 +150,7 @@ def _call_hindsight_llm(system_prompt: str, user_prompt: str, max_tokens: int = 
                 "max_tokens": max_tokens,
                 "temperature": 0.3,
             },
-            timeout=120,
+            timeout=300,
         )
         resp.raise_for_status()
         data = resp.json()

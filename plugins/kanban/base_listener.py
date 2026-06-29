@@ -440,7 +440,7 @@ def reclaim_orphaned_running_task(
         for row in rows:
             pid = row["worker_pid"]
             if pid and not _pid_alive(pid):
-                ws = row.get("workspace_path")
+                ws = row["workspace_path"] if "workspace_path" in row.keys() else None
                 if ws and not _workspace_matches(ws, workspace):
                     continue
                 reason = f"orphaned running task {row['id']} old_pid={pid}"

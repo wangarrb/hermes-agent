@@ -874,6 +874,28 @@ if [ "$DRY_RUN" = "1" ]; then
     exit 0
 fi
 
+# ── Kill stray old listener processes ──────────────────────────────
+# 重启时旧进程可能还活着（之前 kill 6 的教训），新进程会抢占同一 zellij pane。
+# 先杀掉当前角色对应的所有 kanban interactive listener，确保干净启动。
+kill_old_listener() {
+    local role="$1"
+    local pattern
+    # 匹配所有 agent 类型的 listener（hermes/codex/codewhale/claude/reasonix）
+    pattern="kanban_interactive.py.*--profile ${role}[^a-zA-Z]"
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        echo "  ⚠️  发现旧 ${role} listener 进程，正在杀掉："
+        pgrep -af "$pattern" 2>/dev/null | head -5
+        pkill -f "$pattern" 2>/dev/null || true
+        sleep 0.5
+        if pgrep -f "$pattern" >/dev/null 2>&1; then
+            pkill -9 -f "$pattern" 2>/dev/null || true
+        fi
+    fi
+}
+for role in planner implementer critic coordinator reviewer; do
+    kill_old_listener "$role"
+done
+
 # ── Kill any stray dispatch/daemon processes ──────────────────────
 # dispatch 和 daemon 会启动 headless hermes worker，与 interactive listener 竞争
 # claim 导致 DB 锁冲突和索引损坏。启动 kanban 前必须清理。
