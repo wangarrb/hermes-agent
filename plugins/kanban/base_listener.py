@@ -556,9 +556,26 @@ class BaseInteractiveListener:
     ) -> None:
         """Extra monitoring while a task is running (progress watch, etc).
 
-        Default: no extra monitoring.
+        Default: check for API failure on idle pane and inject '继续' to retry.
         """
-        pass
+        zellij_session = getattr(args, "zellij_session", "")
+        zellij_pane_id = str(getattr(args, "zellij_pane_id", ""))
+        if not zellij_session or not zellij_pane_id:
+            return
+
+        screen = zellij_dump_screen(session=zellij_session, pane_id=zellij_pane_id, log_path=log_path)
+        if not screen:
+            return
+
+        # Check if pane is idle (not busy)
+        if not _looks_like_idle_pane(screen, idle_markers=self.idle_markers, busy_markers=self.busy_markers):
+            return
+
+        # Pane is idle while task is running — check for API error
+        self.check_api_failure_retry(
+            session=zellij_session, pane_id=zellij_pane_id, screen=screen,
+            task_id=task_id, log_path=log_path,
+        )
 
     def on_watcher_loop_idle(
         self, args: argparse.Namespace, conn: Any, log_path: Path,
