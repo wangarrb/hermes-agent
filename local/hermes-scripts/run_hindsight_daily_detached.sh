@@ -12,9 +12,10 @@ cd /home/wyr/.hermes
 
 /home/wyr/.hermes/hermes-agent/venv/bin/python \
   /home/wyr/.hermes/scripts/hindsight_memory_pipeline.py \
+  daily \
   --config /home/wyr/.hermes/hindsight/pipeline_config.json \
-  --mode daily \
-  --json \
+  --execute \
+  --confirm run-hindsight-pipeline \
   >> "$LOG_FILE" 2>&1
 
 echo "Pipeline exit code: $?" >> "$LOG_FILE"

@@ -76,6 +76,13 @@ def _get_hindsight_llm_config() -> dict:
     """
     base_url = model = api_key = provider = None
 
+    # Known-dead provider base URLs (key expired or service unavailable).
+    # If container points here, skip container config entirely and use fallback.
+    _DEAD_BASE_URLS = {
+        "https://opencode.ai/zen/v1",
+        "https://opencode.ai/zen/go/v1",
+    }
+
     # 1. Try reading from Hindsight container env vars
     try:
         result = subprocess.run(
@@ -88,10 +95,12 @@ def _get_hindsight_llm_config() -> dict:
                 if "=" in line:
                     k, _, v = line.partition("=")
                     env_map[k] = v
-            base_url = env_map.get("HINDSIGHT_API_LLM_BASE_URL")
-            model = env_map.get("HINDSIGHT_API_LLM_MODEL")
-            api_key = env_map.get("HINDSIGHT_API_LLM_API_KEY")
-            provider = env_map.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
+            _container_base = env_map.get("HINDSIGHT_API_LLM_BASE_URL", "")
+            if _container_base not in _DEAD_BASE_URLS:
+                base_url = _container_base
+                model = env_map.get("HINDSIGHT_API_LLM_MODEL")
+                api_key = env_map.get("HINDSIGHT_API_LLM_API_KEY")
+                provider = env_map.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
     except Exception:
         pass
 
@@ -101,13 +110,17 @@ def _get_hindsight_llm_config() -> dict:
     if not model:
         model = os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL")
     if not api_key:
-        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "OPENCODE_GO_API_KEY")
+        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "XUNFEI...")
         api_key = os.environ.get(key_env)
 
-    # 3. Final defaults (opencode-go is the working provider; tp-api returns 401)
+    # 3. Final defaults (xunfei-coding is the stable domestic provider;
+    # opencode-go returns 403, topenrouter 401, deepseek 402 as of 2026-06-29)
+    if not api_key:
+        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "XUNFEI...")
+        api_key = os.environ.get(key_env)
     return {
-        "base_url": base_url or "https://opencode.ai/zen/go/v1",
-        "model": model or "deepseek-v4-flash",
+        "base_url": base_url or os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2"),
+        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "astron-code-latest"),
         "api_key": api_key,
         "provider": provider or "openai",
     }
@@ -520,9 +533,9 @@ def main() -> int:
     try:
         import subprocess as _sp
         report = _sp.run(
-            [sys.executable, str(Path.home() / ".hermes" / "scripts" / "generate_hindsight_status_report.py")],
+            [sys.executable, str(REAL_HOME / ".hermes" / "scripts" / "generate_hindsight_status_report.py")],
             capture_output=True, text=True, timeout=30,
-            env={**os.environ, "HOME": str(Path.home())},
+            env={**os.environ, "HOME": str(REAL_HOME)},
         )
         if report.returncode == 0:
             print(f"HINDSIGHT_STATUS_REPORT {report.stdout.strip()}")
