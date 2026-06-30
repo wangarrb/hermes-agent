@@ -616,13 +616,14 @@ class BaseInteractiveListener:
     # When agent goes idle mid-task due to API error, inject "继续"
     # up to API_RETRY_MAX times with backoff. After max retries,
     # fall through to existing idle-pane-reclaim logic.
-    API_RETRY_MAX: int = 2
-    API_RETRY_BACKOFF: list[float] = [30.0, 60.0]  # seconds before each retry
+    API_RETRY_MAX: int = 5
+    API_RETRY_BACKOFF: list[float] = [30.0, 60.0, 120.0, 300.0, 600.0]  # seconds before each retry
     API_ERROR_MARKERS: tuple[str, ...] = (
         "⚠", "API call failed", "APIError", "request failed",
         "API request failed", "xunfei request failed",
         "Invalid Params", "AppIdNoAuth", "rate limit",
         "NotEnoughCv", "EngineInternalError",
+        "system is busy",
         "503", "502", "429", "timeout",
     )
 
