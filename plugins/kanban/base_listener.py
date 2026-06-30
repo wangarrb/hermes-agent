@@ -644,6 +644,7 @@ class BaseInteractiveListener:
 
         if not has_error:
             # No API error visible — reset retry state
+            self._api_retry_count = 0
             self._api_retry_first_at = None
             return False
 
