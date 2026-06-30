@@ -569,6 +569,10 @@ class BaseInteractiveListener:
 
         # Check if pane is idle (not busy)
         if not _looks_like_idle_pane(screen, idle_markers=self.idle_markers, busy_markers=self.busy_markers):
+            # Pane is busy (agent recovered) — reset retry state so next error
+            # cycle starts fresh
+            self._api_retry_count = 0
+            self._api_retry_first_at = None
             return
 
         # Pane is idle while task is running — check for API error
