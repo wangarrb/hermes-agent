@@ -576,16 +576,10 @@ class BaseInteractiveListener:
             return
 
         # Pane is idle while task is running — check for API error
-        retried = self.check_api_failure_retry(
+        self.check_api_failure_retry(
             session=zellij_session, pane_id=zellij_pane_id, screen=screen,
             task_id=task_id, log_path=log_path,
         )
-        if not retried and self._api_retry_count >= self.API_RETRY_MAX:
-            # All retries exhausted but error persists — block task to prevent permanent stall
-            tail = "\n".join(_tail_nonempty_lines(screen)).lower()
-            if any(m.lower() in tail for m in self.API_ERROR_MARKERS):
-                log_line(log_path, f"api-retries-exhausted blocking task {task_id} after {self.API_RETRY_MAX} failed retries")
-                kb.update_task(conn, task_id, status="blocked")
 
     def on_watcher_loop_idle(
         self, args: argparse.Namespace, conn: Any, log_path: Path,
