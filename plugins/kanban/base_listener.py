@@ -622,6 +622,7 @@ class BaseInteractiveListener:
         "⚠", "API call failed", "APIError", "request failed",
         "API request failed", "xunfei request failed",
         "Invalid Params", "AppIdNoAuth", "rate limit",
+        "NotEnoughCv", "EngineInternalError",
         "503", "502", "429", "timeout",
     )
 
