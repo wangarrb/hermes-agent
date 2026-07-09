@@ -141,8 +141,8 @@ class ClaudeInteractiveListener(BaseInteractiveListener):
             for project_dir in claude_dir.iterdir():
                 if not project_dir.is_dir():
                     continue
-                # Check if any session files exist
-                session_files = list(project_dir.glob("*.json"))
+                # Check if any session files exist (Claude 2.x uses .jsonl, older uses .json)
+                session_files = list(project_dir.glob("*.jsonl")) + list(project_dir.glob("*.json"))
                 if session_files:
                     return True
         except Exception:

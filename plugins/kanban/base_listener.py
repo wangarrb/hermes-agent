@@ -407,18 +407,30 @@ def _pane_can_accept_new_kanban_task(
     busy_markers: tuple[str, ...],
     queued_input_markers: tuple[str, ...],
 ) -> bool:
-    """Return True when it is safe to inject a new Kanban prompt."""
+    """Return True when it is safe to inject a new Kanban prompt.
+
+    Checks that the LAST non-empty line contains an idle marker (prompt).
+    This is stricter than checking anywhere in the tail — prompt characters
+    like › can appear in tool output, error messages, or scrollback; the
+    pane is only truly idle when the prompt sits at the very bottom.
+    """
     if not idle_markers:
         return True  # no screen detection → always accept
-    tail = "\n".join(_tail_nonempty_lines(text, limit=40)).lower()
-    has_idle = any(marker in tail for marker in idle_markers)
-    has_busy = any(marker in tail for marker in busy_markers)
-    has_queued = any(marker in tail for marker in queued_input_markers)
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return True
+    last_line = lines[-1].lower()
+    has_idle = any(marker.lower() in last_line for marker in idle_markers)
+    has_queued = any(marker.lower() in last_line for marker in queued_input_markers)
     if has_queued:
         return False
-    if has_busy and not has_idle:
+    if not has_idle:
         return False
-    return has_idle
+    # Idle marker in last line — also check busy markers in the same scope
+    # (entire tail) to catch cases where the pane is switching state
+    tail = "\n".join(lines[-40:]).lower()
+    has_busy = any(marker.lower() in tail for marker in busy_markers)
+    return not has_busy
 
 
 # ──────────────────────────────────────────────
@@ -621,14 +633,68 @@ class BaseInteractiveListener:
     # up to API_RETRY_MAX times with backoff. After max retries,
     # fall through to existing idle-pane-reclaim logic.
     API_RETRY_MAX: int = 10
-    API_RETRY_BACKOFF: list[float] = [60.0, 60.0, 60.0, 120.0, 180.0, 300.0, 420.0, 600.0, 780.0, 900.0]  # seconds before each retry
+    API_RETRY_BACKOFF: list[float] = [20.0, 60.0, 60.0, 120.0, 180.0, 300.0, 420.0, 600.0, 780.0, 900.0]  # seconds before each retry
     API_ERROR_MARKERS: tuple[str, ...] = (
-        "⚠", "API call failed", "APIError", "request failed",
-        "API request failed", "xunfei request failed",
-        "Invalid Params", "AppIdNoAuth", "rate limit",
-        "NotEnoughCv", "EngineInternalError",
-        "system is busy",
-        "503", "502", "429", "timeout",
+        # ── Unicode / visual markers ──
+        "⚠",
+        # ── Generic API errors ──
+        "api call failed", "api error", "api request failed",
+        "request failed", "request error",
+        # ── xunfei-specific ──
+        "xunfei request failed", "xunfei request error",
+        "notenoughcv", "engineinternalerror", "system is busy",
+        "invalid params", "appidnoauth",
+        # ── HTTP-level / transport errors (httpx, requests, urllib3) ──
+        # Connection-level
+        "connectionerror", "connection error",
+        "connectionrefused", "connection refused",
+        "connectionreset", "connection reset",
+        "connection aborted",
+        "connection broken",
+        "connection closed by remote",
+        "connecterror", "connect error",
+        "connecttimeout", "connect timeout",
+        # Read/Write
+        "readtimeout", "read timeout",
+        "writetimeout", "write timeout",
+        "pooltimeout", "pool timeout",
+        "proxytimeout", "proxy timeout",
+        # Proxy
+        "proxyerror", "proxy error",
+        # SSL/TLS
+        "sslerror", "ssl error",
+        "certificate_verify_failed", "certificate verify failed",
+        # Protocol
+        "broken pipe", "brokenpipeerror",
+        "remote end closed connection",
+        "remote protocol error",
+        "local protocol error",
+        "eof occurred",
+        "protocol error", "protocolexception",
+        "bad status line",
+        "chunked encoding",
+        "content length mismatch",
+        # Retry / pool
+        "maxretryerror", "max retries exceeded",
+        "newconnectionerror",
+        # Network unreachable
+        "network is unreachable",
+        "no route to host",
+        "cannot connect",
+        "failed to connect",
+        "name resolution error",
+        "dns lookup failed",
+        "name or service not known",
+        "temporary failure in name resolution",
+        # ── Chinese (domestic API providers, OSS proxies) ──
+        "连接失败", "连接超时", "连接被拒",
+        "网络错误", "网络异常", "网络不可达",
+        "请求异常", "请求超时",
+        "服务不可达",
+        # ── HTTP status codes ──
+        "503", "502", "504", "429",
+        # ── Timeout ──
+        "timeout",
     )
 
     def check_api_failure_retry(

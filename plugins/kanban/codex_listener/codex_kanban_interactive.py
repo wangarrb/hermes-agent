@@ -11,6 +11,7 @@ command that reads and executes the prompt.  No \\n in injected text.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -116,6 +117,46 @@ class CodexInteractiveListener(BaseInteractiveListener):
         if task_id:
             return f"codex-kanban [{task_id}]"
         return "codex-kanban"
+
+    # ── Override on_claim_pre_check: check last 5 lines, not just last line ──
+    # Codex TUI layout puts the "›" prompt 2-3 lines above the bottom status
+    # bar (model name, workspace path).  The base class only checks the very
+    # last non-empty line, which is the status bar and never contains "›",
+    # so the pane is never deemed ready.  We check the last 5 non-empty lines
+    # for an idle marker and ensure no busy marker is present in the same
+    # window.  Requires TWO consecutive checks, 2 s apart, for stability
+    # (same pattern as HermesInteractiveListener).
+    def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
+        if not self.idle_markers:
+            return True
+        session = getattr(args, "zellij_session", "")
+        pane_id = getattr(args, "zellij_pane_id", "")
+        if not session or not pane_id:
+            return True
+        for attempt in range(2):
+            screen = zellij_dump_screen(
+                session=session, pane_id=str(pane_id), log_path=log_path,
+            )
+            if not screen:
+                return False
+            tail_lines = _tail_nonempty_lines(screen, limit=5)
+            if not tail_lines:
+                return False
+            tail = "\n".join(tail_lines).lower()
+            has_idle = any(m.lower() in tail for m in self.idle_markers)
+            has_busy = any(m.lower() in tail for m in self.busy_markers)
+            if not has_idle or has_busy:
+                last_line = tail_lines[-1].lower() if tail_lines else ""
+                log_line(log_path, (
+                    f"on_claim_pre_check attempt {attempt+1}/2: "
+                    f"not ready (idle={has_idle} busy={has_busy} "
+                    f"last={last_line[:60]})"
+                ))
+                return False
+            if attempt == 0:
+                import time as _t
+                _t.sleep(2.0)
+        return True
 
 
 # ── Entry point ──

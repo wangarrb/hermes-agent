@@ -17,7 +17,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-HERMES_HOME = Path.home() / ".hermes"
+# Disable proxy for localhost connections (cron environment may have stale proxy env vars)
+for k in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
+    os.environ.pop(k, None)
+os.environ['no_proxy'] = 'localhost,127.0.0.1'
+
+HERMES_HOME = Path("/home/wyr/.hermes")
 STATE_DB = HERMES_HOME / "state.db"
 PROFILE_DIR = HERMES_HOME / "profiles"
 HINDSIGHT_REFLECT = HERMES_HOME / "hindsight" / "offline_reflect"
@@ -106,6 +111,35 @@ def iter_state_dbs() -> list[tuple[str, Path]]:
     return dbs
 
 
+WIKI_DAILY_DIR = Path("/home/wyr/wiki/auto-maintenance/daily")
+
+
+def parse_prev_report(date_str: str) -> dict | None:
+    """Parse previous day's report to get baseline values for delta."""
+    prev_path = WIKI_DAILY_DIR / f"{date_str}.md"
+    if not prev_path.exists():
+        return None
+    stats = {}
+    try:
+        text = prev_path.read_text()
+        # Extract: documents 总数 | X (may contain commas: 27,207)
+        m = re.search(r'documents 总数[|\s]*([\d,]+)', text)
+        if m:
+            stats['documents'] = int(m.group(1).replace(',', ''))
+        m = re.search(r'observations 总数[|\s]*([\d,]+)', text)
+        if m:
+            stats['observations'] = int(m.group(1).replace(',', ''))
+        m = re.search(r'base units 已 consolidation[|\s]*(\d+)', text)
+        if m:
+            stats['consolidated'] = int(m.group(1))
+        m = re.search(r'unconsolidated_base 剩余[|\s]*(\d+)', text)
+        if m:
+            stats['unconsolidated'] = int(m.group(1))
+    except Exception:
+        return None
+    return stats if stats else None
+
+
 def hermes_model_usage(start: datetime, end: datetime) -> list[dict[str, int | str]]:
     rows_out: list[dict[str, int | str]] = []
     for profile, db_path in iter_state_dbs():
@@ -185,10 +219,94 @@ def hindsight_health() -> str:
         return f"unavailable: {type(exc).__name__}"
 
 
+def parse_codex_usage(target_date: str) -> dict | None:
+    """Parse Codex rollout jsonl for token usage (cumulative, need delta).
+
+    token_count events carry per-session cumulative totals. Different sessions
+    have independent counters starting from 0, so we must compute deltas per-session
+    first, then sum across sessions for the target date.
+    """
+    codex_base = Path('/home/wyr/.codex/sessions')
+    cw_base = Path('/home/wyr/.codewhale/sessions')
+    all_session_files = []
+
+    # Collect from both Codex and CodeWhale session dirs
+    for base in [codex_base, cw_base]:
+        if not base.exists():
+            continue
+        # Scan all available year/month/day dirs
+        for year_dir in sorted(base.glob('2026/*')):
+            if not year_dir.is_dir():
+                continue
+            for day_dir in sorted(year_dir.glob('*')):
+                if not day_dir.is_dir():
+                    continue
+                for session_file in day_dir.glob('rollout-*.jsonl'):
+                    all_session_files.append(session_file)
+
+    # Collect per-session first/last token_count per date
+    session_date_entries: dict[tuple, dict] = {}
+
+    for session_file in all_session_files:
+        try:
+            with open(session_file) as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        ts = d.get('timestamp', '')
+                        if not ts or ts[:10] < '2026-05-01':
+                            continue
+                        if d.get('type') == 'event_msg':
+                            payload = d.get('payload', {})
+                            if isinstance(payload, dict) and payload.get('type') == 'token_count':
+                                info = payload.get('info', {})
+                                total = info.get('total_token_usage', {})
+                                date = ts[:10]
+                                entry = {
+                                    'input': total.get('input_tokens', 0),
+                                    'cached': total.get('cached_input_tokens', 0),
+                                    'output': total.get('output_tokens', 0),
+                                }
+                                key = (str(session_file), date)
+                                if key not in session_date_entries:
+                                    session_date_entries[key] = {'first': entry, 'last': entry}
+                                else:
+                                    session_date_entries[key]['last'] = entry
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    total_input = 0
+    total_cached = 0
+    total_output = 0
+    found_any = False
+
+    from datetime import datetime, timedelta
+    target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+    prev_date = (target_dt - timedelta(days=1)).strftime('%Y-%m-%d')
+    for (sf, date), entries in session_date_entries.items():
+        if date not in (target_date, prev_date):
+            continue
+        found_any = True
+        first = entries['first']
+        last = entries['last']
+        total_input += last['input'] - first['input']
+        total_cached += last['cached'] - first['cached']
+        total_output += last['output'] - first['output']
+
+    if not found_any:
+        return None
+
+    return {
+        'input': total_input - total_cached,
+        'cached': total_cached,
+        'output': total_output,
+    }
+
+
 def docker_env() -> dict[str, str]:
-    cmd = "sg docker -c " + shlex.quote(
-        "docker exec hindsight sh -lc 'env | grep -E \"HINDSIGHT_API_(LLM|RETAIN_LLM|REFLECT_LLM|CONSOLIDATION_LLM|ENABLE_OBSERVATIONS|WORKER_CONSOLIDATION_MAX_SLOTS|WORKER_MAX_SLOTS|RETAIN_MAX_CONCURRENT).*\" | sort'"
-    )
+    cmd = "docker exec hindsight sh -lc 'env | grep -E \"HINDSIGHT_API_(LLM|RETAIN_LLM|REFLECT_LLM|CONSOLIDATION_LLM|ENABLE_OBSERVATIONS|WORKER_CONSOLIDATION_MAX_SLOTS|WORKER_MAX_SLOTS|RETAIN_MAX_CONCURRENT).*\" | sort'"
     code, out, _ = run(cmd, timeout=20)
     if code != 0:
         return {}
@@ -230,7 +348,7 @@ def hindsight_model_config(env: dict[str, str]) -> list[dict[str, str]]:
 
 def docker_logs_since(start: datetime) -> str:
     since = start.astimezone(timezone.utc).isoformat()
-    cmd = "sg docker -c " + shlex.quote(f"docker logs --since {shlex.quote(since)} hindsight 2>&1")
+    cmd = f"docker logs --since {shlex.quote(since)} hindsight 2>&1"
     code, out, err = run(cmd, timeout=90)
     if code != 0:
         return out + "\n" + err
@@ -449,9 +567,25 @@ def print_table(headers: list[str], rows: list[list[str]]) -> None:
 
 
 def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="Hermes 日报生成")
+    parser.add_argument("--date", type=str, default=None,
+                        help="目标日期 YYYY-MM-DD，默认昨天")
+    args = parser.parse_args()
+
     now = datetime.now().astimezone()
-    end = now
-    start = now - timedelta(days=1)
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=now.tzinfo)
+        # 统计窗口：目标日期 08:30 ~ 次日 08:30
+        end = target_date + timedelta(hours=8, minutes=30)
+        start = target_date - timedelta(hours=15, minutes=30)
+        report_date_str = args.date
+        now_for_print = target_date
+    else:
+        end = now
+        start = now - timedelta(days=1)
+        report_date_str = now.strftime("%Y-%m-%d")
+        now_for_print = now
 
     hermes_rows = hermes_model_usage(start, end)
     env = docker_env()
@@ -459,11 +593,39 @@ def main() -> int:
     logs = docker_logs_since(start)
     llm_usage, consolidation_batch_logs = parse_hindsight_llm_logs(logs)
     db = hindsight_db_stats(start, end)
-    offline = offline_output_counts(now)
-    progress = topic_progress(now)
+    offline = offline_output_counts(now_for_print)
+    progress = topic_progress(now_for_print)
 
-    print(f"📊 Hermes日报 {now.strftime('%Y-%m-%d')}")
-    print(f"统计窗口: {start.strftime('%Y-%m-%d %H:%M')} ~ {end.strftime('%Y-%m-%d %H:%M')} ({now.tzname()})")
+    print(f"📊 Hermes日报 {report_date_str}")
+    print(f"统计窗口: {start.strftime('%Y-%m-%d %H:%M')} ~ {end.strftime('%Y-%m-%d %H:%M')} ({now_for_print.tzname()})")
+    print()
+
+    # Summary line with delta
+    docs_meta = (db.get("docs") or [["0", "0", "0"]])[0]
+    cons_meta = (db.get("consolidation") or [["0", "0", "0", "0", "0", "0"]])[0]
+    total_docs = int(docs_meta[2])
+    total_obs = int(cons_meta[3])
+    uncons = int(cons_meta[1])
+    failed = int(cons_meta[2])
+
+    prev = None
+    d_doc = d_obs = 0
+    if not args.date:
+        prev_date = (datetime.now().astimezone() - timedelta(days=2)).strftime("%Y-%m-%d")
+        prev = parse_prev_report(prev_date)
+    if prev:
+        d_doc = total_docs - prev.get("documents", total_docs)
+        d_obs = total_obs - prev.get("observations", total_obs)
+        pct_doc = f"({d_doc:+.0f})" if prev.get("documents") else ""
+        pct_obs = f"({d_obs:+.0f})" if prev.get("observations") else ""
+    print(f"概要: Documents={fmt_num(total_docs)}{f' (Δ{d_doc:+d})' if prev and 'documents' in prev else ''}  "
+          f"Observations={fmt_num(total_obs)}{f' (Δ{d_obs:+d})' if prev and 'observations' in prev else ''}  "
+          f"unconsolidated={fmt_num(uncons)}  failed_base={fmt_num(failed)}")
+    last_cons = (db.get("consolidation") or [["0"] * 6])[0]
+    # Try to extract last_consolidated_at from stats via direct API or fallback to db
+    print(f"Consolidation: base_done={fmt_num(int(cons_meta[0]))}  "
+          f"remaining={fmt_num(int(cons_meta[1]))}  "
+          f"failed={fmt_num(int(cons_meta[2]))}")
     print()
 
     print("【工作概要】")
@@ -510,6 +672,20 @@ def main() -> int:
         print_table(["Profile", "模型", "会话", "轮数", "调用", "输入", "Cache读", "Cache写", "输出"], table)
     else:
         print("无 Hermes / profile 会话记录。")
+    print()
+
+    print("【外部 CLI Agent 调用统计（Codex/CodeWhale 增量提取）】")
+    codex_usage = parse_codex_usage(report_date_str)
+    if codex_usage:
+        print("注：输入(增量) = 真实新输入 = prompt - cache；Cache读为累计 cached_input_tokens。")
+        print_table(
+            ["来源", "输入", "Cache读", "输出"],
+            [
+                ["codex", fmt_tok(codex_usage['input']), fmt_tok(codex_usage['cached']), fmt_tok(codex_usage['output'])],
+            ],
+        )
+    else:
+        print("未采集到外部 CLI Agent 调用记录。")
     print()
 
     print("【Hindsight 运行模型配置】")
@@ -631,4 +807,23 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import sys as _sys
+    import io as _io
+    _buf = _io.StringIO()
+    _old_stdout = _sys.stdout
+    _sys.stdout = _buf
+    try:
+        _ret = main()
+    finally:
+        _sys.stdout = _old_stdout
+    _output = _buf.getvalue()
+    print(_output, end="")
+    # 写 wiki 归档（仅 cron 自动运行时，--date 补跑不写）
+    import argparse as _argparse
+    if "--date" not in _sys.argv:
+        _wiki_dir = Path("/home/wyr/wiki/auto-maintenance/daily")
+        _wiki_dir.mkdir(parents=True, exist_ok=True)
+        _date_str = datetime.now().strftime("%Y-%m-%d")
+        _wiki_path = _wiki_dir / f"{_date_str}.md"
+        _wiki_path.write_text(_output)
+    raise SystemExit(_ret)

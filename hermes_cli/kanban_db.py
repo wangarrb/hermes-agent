@@ -5189,7 +5189,17 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    For interactive watchers (claim_lock ends with ``-interactive``),
+    the PID recorded in ``worker_pid`` belongs to the ``--watch-child``
+    poller, *not* the actual TUI agent (codex/codewhale/hermes) that
+    is doing the work.  Killing the poller is harmful: it destroys the
+    only process that can claim future tasks for that pane.  Interactive
+    watchers detect reclaim naturally on their next poll cycle (they see
+    ``active_task`` leave ``running`` state), so SIGTERM/SIGKILL is both
+    unnecessary and destructive.  Skip termination for interactive locks.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -5200,6 +5210,15 @@ def _terminate_reclaimed_worker(
         "sigkill": False,
     }
     if not pid or pid <= 0 or not claim_lock:
+        return info
+
+    # Interactive watchers self-detect reclaim on the next poll cycle.
+    # The PID in worker_pid is the --watch-child poller, not the TUI agent.
+    # Killing the poller leaves the pane orphaned (no future claims).
+    if str(claim_lock).endswith("-interactive"):
+        info["host_local"] = True
+        info["termination_attempted"] = False
+        info["skipped_reason"] = "interactive-watcher-self-detects-reclaim"
         return info
 
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"

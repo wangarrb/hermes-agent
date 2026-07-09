@@ -115,20 +115,27 @@ def _get_hindsight_llm_config() -> dict:
         api_key = os.environ.get(key_env)
 
     # 3. Final defaults (xunfei-coding is the stable domestic provider;
-    # opencode-go returns 403, topenrouter 401, deepseek 402 as of 2026-06-29)
+    #    opencode-go returns 403, topenrouter 401, deepseek 402 as of 2026-06-29)
+    #    The actual env var is XUNFEI_CODING_API_KEY, not XUNFEI...
+    _FALLBACK_KEY_ENV = "XUNFEI_CODING_API_KEY"
     if not api_key:
-        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "XUNFEI...")
+        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", _FALLBACK_KEY_ENV)
         api_key = os.environ.get(key_env)
     return {
         "base_url": base_url or os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2"),
-        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "astron-code-latest"),
+        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "xopglm51"),
         "api_key": api_key,
         "provider": provider or "openai",
     }
 
 
 def _call_hindsight_llm(system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str | None:
-    """Call Hindsight's current LLM (same model Hindsight uses for retain/consolidate)."""
+    """Call Hindsight's current LLM (same model Hindsight uses for retain/consolidate).
+
+    Retries up to 10 times on transient server errors (5xx, 429) with
+    exponential backoff (5s → 180s max).  Non-transient errors (4xx except 429)
+    fail immediately.
+    """
     import requests as _requests
 
     cfg = _get_hindsight_llm_config()
@@ -137,27 +144,52 @@ def _call_hindsight_llm(system_prompt: str, user_prompt: str, max_tokens: int = 
         print("ERROR: cannot determine Hindsight LLM API key", flush=True)
         return None
 
-    try:
-        resp = _requests.post(
-            f"{cfg['base_url']}/chat/completions",
-            headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"},
-            json={
-                "model": cfg["model"],
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "max_tokens": max_tokens,
-                "temperature": 0.3,
-            },
-            timeout=300,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"topenrouter call failed: {e}", flush=True)
-        return None
+    _BACKOFF = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180]
+    last_exc = None
+    for attempt in range(10):
+        try:
+            resp = _requests.post(
+                f"{cfg['base_url']}/chat/completions",
+                headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"},
+                json={
+                    "model": cfg["model"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0.3,
+                },
+                timeout=300,
+            )
+            if resp.status_code in (429, 502, 503, 504):
+                wait = _BACKOFF[attempt] if attempt < len(_BACKOFF) else 180
+                print(f"  LLM {resp.status_code}, retry {attempt+1}/10 in {wait}s...", flush=True)
+                time.sleep(wait)
+                last_exc = Exception(f"HTTP {resp.status_code}")
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except (_requests.ConnectionError, _requests.Timeout) as e:
+            wait = _BACKOFF[attempt] if attempt < len(_BACKOFF) else 180
+            print(f"  LLM transport error ({e}), retry {attempt+1}/10 in {wait}s...", flush=True)
+            time.sleep(wait)
+            last_exc = e
+        except Exception as e:
+            if isinstance(e, _requests.HTTPError) and e.response is not None:
+                code = e.response.status_code
+                if code in (429, 502, 503, 504):
+                    wait = _BACKOFF[attempt] if attempt < len(_BACKOFF) else 180
+                    print(f"  LLM HTTP {code}, retry {attempt+1}/10 in {wait}s...", flush=True)
+                    time.sleep(wait)
+                    last_exc = e
+                    continue
+            print(f"  LLM call failed: {e}", flush=True)
+            return None
+
+    print(f"  LLM call failed after 10 retries: {last_exc}", flush=True)
+    return None
 
 
 def _collect_today_context(today: str) -> str:
@@ -457,12 +489,48 @@ def run_research_summary(pipeline_exit_code: int, before_stats: dict | None, aft
 
 
 def main() -> int:
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(description="Hindsight offline pipeline wrapper")
+    _ap.add_argument("--mode", choices=["daily", "full"], default="daily",
+                     help="Pipeline mode: daily (default) or full (daily+weekly+wiki)")
+    _ap.add_argument("--include-wiki", action="store_true",
+                     help="For full mode, include wiki maintenance")
+    _ap.add_argument("--skip-daily", action="store_true",
+                     help="For full mode, skip daily steps (retain/daily_reflect)")
+    _args, _ = _ap.parse_known_args()
+    pipeline_mode = _args.mode
+    include_wiki = _args.include_wiki
+    skip_daily = _args.skip_daily
+
     start = time.time()
-    print(f"[Hindsight Daily Pipeline]", flush=True)
+    print(f"[Hindsight {'Full' if pipeline_mode == 'full' else 'Daily'} Pipeline]", flush=True)
 
     if not PIPELINE_SCRIPT.exists():
         print(f"ERROR: script not found: {PIPELINE_SCRIPT}")
         return 1
+
+    # Pre-step: auto-clean orphaned consolidation units before pipeline runs.
+    # Hindsight's consolidation can leave memory_units with consolidation_failed_at
+    # set but no actual pending work, causing pending_consolidation to never drop
+    # and blocking the wait_native_consolidation gate forever.
+    print("  Pre-clean orphaned consolidation units...", flush=True)
+    try:
+        fix_script = HERMES_HOME / "scripts" / "fix_orphaned_consolidation.py"
+        if fix_script.exists():
+            import subprocess as _sp
+            fix = _sp.run(
+                [sys.executable, str(fix_script), "--bypass"],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "HOME": str(REAL_HOME)},
+            )
+            if fix.returncode == 0:
+                print(f"  Clean OK: {fix.stdout.strip()}", flush=True)
+            else:
+                print(f"  Clean failed (non-fatal): {fix.stderr[:200]}", flush=True)
+        else:
+            print(f"  Clean script not found (skip)", flush=True)
+    except Exception as e:
+        print(f"  Pre-clean error (non-fatal): {e}", flush=True)
 
     # Health check
     if not check_hindsight():
@@ -472,11 +540,12 @@ def main() -> int:
     # Snapshot before
     before = get_summary()
 
-    # Run pipeline — full output to log, no timeout
+    # Run pipeline — full output to log, no timeout (cron scheduler handles timeout)
     with open(LOG_FILE, "w", encoding="utf-8") as log_fh:
         env = {
             "HOME": str(REAL_HOME),
             "HERMES_HOME": str(HERMES_HOME),
+            "HINDSIGHT_SESSION_PROFILE_MODE": "all",
             "HERMES_ACCEPT_HOOKS": "1",
             "PYTHONUNBUFFERED": "1",
         }
@@ -484,11 +553,11 @@ def main() -> int:
             [
                 sys.executable, "-u",
                 str(PIPELINE_SCRIPT),
-                "daily",
+                pipeline_mode,
                 "--execute",
                 "--confirm",
                 "run-hindsight-pipeline",
-            ],
+            ] + (["--include-wiki"] if include_wiki else []) + (["--skip-daily"] if skip_daily else []),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             text=True,
