@@ -228,10 +228,19 @@ def parse_codex_usage(target_date: str) -> dict | None:
     """
     codex_base = Path('/home/wyr/.codex/sessions')
     cw_base = Path('/home/wyr/.codewhale/sessions')
+    codex_kanban_base = Path('/home/wyr/.codex-kanban')
     all_session_files = []
 
-    # Collect from both Codex and CodeWhale session dirs
-    for base in [codex_base, cw_base]:
+    # Collect from Codex global sessions, CodeWhale sessions, and
+    # per-role Codex kanban sessions (start-kanban.sh uses per-role CODEX_HOME)
+    scan_dirs = [codex_base, cw_base]
+    if codex_kanban_base.exists():
+        for role_dir in sorted(codex_kanban_base.iterdir()):
+            role_sessions = role_dir / 'sessions'
+            if role_sessions.is_dir():
+                scan_dirs.append(role_sessions)
+
+    for base in scan_dirs:
         if not base.exists():
             continue
         # Scan all available year/month/day dirs
