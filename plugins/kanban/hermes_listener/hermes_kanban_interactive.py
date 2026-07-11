@@ -165,8 +165,15 @@ class HermesInteractiveListener(BaseInteractiveListener):
         "remote end closed connection",
         "network is unreachable",
         "http 429", "http 502", "http 503", "http 504",
+        "http 400",
         "code: 429", "code: 502", "code: 503", "code: 504",
         "error code: 429", "error code: 502", "error code: 503", "error code: 504",
+        # Hermes error box markers (span 15+ lines, need wider detection window)
+        "non-retryable",
+        "aborting",
+        "invalid character",
+        "inference failed",
+        "param validation error",
     )
 
     def on_task_running_monitor(
@@ -184,8 +191,8 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if not screen:
             return
 
-        # Use only last 10 lines for error detection (not 20)
-        tail_lines = _tail_nonempty_lines(screen, limit=10)
+        # Use last 20 lines for error detection (Hermes error boxes span 15+ lines)
+        tail_lines = _tail_nonempty_lines(screen, limit=20)
         tail = "\n".join(tail_lines).lower()
 
         # Idle marker must be in the LAST line (prompt at bottom), not just
@@ -201,7 +208,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
             self._api_retry_first_at = None
             return
 
-        # Check for API error in the last 5 lines only
+        # Check for API error in the tail (Hermes error boxes are wide)
         has_error = any(m in tail for m in self._HERMES_STRICT_ERROR_MARKERS)
         if not has_error:
             self._api_retry_count = 0
