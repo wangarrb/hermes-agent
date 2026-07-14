@@ -251,6 +251,17 @@ class HolographicMemoryProvider(MemoryProvider):
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
+        # Close the SQLite connection deterministically instead of leaking it
+        # to GC. MemoryStore opens its connection with check_same_thread=False
+        # (store.py), so without an explicit close() the sqlite3.Connection's
+        # fd is released by refcount/GC at a non-deterministic time on a
+        # non-deterministic thread, churning a DB fd through the kernel's free
+        # pool on every session teardown. close() already exists and is cheap.
+        if self._store is not None:
+            try:
+                self._store.close()
+            except Exception as e:
+                logger.debug("Holographic shutdown close() failed: %s", e)
         self._store = None
         self._retriever = None
 
@@ -364,10 +375,8 @@ class HolographicMemoryProvider(MemoryProvider):
         ]
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
-            re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bthe\s+(?:project|team)\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
-
-        # Chinese pattern matching (fork customization)
         _CN_PREF_PATTERNS = [
             re.compile(r'我(?:喜欢|偏好|习惯|常用|想要|需要|用)(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'我的(?:默认|常用|偏好|首选)(?:\w+)?是(.+?)(?:[，。！？\n]|$)'),
@@ -427,7 +436,6 @@ class HolographicMemoryProvider(MemoryProvider):
                         pass
                     break
 
-            # Chinese pattern matching (fork customization)
             for pattern in _CN_PREF_PATTERNS:
                 if pattern.search(content):
                     try:
