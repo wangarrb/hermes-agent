@@ -976,6 +976,15 @@ class ContextCompressor(ContextEngine):
         effective_window = context_length - (max_tokens or 0)
         if effective_window <= 0:
             effective_window = context_length
+        # Fork customization: cap max_tokens deduction at 30% of context_length.
+        # The upstream logic treats max_tokens as "reserved output space", but
+        # max_tokens in config.yaml is a *maximum limit*, not a per-request
+        # reservation.  Models with large max_tokens (e.g. 128K on a 200K
+        # context) would see effective_window shrink to 72K, causing premature
+        # compression at ~64K.  Cap the deduction so at most 30% of the window
+        # is treated as output reservation.
+        if max_tokens and max_tokens > int(context_length * 0.30):
+            effective_window = int(context_length * 0.70)
         pct_value = int(effective_window * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
         # If flooring pushed the threshold to/over the effective window it can
