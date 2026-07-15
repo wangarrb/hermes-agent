@@ -111,19 +111,17 @@ def _get_hindsight_llm_config() -> dict:
     if not model:
         model = os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL")
     if not api_key:
-        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "XUNFEI...")
+        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "ONEAPI_API_KEY")
         api_key = os.environ.get(key_env)
 
-    # 3. Final defaults (xunfei-coding is the stable domestic provider;
-    #    opencode-go returns 403, topenrouter 401, deepseek 402 as of 2026-06-29)
-    #    The actual env var is XUNFEI_CODING_API_KEY, not XUNFEI...
-    _FALLBACK_KEY_ENV = "XUNFEI_CODING_API_KEY"
+    # 3. Final defaults (oneapi deepseek-v4-flash via local oneapi gateway)
+    _FALLBACK_KEY_ENV = "ONEAPI_API_KEY"
     if not api_key:
         key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", _FALLBACK_KEY_ENV)
         api_key = os.environ.get(key_env)
     return {
-        "base_url": base_url or os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2"),
-        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "xopglm51"),
+        "base_url": base_url or os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL", "http://127.0.0.1:3000/v1"),
+        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "deepseek-v4-flash"),
         "api_key": api_key,
         "provider": provider or "openai",
     }
