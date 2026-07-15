@@ -1054,8 +1054,14 @@ def _classify_by_status(
     if status_code == 408:
         return result_fn(FailoverReason.timeout, retryable=True)
 
-    # Other 4xx — non-retryable
+    # Other 4xx — non-retryable, except 401 (intermittent gateway DB lock)
     if 400 <= status_code < 500:
+        if status_code == 401:
+            return result_fn(
+                FailoverReason.format_error,
+                retryable=True,
+                should_fallback=True,
+            )
         return result_fn(
             FailoverReason.format_error,
             retryable=False,
