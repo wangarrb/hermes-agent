@@ -118,6 +118,19 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_generation(task_id: str) -> Optional[int]:
+    """Return the task generation pinned into this worker's environment."""
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_GENERATION")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -526,6 +539,8 @@ def _handle_complete(args: dict, **kw) -> str:
         except json.JSONDecodeError:
             pass
     created_cards = args.get("created_cards")
+    allow_no_change = bool(args.get("allow_no_change", False))
+    no_change_reason = str(args.get("no_change_reason") or "").strip() or None
     artifacts = args.get("artifacts")
     if created_cards is not None:
         if isinstance(created_cards, str):
@@ -623,12 +638,23 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
+            expected_run_id = _worker_run_id(tid)
+            expected_generation = _worker_generation(tid)
+            if not os.environ.get("HERMES_KANBAN_TASK") and task:
+                # Orchestrator tools are an explicit operator surface, not a
+                # stale worker prompt. Fence them to the state they just read.
+                expected_run_id = task.current_run_id
+                expected_generation = task.generation
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=expected_run_id,
+                    expected_generation=expected_generation,
+                    allow_no_change=allow_no_change,
+                    no_change_reason=no_change_reason,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -712,12 +738,18 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        expected_run_id = _worker_run_id(tid)
+        expected_generation = _worker_generation(tid)
+        if not os.environ.get("HERMES_KANBAN_TASK") and task:
+            expected_run_id = task.current_run_id
+            expected_generation = task.generation
         try:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
+                expected_generation=expected_generation,
             )
             if not ok:
                 return tool_error(
@@ -1279,6 +1311,20 @@ KANBAN_COMPLETE_SCHEMA = {
                     "are not the deliverable. The path must exist "
                     "on disk when the notifier runs; missing files "
                     "are silently skipped."
+                ),
+            },
+            "allow_no_change": {
+                "type": "boolean",
+                "description": (
+                    "Analysis-only escape hatch after return-for-rework. "
+                    "Use only when no workspace change is expected and always "
+                    "provide no_change_reason."
+                ),
+            },
+            "no_change_reason": {
+                "type": "string",
+                "description": (
+                    "Required justification when allow_no_change=true."
                 ),
             },
             "board": _board_schema_prop(),

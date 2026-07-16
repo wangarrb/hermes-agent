@@ -148,7 +148,8 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "stale", "done",
 ]
 
 
@@ -843,14 +844,24 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
+                current = kanban_db.get_task(conn, task_id)
                 ok = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    expected_run_id=(current.current_run_id if current else None),
+                    expected_generation=(current.generation if current else None),
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                current = kanban_db.get_task(conn, task_id)
+                ok = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    expected_run_id=(current.current_run_id if current else None),
+                    expected_generation=(current.generation if current else None),
+                )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -990,6 +1001,31 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
+    existing = kanban_db.get_task(conn, task_id)
+    if (
+        existing is not None
+        and existing.status == "done"
+        and new_status not in {"done", "archived"}
+    ):
+        # A completed parent leaving done invalidates the execution contract of
+        # every descendant, including descendants that already completed.
+        # Reuse the kernel transition instead of the former one-hop ready
+        # demotion so dashboard drag/drop cannot bypass generation fencing.
+        kanban_db.return_task_for_rework(
+            conn,
+            task_id,
+            actor="dashboard",
+            reason=f"status changed from done to {new_status}",
+            promote_when_unheld=(new_status == "ready"),
+        )
+        if new_status not in {"todo", "ready"}:
+            with kanban_db.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ? AND rework_hold = 0",
+                    (new_status, task_id),
+                )
+        return True
+
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
@@ -1186,14 +1222,31 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
+                        current = kanban_db.get_task(conn, tid)
                         ok = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            expected_run_id=(
+                                current.current_run_id if current else None
+                            ),
+                            expected_generation=(
+                                current.generation if current else None
+                            ),
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        current = kanban_db.get_task(conn, tid)
+                        ok = kanban_db.block_task(
+                            conn,
+                            tid,
+                            expected_run_id=(
+                                current.current_run_id if current else None
+                            ),
+                            expected_generation=(
+                                current.generation if current else None
+                            ),
+                        )
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):

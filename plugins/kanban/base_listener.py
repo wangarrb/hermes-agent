@@ -179,21 +179,32 @@ def role_guidance(profile: str) -> str:
 def build_interactive_prompt(
     *, agent_name: str, board: str, profile: str, task_id: str,
     task_assignee: str, task_title: str, context: str, workspace: Path,
+    run_id: int | None = None, generation: int = 1,
 ) -> str:
     """Build the full task prompt (written to a file, not injected directly)."""
     assist_note = ""
     if task_assignee != profile:
         assist_note = f"（注意：当前 profile={profile}，但本任务 assignee={task_assignee}，按 {task_assignee} 职责执行）"
-    return textwrap.dedent(
+    run_fence = f" --run-id {run_id}" if run_id is not None else ""
+    generation_fence = f" --generation {int(generation)}"
+    task_role_section = ""
+    if task_assignee != profile:
+        task_role_section = "当前任务角色说明：\n" + role_guidance(task_assignee)
+    prompt = textwrap.dedent(
         f"""
         ─── Kanban 任务 {task_id} ───
         标题：{task_title}
         角色：{task_assignee} {assist_note}
 
         关键规则：
-        1. 完成后调用 `hermes kanban --board {board} complete {task_id} --summary "..."`
-        2. 阻塞时调用 `hermes kanban --board {board} block {task_id} --reason "..."`
+        1. 完成后调用 `hermes kanban --board {board} complete {task_id}{run_fence}{generation_fence} --summary "..."`
+        2. 阻塞时调用 `hermes kanban --board {board} block {task_id} "..."{run_fence}{generation_fence}`
         3. 默认中文；路径/命令保留英文
+
+        执行边界：task_id={task_id} run_id={run_id if run_id is not None else 'none'} generation={int(generation)}
+        HERMES_KANBAN_TASK={task_id} HERMES_KANBAN_RUN_ID={run_id if run_id is not None else ''} HERMES_KANBAN_GENERATION={int(generation)}
+
+        __TASK_ROLE_SECTION__
 
         上下文：
         {context}
@@ -201,6 +212,7 @@ def build_interactive_prompt(
         ─── 开始执行任务 {task_id} ───
         """
     ).strip()
+    return prompt.replace("__TASK_ROLE_SECTION__", task_role_section)
 
 
 def prompt_dir(workspace: Path, board: str, pane_profile: str, *, agent_slug: str) -> Path:
@@ -212,7 +224,7 @@ def prompt_dir(workspace: Path, board: str, pane_profile: str, *, agent_slug: st
 def write_task_prompt(
     *, agent_name: str, agent_slug: str, board: str, profile: str,
     task_id: str, task_assignee: str, task_title: str, context: str,
-    workspace: Path,
+    workspace: Path, run_id: int | None = None, generation: int = 1,
 ) -> Path:
     d = prompt_dir(workspace, board, profile, agent_slug=agent_slug)
     d.mkdir(parents=True, exist_ok=True)
@@ -222,6 +234,7 @@ def write_task_prompt(
             agent_name=agent_name, board=board, profile=profile,
             task_id=task_id, task_assignee=task_assignee,
             task_title=task_title, context=context, workspace=workspace,
+            run_id=run_id, generation=generation,
         ),
         encoding="utf-8",
     )
@@ -534,10 +547,10 @@ class BaseInteractiveListener:
         session = getattr(args, "zellij_session", "")
         pane_id = getattr(args, "zellij_pane_id", "")
         if not session or not pane_id:
-            return True
+            return False
         screen = zellij_dump_screen(session=session, pane_id=str(pane_id), log_path=log_path)
-        if screen is None:
-            return True
+        if not screen or not screen.strip():
+            return False
         return _pane_can_accept_new_kanban_task(
             screen, self.idle_markers, self.busy_markers, self.queued_input_markers,
         )
@@ -627,6 +640,7 @@ class BaseInteractiveListener:
         self._log_path: Path = Path("/tmp/kanban.log")
         self._api_retry_count: int = 0       # per-task API failure retry counter
         self._api_retry_first_at: float | None = None  # when first API-idle was seen
+        self._active_control_id: int | None = None
 
     # ── API failure retry on idle ──
     # When agent goes idle mid-task due to API error, inject "继续"
@@ -751,6 +765,154 @@ class BaseInteractiveListener:
     def _claim_lock(self) -> str:
         return f"{socket.gethostname()}:{os.getpid()}:{self.agent_slug}-interactive"
 
+    def _control_receiver(self, args: argparse.Namespace) -> str:
+        """Stable pane identity, preserved when a watcher process restarts."""
+        session = str(getattr(args, "zellij_session", "") or "session")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "pane")
+        return (
+            f"{self.agent_slug}:{self._board}:{self._profile}:"
+            f"{session}:{pane_id}"
+        )
+
+    def _mark_prompt_superseded(self, control: kb.ControlMessage) -> Path:
+        path = prompt_dir(
+            self._workspace, self._board, self._profile,
+            agent_slug=self.agent_slug,
+        ) / f"task-{control.task_id}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        marker = (
+            f"\n\nSUPERSEDED by control {control.id}: run {control.run_id}, "
+            f"generation {control.generation}, returned via "
+            f"{control.return_task_id}. Do not complete this prompt.\n"
+        )
+        if path.exists():
+            existing = path.read_text(encoding="utf-8", errors="replace")
+            if f"SUPERSEDED by control {control.id}:" not in existing:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(marker)
+        else:
+            path.write_text(marker.lstrip(), encoding="utf-8")
+        return path
+
+    def _control_prompt(self, control: kb.ControlMessage) -> str:
+        return (
+            f"[SYSTEM CONTROL {control.id}] Task {control.task_id} run "
+            f"{control.run_id} generation {control.generation} is SUPERSEDED "
+            f"by return-for-rework {control.return_task_id}. Stop the old "
+            f"contract at this safe input boundary; do not complete or block "
+            f"it. Read the durable pause comment on {control.task_id} and "
+            f"reviewer reason on {control.return_task_id}, then acknowledge "
+            f"with `hermes kanban "
+            f"--board {self._board} control-ack {control.id}`."
+        )
+
+    def _control_safe_boundary(
+        self, args: argparse.Namespace, log_path: Path,
+    ) -> bool:
+        """Require positive pane-idle evidence before a control injection."""
+        if not self.idle_markers:
+            return False
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if not session or not pane_id:
+            return False
+        screen = zellij_dump_screen(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
+        if not screen or not screen.strip():
+            return False
+        # Reuse each backend's idle semantics (Codex's prompt is not on the
+        # last line, while other TUIs use the base implementation). The
+        # positive screen probe above prevents their normal claim fail-open
+        # behavior from becoming a control-plane interrupt.
+        return bool(self.on_claim_pre_check(args, log_path))
+
+    def pump_control_messages(
+        self, args: argparse.Namespace, conn: Any, log_path: Path,
+    ) -> bool:
+        """Deliver or hold one cooperative control before normal claim logic.
+
+        Returns True whenever the pane must not claim a task this tick: a
+        control is pending while the pane is busy, being delivered, or already
+        delivered and awaiting ACK.
+        """
+        profiles = claim_assignees(args)
+        receiver = self._control_receiver(args)
+        control = kb.peek_control_message(
+            conn, profiles=profiles, receiver=receiver,
+        )
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if control is None:
+            if self._active_control_id is not None:
+                self._active_control_id = None
+                zellij_rename_pane(
+                    session=session,
+                    pane_id=pane_id,
+                    name=self.pane_label(),
+                    log_path=log_path,
+                )
+            return False
+
+        if control.status == "delivered":
+            self._active_control_id = control.id
+            zellij_rename_pane(
+                session=session,
+                pane_id=pane_id,
+                name=f"[PAUSE {control.task_id}]",
+                log_path=log_path,
+            )
+            return True
+
+        if not self._control_safe_boundary(args, log_path):
+            self._active_control_id = control.id
+            zellij_rename_pane(
+                session=session,
+                pane_id=pane_id,
+                name=f"[PAUSE {control.task_id}]",
+                log_path=log_path,
+            )
+            return True
+
+        leased = kb.lease_control_message(
+            conn,
+            profiles=profiles,
+            receiver=receiver,
+        )
+        if leased is None:
+            return False
+        if leased.status == "delivered":
+            self._active_control_id = leased.id
+            return True
+
+        self._mark_prompt_superseded(leased)
+        prompt = self._control_prompt(leased)
+        ok = zellij_inject(
+            session=session,
+            pane_id=pane_id,
+            text=prompt,
+            log_path=log_path,
+        )
+        if not ok:
+            kb.release_control_lease(conn, leased.id, receiver=receiver)
+            log_line(log_path, f"control injection failed; released {leased.id}")
+            return True
+
+        if not kb.mark_control_delivered(conn, leased.id, receiver=receiver):
+            log_line(log_path, f"control {leased.id} injected but delivery CAS failed")
+        self._active_control_id = leased.id
+        zellij_rename_pane(
+            session=session,
+            pane_id=pane_id,
+            name=f"[PAUSE {leased.task_id}]",
+            log_path=log_path,
+        )
+        log_line(
+            log_path,
+            f"delivered control {leased.id} for {leased.task_id}; awaiting ACK",
+        )
+        return True
+
     # ── claim_and_inject_one ──
     def claim_and_inject_one(
         self, args: argparse.Namespace, *, log_path: Path, conn: Any | None = None,
@@ -758,6 +920,11 @@ class BaseInteractiveListener:
         board = self._board
         workspace = self._workspace
         pane_profile = self._profile
+
+        # Every backend reaches this shared path, including subclasses with a
+        # custom watcher loop. Controls therefore preempt claims uniformly.
+        if conn is not None and self.pump_control_messages(args, conn, log_path):
+            return None, None
 
         # Pre-check: is pane ready?
         if not self.on_claim_pre_check(args, log_path):
@@ -799,6 +966,8 @@ class BaseInteractiveListener:
             task_assignee=getattr(claimed, "assignee", None) or pane_profile,
             task_title=claimed.title,
             context=context, workspace=workspace,
+            run_id=claimed.current_run_id,
+            generation=claimed.generation,
         )
 
         # Post-claim idle confirmation

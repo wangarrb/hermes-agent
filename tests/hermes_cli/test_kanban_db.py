@@ -195,17 +195,56 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        tables = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
+    assert "generation" in task_columns
+    assert "rework_hold" in task_columns
+    assert "rework_baseline_fingerprint" in task_columns
+    assert {"task_control_messages", "task_control_holds"} <= tables
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+
+
+def test_reinitialization_does_not_refresh_dependency_generation_snapshot(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        conn.execute(
+            "UPDATE tasks SET generation = generation + 1 WHERE id = ?",
+            (parent,),
+        )
+        conn.commit()
+        before = conn.execute(
+            "SELECT parent_generation FROM task_links "
+            "WHERE parent_id = ? AND child_id = ?",
+            (parent, child),
+        ).fetchone()["parent_generation"]
+
+    kb.init_db()
+    with kb.connect() as conn:
+        after = conn.execute(
+            "SELECT parent_generation FROM task_links "
+            "WHERE parent_id = ? AND child_id = ?",
+            (parent, child),
+        ).fetchone()["parent_generation"]
+
+    assert before == 1
+    assert after == before
 
 
 # ---------------------------------------------------------------------------
@@ -2951,6 +2990,7 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_GENERATION"] == "1"
 
 
 # ---------------------------------------------------------------------------

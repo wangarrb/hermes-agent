@@ -58,6 +58,8 @@ class ListenerState:
     running: bool = True        # False = exit the listener loop
     paused: bool = False       # True = skip polling until resumed
     current_task_id: str = ""  # non-empty when a task is claimed
+    current_run_id: Optional[int] = None
+    current_generation: Optional[int] = None
 
     # Coordination
     interrupt_requested: bool = False   # set on Ctrl+C while agent is busy
@@ -69,6 +71,8 @@ class ListenerState:
     def cleanup(self) -> None:
         self.running = False
         self.current_task_id = ""
+        self.current_run_id = None
+        self.current_generation = None
         self.interrupt_requested = False
 
 
@@ -286,8 +290,6 @@ def _find_ready_task(
             os.environ["HERMES_KANBAN_BOARD"] = old_board
         elif not old_board and "HERMES_KANBAN_BOARD" in os.environ:
             del os.environ["HERMES_KANBAN_BOARD"]
-
-
 def _heal_blocked_tasks(board: str) -> None:
     """Scan for blocked tasks that can be auto-healed and fix them.
 
@@ -436,6 +438,8 @@ def _claim_and_run(
                 return False
 
         state.current_task_id = task_id
+        state.current_run_id = claimed.current_run_id
+        state.current_generation = claimed.generation
         state.interrupt_requested = False
 
         _print(f"claimed task {task_id}: {task_info.get('title', '')}" +
@@ -481,6 +485,9 @@ def _claim_and_run(
         # Set HERMES_KANBAN_TASK so kanban tool handlers have a default task_id
         os.environ["HERMES_KANBAN_TASK"] = task_id
         os.environ["HERMES_KANBAN_CLAIM_LOCK"] = claimed.claim_lock or ""
+        if claimed.current_run_id is not None:
+            os.environ["HERMES_KANBAN_RUN_ID"] = str(claimed.current_run_id)
+        os.environ["HERMES_KANBAN_GENERATION"] = str(claimed.generation)
 
         # Keep HERMES_KANBAN_TASK set for the duration of this task.
         # We don't restore it here because process_loop picks up the env
@@ -501,9 +508,9 @@ def _claim_and_run(
 
 def _cleanup_after_task(state: ListenerState) -> None:
     """Clean up env vars after a task completes or is interrupted."""
-    if not state.current_task_id:
-        return
     state.current_task_id = ""
+    state.current_run_id = None
+    state.current_generation = None
 
     # Clear the listener flag so kanban tools go away
     try:
@@ -513,7 +520,12 @@ def _cleanup_after_task(state: ListenerState) -> None:
         pass
 
     # Clear env vars
-    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_CLAIM_LOCK"):
+    for key in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_GENERATION",
+        "HERMES_KANBAN_CLAIM_LOCK",
+    ):
         if key in os.environ:
             del os.environ[key]
 
@@ -569,11 +581,26 @@ def _auto_complete_if_still_running(state: ListenerState) -> None:
         with kb.connect() as conn:
             task = kb.get_task(conn, tid)
             if task and task.status == "running":
+                if (
+                    state.current_run_id is None
+                    or state.current_generation is None
+                    or task.current_run_id != state.current_run_id
+                    or task.generation != state.current_generation
+                ):
+                    print(
+                        f"{C.DIM}[kanban-listener] ignored stale callback for "
+                        f"{tid}: expected run={state.current_run_id} "
+                        f"generation={state.current_generation}, current "
+                        f"run={task.current_run_id} generation={task.generation}"
+                        f"{C.RESET}"
+                    )
+                    return
                 # Get last run with full detail
                 last_run = conn.execute(
-                    "SELECT outcome, summary, error, started_at, ended_at "
-                    "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
-                    (tid,),
+                    "SELECT id, generation, outcome, summary, error, "
+                    "started_at, ended_at FROM task_runs "
+                    "WHERE task_id = ? AND id = ?",
+                    (tid, state.current_run_id),
                 ).fetchone()
 
                 # --- Determine if the run was genuinely productive ---
@@ -610,12 +637,20 @@ def _auto_complete_if_still_running(state: ListenerState) -> None:
                 elif has_real_summary:
                     # Case 3: agent produced real output but forgot kanban_complete()
                     # → safe to auto-complete, preserve the agent's summary
-                    kb.complete_task(
+                    completed = kb.complete_task(
                         conn, tid,
                         result="auto-completed by listener safety net",
                         summary=last_run["summary"],
+                        expected_run_id=state.current_run_id,
+                        expected_generation=state.current_generation,
                     )
-                    print(f"{C.DIM}[kanban-listener] auto-completed task {tid} (agent had real output){C.RESET}")
+                    if completed:
+                        print(f"{C.DIM}[kanban-listener] auto-completed task {tid} (agent had real output){C.RESET}")
+                    else:
+                        print(
+                            f"{C.DIM}[kanban-listener] completion fence "
+                            f"rejected stale callback for {tid}{C.RESET}"
+                        )
                     return
                 else:
                     # Case 4: no crash, not too short, but no real summary
@@ -723,6 +758,7 @@ def _reclaim_current(state: ListenerState) -> None:
             os.environ["HERMES_KANBAN_BOARD"] = old_board
         elif not old_board and "HERMES_KANBAN_BOARD" in os.environ:
             del os.environ["HERMES_KANBAN_BOARD"]
+    _cleanup_after_task(state)
 
 
 def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:

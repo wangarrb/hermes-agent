@@ -290,10 +290,10 @@ class ReasonixInteractiveListener(BaseInteractiveListener):
         session = getattr(args, "zellij_session", "")
         pane_id = getattr(args, "zellij_pane_id", "")
         if not session or not pane_id:
-            return True
+            return False
         screen = zellij_dump_screen(session=session, pane_id=str(pane_id), log_path=log_path)
-        if screen is None:
-            return True
+        if not screen or not screen.strip():
+            return False
         return _reasonix_pane_can_accept_new_kanban_task(screen)
 
     # ── Override: on_claim_post_confirm (2-round idle check) ──

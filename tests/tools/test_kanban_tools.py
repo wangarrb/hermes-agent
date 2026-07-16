@@ -1664,6 +1664,29 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     assert d.get("ok") is True
 
 
+def test_worker_tool_carries_generation_fence_after_rework(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        first = kb.get_task(conn, worker_env)
+        returned = kb.return_task_for_rework(
+            conn, worker_env, actor="reviewer", reason="retry"
+        )
+        kb.ack_control_message(conn, returned.control_ids[0], receiver="old-worker")
+        second = kb.claim_task(conn, worker_env, claimer="new-worker")
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(first.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_GENERATION", str(first.generation))
+    rejected = json.loads(kt._handle_complete({"summary": "late old result"}))
+    assert rejected.get("ok") is not True
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_GENERATION", str(second.generation))
+    accepted = json.loads(kt._handle_complete({"summary": "current result"}))
+    assert accepted.get("ok") is True
+
+
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
     any task via explicit task_id. The check only applies to workers."""
@@ -1689,6 +1712,34 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == tid
+
+
+def test_orchestrator_tool_fences_to_current_rework_generation(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_GENERATION", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="operator closeout")
+        assert kb.complete_task(conn, task_id, summary="v1")
+        kb.return_task_for_rework(
+            conn, task_id, actor="reviewer", reason="re-evaluate"
+        )
+
+    result = json.loads(
+        kt._handle_complete({"task_id": task_id, "summary": "v2 accepted"})
+    )
+    assert result.get("ok") is True
 
 
 # ---------------------------------------------------------------------------

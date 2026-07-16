@@ -437,6 +437,61 @@ def test_reopening_parent_demotes_ready_child(client):
     assert child_after_reopen["status"] == "todo"
 
 
+def test_reopening_parent_marks_completed_descendant_stale(client):
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"}
+    ).status_code == 200
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}", json={"status": "done"}
+    ).status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "todo"}
+    )
+    assert response.status_code == 200
+    parent_after = client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}"
+    ).json()["task"]
+    child_after = client.get(
+        f"/api/plugins/kanban/tasks/{child['id']}"
+    ).json()["task"]
+
+    assert parent_after["status"] == "todo"
+    assert parent_after["generation"] == 2
+    assert child_after["status"] == "stale"
+    assert child_after["generation"] == 2
+
+
+def test_dashboard_can_complete_current_rework_generation(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "implementation"}
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "done"}
+    ).status_code == 200
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "todo"}
+    ).status_code == 200
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"}
+    ).status_code == 200
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done", "summary": "current generation accepted"},
+    )
+
+    assert response.status_code == 200
+    completed = response.json()["task"]
+    assert completed["status"] == "done"
+    assert completed["generation"] == 2
+
+
 def test_patch_reassign(client):
     t = client.post(
         "/api/plugins/kanban/tasks",
