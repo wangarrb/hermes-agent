@@ -86,7 +86,6 @@ _REASONIX_IDLE_MARKERS = (
 )
 
 _REASONIX_BUSY_MARKERS = (
-    "kanban_task_boundary",
     "hermes kanban 已领取任务",
     "完成后必须运行",
     "processing",

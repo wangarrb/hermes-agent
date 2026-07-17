@@ -87,7 +87,6 @@ _DEEPSEEK_IDLE_MARKERS = (
 )
 _DEEPSEEK_BUSY_MARKERS = (
     "activity: thinking",
-    "kanban_task_boundary",
     "running",
     "executing",
 )
