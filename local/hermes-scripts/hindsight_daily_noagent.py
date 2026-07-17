@@ -121,7 +121,7 @@ def _get_hindsight_llm_config() -> dict:
         api_key = os.environ.get(key_env)
     return {
         "base_url": base_url or os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL", "http://127.0.0.1:3000/v1"),
-        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "deepseek-v4-flash"),
+        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "xopdeepseekv4flash"),
         "api_key": api_key,
         "provider": provider or "openai",
     }
