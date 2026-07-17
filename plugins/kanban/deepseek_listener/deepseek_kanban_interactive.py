@@ -15,11 +15,12 @@ interactive listener because it needs:
 Idle markers:
   - "编写任务或使用 /" (composer prompt)
   - "输入消息" (alternative composer prompt)
+  - "❯ " (suggested composer prompt)
   - "KANBAN_TASK_BOUNDARY" (our injection marker — pane is idle after previous task)
 
 Busy markers:
   - "activity: thinking" (ghost: stale after response completes)
-  - "kanban_task_boundary" (during active task processing)
+  - "工作中" (localized active response indicator)
   - "running" / "executing" (tool execution)
 
 Injection strategy: write prompt to .md file, inject single-line
@@ -83,10 +84,12 @@ from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
 _DEEPSEEK_IDLE_MARKERS = (
     "编写任务或使用 /",
     "输入消息",
+    "❯ ",
     "kanban_task_boundary",
 )
 _DEEPSEEK_BUSY_MARKERS = (
     "activity: thinking",
+    "工作中",
     "running",
     "executing",
 )
