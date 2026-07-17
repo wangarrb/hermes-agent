@@ -141,70 +141,140 @@ def parse_prev_report(date_str: str) -> dict | None:
 
 
 def hermes_model_usage(start: datetime, end: datetime) -> list[dict[str, int | str]]:
+    """Extract actual per-call model usage from agent.log files.
+
+    Uses the 'API call #N: model=xxx ... in=yyy out=zzz' log lines to get
+    the actual model used per API call, not the session-startup model.
+    Falls back to state.db sessions.model if agent.log is unavailable.
+    """
     rows_out: list[dict[str, int | str]] = []
-    for profile, db_path in iter_state_dbs():
-        con = sqlite3.connect(db_path)
+
+    # Regex to parse: "API call #N: model=xxx provider=yyy in=A out=B total=C latency=Ds cache=E/F (P%)"
+    _call_re = re.compile(
+        r'API call #\d+:\s+model=(\S+)\s+provider=\S+\s+'
+        r'in=(\d+)\s+out=(\d+)\s+total=\d+\s+latency=[\d.]+s\s+'
+        r'cache=(\d+)/(\d+)'
+    )
+
+    # Map profile → agent.log path
+    log_paths: list[tuple[str, Path]] = []
+    default_log = HERMES_HOME / "logs" / "agent.log"
+    if default_log.exists():
+        log_paths.append(("default", default_log))
+    if PROFILE_DIR.exists():
+        for p in sorted(PROFILE_DIR.iterdir()):
+            agent_log = p / "logs" / "agent.log"
+            if agent_log.exists():
+                log_paths.append((p.name, agent_log))
+
+    start_ts_str = start.strftime("%Y-%m-%d %H:%M:%S")
+    end_ts_str = end.strftime("%Y-%m-%d %H:%M:%S")
+
+    for profile, log_path in log_paths:
+        # Per-model aggregation
+        agg: dict[str, dict] = defaultdict(lambda: {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "sessions": set()})
         try:
-            # Use messages.timestamp to find sessions active in the window.
-            # Filtering only by sessions.started_at misses long-running sessions
-            # that started yesterday but consumed tokens today.
+            with open(log_path, "r", errors="replace") as f:
+                for line in f:
+                    # Quick filter by date prefix
+                    if len(line) < 20 or line[0] != '2':
+                        continue
+                    ts = line[:19]  # "2026-07-16 10:19:57"
+                    if ts < start_ts_str or ts >= end_ts_str:
+                        continue
+                    m = _call_re.search(line)
+                    if not m:
+                        continue
+                    model = m.group(1)
+                    inp = int(m.group(2))
+                    outp = int(m.group(3))
+                    cache_r = int(m.group(4))
+                    # Extract session_id from [session_id] in the log line
+                    sess_m = re.search(r'\[([0-9a-f_]+)\]', line)
+                    if sess_m:
+                        agg[model]["sessions"].add(sess_m.group(1))
+                    agg[model]["calls"] += 1
+                    agg[model]["input"] += inp
+                    agg[model]["output"] += outp
+                    agg[model]["cache_read"] += cache_r
+        except OSError:
+            continue
+
+        for model, d in agg.items():
+            rows_out.append({
+                "profile": profile,
+                "model": model,
+                "sessions": len(d["sessions"]),
+                "turns": 0,  # turns not available per-call from log
+                "calls": d["calls"],
+                "input_tokens": d["input"],
+                "cache_read_tokens": d["cache_read"],
+                "cache_write_tokens": 0,  # not in log
+                "output_tokens": d["output"],
+            })
+
+    # Fallback: if no agent.log data, use state.db sessions.model
+    if not rows_out:
+        for profile, db_path in iter_state_dbs():
+            con = sqlite3.connect(db_path)
             try:
-                rows = con.execute(
-                    """
-                    WITH active AS (
-                        SELECT DISTINCT session_id
-                        FROM messages
-                        WHERE timestamp >= ? AND timestamp < ?
-                    )
-                    SELECT COALESCE(s.model, '(unknown)') AS model,
-                           COUNT(DISTINCT s.id) AS sessions,
-                           COALESCE(SUM(s.message_count), 0) AS turns,
-                           COALESCE(SUM(s.api_call_count), 0) AS calls,
-                           COALESCE(SUM(s.input_tokens), 0) AS input_tokens,
-                           COALESCE(SUM(s.cache_read_tokens), 0) AS cache_read_tokens,
-                           COALESCE(SUM(s.cache_write_tokens), 0) AS cache_write_tokens,
-                           COALESCE(SUM(s.output_tokens), 0) AS output_tokens
-                    FROM sessions s
-                    JOIN active a ON a.session_id = s.id
-                    GROUP BY s.model
-                    ORDER BY calls DESC, input_tokens DESC
-                    """,
-                    (start.timestamp(), end.timestamp()),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                rows = con.execute(
-                    """
-                    SELECT COALESCE(model, '(unknown)') AS model,
-                           COUNT(*) AS sessions,
-                           COALESCE(SUM(message_count), 0) AS turns,
-                           COALESCE(SUM(api_call_count), 0) AS calls,
-                           COALESCE(SUM(input_tokens), 0) AS input_tokens,
-                           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                           COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
-                           COALESCE(SUM(output_tokens), 0) AS output_tokens
-                    FROM sessions
-                    WHERE started_at >= ? AND started_at < ?
-                    GROUP BY model
-                    ORDER BY calls DESC, input_tokens DESC
-                    """,
-                    (start.timestamp(), end.timestamp()),
-                ).fetchall()
-        finally:
-            con.close()
-        for r in rows:
-            rows_out.append(
-                {
-                    "profile": profile,
-                    "model": r[0],
-                    "sessions": int(r[1] or 0),
-                    "turns": int(r[2] or 0),
-                    "calls": int(r[3] or 0),
-                    "input_tokens": int(r[4] or 0),
-                    "cache_read_tokens": int(r[5] or 0),
-                    "cache_write_tokens": int(r[6] or 0),
-                    "output_tokens": int(r[7] or 0),
-                }
-            )
+                try:
+                    rows = con.execute(
+                        """
+                        WITH active AS (
+                            SELECT DISTINCT session_id
+                            FROM messages
+                            WHERE timestamp >= ? AND timestamp < ?
+                        )
+                        SELECT COALESCE(s.model, '(unknown)') AS model,
+                               COUNT(DISTINCT s.id) AS sessions,
+                               COALESCE(SUM(s.message_count), 0) AS turns,
+                               COALESCE(SUM(s.api_call_count), 0) AS calls,
+                               COALESCE(SUM(s.input_tokens), 0) AS input_tokens,
+                               COALESCE(SUM(s.cache_read_tokens), 0) AS cache_read_tokens,
+                               COALESCE(SUM(s.cache_write_tokens), 0) AS cache_write_tokens,
+                               COALESCE(SUM(s.output_tokens), 0) AS output_tokens
+                        FROM sessions s
+                        JOIN active a ON a.session_id = s.id
+                        GROUP BY s.model
+                        ORDER BY calls DESC, input_tokens DESC
+                        """,
+                        (start.timestamp(), end.timestamp()),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    rows = con.execute(
+                        """
+                        SELECT COALESCE(model, '(unknown)') AS model,
+                               COUNT(*) AS sessions,
+                               COALESCE(SUM(message_count), 0) AS turns,
+                               COALESCE(SUM(api_call_count), 0) AS calls,
+                               COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                               COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                               COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                               COALESCE(SUM(output_tokens), 0) AS output_tokens
+                        FROM sessions
+                        WHERE started_at >= ? AND started_at < ?
+                        GROUP BY model
+                        ORDER BY calls DESC, input_tokens DESC
+                        """,
+                        (start.timestamp(), end.timestamp()),
+                    ).fetchall()
+            finally:
+                con.close()
+            for r in rows:
+                rows_out.append(
+                    {
+                        "profile": profile,
+                        "model": r[0],
+                        "sessions": int(r[1] or 0),
+                        "turns": int(r[2] or 0),
+                        "calls": int(r[3] or 0),
+                        "input_tokens": int(r[4] or 0),
+                        "cache_read_tokens": int(r[5] or 0),
+                        "cache_write_tokens": int(r[6] or 0),
+                        "output_tokens": int(r[7] or 0),
+                    }
+                )
     return sorted(rows_out, key=lambda r: (int(r["calls"]), int(r["input_tokens"])), reverse=True)
 
 
