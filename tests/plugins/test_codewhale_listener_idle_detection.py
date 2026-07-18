@@ -39,6 +39,19 @@ kanban_task_boundary 请读取任务并执行。
     assert not _can_accept(active_screen)
 
 
+def test_codewhale_idle_status_line_allows_injection() -> None:
+    resumed_idle_screen = """\
+cw auto · act · Full Access
+────────────────────────────────────────────
+previous assistant response
+────────────────────────────────────────────
+❯ 编写任务或使用 /。
+· 空闲                             F1:快捷键
+"""
+
+    assert _can_accept(resumed_idle_screen)
+
+
 def test_full_access_launch_can_resume_matching_saved_session() -> None:
     assert deepseek_kanban_interactive._should_continue_session(
         continue_requested=True,

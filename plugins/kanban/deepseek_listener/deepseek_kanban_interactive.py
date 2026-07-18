@@ -85,6 +85,7 @@ from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
 _DEEPSEEK_IDLE_MARKERS = (
     "编写任务或使用 /",
     "输入消息",
+    "· 空闲",
     "❯ ",
     "kanban_task_boundary",
 )
