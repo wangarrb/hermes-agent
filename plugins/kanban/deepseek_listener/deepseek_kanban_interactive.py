@@ -337,6 +337,22 @@ def _should_restart_watcher(returncode: int | None) -> bool:
     return True
 
 
+def _should_continue_session(
+    *,
+    continue_requested: bool,
+    full_access_requested: bool,
+    other_active: bool,
+    has_sessions: bool,
+) -> bool:
+    """Resume only when stale session permissions cannot override the launch mode."""
+    return (
+        continue_requested
+        and not full_access_requested
+        and not other_active
+        and has_sessions
+    )
+
+
 # ──────────────────────────────────────────────
 # CodeWhale subclass
 # ──────────────────────────────────────────────
@@ -931,7 +947,13 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         ws_path = Path(session_workspace)
         other_active = other_continue_deepseek_active(ws_path)
         has_sessions = self.has_saved_sessions(ws_path)
-        want_continue = getattr(args, "continue_session", True) and not other_active and has_sessions
+        full_access_requested = getattr(args, "yolo", True)
+        want_continue = _should_continue_session(
+            continue_requested=getattr(args, "continue_session", True),
+            full_access_requested=full_access_requested,
+            other_active=other_active,
+            has_sessions=has_sessions,
+        )
 
         if want_continue:
             runtime_bin = shutil.which("codewhale-tui") or getattr(args, "deepseek_tui_bin", "codewhale")
@@ -939,7 +961,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         else:
             deepseek_cmd = [getattr(args, "deepseek_tui_bin", "codewhale"), "run", "--workspace", session_workspace, "--fresh"]
 
-        if getattr(args, "yolo", True):
+        if full_access_requested:
             deepseek_cmd.append("--yolo")
         for extra in getattr(args, "deepseek_arg", None) or []:
             deepseek_cmd.append(extra)

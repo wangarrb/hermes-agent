@@ -33,3 +33,21 @@ kanban_task_boundary 请读取任务并执行。
     assert _can_accept(completed_screen)
     assert not _can_accept(historical_prompt)
     assert not _can_accept(active_screen)
+
+
+def test_full_access_launch_never_resumes_saved_session() -> None:
+    assert not deepseek_kanban_interactive._should_continue_session(
+        continue_requested=True,
+        full_access_requested=True,
+        other_active=False,
+        has_sessions=True,
+    )
+
+
+def test_non_full_access_launch_can_resume_saved_session() -> None:
+    assert deepseek_kanban_interactive._should_continue_session(
+        continue_requested=True,
+        full_access_requested=False,
+        other_active=False,
+        has_sessions=True,
+    )
