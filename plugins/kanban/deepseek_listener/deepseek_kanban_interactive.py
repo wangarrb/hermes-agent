@@ -290,6 +290,47 @@ def _proc_environment_value(pid: str | int, name: str) -> str | None:
     return None
 
 
+def _proc_parent_pid(pid: str | int) -> int | None:
+    try:
+        lines = Path(f"/proc/{pid}/status").read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _codewhale_process_role_home(
+    pid: str | int, *, home: Path | None = None,
+) -> Path | None:
+    """Resolve role ownership even when a TUI makes /proc environ unreadable."""
+    active_home = _proc_environment_value(pid, "CODEWHALE_HOME")
+    if active_home:
+        return Path(active_home).expanduser()
+
+    current_pid = int(pid)
+    seen = {current_pid}
+    for _ in range(8):
+        parent_pid = _proc_parent_pid(current_pid)
+        if parent_pid is None or parent_pid <= 0 or parent_pid in seen:
+            break
+        seen.add(parent_pid)
+        parts = _proc_cmdline(parent_pid)
+        if any(
+            Path(part).name == "deepseek_kanban_interactive.py"
+            for part in parts
+        ):
+            profile = _cmd_arg_value(parts, "--profile")
+            if profile:
+                return (home or Path.home()) / f".codewhale-kanban-{profile}"
+        current_pid = parent_pid
+    return None
+
+
 def other_continue_deepseek_active(
     workspace: Path, *, role_home: Path | None = None,
 ) -> bool:
@@ -311,7 +352,7 @@ def other_continue_deepseek_active(
             continue
         if _same_workspace_arg(parts, workspace):
             if role_home is not None:
-                active_home = _proc_environment_value(entry.name, "CODEWHALE_HOME")
+                active_home = _codewhale_process_role_home(entry.name)
                 if active_home is not None:
                     try:
                         if Path(active_home).expanduser().resolve() != role_home.resolve():

@@ -68,6 +68,40 @@ def test_launch_does_not_resume_without_match_or_with_same_role_active() -> None
     )
 
 
+def test_unreadable_child_environment_uses_listener_profile_role_home(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    parent_by_pid = {200: 100, 100: 1}
+    cmdline_by_pid = {
+        100: [
+            "python3",
+            "/repo/plugins/kanban/deepseek_listener/deepseek_kanban_interactive.py",
+            "--profile",
+            "coordinator",
+        ],
+        1: ["/sbin/init"],
+    }
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "_proc_environment_value",
+        lambda pid, name: None,
+    )
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "_proc_parent_pid",
+        lambda pid: parent_by_pid.get(int(pid)),
+    )
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "_proc_cmdline",
+        lambda pid: cmdline_by_pid.get(int(pid), []),
+    )
+
+    assert deepseek_kanban_interactive._codewhale_process_role_home(
+        200, home=tmp_path,
+    ) == tmp_path / ".codewhale-kanban-coordinator"
+
+
 def test_saved_session_must_match_project_workspace(tmp_path: Path) -> None:
     role_home = tmp_path / ".codewhale-kanban-implementer"
     sessions = role_home / "sessions"
