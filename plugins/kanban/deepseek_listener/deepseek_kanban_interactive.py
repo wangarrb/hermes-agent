@@ -100,6 +100,7 @@ _DEEPSEEK_QUEUED_INPUT_MARKERS = ()
 _STEERING_MARKER = "steering"
 _STEERING_COOLDOWN_S = 30.0
 _FULL_ACCESS_RETRY_S = 5.0
+_POST_INJECT_CONFIRM_S = 1.5
 _last_steering_dismiss_at: dict[str, float] = {}
 
 
@@ -181,6 +182,18 @@ def _sessions_latest_mtime() -> float:
 def _screen_fingerprint(screen: str) -> str:
     lines = _tail_nonempty_lines(screen, limit=20)
     return "|".join(lines[-5:])
+
+
+def _has_queued_kanban_prompt(screen: str) -> bool:
+    """Return whether CodeWhale still shows the injected prompt in its composer."""
+    tail = _tail_nonempty_lines(screen, limit=20)
+    tail_lower = "\n".join(tail).lower()
+    if any(marker in tail_lower for marker in _DEEPSEEK_BUSY_MARKERS):
+        return False
+    return any(
+        "❯" in line and "kanban_task_boundary" in line.lower()
+        for line in tail
+    )
 
 
 def _auto_dismiss_steering(
@@ -554,6 +567,37 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         if task_id:
             return f"{profile}-deepseek [{task_id}]"
         return f"{profile}-deepseek listening"
+
+    def on_post_inject(
+        self, args: argparse.Namespace, *,
+        zellij_session: str, zellij_pane_id: str, log_path: Path,
+    ) -> None:
+        """Submit a CodeWhale prompt that remained queued after the first Enter."""
+        time.sleep(_POST_INJECT_CONFIRM_S)
+        screen = zellij_dump_screen(
+            session=zellij_session,
+            pane_id=zellij_pane_id,
+            log_path=log_path,
+        )
+        if not screen or not _has_queued_kanban_prompt(screen):
+            return
+        cmd_base = (
+            ["zellij", "--session", zellij_session, "action"]
+            if zellij_session
+            else ["zellij", "action"]
+        )
+        subprocess.run(
+            cmd_base + ["write", "-p", zellij_pane_id, "13"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        log_line(
+            log_path,
+            "codewhale post-inject: queued Kanban prompt remained; sent raw Enter",
+        )
 
     # ── Override: on_claim_pre_check with steering dismiss ──
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:

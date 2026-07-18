@@ -52,6 +52,82 @@ previous assistant response
     assert _can_accept(resumed_idle_screen)
 
 
+def test_codewhale_post_inject_submits_queued_prompt_with_raw_enter(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
+    commands: list[list[str]] = []
+    screen = """\
+cw auto · operate · Full Access
+────────────────────────────────────────────
+❯ kanban_task_boundary 请读取 /tmp/task.md 中的 Kanban 任务并执行。
+"""
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "zellij_dump_screen",
+        lambda **kwargs: screen,
+    )
+    monkeypatch.setattr(deepseek_kanban_interactive.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        deepseek_kanban_interactive.subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    listener.on_post_inject(
+        Namespace(),
+        zellij_session="kanban-test",
+        zellij_pane_id="7",
+        log_path=tmp_path / "listener.log",
+    )
+
+    assert commands == [
+        [
+            "zellij",
+            "--session",
+            "kanban-test",
+            "action",
+            "write",
+            "-p",
+            "7",
+            "13",
+        ]
+    ]
+
+
+def test_codewhale_post_inject_does_not_resubmit_busy_prompt(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
+    commands: list[list[str]] = []
+    screen = """\
+kanban_task_boundary 请读取任务并执行。
+⣤ 工作中
+────────────────────────────────────────────
+❯ Coordinate parallel tasks...
+"""
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "zellij_dump_screen",
+        lambda **kwargs: screen,
+    )
+    monkeypatch.setattr(deepseek_kanban_interactive.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        deepseek_kanban_interactive.subprocess,
+        "run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    listener.on_post_inject(
+        Namespace(),
+        zellij_session="kanban-test",
+        zellij_pane_id="7",
+        log_path=tmp_path / "listener.log",
+    )
+
+    assert commands == []
+
+
 def test_full_access_launch_can_resume_matching_saved_session() -> None:
     assert deepseek_kanban_interactive._should_continue_session(
         continue_requested=True,
