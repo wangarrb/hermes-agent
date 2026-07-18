@@ -29,6 +29,7 @@ command referencing the file.  No \\n in injected text.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -97,6 +98,7 @@ _DEEPSEEK_QUEUED_INPUT_MARKERS = ()
 
 _STEERING_MARKER = "steering"
 _STEERING_COOLDOWN_S = 30.0
+_FULL_ACCESS_RETRY_S = 5.0
 _last_steering_dismiss_at: dict[str, float] = {}
 
 
@@ -276,7 +278,21 @@ def _same_workspace_arg(parts: list[str], workspace: Path) -> bool:
     return False
 
 
-def other_continue_deepseek_active(workspace: Path) -> bool:
+def _proc_environment_value(pid: str | int, name: str) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    prefix = f"{name}=".encode()
+    for item in raw.split(b"\x00"):
+        if item.startswith(prefix):
+            return item[len(prefix):].decode(errors="replace")
+    return None
+
+
+def other_continue_deepseek_active(
+    workspace: Path, *, role_home: Path | None = None,
+) -> bool:
     current_pid = os.getpid()
     try:
         proc_entries = list(Path("/proc").iterdir())
@@ -294,6 +310,14 @@ def other_continue_deepseek_active(workspace: Path) -> bool:
         if "--continue" not in parts and "-c" not in parts:
             continue
         if _same_workspace_arg(parts, workspace):
+            if role_home is not None:
+                active_home = _proc_environment_value(entry.name, "CODEWHALE_HOME")
+                if active_home is not None:
+                    try:
+                        if Path(active_home).expanduser().resolve() != role_home.resolve():
+                            continue
+                    except OSError:
+                        pass
             return True
     return False
 
@@ -340,17 +364,11 @@ def _should_restart_watcher(returncode: int | None) -> bool:
 def _should_continue_session(
     *,
     continue_requested: bool,
-    full_access_requested: bool,
     other_active: bool,
     has_sessions: bool,
 ) -> bool:
-    """Resume only when stale session permissions cannot override the launch mode."""
-    return (
-        continue_requested
-        and not full_access_requested
-        and not other_active
-        and has_sessions
-    )
+    """Resume a matching role session when no other process owns it."""
+    return continue_requested and not other_active and has_sessions
 
 
 def _role_runtime_paths(
@@ -385,6 +403,54 @@ def _prepare_role_config(
         return None
     shutil.copy2(source_config, role_config, follow_symlinks=True)
     return role_config
+
+
+def _has_saved_session_for_workspace(*, role_home: Path, workspace: Path) -> bool:
+    """Return whether the role has a saved session rooted at this workspace."""
+    sessions_dir = role_home / "sessions"
+    if not sessions_dir.is_dir():
+        return False
+    expected = workspace.expanduser().resolve()
+    session_paths = sorted(
+        sessions_dir.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for session_path in session_paths:
+        try:
+            payload = json.loads(session_path.read_text(encoding="utf-8"))
+            saved = payload.get("metadata", {}).get("workspace")
+            if saved and Path(saved).expanduser().resolve() == expected:
+                return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
+
+
+def _send_full_access_key(
+    *, session: str, pane_id: str, log_path: Path,
+) -> bool:
+    """Select CodeWhale Full Access without submitting composer input."""
+    cmd_base = (
+        ["zellij", "--session", session, "action"]
+        if session
+        else ["zellij", "action"]
+    )
+    try:
+        subprocess.run(
+            cmd_base + ["send-keys", "-p", str(pane_id), "Alt y"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        log_line(
+            log_path,
+            f"CodeWhale Full Access key failed rc={exc.returncode}: {exc.stderr.strip()}",
+        )
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -449,6 +515,8 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
 
     # ── Override: on_claim_pre_check with steering dismiss ──
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
+        if not self._ensure_full_access(args, log_path):
+            return False
         session = getattr(args, "zellij_session", "")
         pane_id = getattr(args, "zellij_pane_id", "")
         if not session or not pane_id:
@@ -464,6 +532,43 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         return _pane_can_accept_new_kanban_task(
             screen, self.idle_markers, self.busy_markers, self.queued_input_markers,
         )
+
+    def _ensure_full_access(
+        self, args: argparse.Namespace, log_path: Path,
+    ) -> bool:
+        """Gate claims until a resumed CodeWhale pane confirms Full Access."""
+        if not getattr(args, "yolo", True):
+            return True
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if not session or not pane_id:
+            return False
+        screen = zellij_dump_screen(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
+        if not screen or not screen.strip():
+            return False
+        if "full access" in screen.lower():
+            return True
+        if not _pane_can_accept_new_kanban_task(
+            screen,
+            self.idle_markers,
+            self.busy_markers,
+            self.queued_input_markers,
+        ):
+            return False
+        now = time.time()
+        if now - self._last_full_access_request_at < _FULL_ACCESS_RETRY_S:
+            return False
+        if _send_full_access_key(
+            session=session, pane_id=pane_id, log_path=log_path,
+        ):
+            self._last_full_access_request_at = now
+            log_line(
+                log_path,
+                "requested CodeWhale Full Access; claims remain gated until confirmed",
+            )
+        return False
 
     # ── Override: on_claim_post_confirm (2-round idle check) ──
     def on_claim_post_confirm(self, args: argparse.Namespace, log_path: Path) -> bool:
@@ -547,6 +652,8 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
 
     # ── Override: on_watcher_loop_idle (steering dismiss while idle) ──
     def on_watcher_loop_idle(self, args: argparse.Namespace, conn: Any, log_path: Path) -> None:
+        if not self._ensure_full_access(args, log_path):
+            return
         session = getattr(args, "zellij_session", "")
         pane_id = getattr(args, "zellij_pane_id", "")
         if not session or not pane_id:
@@ -599,6 +706,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         self._last_activity_at: float = time.time()
         self._last_liveness_check: float = 0.0
         self._last_task_transition_at: float = 0.0
+        self._last_full_access_request_at: float = 0.0
 
     def _reset_active_task(self) -> None:
         """Reset all active-task tracking state."""
@@ -984,12 +1092,15 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         # ── Build deepseek command with session/provider logic ──
         session_workspace = str(tool_workspace)
         ws_path = Path(session_workspace)
-        other_active = other_continue_deepseek_active(ws_path)
-        has_sessions = self.has_saved_sessions(ws_path)
+        other_active = other_continue_deepseek_active(
+            ws_path, role_home=role_home,
+        )
+        has_sessions = _has_saved_session_for_workspace(
+            role_home=role_home, workspace=ws_path,
+        )
         full_access_requested = getattr(args, "yolo", True)
         want_continue = _should_continue_session(
             continue_requested=getattr(args, "continue_session", True),
-            full_access_requested=full_access_requested,
             other_active=other_active,
             has_sessions=has_sessions,
         )
