@@ -361,6 +361,32 @@ def _role_runtime_paths(
     return role_home, workspace
 
 
+def _prepare_role_config(
+    *, role_home: Path, source_home: Path | None = None,
+) -> Path | None:
+    """Materialize a regular role config without overwriting role-local settings."""
+    source_config = (source_home or Path.home() / ".codewhale") / "config.toml"
+    role_config = role_home / "config.toml"
+    role_home.mkdir(parents=True, exist_ok=True)
+
+    if role_config.is_symlink():
+        backup = role_home / ".config.toml.symlink-backup"
+        suffix = 1
+        while backup.exists() or backup.is_symlink():
+            backup = role_home / f".config.toml.symlink-backup-{suffix}"
+            suffix += 1
+        role_config.rename(backup)
+    elif role_config.exists():
+        if not role_config.is_file():
+            raise RuntimeError(f"CodeWhale role config is not a file: {role_config}")
+        return role_config
+
+    if not source_config.is_file():
+        return None
+    shutil.copy2(source_config, role_config, follow_symlinks=True)
+    return role_config
+
+
 # ──────────────────────────────────────────────
 # CodeWhale subclass
 # ──────────────────────────────────────────────
@@ -949,7 +975,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         role_home, tool_workspace = _role_runtime_paths(
             workspace=Path(workspace), profile=profile,
         )
-        role_home.mkdir(parents=True, exist_ok=True)
+        _prepare_role_config(role_home=role_home)
         env["CODEWHALE_HOME"] = str(role_home)
         log_line(log_path, f"CODEWHALE_HOME={role_home}")
         log_path.parent.mkdir(parents=True, exist_ok=True)
