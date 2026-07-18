@@ -353,6 +353,14 @@ def _should_continue_session(
     )
 
 
+def _role_runtime_paths(
+    *, workspace: Path, profile: str, home: Path | None = None,
+) -> tuple[Path, Path]:
+    """Keep role session state isolated while tools stay rooted in the project."""
+    role_home = (home or Path.home()) / f".codewhale-kanban-{profile}"
+    return role_home, workspace
+
+
 # ──────────────────────────────────────────────
 # CodeWhale subclass
 # ──────────────────────────────────────────────
@@ -936,14 +944,19 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
                 pass
 
         env = self.build_launch_env(args)
+        # Per-role CODEWHALE_HOME so sessions are isolated (not shared globally)
+        profile = args.profile or "implementer"
+        role_home, tool_workspace = _role_runtime_paths(
+            workspace=Path(workspace), profile=profile,
+        )
+        role_home.mkdir(parents=True, exist_ok=True)
+        env["CODEWHALE_HOME"] = str(role_home)
+        log_line(log_path, f"CODEWHALE_HOME={role_home}")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_f = log_path.open("a", encoding="utf-8")
 
         # ── Build deepseek command with session/provider logic ──
-        base_workspace = str(workspace)
-        profile = args.profile or "implementer"
-        session_workspace = str(Path(base_workspace) / ".ds-sessions" / profile)
-        Path(session_workspace).mkdir(parents=True, exist_ok=True)
+        session_workspace = str(tool_workspace)
         ws_path = Path(session_workspace)
         other_active = other_continue_deepseek_active(ws_path)
         has_sessions = self.has_saved_sessions(ws_path)

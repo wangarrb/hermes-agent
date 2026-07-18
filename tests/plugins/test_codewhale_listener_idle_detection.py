@@ -1,5 +1,7 @@
 """CodeWhale composer detection for interactive Kanban injection."""
 
+from pathlib import Path
+
 from plugins.kanban import base_listener
 from plugins.kanban.deepseek_listener import deepseek_kanban_interactive
 
@@ -51,3 +53,16 @@ def test_non_full_access_launch_can_resume_saved_session() -> None:
         other_active=False,
         has_sessions=True,
     )
+
+
+def test_role_sessions_do_not_replace_the_project_tool_workspace(tmp_path: Path) -> None:
+    project_workspace = tmp_path / "Egomotion4D"
+
+    role_home, tool_workspace = deepseek_kanban_interactive._role_runtime_paths(
+        workspace=project_workspace,
+        profile="implementer",
+        home=tmp_path,
+    )
+
+    assert role_home == tmp_path / ".codewhale-kanban-implementer"
+    assert tool_workspace == project_workspace
