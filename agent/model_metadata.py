@@ -276,7 +276,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # (5, 5.1, 5-turbo) are ~202K.  Longest-key-first substring matching
     # ensures "glm-5.2" resolves to 1M while older variants still hit the
     # generic 202K fallback.
-    "glm-5.2": 1_048_576,
+    "glm-5.2": 500000,
     "xopglm52": 500000,
     "xopglm51": 200000,
     "glm": 202752,
