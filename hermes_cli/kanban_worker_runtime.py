@@ -28,6 +28,7 @@ class ClaimPolicy:
     assist_claim_delay_s: float = 0.0
     assist_claim_delays: dict[str, float] = field(default_factory=dict)
     assist_claim_profile_delays: dict[tuple[str, str], float] = field(default_factory=dict)
+    previous_worker_delay_s: float = 0.0
 
 
 def _dedupe_nonempty(items: list[str]) -> list[str]:
@@ -145,6 +146,7 @@ def claim_policy_from_args(args: argparse.Namespace, *, default_profile: str) ->
         assist_claim_delay_s=_float_arg(getattr(args, "assist_claim_delay_s", 0.0)),
         assist_claim_delays=assist_claim_delays_from_args(args),
         assist_claim_profile_delays=assist_claim_profile_delays_from_args(args),
+        previous_worker_delay_s=_float_arg(getattr(args, "previous_worker_delay_s", 0.0)),
     )
 
 
@@ -165,13 +167,32 @@ def ready_since(conn, task_id: str, fallback_created_at: int) -> int:
     """Return the most recent timestamp where a task became claimable."""
     row = conn.execute(
         "SELECT MAX(created_at) AS ts FROM task_events "
-        "WHERE task_id=? AND kind IN ('created','promoted','assigned','reclaimed','unblocked')",
+        "WHERE task_id=? AND kind IN ("
+        "'created','promoted','assigned','reclaimed','unblocked',"
+        "'rework_hold_released')",
         (task_id,),
     ).fetchone()
     try:
         return int(row["ts"] or fallback_created_at or 0)
     except Exception:
         return int(fallback_created_at or 0)
+
+
+def _previous_worker_profile(conn, task_id: str) -> str | None:
+    """Return the profile of the most recent execution attempt for *task_id*.
+
+    Used for the previous-worker priority window: a task returned for rework
+    should be claimable first by the worker who last executed it.
+    """
+    row = conn.execute(
+        "SELECT profile FROM task_runs "
+        "WHERE task_id=? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["profile"] or "").strip() or None
 
 
 def assist_candidate_ready(
@@ -182,12 +203,27 @@ def assist_candidate_ready(
     assignee: str,
     now_fn=time.time,
 ) -> bool:
-    """Return True when *task* is eligible for the pane's claim policy."""
+    """Return True when *task* is eligible for the pane's claim policy.
+
+    If ``previous_worker_delay_s > 0`` and the task was previously executed by
+    a different profile, this pane must wait *previous_worker_delay_s* seconds
+    before it can claim the task.  The previous worker pane has no delay.
+    """
     delay_s = assist_claim_delay_for(policy, assignee)
-    if delay_s <= 0:
-        return True
-    ready_age = now_fn() - ready_since(conn, task.id, int(getattr(task, "created_at", 0) or 0))
-    return ready_age >= delay_s
+    if delay_s > 0:
+        ready_age = now_fn() - ready_since(conn, task.id, int(getattr(task, "created_at", 0) or 0))
+        if ready_age < delay_s:
+            return False
+
+    prev_delay = getattr(policy, "previous_worker_delay_s", 0.0)
+    if prev_delay > 0:
+        prev_profile = _previous_worker_profile(conn, task.id)
+        if prev_profile is not None and prev_profile != policy.profile:
+            ready_age = now_fn() - ready_since(conn, task.id, int(getattr(task, "created_at", 0) or 0))
+            if ready_age < prev_delay:
+                return False
+
+    return True
 
 
 def select_ready_candidate(conn, *, policy: ClaimPolicy) -> kb.Task | None:

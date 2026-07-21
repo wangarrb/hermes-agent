@@ -3098,6 +3098,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "WAL")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     # Clear module cache so a fresh connect() is attempted
@@ -4369,8 +4370,44 @@ def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog
 
 
 # ---------------------------------------------------------------------------
-# Connection pragmas (secure_delete, cell_size_check, synchronous=FULL)
+# Connection pragmas (journal mode, secure_delete, cell_size_check, synchronous=FULL)
 # ---------------------------------------------------------------------------
+
+
+def test_connect_defaults_to_delete_journal_mode(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_connect_allows_explicit_wal_opt_in(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "WAL")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_connect_reuses_delete_mode_while_another_reader_is_active(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    first = kb.connect(db_path=db_path)
+    try:
+        first.execute("BEGIN")
+        first.execute("SELECT count(*) FROM tasks").fetchone()
+        second = kb.connect(db_path=db_path)
+        try:
+            assert second.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        finally:
+            second.close()
+    finally:
+        first.rollback()
+        first.close()
 
 
 def test_connect_sets_secure_delete_on(tmp_path):

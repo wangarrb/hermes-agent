@@ -1,8 +1,11 @@
 #!/bin/bash
 # 启动 kanban 5分窗口。角色固定，底层 agent 可切换。
-# 默认布局：左上planner=codex,右上reviewer=,左下implementer=codewhale,中下critic=codewhale,右下coordinator=hermes
+# 默认布局：左上planner=hermes,右上reviewer=codex,左下implementer=hermes,中下critic=hermes,右下coordinator=hermes
 # 默认任务交付：inject（通过 Zellij 注入）；self-poll 已移除
 # 双角色用法：--assist-role coordinator:implementer --assist-role critic:implementer
+
+SOURCE_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 
 set -euo pipefail
 
@@ -23,10 +26,10 @@ usage() {
 
 角色 -> agent 映射（默认就是当前常用配置）:
   -o, --coordinator-agent <agent>  coordinator 使用的 agent，默认 hermes
-  -p, --planner-agent <agent>      planner 使用的 agent，默认 codex
-  -r, --reviewer-agent <agent>     reviewer 使用的 agent，默认 claude
-  -i, --implementer-agent <agent>  implementer 使用的 agent，默认 codewhale
-  -c, --critic-agent <agent>       critic 使用的 agent，默认 codewhale
+  -p, --planner-agent <agent>      planner 使用的 agent，默认 hermes
+  -r, --reviewer-agent <agent>     reviewer 使用的 agent，默认 codex
+  -i, --implementer-agent <agent>  implementer 使用的 agent，默认 hermes
+  -c, --critic-agent <agent>       critic 使用的 agent，默认 hermes
 
 支持的 agent:
   hermes
@@ -46,8 +49,12 @@ Agent 参数:
   --deepseek-continue-primary <r>  覆盖 continue primary 角色（默认自动选 implementer > planner > coordinator > critic）。
                                    设为 critic 可让 critic pane 继续旧会话而非 implementer。
   --idle-pane-reclaim-s <sec>      CodeWhale pane 连续空闲多久后回收 running 任务；默认 bridge=600
+  --hermes-toolsets <sets>         Hermes pane 的 toolsets，默认 file,terminal,skills,todo,memory,search,web,browser,cronjob,delegation,session_search,vision,clarify,code_execution；
+                                   设为 all 或空值表示不限制。toolsets 是会话启动时固定的，不能运行中热加载。
   --task-delivery <mode>           （已废弃）仅保留 inject 模式；self-poll/worker 已移除。
   --assist-claim-delay-s <sec>     辅助 assignee 的 ready 任务等待多久后才允许被本 pane claim
+  --previous-worker-delay-s <sec>  退回的任务，非上次执行者需等待多少秒后才可 claim；
+                                   上次执行者无延迟。默认 0（禁用）。推荐 180。
   --assist-role-delay <spec>       控制某个 profile 辅助 claim 的延时；支持 profile:assignee:sec、
                                    profile:sec、:sec、sec。省略时默认 profile/assignee=implementer
   --assist-profile-delay <spec>    同上，但总是作为全局 profile 规则下发，适合 backup_immplementer
@@ -125,16 +132,18 @@ clean_session_name() {
 BOARD=""
 WORKSPACE="${KANBAN_WORKSPACE:-${CODEWHALE_KANBAN_WORKSPACE:-${CODEX_KANBAN_WORKSPACE:-${DEEPSEEK_KANBAN_WORKSPACE:-${REAL_HOME}/code/Egomotion4D}}}}"
 COORDINATOR_AGENT="${KANBAN_COORDINATOR_AGENT:-hermes}"
-PLANNER_AGENT="${KANBAN_PLANNER_AGENT:-codex}"
-IMPLEMENTER_AGENT="${KANBAN_IMPLEMENTER_AGENT:-codewhale}"
-CRITIC_AGENT="${KANBAN_CRITIC_AGENT:-codewhale}"
-REVIEWER_AGENT="${KANBAN_REVIEWER_AGENT:-claude}"
+PLANNER_AGENT="${KANBAN_PLANNER_AGENT:-hermes}"
+IMPLEMENTER_AGENT="${KANBAN_IMPLEMENTER_AGENT:-hermes}"
+CRITIC_AGENT="${KANBAN_CRITIC_AGENT:-hermes}"
+REVIEWER_AGENT="${KANBAN_REVIEWER_AGENT:-codex}"
 DEEPSEEK_PROVIDER="${DEEPSEEK_KANBAN_PROVIDER:-openrouter}"
 DEEPSEEK_MODEL="${DEEPSEEK_KANBAN_MODEL:-}"
-DEEPSEEK_CONTINUE_POLICY="${DEEPSEEK_KANBAN_CONTINUE_POLICY:-auto}"
+DEEPSEEK_CONTINUE_POLICY="${DEEPSEEK_KANBAN_CONTINUE_POLICY:-all}"
 DEEPSEEK_CONTINUE_PRIMARY="${DEEPSEEK_KANBAN_CONTINUE_PRIMARY:-}"
 DEEPSEEK_TASK_TIMEOUT="${DEEPSEEK_KANBAN_TASK_TIMEOUT:-}"
-DEEPSEEK_IDLE_PANE_RECLAIM="${DEEPSEEK_KANBAN_IDLE_PANE_RECLAIM:-}"
+DEEPSEEK_IDLE_PANE_RECLAIM="${DEEPSEEK_KANBAN_IDLE_PANE_RECLAIM:-7200}"
+PREVIOUS_WORKER_DELAY="${KANBAN_PREVIOUS_WORKER_DELAY_S:-180}"
+HERMES_TOOLSETS="${KANBAN_HERMES_TOOLSETS:-file,terminal,skills,todo,memory,search,web,browser,cronjob,delegation,session_search,vision,clarify,code_execution}"
 TASK_DELIVERY="${KANBAN_TASK_DELIVERY:-inject}"
 ASSIST_CLAIM_DELAY="${KANBAN_ASSIST_CLAIM_DELAY_S:-${HERMES_KANBAN_ASSIST_CLAIM_DELAY_S:-}}"
 CODEX_MODEL="${CODEX_KANBAN_MODEL:-}"
@@ -342,10 +351,14 @@ while [[ $# -gt 0 ]]; do
             need_value "$1" "${2:-}"; DEEPSEEK_TASK_TIMEOUT="$2"; shift 2 ;;
         --idle-pane-reclaim-s)
             need_value "$1" "${2:-}"; DEEPSEEK_IDLE_PANE_RECLAIM="$2"; shift 2 ;;
+        --hermes-toolsets)
+            need_value "$1" "${2:-}"; HERMES_TOOLSETS="$2"; shift 2 ;;
         --task-delivery)
             need_value "$1" "${2:-}"; TASK_DELIVERY="$2"; shift 2 ;;
         --assist-claim-delay-s)
             need_value "$1" "${2:-}"; ASSIST_CLAIM_DELAY="$2"; shift 2 ;;
+        --previous-worker-delay-s)
+            need_value "$1" "${2:-}"; PREVIOUS_WORKER_DELAY="$2"; shift 2 ;;
         --assist-role-delay)
             need_value "$1" "${2:-}"; add_assist_role_delay "$2"; shift 2 ;;
         --assist-profile-delay)
@@ -530,7 +543,7 @@ self_pid = os.getpid()
 
 roles = {"coordinator", "planner", "implementer", "critic", "reviewer"}
 hermes_re = re.compile(r"\bhermes\b.*\s-p\s+(coordinator|planner|implementer|critic|reviewer)\b")
-listener_re = re.compile(r"(codex-kanban-interactive|codex_kanban_interactive\.py|codex-kanban-listen|codex_kanban_listener\.py|codewhale-kanban-interactive|codewhale_kanban_interactive\.py|deepseek-kanban-interactive|deepseek_kanban_interactive\.py|deepseek-kanban-listen|deepseek_kanban_listener\.py|reasonix-kanban-interactive|reasonix_kanban_interactive\.py|claude-kanban-interactive|claude_kanban_interactive\.py)")
+listener_re = re.compile(r"(codex-kanban-interactive|codex_kanban_interactive\.py|codex-kanban-listen|codex_kanban_listener\.py|codewhale-kanban-interactive|codewhale_kanban_interactive\.py|deepseek-kanban-interactive|deepseek_kanban_interactive\.py|deepseek-kanban-listen|deepseek_kanban_listener\.py|reasonix-kanban-interactive|reasonix_kanban_interactive\.py|claude-kanban-interactive|claude_kanban_interactive\.py|hermes-kanban-role-context-listener\.py)")
 board_arg_re = re.compile(r"(?:--board(?:=|\s+)|HERMES_KANBAN_BOARD=)" + re.escape(board) + r"(?=\s|$)") if board else None
 
 def read_cmd(pid: int) -> str:
@@ -655,6 +668,24 @@ if [ "$DRY_RUN" != "1" ] && [ "$CLEAN" = "1" ]; then
         # Wait for flock files to be released after process death
         sleep 1
     fi
+    # Kill stale MCP server processes for this workspace.
+    # stdio MCP servers are per-client; when the parent Hermes/zellij session
+    # dies, orphaned MCP processes linger forever.  Since start-kanban.sh is
+    # already killing the old session + all workers, the old MCP processes are
+    # guaranteed to be stale.  Kill them before spawning fresh ones.
+    ws_basename=""
+    ws_basename="$(basename "$WORKSPACE")"
+    for mcp_re in "serena.*start-mcp-server.*${ws_basename}" "repowise.*mcp.*${ws_basename}"; do
+        stale_mcp="$(pgrep -f "$mcp_re" 2>/dev/null || true)"
+        if [ -n "$stale_mcp" ]; then
+            echo "  killing stale MCP processes: $(echo "$stale_mcp" | tr '\n' ' ')"
+            echo "$stale_mcp" | xargs kill 2>/dev/null || true
+            sleep 0.5
+            # SIGKILL any survivors
+            survivor="$(pgrep -f "$mcp_re" 2>/dev/null || true)"
+            [ -n "$survivor" ] && echo "$survivor" | xargs kill -9 2>/dev/null || true
+        fi
+    done
     if [ -n "$target_sessions" ]; then
         echo "发现同名 zellij session，将只清理这些 session:"
         echo "$target_sessions"
@@ -692,13 +723,16 @@ append_assist_delay_args() {
             cmd+=" --assist-claim-profile-delay $(shell_quote "$item")"
         done
     fi
+    if [ -n "$PREVIOUS_WORKER_DELAY" ]; then
+        cmd+=" --previous-worker-delay-s $(shell_quote "$PREVIOUS_WORKER_DELAY")"
+    fi
     printf '%s' "$cmd"
 }
 
 build_role_command() {
     local role="$1"
     local agent="$2"
-    local board_q role_q workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item
+    local board_q role_q workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q
     board_q="$(shell_quote "$BOARD")"
     role_q="$(shell_quote "$role")"
     workspace_q="$(shell_quote "$WORKSPACE")"
@@ -746,6 +780,14 @@ build_role_command() {
         profile_delays_q="$(shell_quote "$GLOBAL_ASSIST_PROFILE_DELAYS")"
         assist_delay_env+=" HERMES_KANBAN_ASSIST_CLAIM_PROFILE_DELAYS=${profile_delays_q}"
     fi
+    if [ -n "$PREVIOUS_WORKER_DELAY" ]; then
+        assist_delay_env+=" HERMES_KANBAN_PREVIOUS_WORKER_DELAY_S=$(shell_quote "$PREVIOUS_WORKER_DELAY")"
+    fi
+    hermes_toolsets_env=""
+    if [ -n "$HERMES_TOOLSETS" ]; then
+        hermes_toolsets_q="$(shell_quote "$HERMES_TOOLSETS")"
+        hermes_toolsets_env=" HERMES_KANBAN_TOOLSETS=${hermes_toolsets_q}"
+    fi
 
     case "$agent" in
         hermes)
@@ -753,10 +795,28 @@ build_role_command() {
             # watcher (claims tasks, injects prompts via zellij) in background,
             # then hermes --continue in foreground. Same architecture as
             # codex/codewhale/claude listeners — no /listen-kanban needed.
-            printf 'sleep %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s%s /home/wyr/bin/hermes-kanban-continue -p %s' "$stagger_s" "$workspace_q" "$board_q" "$claim_q" "$assist_delay_env" "$role_q"
+            # The local watcher overlay materializes task-scoped assignee/skill
+            # context after claim without modifying the Hermes Agent source tree.
+            watcher_script_q="$(shell_quote "$SCRIPT_DIR/hermes-kanban-role-context-listener.py")"
+            continue_script_q="$(shell_quote "$SCRIPT_DIR/hermes-kanban-continue")"
+            printf 'sleep %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s HERMES_KANBAN_WATCHER_SCRIPT=%s%s%s %s -p %s' "$stagger_s" "$workspace_q" "$board_q" "$claim_q" "$watcher_script_q" "$assist_delay_env" "$hermes_toolsets_env" "$continue_script_q" "$role_q"
             ;;
         codex)
-            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            # Per-role CODEX_HOME: each codex pane (planner/critic) gets its own
+            # session directory so 'codex resume --last' resumes the correct
+            # session for THAT role, not the global most-recent one.
+            # Shared files (config, auth, skills) are symlinked from ~/.codex.
+            local codex_home="${REAL_HOME}/.codex-kanban/${role}"
+            mkdir -p "$codex_home/sessions"
+            for f in config.toml auth.json hooks.json installation_id .personality_migration version.json AGENTS.md RTK.md models_cache.json; do
+                [ -e "${REAL_HOME}/.codex/$f" ] && [ ! -e "$codex_home/$f" ] && ln -sf "${REAL_HOME}/.codex/$f" "$codex_home/$f"
+            done
+            for d in claude-skills superpowers skills plugins; do
+                [ -d "${REAL_HOME}/.codex/$d" ] && [ ! -e "$codex_home/$d" ] && ln -sf "${REAL_HOME}/.codex/$d" "$codex_home/$d"
+            done
+            local codex_home_q
+            codex_home_q="$(shell_quote "$codex_home")"
+            cmd="cd ${workspace_q} && CODEX_HOME=${codex_home_q} HERMES_KANBAN_BOARD=${board_q} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$CODEX_MODEL" ]; then
                 model_q="$(shell_quote "$CODEX_MODEL")"
@@ -866,6 +926,9 @@ if agent_is_used deepseek-reasonix; then
     echo "  Reasonix model: ${DEEPSEEK_MODEL:-auto}"
     echo "  DeepSeek continue policy: ${DEEPSEEK_CONTINUE_POLICY} (primary=$(deepseek_primary_role), panes=$(deepseek_pane_count))"
 fi
+if agent_is_used hermes; then
+    echo "  Hermes toolsets: ${HERMES_TOOLSETS:-all}"
+fi
 echo ""
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -911,5 +974,21 @@ for proc_pattern in "hermes.*kanban.*dispatch" "hermes.*kanban.*daemon"; do
         fi
     fi
 done
+
+# ── Launch watcher supervisor (single process, monitors all watcher children) ──
+# Kill old supervisor if running
+if pgrep -f "kanban-watcher-supervisor" >/dev/null 2>&1; then
+    pkill -f "kanban-watcher-supervisor" 2>/dev/null || true
+    sleep 0.5
+fi
+SUPERVISOR="$SCRIPT_DIR/kanban-watcher-supervisor.py"
+if [ -x "$SUPERVISOR" ]; then
+    SUPERVISOR_LOG="$HOME/.hermes/hermes-agent/kanban_logs/$BOARD/watcher-supervisor-stderr.log"
+    nohup python3 "$SUPERVISOR" --session "$SESSION_NAME" --poll-s 30 \
+        > "$SUPERVISOR_LOG" 2>&1 &
+    echo "  watcher supervisor started: pid=$! (stderr log: $SUPERVISOR_LOG)"
+else
+    echo "  ⚠️  watcher supervisor not found at $SUPERVISOR, skipping"
+fi
 
 exec zellij --session "$SESSION_NAME" --new-session-with-layout kanban-launcher

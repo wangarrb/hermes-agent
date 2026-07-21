@@ -209,13 +209,8 @@ class _PaneProgressWatch:
 
 
 def _should_restart_watcher(returncode: int | None, *, reasonix_alive: bool = True) -> bool:
-    if returncode is None:
-        return True
-    if returncode == 0:
-        return False
-    if not reasonix_alive:
-        return False
-    return True
+    # A clean watcher exit is still a lost listener while the TUI is alive.
+    return returncode is not None and reasonix_alive
 
 
 # ──────────────────────────────────────────────
@@ -363,7 +358,7 @@ class ReasonixInteractiveListener(BaseInteractiveListener):
             pass
 
         import signal as sig
-        from base_listener import _handle_stop
+        from base_listener import _handle_stop, stop_requested
         sig.signal(sig.SIGINT, _handle_stop)
         sig.signal(sig.SIGTERM, _handle_stop)
 
@@ -453,7 +448,7 @@ class ReasonixInteractiveListener(BaseInteractiveListener):
         self._last_task_transition_at = 0.0
 
         try:
-            while True:
+            while not stop_requested():
                 now = time.time()
                 conn = _ensure_conn()
                 if conn is None:

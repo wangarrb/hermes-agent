@@ -60,6 +60,11 @@ def _handle_stop(signum: int, frame: Any) -> None:  # noqa: ARG001
     _STOP = True
 
 
+def stop_requested() -> bool:
+    """Return the shared watcher stop flag for listener-specific loops."""
+    return _STOP
+
+
 # ──────────────────────────────────────────────
 # Shared utility functions (used by all listeners)
 # ──────────────────────────────────────────────
@@ -646,70 +651,68 @@ class BaseInteractiveListener:
     # When agent goes idle mid-task due to API error, inject "继续"
     # up to API_RETRY_MAX times with backoff. After max retries,
     # fall through to existing idle-pane-reclaim logic.
-    API_RETRY_MAX: int = 10
-    API_RETRY_BACKOFF: list[float] = [20.0, 60.0, 60.0, 120.0, 180.0, 300.0, 420.0, 600.0, 780.0, 900.0]  # seconds before each retry
+    # Retry intervals: 5min → 10min → 20min (total ~35min window).
+    API_RETRY_MAX: int = 3
+    API_RETRY_BACKOFF: list[float] = [300.0, 600.0, 1200.0]  # 5min, 10min, 20min
     API_ERROR_MARKERS: tuple[str, ...] = (
-        # ── Unicode / visual markers ──
-        "⚠",
-        # ── Generic API errors ──
-        "api call failed", "api error", "api request failed",
-        "request failed", "request error",
-        # ── xunfei-specific ──
-        "xunfei request failed", "xunfei request error",
-        "notenoughcv", "engineinternalerror", "system is busy",
-        "invalid params", "appidnoauth",
-        # ── HTTP-level / transport errors (httpx, requests, urllib3) ──
-        # Connection-level
-        "connectionerror", "connection error",
-        "connectionrefused", "connection refused",
-        "connectionreset", "connection reset",
-        "connection aborted",
-        "connection broken",
-        "connection closed by remote",
-        "connecterror", "connect error",
-        "connecttimeout", "connect timeout",
-        # Read/Write
-        "readtimeout", "read timeout",
-        "writetimeout", "write timeout",
-        "pooltimeout", "pool timeout",
-        "proxytimeout", "proxy timeout",
-        # Proxy
-        "proxyerror", "proxy error",
-        # SSL/TLS
-        "sslerror", "ssl error",
-        "certificate_verify_failed", "certificate verify failed",
-        # Protocol
-        "broken pipe", "brokenpipeerror",
-        "remote end closed connection",
-        "remote protocol error",
-        "local protocol error",
-        "eof occurred",
-        "protocol error", "protocolexception",
-        "bad status line",
-        "chunked encoding",
-        "content length mismatch",
-        # Retry / pool
-        "maxretryerror", "max retries exceeded",
-        "newconnectionerror",
-        # Network unreachable
-        "network is unreachable",
-        "no route to host",
-        "cannot connect",
-        "failed to connect",
-        "name resolution error",
-        "dns lookup failed",
-        "name or service not known",
-        "temporary failure in name resolution",
-        # ── Chinese (domestic API providers, OSS proxies) ──
-        "连接失败", "连接超时", "连接被拒",
-        "网络错误", "网络异常", "网络不可达",
-        "请求异常", "请求超时",
-        "服务不可达",
-        # ── HTTP status codes ──
-        "503", "502", "504", "429",
-        # ── Timeout ──
-        "timeout",
-    )
+            # ── Generic API errors ──
+            "api call failed", "api error", "api request failed",
+            "request failed", "request error",
+            # ── xunfei-specific ──
+            "xunfei request failed", "xunfei request error",
+            "notenoughcv", "engineinternalerror", "system is busy",
+            "invalid params", "appidnoauth",
+            # ── HTTP-level / transport errors (httpx, requests, urllib3) ──
+            # Connection-level
+            "connectionerror", "connection error",
+            "connectionrefused", "connection refused",
+            "connectionreset", "connection reset",
+            "connection aborted",
+            "connection broken",
+            "connection closed by remote",
+            "connecterror", "connect error",
+            "connecttimeout", "connect timeout",
+            # Read/Write
+            "readtimeout", "read timeout",
+            "writetimeout", "write timeout",
+            "pooltimeout", "pool timeout",
+            # Proxy
+            "proxyerror", "proxy error",
+            # SSL/TLS
+            "sslerror", "ssl error",
+            "certificate_verify_failed", "certificate verify failed",
+            # Protocol
+            "broken pipe", "brokenpipeerror",
+            "remote end closed connection",
+            "remote protocol error",
+            "local protocol error",
+            "eof occurred",
+            "protocol error", "protocolexception",
+            "bad status line",
+            "chunked encoding",
+            "content length mismatch",
+            # Retry / pool
+            "maxretryerror", "max retries exceeded",
+            "newconnectionerror",
+            # Network unreachable
+            "network is unreachable",
+            "no route to host",
+            "cannot connect",
+            "failed to connect",
+            "name resolution error",
+            "dns lookup failed",
+            "name or service not known",
+            "temporary failure in name resolution",
+            # ── Chinese (domestic API providers, OSS proxies) ──
+            "连接失败", "连接超时", "连接被拒",
+            "网络错误", "网络异常", "网络不可达",
+            "请求异常", "请求超时",
+            "服务不可达",
+            # ── HTTP status codes ──
+            "503", "502", "504", "429",
+            # ── Timeout ──
+            "timeout",
+        )
 
     def check_api_failure_retry(
         self, *, session: str, pane_id: str, screen: str,
@@ -732,7 +735,11 @@ class BaseInteractiveListener:
             self._api_retry_first_at = None
             return False
 
-        # API error detected on pane — check if we should retry now
+        # API error detected — record which markers matched
+        matched = [m for m in self.API_ERROR_MARKERS if m.lower() in tail]
+        log_line(log_path, f"api-error-matched for task {task_id}: markers={matched} (retry {self._api_retry_count}/{self.API_RETRY_MAX})")
+
+        # check if we should retry now
         now = time.time()
         if self._api_retry_first_at is None:
             self._api_retry_first_at = now
@@ -1111,15 +1118,11 @@ class BaseInteractiveListener:
                 except sqlite3.DatabaseError as exc:
                     msg = str(exc).lower()
                     if "malformed" in msg or "corrupt" in msg:
-                        log_line(log_path, f"DB corruption detected: {exc}; attempting REINDEX repair")
-                        try:
-                            repair_conn = sqlite3.connect(str(kb.kanban_db_path(board=board)), timeout=120.0)
-                            repair_conn.execute("PRAGMA integrity_check")
-                            repair_conn.execute("REINDEX")
-                            repair_conn.close()
-                            log_line(log_path, "REINDEX repair succeeded; retrying connect")
-                        except Exception as repair_exc:
-                            log_line(log_path, f"REINDEX repair failed: {repair_exc}")
+                        log_line(
+                            log_path,
+                            f"DB corruption detected: {exc}; refusing unsafe "
+                            "in-watcher REINDEX repair (fail-closed)",
+                        )
                     consecutive_db_errors += 1
                     time.sleep(4.0)
                 except Exception as exc:
@@ -1354,6 +1357,9 @@ class BaseInteractiveListener:
         parser.add_argument("--sandbox", default=None, help="Optional sandbox override")
         parser.add_argument("--assist-claim-delay-s", type=float, default=0.0, help="Delay before claiming secondary assignees")
         parser.add_argument("--assist-claim-delay-for", action="append", default=[], help="Per-assignee assist delay")
+        parser.add_argument("--previous-worker-delay-s", type=float,
+                            default=float(os.environ.get("HERMES_KANBAN_PREVIOUS_WORKER_DELAY_S", "0")),
+                            help="Seconds a non-previous-worker must wait before claiming a reworked task")
         parser.add_argument("--startup-delay-s", type=float, default=8.0, help="Delay before first claim (seconds)")
         parser.add_argument("--once", action="store_true", help="Process at most one task then exit")
         parser.add_argument("--watch-child", action="store_true", help=argparse.SUPPRESS)

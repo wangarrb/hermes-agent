@@ -409,11 +409,10 @@ def default_model_for_provider(friendly_provider: str) -> str:
 
 
 def _should_restart_watcher(returncode: int | None) -> bool:
-    if returncode is None:
-        return True
-    if returncode == 0:
-        return False
-    return True
+    # The launcher calls this only after poll() reports an exit. While the TUI
+    # remains alive, a clean watcher exit is still a lost listener and must be
+    # restarted just like a crash.
+    return returncode is not None
 
 
 def _should_continue_session(
@@ -424,6 +423,23 @@ def _should_continue_session(
 ) -> bool:
     """Resume a matching role session when no other process owns it."""
     return continue_requested and not other_active and has_sessions
+
+
+def _build_codewhale_runtime_cmd(
+    *,
+    want_continue: bool,
+    runtime_bin: str,
+    fresh_bin: str,
+    workspace: str,
+    extra_args: list[str],
+) -> list[str]:
+    """Build a TUI command without coupling Full Access to Act mode."""
+    if want_continue:
+        cmd = [runtime_bin, "--workspace", workspace, "--continue"]
+    else:
+        cmd = [fresh_bin, "run", "--workspace", workspace, "--fresh"]
+    cmd.extend(extra_args)
+    return cmd
 
 
 def _role_runtime_paths(
@@ -437,7 +453,7 @@ def _role_runtime_paths(
 def _prepare_role_config(
     *, role_home: Path, source_home: Path | None = None,
 ) -> Path | None:
-    """Materialize a regular role config without overwriting role-local settings."""
+    """Synchronize the main config into a regular role-local config file."""
     source_config = (source_home or Path.home() / ".codewhale") / "config.toml"
     role_config = role_home / "config.toml"
     role_home.mkdir(parents=True, exist_ok=True)
@@ -452,10 +468,9 @@ def _prepare_role_config(
     elif role_config.exists():
         if not role_config.is_file():
             raise RuntimeError(f"CodeWhale role config is not a file: {role_config}")
-        return role_config
 
     if not source_config.is_file():
-        return None
+        return role_config if role_config.is_file() else None
     shutil.copy2(source_config, role_config, follow_symlinks=True)
     return role_config
 
@@ -482,10 +497,10 @@ def _has_saved_session_for_workspace(*, role_home: Path, workspace: Path) -> boo
     return False
 
 
-def _send_full_access_key(
+def _send_operate_command(
     *, session: str, pane_id: str, log_path: Path,
 ) -> bool:
-    """Select CodeWhale Full Access without submitting composer input."""
+    """Switch an idle fresh CodeWhale pane to Operate mode."""
     cmd_base = (
         ["zellij", "--session", session, "action"]
         if session
@@ -493,7 +508,22 @@ def _send_full_access_key(
     )
     try:
         subprocess.run(
-            cmd_base + ["send-keys", "-p", str(pane_id), "Alt y"],
+            cmd_base + ["send-keys", "-p", str(pane_id), "Ctrl u"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        subprocess.run(
+            cmd_base + ["write-chars", "-p", str(pane_id), "/mode operate"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.2)
+        subprocess.run(
+            cmd_base + ["send-keys", "-p", str(pane_id), "Enter"],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -503,7 +533,7 @@ def _send_full_access_key(
     except subprocess.CalledProcessError as exc:
         log_line(
             log_path,
-            f"CodeWhale Full Access key failed rc={exc.returncode}: {exc.stderr.strip()}",
+            f"CodeWhale Operate command failed rc={exc.returncode}: {exc.stderr.strip()}",
         )
         return False
 
@@ -601,6 +631,8 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
 
     # ── Override: on_claim_pre_check with steering dismiss ──
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
+        if not self._ensure_fresh_operate(args, log_path):
+            return False
         if not self._ensure_full_access(args, log_path):
             return False
         session = getattr(args, "zellij_session", "")
@@ -619,6 +651,39 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
             screen, self.idle_markers, self.busy_markers, self.queued_input_markers,
         )
 
+    def _ensure_fresh_operate(
+        self, args: argparse.Namespace, log_path: Path,
+    ) -> bool:
+        """Gate fresh-session claims until the pane confirms Operate mode."""
+        if os.environ.get("CODEWHALE_KANBAN_FRESH_OPERATE") != "1":
+            return True
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if not session or not pane_id:
+            return False
+        screen = zellij_dump_screen(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
+        if not screen or not screen.strip():
+            return False
+        header = "\n".join(screen.splitlines()[:3]).lower()
+        if "· operate ·" in header:
+            os.environ.pop("CODEWHALE_KANBAN_FRESH_OPERATE", None)
+            return True
+        if "· act ·" not in header or not _pane_can_accept_new_kanban_task(
+            screen, self.idle_markers, self.busy_markers, self.queued_input_markers,
+        ):
+            return False
+        last_request = getattr(self, "_fresh_operate_requested_at", 0.0)
+        if time.time() - last_request < 2.0:
+            return False
+        if _send_operate_command(
+            session=session, pane_id=pane_id, log_path=log_path,
+        ):
+            self._fresh_operate_requested_at = time.time()
+            log_line(log_path, "fresh CodeWhale pane requested Operate mode")
+        return False
+
     def _ensure_full_access(
         self, args: argparse.Namespace, log_path: Path,
     ) -> bool:
@@ -636,24 +701,17 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
             return False
         if "full access" in screen.lower():
             return True
-        if not _pane_can_accept_new_kanban_task(
-            screen,
-            self.idle_markers,
-            self.busy_markers,
-            self.queued_input_markers,
-        ):
-            return False
         now = time.time()
         if now - self._last_full_access_request_at < _FULL_ACCESS_RETRY_S:
             return False
-        if _send_full_access_key(
-            session=session, pane_id=pane_id, log_path=log_path,
-        ):
-            self._last_full_access_request_at = now
-            log_line(
-                log_path,
-                "requested CodeWhale Full Access; claims remain gated until confirmed",
-            )
+        self._last_full_access_request_at = now
+        log_line(
+            log_path,
+            "CodeWhale is not Full Access; claims remain gated. "
+            "Set permission_posture=\"full-access\" in settings.toml, remove any "
+            "approval_policy lock, keep sandbox_mode=\"danger-full-access\", and "
+            "restart the listener. Built-in and repo-law safety holds still apply.",
+        )
         return False
 
     # ── Override: on_claim_post_confirm (2-round idle check) ──
@@ -757,6 +815,17 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         deepseek_provider = getattr(args, "provider", None)
         provider_str, provider_label = normalize_provider(deepseek_provider)
         deepseek_model = getattr(args, "model", None) or default_model_for_provider(provider_label)
+        if not provider_str:
+            for key in (
+                "CODEWHALE_PROVIDER", "CODEWHALE_MODEL", "CODEWHALE_BASE_URL",
+                "CODEWHALE_API_KEY", "DEEPSEEK_PROVIDER", "DEEPSEEK_MODEL",
+                "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "OPENROUTER_BASE_URL",
+                "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
+                "NOVITA_BASE_URL", "NOVITA_MODEL", "NOVITA_API_KEY",
+            ):
+                env.pop(key, None)
+            env.pop("DEEPSEEK_YOLO", None)
+            return env
         if provider_str:
             env["DEEPSEEK_PROVIDER"] = provider_str
             if provider_label == "openrouter":
@@ -771,8 +840,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
             env["OPENROUTER_API_KEY"] = topenrouter_key
         if opencode_key:
             env["OPENAI_API_KEY"] = opencode_key
-        if getattr(args, "yolo", True):
-            env["DEEPSEEK_YOLO"] = "true"
+        env.pop("DEEPSEEK_YOLO", None)
         return env
 
     # ── Override: build_watcher_extra_args ──
@@ -820,7 +888,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
             pass
 
         import signal as sig
-        from base_listener import _handle_stop
+        from base_listener import _handle_stop, stop_requested
         sig.signal(sig.SIGINT, _handle_stop)
         sig.signal(sig.SIGTERM, _handle_stop)
 
@@ -910,7 +978,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         self._last_task_transition_at = 0.0
 
         try:
-            while True:
+            while not stop_requested():
                 now = time.time()
                 conn = _ensure_conn()
                 if conn is None:
@@ -1184,23 +1252,23 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         has_sessions = _has_saved_session_for_workspace(
             role_home=role_home, workspace=ws_path,
         )
-        full_access_requested = getattr(args, "yolo", True)
         want_continue = _should_continue_session(
             continue_requested=getattr(args, "continue_session", True),
             other_active=other_active,
             has_sessions=has_sessions,
         )
-
         if want_continue:
-            runtime_bin = shutil.which("codewhale-tui") or getattr(args, "deepseek_tui_bin", "codewhale")
-            deepseek_cmd = [runtime_bin, "--workspace", session_workspace, "--continue"]
+            env.pop("CODEWHALE_KANBAN_FRESH_OPERATE", None)
         else:
-            deepseek_cmd = [getattr(args, "deepseek_tui_bin", "codewhale"), "run", "--workspace", session_workspace, "--fresh"]
-
-        if full_access_requested:
-            deepseek_cmd.append("--yolo")
-        for extra in getattr(args, "deepseek_arg", None) or []:
-            deepseek_cmd.append(extra)
+            env["CODEWHALE_KANBAN_FRESH_OPERATE"] = "1"
+        deepseek_cmd = _build_codewhale_runtime_cmd(
+            want_continue=want_continue,
+            runtime_bin=shutil.which("codewhale-tui")
+            or getattr(args, "deepseek_tui_bin", "codewhale"),
+            fresh_bin=getattr(args, "deepseek_tui_bin", "codewhale"),
+            workspace=session_workspace,
+            extra_args=list(getattr(args, "deepseek_arg", None) or []),
+        )
 
         log_line(log_path, f"launcher starting watcher: {' '.join(watcher_cmd)}")
         log_line(log_path, f"launcher starting codewhale: {' '.join(deepseek_cmd)}")

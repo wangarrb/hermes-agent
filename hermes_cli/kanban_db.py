@@ -1780,6 +1780,41 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+def _apply_kanban_connection_pragmas(
+    conn: sqlite3.Connection, path: Path
+) -> None:
+    """Apply durability pragmas; default to serialized rollback journaling."""
+    journal_mode = os.environ.get(
+        "HERMES_KANBAN_JOURNAL_MODE", "DELETE"
+    ).strip().upper()
+    if journal_mode == "WAL":
+        current = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        if current != "wal":
+            from hermes_state import apply_wal_with_fallback
+
+            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+    elif journal_mode == "DELETE":
+        current = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        if current != "delete":
+            actual = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            if str(actual).lower() != "delete":
+                raise sqlite3.OperationalError(
+                    f"failed to set kanban journal_mode=DELETE; got {actual!r}"
+                )
+    else:
+        raise ValueError(
+            "HERMES_KANBAN_JOURNAL_MODE must be DELETE or WAL, "
+            f"got {journal_mode!r}"
+        )
+    # Keep the connection contract stable. SQLite stores this per-connection;
+    # it is inert in DELETE mode and takes effect if a caller opts into WAL.
+    conn.execute("PRAGMA wal_autocheckpoint=100")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA secure_delete=ON")
+    conn.execute("PRAGMA cell_size_check=ON")
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -1787,8 +1822,10 @@ def connect(
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    DELETE journal mode is the default for kanban databases. Kanban has
+    several independent watcher processes but a low write rate, so strict
+    rollback-journal writer serialization is preferable to WAL. Set
+    ``HERMES_KANBAN_JOURNAL_MODE=WAL`` to opt in to WAL explicitly.
 
     The first connection to a given path auto-runs :func:`init_db` so
     fresh installs and test harnesses that construct `connect()`
@@ -1825,13 +1862,7 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                conn.execute("PRAGMA foreign_keys=ON")
-                conn.execute("PRAGMA secure_delete=ON")
-                conn.execute("PRAGMA cell_size_check=ON")
+                _apply_kanban_connection_pragmas(conn, path)
         except Exception:
             conn.close()
             raise
@@ -1850,26 +1881,7 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                # WAL activation can take an exclusive lock while SQLite creates the
-                # sidecar files for a fresh database. Keep it in the same process-local
-                # critical section as schema initialization so concurrent gateway
-                # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one WARNING so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
-                conn.execute("PRAGMA foreign_keys=ON")
-                # Zero freed pages so a later torn write cannot expose stale
-                # cell content; persisted in the DB header for new DBs.
-                conn.execute("PRAGMA secure_delete=ON")
-                # Surface corrupt cells as read errors instead of silent
-                # wrong-data returns.
-                conn.execute("PRAGMA cell_size_check=ON")
+                _apply_kanban_connection_pragmas(conn, path)
                 needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive

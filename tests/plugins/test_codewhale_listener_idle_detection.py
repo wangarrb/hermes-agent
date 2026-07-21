@@ -6,6 +6,7 @@ from pathlib import Path
 
 from plugins.kanban import base_listener
 from plugins.kanban.deepseek_listener import deepseek_kanban_interactive
+from plugins.kanban.reasonix_listener import reasonix_kanban_interactive
 
 
 def _can_accept(screen: str) -> bool:
@@ -14,6 +15,16 @@ def _can_accept(screen: str) -> bool:
         deepseek_kanban_interactive._DEEPSEEK_IDLE_MARKERS,
         deepseek_kanban_interactive._DEEPSEEK_BUSY_MARKERS,
         deepseek_kanban_interactive._DEEPSEEK_QUEUED_INPUT_MARKERS,
+    )
+
+
+def test_listener_launcher_restarts_cleanly_exited_watchers() -> None:
+    assert deepseek_kanban_interactive._should_restart_watcher(0)
+    assert reasonix_kanban_interactive._should_restart_watcher(
+        0, reasonix_alive=True
+    )
+    assert not reasonix_kanban_interactive._should_restart_watcher(
+        0, reasonix_alive=False
     )
 
 
@@ -218,11 +229,10 @@ def test_saved_session_must_match_project_workspace(tmp_path: Path) -> None:
     )
 
 
-def test_restricted_idle_pane_requests_full_access_before_claim(
+def test_restricted_idle_pane_blocks_claim_without_changing_mode(
     tmp_path: Path, monkeypatch,
 ) -> None:
     listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
-    sent: list[tuple[str, str]] = []
     screen = """\
 cw DeepSeek · operate · never
 ───────────────────────────
@@ -233,11 +243,6 @@ cw DeepSeek · operate · never
         "zellij_dump_screen",
         lambda **kwargs: screen,
     )
-    monkeypatch.setattr(
-        deepseek_kanban_interactive,
-        "_send_full_access_key",
-        lambda *, session, pane_id, log_path: sent.append((session, pane_id)) or True,
-    )
     args = Namespace(
         yolo=True,
         zellij_session="kanban-test",
@@ -246,7 +251,54 @@ cw DeepSeek · operate · never
     )
 
     assert not listener._ensure_full_access(args, tmp_path / "listener.log")
+    assert "not Full Access" in (tmp_path / "listener.log").read_text()
+
+
+def test_fresh_act_pane_switches_to_operate_before_claim(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setenv("CODEWHALE_KANBAN_FRESH_OPERATE", "1")
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "zellij_dump_screen",
+        lambda **kwargs: "cw Novita AI · auto · act · Full Access\n❯ 编写任务或使用 /。",
+    )
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "_send_operate_command",
+        lambda *, session, pane_id, log_path: sent.append((session, pane_id)) or True,
+    )
+    args = Namespace(zellij_session="kanban-test", zellij_pane_id="4")
+
+    assert not listener._ensure_fresh_operate(args, tmp_path / "listener.log")
     assert sent == [("kanban-test", "4")]
+
+
+def test_fresh_operate_pane_passes_mode_gate(tmp_path: Path, monkeypatch) -> None:
+    listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
+    monkeypatch.setenv("CODEWHALE_KANBAN_FRESH_OPERATE", "1")
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "zellij_dump_screen",
+        lambda **kwargs: "cw Novita AI · auto · operate · Full Access\n❯ 编写任务或使用 /。",
+    )
+    args = Namespace(zellij_session="kanban-test", zellij_pane_id="4")
+
+    assert listener._ensure_fresh_operate(args, tmp_path / "listener.log")
+
+
+def test_resumed_pane_skips_fresh_mode_gate(tmp_path: Path, monkeypatch) -> None:
+    listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
+    monkeypatch.delenv("CODEWHALE_KANBAN_FRESH_OPERATE", raising=False)
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "zellij_dump_screen",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not inspect pane")),
+    )
+
+    assert listener._ensure_fresh_operate(Namespace(), tmp_path / "listener.log")
 
 
 def test_full_access_pane_passes_startup_gate(tmp_path: Path, monkeypatch) -> None:
@@ -271,11 +323,10 @@ cw DeepSeek · operate · Full Access
     assert listener._ensure_full_access(args, tmp_path / "listener.log")
 
 
-def test_restricted_busy_pane_does_not_receive_mode_key(
+def test_restricted_busy_pane_blocks_claim_without_changing_mode(
     tmp_path: Path, monkeypatch,
 ) -> None:
     listener = deepseek_kanban_interactive.CodeWhaleInteractiveListener()
-    sent: list[tuple[str, str]] = []
     screen = """\
 cw DeepSeek · operate · never
 ───────────────────────────
@@ -286,11 +337,6 @@ cw DeepSeek · operate · never
         "zellij_dump_screen",
         lambda **kwargs: screen,
     )
-    monkeypatch.setattr(
-        deepseek_kanban_interactive,
-        "_send_full_access_key",
-        lambda *, session, pane_id, log_path: sent.append((session, pane_id)) or True,
-    )
     args = Namespace(
         yolo=True,
         zellij_session="kanban-test",
@@ -299,7 +345,6 @@ cw DeepSeek · operate · never
     )
 
     assert not listener._ensure_full_access(args, tmp_path / "listener.log")
-    assert sent == []
 
 
 def test_role_sessions_do_not_replace_the_project_tool_workspace(tmp_path: Path) -> None:
@@ -339,7 +384,7 @@ def test_role_config_symlink_is_migrated_to_regular_file(tmp_path: Path) -> None
     assert (role_home / ".config.toml.symlink-backup").is_symlink()
 
 
-def test_existing_regular_role_config_is_preserved(tmp_path: Path) -> None:
+def test_existing_regular_role_config_is_synced_from_source(tmp_path: Path) -> None:
     source_home = tmp_path / ".codewhale"
     role_home = tmp_path / ".codewhale-kanban-implementer"
     source_home.mkdir()
@@ -353,4 +398,72 @@ def test_existing_regular_role_config_is_preserved(tmp_path: Path) -> None:
         source_home=source_home,
     )
 
-    assert role_config.read_text(encoding="utf-8") == 'model = "role-specific"\n'
+    assert role_config.is_file()
+    assert not role_config.is_symlink()
+    assert role_config.read_text(encoding="utf-8") == 'model = "source"\n'
+
+
+def test_default_launch_env_uses_role_config_without_inherited_provider_overrides(
+    monkeypatch,
+) -> None:
+    inherited = {
+        "CODEWHALE_PROVIDER": "openai",
+        "CODEWHALE_MODEL": "gpt-5",
+        "CODEWHALE_BASE_URL": "https://api.openai.com/v1",
+        "CODEWHALE_API_KEY": "openai-key",
+        "DEEPSEEK_API_KEY": "deepseek-key",
+        "OPENROUTER_API_KEY": "openrouter-key",
+        "OPENAI_API_KEY": "openai-key",
+        "NOVITA_BASE_URL": "https://api.novita.ai/v3/openai",
+    }
+    monkeypatch.setattr(
+        deepseek_kanban_interactive.BaseInteractiveListener,
+        "build_launch_env",
+        lambda self, args: dict(inherited),
+    )
+    monkeypatch.setattr(
+        deepseek_kanban_interactive,
+        "_read_hermes_dotenv_key",
+        lambda name: "fallback-key",
+    )
+
+    env = deepseek_kanban_interactive.CodeWhaleInteractiveListener().build_launch_env(
+        Namespace(provider=None, model=None, yolo=True)
+    )
+
+    assert not set(inherited) & set(env)
+    assert "DEEPSEEK_YOLO" not in env
+
+
+def test_runtime_commands_keep_full_access_separate_from_tui_mode() -> None:
+    fresh = deepseek_kanban_interactive._build_codewhale_runtime_cmd(
+        want_continue=False,
+        runtime_bin="codewhale-tui",
+        fresh_bin="codewhale",
+        workspace="/tmp/project",
+        extra_args=["--verbose"],
+    )
+    resumed = deepseek_kanban_interactive._build_codewhale_runtime_cmd(
+        want_continue=True,
+        runtime_bin="codewhale-tui",
+        fresh_bin="codewhale",
+        workspace="/tmp/project",
+        extra_args=[],
+    )
+
+    assert fresh == [
+        "codewhale",
+        "run",
+        "--workspace",
+        "/tmp/project",
+        "--fresh",
+        "--verbose",
+    ]
+    assert resumed == [
+        "codewhale-tui",
+        "--workspace",
+        "/tmp/project",
+        "--continue",
+    ]
+    assert "--yolo" not in fresh
+    assert "--yolo" not in resumed

@@ -144,3 +144,9 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Local Kanban runtime state. Source overlays live under local/bin and
+# local/hermes-scripts; databases, logs and ad-hoc backups never belong in git.
+/kanban_*.db
+/kanban_logs/
+/local/bin/*.bak
