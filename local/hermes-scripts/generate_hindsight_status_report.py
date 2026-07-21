@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from datetime import datetime
@@ -16,6 +17,51 @@ WIKI_DIR = Path.home() / "wiki" / "auto-maintenance" / "reports"
 OFFLINE_ROOT = Path.home() / ".hermes" / "hindsight" / "offline_reflect"
 V2_ROOT = OFFLINE_ROOT / "v2_rebuild"
 WEEKLY_ROOT = OFFLINE_ROOT / "weekly"
+ARCHIVE_DIR = Path.home() / "wiki" / "auto-maintenance" / "archive" / "status-reports"
+
+
+def archive_old_reports(
+    reports_dir: Path, archive_dir: Path, *, keep: int = 14
+) -> int:
+    """Keep a bounded active status history and move older evidence to archive."""
+    files = sorted(reports_dir.glob("hindsight-status-*.md"))
+    if len(files) <= keep:
+        return 0
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for path in files[:-keep]:
+        target = archive_dir / path.name
+        if target.exists():
+            continue
+        path.replace(target)
+        moved += 1
+    return moved
+
+
+def current_llm_config() -> dict[str, str]:
+    """Read the live container config instead of reporting a stale profile name."""
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", "hindsight", "env"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+    env = dict(
+        line.split("=", 1)
+        for line in proc.stdout.splitlines()
+        if "=" in line
+    )
+    return {
+        "provider": env.get("HINDSIGHT_API_LLM_PROVIDER", "?"),
+        "model": env.get("HINDSIGHT_API_LLM_MODEL", "?"),
+        "base_url": env.get("HINDSIGHT_API_LLM_BASE_URL", "?"),
+        "enable_observations": env.get("HINDSIGHT_API_ENABLE_OBSERVATIONS", "?"),
+    }
 
 
 def generate_report(output_dir: Path | None = None) -> Path:
@@ -94,15 +140,19 @@ def generate_report(output_dir: Path | None = None) -> Path:
         lines.append(f"- by_type: {summary.get('by_type', {})}")
         lines.append("")
 
-    # Config
+    # Live config
+    llm = current_llm_config()
     lines.append("## Pipeline Config")
-    lines.append("- LLM profile: opencode-go-deepseek-v4-flash")
-    lines.append("- max_tokens: 65536")
-    lines.append("- budget: 200 units / 10M chars")
+    lines.append(f"- provider/model: {llm.get('provider', '?')}/{llm.get('model', '?')}")
+    lines.append(f"- base_url: {llm.get('base_url', '?')}")
+    lines.append(f"- enable_observations: {llm.get('enable_observations', '?')}")
     lines.append("")
 
     report = "\n".join(lines)
-    report_path.write_text(report, encoding="utf-8")
+    tmp_path = out / f".{report_path.name}.tmp"
+    tmp_path.write_text(report, encoding="utf-8")
+    os.replace(tmp_path, report_path)
+    archive_old_reports(out, ARCHIVE_DIR, keep=14)
     return report_path
 
 

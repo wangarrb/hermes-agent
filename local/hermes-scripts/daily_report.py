@@ -25,10 +25,15 @@ os.environ['no_proxy'] = 'localhost,127.0.0.1'
 HERMES_HOME = Path("/home/wyr/.hermes")
 STATE_DB = HERMES_HOME / "state.db"
 PROFILE_DIR = HERMES_HOME / "profiles"
-HINDSIGHT_REFLECT = HERMES_HOME / "hindsight" / "offline_reflect"
 PSQL = os.environ.get("HINDSIGHT_PSQL", "/home/wyr/.hindsight-docker/installation/18.1.0/bin/psql")
 HINDSIGHT_API = os.environ.get("HINDSIGHT_API", "http://127.0.0.1:8888")
 BANK = os.environ.get("HINDSIGHT_BANK", "hermes")
+MENTAL_MODEL_ROOT = HERMES_HOME / "mental-models" / "egomotion4d"
+MENTAL_MODEL_REGISTRY = MENTAL_MODEL_ROOT / "registry.json"
+PROJECT_MAINTENANCE_ROOT = Path(
+    "/home/wyr/wiki/auto-maintenance/project/egomotion4d"
+)
+RESEARCH_DIGEST_DIR = PROJECT_MAINTENANCE_ROOT / "research-digests"
 
 
 def fmt_num(num: int | float | None) -> str:
@@ -124,20 +129,170 @@ def parse_prev_report(date_str: str) -> dict | None:
         text = prev_path.read_text()
         # Extract: documents 总数 | X (may contain commas: 27,207)
         m = re.search(r'documents 总数[|\s]*([\d,]+)', text)
+        if not m:
+            m = re.search(r'Documents=([\d,]+)', text)
         if m:
             stats['documents'] = int(m.group(1).replace(',', ''))
         m = re.search(r'observations 总数[|\s]*([\d,]+)', text)
+        if not m:
+            m = re.search(r'Observations=([\d,]+)', text)
         if m:
             stats['observations'] = int(m.group(1).replace(',', ''))
         m = re.search(r'base units 已 consolidation[|\s]*(\d+)', text)
+        if not m:
+            m = re.search(r'Consolidation:\s*base_done=([\d,]+)', text)
         if m:
-            stats['consolidated'] = int(m.group(1))
+            stats['consolidated'] = int(m.group(1).replace(',', ''))
         m = re.search(r'unconsolidated_base 剩余[|\s]*(\d+)', text)
+        if not m:
+            m = re.search(r'unconsolidated=([\d,]+)', text)
         if m:
-            stats['unconsolidated'] = int(m.group(1))
+            stats['unconsolidated'] = int(m.group(1).replace(',', ''))
     except Exception:
         return None
     return stats if stats else None
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def mental_model_rows(
+    start: datetime,
+    end: datetime,
+    *,
+    registry_path: Path = MENTAL_MODEL_REGISTRY,
+) -> list[dict[str, str]]:
+    """Return concise, registry-derived model state for the report window."""
+    if not registry_path.exists():
+        return []
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    rows: list[dict[str, str]] = []
+    for logical_id, model in sorted(registry.get("models", {}).items()):
+        accepted = model.get("accepted_revision")
+        if not isinstance(accepted, dict):
+            rows.append(
+                {
+                    "logical_id": logical_id,
+                    "state": str(model.get("last_verdict") or "INITIAL"),
+                    "change": "NO_ACCEPTED_REVISION",
+                    "quality": "-",
+                    "revision": "-",
+                }
+            )
+            continue
+
+        exact = (
+            model.get("last_verdict") == "PASS_PUBLISH"
+            and accepted.get("slot") == model.get("active_slot")
+            and accepted.get("source_evidence_sha")
+            == model.get("source_evidence_sha")
+            and bool(accepted.get("content_sha"))
+        )
+        accepted_at = _parse_timestamp(accepted.get("accepted_at"))
+        changed = bool(
+            accepted_at
+            and start.timestamp() <= accepted_at.timestamp() < end.timestamp()
+        )
+        quality_match = re.search(r"quality=(\d+)", str(model.get("verdict_detail", "")))
+        rows.append(
+            {
+                "logical_id": logical_id,
+                "state": "READY" if exact else "STALE_OR_BLOCKED",
+                "change": "PUBLISHED" if changed else "UNCHANGED",
+                "quality": quality_match.group(1) if quality_match else "-",
+                "revision": str(accepted.get("content_sha", ""))[:12] or "-",
+            }
+        )
+    return rows
+
+
+def window_operation_summary(rows: list[list[str]]) -> str:
+    """Summarize only operations created inside the report window."""
+    grouped: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for operation, status, count in rows:
+        grouped[operation][status] += int(count)
+    parts = []
+    for operation in sorted(grouped):
+        states = grouped[operation]
+        details = []
+        if states.get("completed"):
+            details.append(f"{states['completed']} ok")
+        if states.get("failed"):
+            details.append(f"{states['failed']} failed")
+        if states.get("pending"):
+            details.append(f"{states['pending']} pending")
+        if states.get("processing"):
+            details.append(f"{states['processing']} processing")
+        if details:
+            parts.append(f"{operation}=" + "/".join(details))
+    return "; ".join(parts) if parts else "none"
+
+
+def current_operation_alerts(
+    _window_rows: list[list[str]], all_time_queue: list[list[str]]
+) -> list[str]:
+    """Report currently active work; window failures remain in the data table."""
+    return [
+        f"active queue: {operation} {status} x{count}"
+        for status, operation, count in all_time_queue
+        if status in {"pending", "processing"} and int(count) > 0
+    ]
+
+
+def load_research_digest(report_date: str) -> str | None:
+    path = RESEARCH_DIGEST_DIR / f"{report_date}.md"
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8")
+        return re.sub(r"\A\s*<!--.*?-->\s*", "", content, flags=re.DOTALL).strip()
+    except OSError:
+        return None
+
+
+def pitfall_summary(start: datetime, end: datetime) -> dict[str, object]:
+    path = MENTAL_MODEL_ROOT / "pitfall_index.json"
+    result: dict[str, object] = {"counts": {}, "changes": []}
+    if not path.exists():
+        return result
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return result
+    counts: dict[str, int] = defaultdict(int)
+    changes = []
+    for entry in data.get("entries", []):
+        status = str(entry.get("status", "unknown"))
+        counts[status] += 1
+        lifecycle_times = [
+            timestamp
+            for timestamp in (
+                _parse_timestamp(entry.get("created_at")),
+                _parse_timestamp(entry.get("updated_at")),
+            )
+            if timestamp is not None
+        ]
+        if any(start <= timestamp < end for timestamp in lifecycle_times):
+            changes.append(
+                {
+                    "p_id": str(entry.get("p_id", "?")),
+                    "status": status,
+                    "title": str(entry.get("title", "")),
+                }
+            )
+    result["counts"] = dict(counts)
+    result["changes"] = changes
+    return result
 
 
 def hermes_model_usage(start: datetime, end: datetime) -> list[dict[str, int | str]]:
@@ -290,7 +445,7 @@ def hindsight_health() -> str:
 
 
 def parse_codex_usage(target_date: str) -> dict | None:
-    """Parse Codex rollout jsonl for token usage (cumulative, need delta).
+    """Parse aggregate Codex/CodeWhale rollout usage (cumulative, need delta).
 
     token_count events carry per-session cumulative totals. Different sessions
     have independent counters starting from 0, so we must compute deltas per-session
@@ -553,22 +708,6 @@ def hindsight_db_stats(start: datetime, end: datetime) -> dict:
             WHERE bank_id='{BANK}';
             """
         )
-        stats["offline_docs"] = psql(
-            f"""
-            WITH od AS (
-              SELECT d.id, coalesce(count(m.id),0) units
-              FROM documents d
-              LEFT JOIN memory_units m ON m.bank_id=d.bank_id AND m.document_id=d.id
-              WHERE d.bank_id='{BANK}' AND d.id LIKE 'hermes-offline-consolidation::%'
-              GROUP BY d.id
-            )
-            SELECT count(*) total,
-                   count(*) filter(where units=0) zero,
-                   count(*) filter(where units>0) with_units,
-                   coalesce(sum(units),0) units
-            FROM od;
-            """
-        )
     except Exception as exc:
         stats["errors"].append(str(exc))
     return stats
@@ -577,11 +716,7 @@ def hindsight_db_stats(start: datetime, end: datetime) -> dict:
 def offline_output_counts(now: datetime) -> dict[str, str | int]:
     v2_dir = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
     rebuild_dir = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_rebuild"
-    v2_global_md = v2_dir / "global" / "global.md"
-    v2_global_json = v2_dir / "global" / "global.json"
     v2_manifest = v2_dir / "manifest.json"
-    v2_obs_index = v2_dir / "observations_index.jsonl"
-    v2_topics = v2_dir / "topics"
     v2_latest = rebuild_dir / "latest.json"
 
     # 读取 v2 manifest 统计
@@ -595,47 +730,11 @@ def offline_output_counts(now: datetime) -> dict[str, str | int]:
         except Exception:
             pass
 
-    # 统计 v2 目录下 topic cards 个数（取 manifest 的 card_count 更准）
     return {
-        "v2_global_md": str(v2_global_md) if v2_global_md.exists() else "不存在",
-        "v2_global_md_mtime": datetime.fromtimestamp(v2_global_md.stat().st_mtime).strftime("%m-%d %H:%M") if v2_global_md.exists() else "-",
-        "v2_global_json": str(v2_global_json) if v2_global_json.exists() else "不存在",
-        "v2_manifest": str(v2_manifest) if v2_manifest.exists() else "不存在",
-        "v2_obs_index": str(v2_obs_index) if v2_obs_index.exists() else "不存在",
-        "v2_obs_index_size": v2_obs_index.stat().st_size if v2_obs_index.exists() else 0,
-        "v2_topics": str(v2_topics) if v2_topics.exists() else "不存在",
-        "v2_topic_dirs": len(list(v2_topics.iterdir())) if v2_topics.exists() else 0,
         "v2_card_count": card_count,
         "v2_observation_count": obs_index_count,
-        "v2_latest": str(v2_latest) if v2_latest.exists() else "不存在",
         "v2_latest_mtime": datetime.fromtimestamp(v2_latest.stat().st_mtime).strftime("%m-%d %H:%M") if v2_latest.exists() else "-",
-        # 旧目录（v0.5.x 遗留）
-        "legacy_daily": "不存在（v0.6.x 改用 V2 cards 体系，无日度目录产物）",
-        "legacy_weekly": "不存在（v0.6.x 改用 V2 cards 体系，无周度目录产物）",
     }
-
-
-def topic_progress(now: datetime) -> list[str]:
-    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    daily_dir = HINDSIGHT_REFLECT / "daily" / yesterday_str
-    points: list[str] = []
-    if not daily_dir.exists():
-        return points
-    for f in sorted(daily_dir.glob("*.md"))[:10]:
-        topic = f.name.split("__")[0] if "__" in f.name else f.stem
-        try:
-            content = f.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        match = re.search(r"## Executive Summary\n(.*?)(?:\n##|\Z)", content, re.DOTALL)
-        if not match:
-            continue
-        for line in match.group(1).splitlines():
-            line = line.strip()
-            if line.startswith("-") and len(line) > 10:
-                points.append(f"• {topic}: {line[1:].strip()[:80]}")
-                break
-    return points[:6]
 
 
 def print_table(headers: list[str], rows: list[list[str]]) -> None:
@@ -649,7 +748,9 @@ def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Hermes 日报生成")
     parser.add_argument("--date", type=str, default=None,
-                        help="目标日期 YYYY-MM-DD，默认昨天")
+                        help="报告日期 YYYY-MM-DD，默认当前日期")
+    parser.add_argument("--write", action="store_true",
+                        help="补跑 --date 时也原子写入对应日报")
     args = parser.parse_args()
 
     now = datetime.now().astimezone()
@@ -673,7 +774,10 @@ def main() -> int:
     llm_usage, consolidation_batch_logs = parse_hindsight_llm_logs(logs)
     db = hindsight_db_stats(start, end)
     offline = offline_output_counts(now_for_print)
-    progress = topic_progress(now_for_print)
+    model_rows = mental_model_rows(start, end)
+    digest_date = (now_for_print - timedelta(days=1)).strftime("%Y-%m-%d")
+    research_digest = load_research_digest(digest_date)
+    pitfalls = pitfall_summary(start, end)
 
     print(f"📊 Hermes日报 {report_date_str}")
     print(f"统计窗口: {start.strftime('%Y-%m-%d %H:%M')} ~ {end.strftime('%Y-%m-%d %H:%M')} ({now_for_print.tzname()})")
@@ -707,12 +811,43 @@ def main() -> int:
           f"failed={fmt_num(int(cons_meta[2]))}")
     print()
 
-    print("【工作概要】")
-    if progress:
-        for line in progress:
-            print(line)
+    ops_rows = db.get("ops") or []
+    queue_rows = db.get("queue") or []
+    alerts = current_operation_alerts(ops_rows, queue_rows)
+    ready_models = sum(row["state"] == "READY" for row in model_rows)
+
+    print("【今日结论】")
+    print(f"• Hindsight: {hindsight_health()}；consolidation backlog={fmt_num(uncons)}，failed_base={fmt_num(failed)}。")
+    print(f"• Mental Models: {ready_models}/{len(model_rows)} READY；本窗口发布 {sum(row['change'] == 'PUBLISHED' for row in model_rows)} 个。")
+    print(f"• 需关注事项: {len(alerts) + int(failed > 0)}；只统计窗口内失败与当前 active queue，不重复展示历史终态。")
+    print()
+
+    print(f"【研发进展（{digest_date}）】")
+    if research_digest:
+        for line in research_digest.splitlines():
+            if not line.startswith("<!--") and not line.startswith("-->"):
+                print(line)
     else:
-        print("• 今日重点以 Hermes/Hindsight 使用统计、离线管线状态和异常检查为主。")
+        print("无 compact research digest；稳定项目知识请查看下方 KG/Graphify 入口。")
+    print()
+
+    print("【Mental Models】")
+    if model_rows:
+        print_table(
+            ["模型", "窗口变化", "当前状态", "质量", "Revision"],
+            [
+                [
+                    row["logical_id"].removeprefix("egomotion4d-"),
+                    row["change"],
+                    row["state"],
+                    row["quality"],
+                    row["revision"],
+                ]
+                for row in model_rows
+            ],
+        )
+    else:
+        print("未找到 mental-model registry。")
     print()
 
     print("【Hermes / Profiles 模型用量】")
@@ -753,14 +888,14 @@ def main() -> int:
         print("无 Hermes / profile 会话记录。")
     print()
 
-    print("【外部 CLI Agent 调用统计（Codex/CodeWhale 增量提取）】")
+    print("【外部 CLI Agent 聚合用量】")
     codex_usage = parse_codex_usage(report_date_str)
     if codex_usage:
         print("注：输入(增量) = 真实新输入 = prompt - cache；Cache读为累计 cached_input_tokens。")
         print_table(
             ["来源", "输入", "Cache读", "输出"],
             [
-                ["codex", fmt_tok(codex_usage['input']), fmt_tok(codex_usage['cached']), fmt_tok(codex_usage['output'])],
+                ["Codex + CodeWhale", fmt_tok(codex_usage['input']), fmt_tok(codex_usage['cached']), fmt_tok(codex_usage['output'])],
             ],
         )
     else:
@@ -770,9 +905,16 @@ def main() -> int:
     print("【Hindsight 运行模型配置】")
     print(f"健康状态: {hindsight_health()}")
     if model_cfg:
+        grouped_cfg: dict[tuple[str, str, str, str], list[str]] = defaultdict(list)
+        for row in model_cfg:
+            key = (row["provider"], row["model"], row["base_url"], row["location"])
+            grouped_cfg[key].append(row["scope"])
         print_table(
             ["用途", "provider", "model", "base_url", "location"],
-            [[r["scope"], r["provider"], r["model"], r["base_url"], r["location"]] for r in model_cfg],
+            [
+                [",".join(scopes), provider, model, base_url, location]
+                for (provider, model, base_url, location), scopes in grouped_cfg.items()
+            ],
         )
     else:
         print("未能读取 hindsight 容器模型环境。")
@@ -805,83 +947,88 @@ def main() -> int:
         print("未从当前容器日志捕获 Hindsight LLM token 记录；保留 DB 工作量统计。")
     print()
 
-    print("【Hindsight 工作量 / 数据修改】")
-    ops_rows = db.get("ops") or []
-    if ops_rows:
-        print("操作队列（窗口内创建）:")
-        print_table(["operation", "status", "数量"], [[a, b, fmt_num(int(c))] for a, b, c in ops_rows])
+    print("【Hindsight 数据变化】")
     docs = (db.get("docs") or [["0", "0", "0"]])[0]
     cons = (db.get("consolidation") or [["0", "0", "0", "0", "0", "0"]])[0]
-    off = (db.get("offline_docs") or [["0", "0", "0", "0"]])[0]
-    print("核心修改统计:")
+    units_rows = db.get("units_by_type") or []
+    unit_changes = ", ".join(
+        f"{row[0]} +{fmt_num(int(row[1]))}" for row in units_rows if int(row[1])
+    ) or "无新增"
+    unit_totals = ", ".join(
+        f"{row[0]} {fmt_num(int(row[3]))}" for row in units_rows
+    ) or "未知"
     print_table(
-        ["指标", "数量"],
+        ["领域", "窗口变化", "当前状态"],
         [
-            ["documents 新增", fmt_num(int(docs[0]))],
-            ["documents 更新(既有)", fmt_num(int(docs[1]))],
-            ["documents 总数", fmt_num(int(docs[2]))],
-            ["base units 已 consolidation", fmt_num(int(cons[0]))],
-            ["unconsolidated_base 剩余", fmt_num(int(cons[1]))],
-            ["failed_base", fmt_num(int(cons[2]))],
-            ["observations 总数", fmt_num(int(cons[3]))],
-            ["observations 新增", fmt_num(int(cons[4]))],
-            ["observations 更新(既有)", fmt_num(int(cons[5]))],
-            ["offline docs total/with_units/zero/units", f"{off[0]}/{off[2]}/{off[1]}/{off[3]}"],
+            [
+                "Documents",
+                f"+{fmt_num(int(docs[0]))} / 更新 {fmt_num(int(docs[1]))}",
+                fmt_num(int(docs[2])),
+            ],
+            ["Memory units", unit_changes, unit_totals],
+            [
+                "Consolidation",
+                f"完成 {fmt_num(int(cons[0]))}",
+                f"待处理 {fmt_num(int(cons[1]))} / 失败 {fmt_num(int(cons[2]))}",
+            ],
+            ["Operations", window_operation_summary(ops_rows), "仅窗口内创建"],
+            [
+                "V2 cards",
+                f"rebuild {offline['v2_latest_mtime']}",
+                f"{offline['v2_card_count']} cards / {offline['v2_observation_count']} observations",
+            ],
         ],
     )
-    units_rows = db.get("units_by_type") or []
-    if units_rows:
-        print("memory_units 按类型:")
-        print_table(["fact_type", "新增", "更新(既有)", "总数"], [[r[0], fmt_num(int(r[1])), fmt_num(int(r[2])), fmt_num(int(r[3]))] for r in units_rows])
     sources = db.get("doc_sources") or []
     if sources:
-        print("documents 新增来源(top): " + "; ".join(f"{s}:{c}" for s, c in sources))
+        print("新增来源: " + "; ".join(f"{s}:{c}" for s, c in sources))
     if consolidation_batch_logs.get("batches"):
         print(
-            "consolidation batch 日志: "
-            f"{consolidation_batch_logs['batches']}批 / {consolidation_batch_logs['memories']} memories / "
-            f"{consolidation_batch_logs['llm_calls']} LLM calls / "
-            f"created={consolidation_batch_logs['created']} updated={consolidation_batch_logs['updated']} skipped={consolidation_batch_logs['skipped']} failed={consolidation_batch_logs['failed']}"
+            "Consolidation batches: "
+            f"{consolidation_batch_logs['batches']} 批 / {consolidation_batch_logs['memories']} memories / "
+            f"created {consolidation_batch_logs['created']} / updated {consolidation_batch_logs['updated']} / "
+            f"failed {consolidation_batch_logs['failed']}"
         )
     print()
 
-    print("【Hindsight 当前队列】")
-    queue_rows = db.get("queue") or []
-    if queue_rows:
-        print_table(["status", "operation", "数量"], [[a, b, fmt_num(int(c))] for a, b, c in queue_rows])
+    print("【算法坑】")
+    pitfall_counts = pitfalls.get("counts", {})
+    print(
+        "当前: "
+        + ", ".join(
+            f"{status}={count}" for status, count in sorted(pitfall_counts.items())
+        )
+    )
+    changed_pitfalls = pitfalls.get("changes", [])
+    if changed_pitfalls:
+        for entry in changed_pitfalls[:3]:
+            print(f"• {entry['p_id']} [{entry['status']}]: {entry['title']}")
+        if len(changed_pitfalls) > 3:
+            print(f"• 其余 {len(changed_pitfalls) - 3} 条见 canonical catalog。")
     else:
-        print("未读取到队列统计。")
-    print()
-
-    print("【Consolidation / V2 Cards 体系输出】")
-    print(f"V2 global.md: {offline['v2_global_md']} ({offline['v2_global_md_mtime']})")
-    print(f"V2 global.json: {offline['v2_global_json']}")
-    print(f"V2 manifest: {offline['v2_manifest']} — {offline['v2_card_count']} cards, {offline['v2_observation_count']} observations")
-    print(f"V2 obs index: {offline['v2_obs_index']} ({fmt_tok(offline['v2_obs_index_size'])})")
-    print(f"V2 topics: {offline['v2_topics']} ({offline['v2_topic_dirs']} topic dirs)")
-    print(f"V2 rebuild: {offline['v2_latest']} ({offline['v2_latest_mtime']})")
-    print(f"Legacy daily: {offline['legacy_daily']}")
-    print(f"Legacy weekly: {offline['legacy_weekly']}")
+        print("• 本窗口无可归因的 Pitfall lifecycle 变更。")
+    print("• 研发 digest 不分配 P-id；唯一 writer 为 pitfall_writer.py。")
     print()
 
     print("【异常】")
     errors = db.get("errors") or []
-    failed_ops = [r for r in queue_rows if r[0] == "failed"]
     failed_base = int(cons[2]) if cons and len(cons) > 2 else 0
-    if not errors and not failed_ops and failed_base == 0:
-        print("• 未发现 Hindsight failed_operations / failed_base。")
+    if not errors and not alerts and failed_base == 0:
+        print("• 无未解决 active queue 或 failed_base；窗口内终态失败已在数据表中展示。")
     else:
         for e in errors:
             print(f"• Hindsight DB 统计异常: {e}")
-        for r in failed_ops:
-            print(f"• failed operation: {r[1]} x {r[2]}")
+        for alert in alerts:
+            print(f"• {alert}")
         if failed_base:
             print(f"• failed_base={failed_base}")
     print()
 
-    print("【日报输出偏好】")
-    print("• 正文直接用文字/表格展示；不要只发送 md 文件或 MEDIA 附件。")
-    print("• 如需归档，可另写 /home/wyr/wiki/auto-maintenance/daily/YYYY-MM-DD.md，但用户可见回复必须包含正文表格。")
+    print("【索引】")
+    print("• 项目知识: /home/wyr/wiki/auto-maintenance/project/egomotion4d/knowledge/")
+    print("• Mental Models: /home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/")
+    print("• 算法坑: /home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/pitfall-catalog.md")
+    print("• Hindsight 状态: /home/wyr/wiki/auto-maintenance/reports/")
     return 0
 
 
@@ -897,12 +1044,16 @@ if __name__ == "__main__":
         _sys.stdout = _old_stdout
     _output = _buf.getvalue()
     print(_output, end="")
-    # 写 wiki 归档（仅 cron 自动运行时，--date 补跑不写）
-    import argparse as _argparse
-    if "--date" not in _sys.argv:
+    # Write the canonical daily entry. Backfills require explicit --write.
+    if "--date" not in _sys.argv or "--write" in _sys.argv:
         _wiki_dir = Path("/home/wyr/wiki/auto-maintenance/daily")
         _wiki_dir.mkdir(parents=True, exist_ok=True)
-        _date_str = datetime.now().strftime("%Y-%m-%d")
+        if "--date" in _sys.argv:
+            _date_str = _sys.argv[_sys.argv.index("--date") + 1]
+        else:
+            _date_str = datetime.now().strftime("%Y-%m-%d")
         _wiki_path = _wiki_dir / f"{_date_str}.md"
-        _wiki_path.write_text(_output)
+        _tmp_path = _wiki_dir / f".{_date_str}.tmp"
+        _tmp_path.write_text(_output, encoding="utf-8")
+        os.replace(_tmp_path, _wiki_path)
     raise SystemExit(_ret)

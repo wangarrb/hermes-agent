@@ -1,0 +1,43 @@
+{
+  "source_query": "基于专用 curated evidence 生成 Egomotion4D 算法设计避坑指南。只使用 D76/D79/D80 顶层承重共识以及 D19-D33、D35-D43 的当前有效决策。\n\n完整性合同:\n- 必须逐条覆盖 D76、D79、D80、D19-D33、D35-D43，每个编号至少出现一次\n- D43 必须完整写出重开条件，不得截断\n- D76 必须保留边界：D70/D72 仅因逐场景 independent GT calibration 才可报告米制；这不证明 GT-free canonical gauge 是米制\n- 最后一行必须且只能是 END_GUARDRAILS\n\n语义合同:\n- 每条避坑必须引用真实 D 编号\n- 禁止编造 P-id 或引用 Hindsight UUID\n- 禁止包含 D44+ 实现进展、Phase3/GTSAM/4DGS/配置/任务状态\n- 禁止修改已关闭路线的 reopen 条件\n- 禁止 invent 决策语义；只包含 status=current 的决策\n- 使用紧凑表格或列表，总输出不超过 2800 tokens",
+  "tags": [
+    "egomotion4d",
+    "hmm-guardrails-current"
+  ],
+  "max_tokens": 3072,
+  "required_anchors": [
+    "D76",
+    "D79",
+    "D80",
+    "D19",
+    "D20",
+    "D21",
+    "D22",
+    "D23",
+    "D24",
+    "D25",
+    "D26",
+    "D27",
+    "D28",
+    "D29",
+    "D30",
+    "D31",
+    "D32",
+    "D33",
+    "D35",
+    "D36",
+    "D37",
+    "D38",
+    "D39",
+    "D40",
+    "D41",
+    "D42",
+    "D43"
+  ],
+  "required_terminal_marker": "END_GUARDRAILS",
+  "adjudicator_contract_version": 3,
+  "source_files": [
+    "sources/guardrails_current_evidence.md"
+  ],
+  "source_document_id": "egomotion4d-hmm-guardrails-current-v1"
+}

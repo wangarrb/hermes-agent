@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module(name='daily_report'):
-    spec = importlib.util.spec_from_file_location(name, ROOT / f'{name}.py')
+    spec = importlib.util.spec_from_file_location(name, ROOT / 'daily_report.py')
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     assert spec.loader is not None
@@ -53,3 +54,127 @@ def test_hermes_model_usage_aggregates_default_and_profile_state_dbs(tmp_path):
     assert by_profile['planner']['model'] == 'kanban-model'
     assert by_profile['planner']['calls'] == 5
     assert by_profile['planner']['input_tokens'] == 300
+
+
+def test_mental_model_rows_report_exact_readiness_and_window_change(tmp_path):
+    mod = load_module('daily_report_models')
+    registry = {
+        'models': {
+            'egomotion4d-static-surface': {
+                'active_slot': 'b',
+                'last_verdict': 'PASS_PUBLISH',
+                'verdict_detail': 'quality=95',
+                'source_evidence_sha': 'e' * 64,
+                'accepted_revision': {
+                    'slot': 'b',
+                    'content_sha': 'c' * 64,
+                    'source_evidence_sha': 'e' * 64,
+                    'accepted_at': '2026-07-21T01:00:00Z',
+                },
+            },
+            'egomotion4d-dynamic-actor': {
+                'active_slot': 'a',
+                'last_verdict': 'REJECT',
+                'source_evidence_sha': 'f' * 64,
+            },
+        }
+    }
+    path = tmp_path / 'registry.json'
+    path.write_text(json.dumps(registry), encoding='utf-8')
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+
+    rows = mod.mental_model_rows(start, end, registry_path=path)
+
+    by_id = {row['logical_id']: row for row in rows}
+    assert by_id['egomotion4d-static-surface']['state'] == 'READY'
+    assert by_id['egomotion4d-static-surface']['change'] == 'PUBLISHED'
+    assert by_id['egomotion4d-static-surface']['revision'] == 'c' * 12
+    assert by_id['egomotion4d-static-surface']['quality'] == '95'
+    assert by_id['egomotion4d-dynamic-actor']['state'] == 'REJECT'
+    assert by_id['egomotion4d-dynamic-actor']['change'] == 'NO_ACCEPTED_REVISION'
+
+
+def test_operation_summary_excludes_historical_terminal_queue_rows():
+    mod = load_module('daily_report_operations')
+    window_ops = [
+        ['consolidation', 'completed', '7'],
+        ['refresh_mental_model', 'completed', '25'],
+        ['refresh_mental_model', 'failed', '1'],
+    ]
+    all_time_queue = [
+        ['completed', 'retain', '17694'],
+        ['cancelled', 'retain', '21'],
+        ['failed', 'retain', '3'],
+        ['processing', 'consolidation', '1'],
+    ]
+
+    summary = mod.window_operation_summary(window_ops)
+    alerts = mod.current_operation_alerts(window_ops, all_time_queue)
+
+    assert 'refresh_mental_model=25 ok/1 failed' in summary
+    assert alerts == ['active queue: consolidation processing x1']
+
+
+def test_load_research_digest_hides_generation_metadata(tmp_path):
+    mod = load_module('daily_report_digest')
+    mod.RESEARCH_DIGEST_DIR = tmp_path
+    (tmp_path / '2026-07-20.md').write_text(
+        '<!--\nllm: openai/model\nbase_url: http://oneapi/v1\n-->\n\n# Digest\nbody\n',
+        encoding='utf-8',
+    )
+
+    assert mod.load_research_digest('2026-07-20') == '# Digest\nbody'
+
+
+def test_parse_prev_report_accepts_compact_daily_header(tmp_path):
+    mod = load_module('daily_report_prev_compact')
+    mod.WIKI_DAILY_DIR = tmp_path
+    (tmp_path / '2026-07-21.md').write_text(
+        '概要: Documents=27,886 (Δ+29)  Observations=22,065 (Δ+136)  '
+        'unconsolidated=0  failed_base=0\n'
+        'Consolidation: base_done=26  remaining=0  failed=0\n',
+        encoding='utf-8',
+    )
+
+    assert mod.parse_prev_report('2026-07-21') == {
+        'documents': 27886,
+        'observations': 22065,
+        'consolidated': 26,
+        'unconsolidated': 0,
+    }
+
+
+def test_pitfall_summary_uses_lifecycle_timestamps_not_coarse_date(tmp_path):
+    mod = load_module('daily_report_pitfalls')
+    root = tmp_path / 'mental-models' / 'egomotion4d'
+    root.mkdir(parents=True)
+    mod.MENTAL_MODEL_ROOT = root
+    (root / 'pitfall_index.json').write_text(
+        json.dumps(
+            {
+                'entries': [
+                    {
+                        'p_id': 'P1',
+                        'status': 'candidate',
+                        'title': 'timestamped',
+                        'date': '2026-07-21',
+                        'created_at': '2026-07-21T01:00:00Z',
+                    },
+                    {
+                        'p_id': 'P2',
+                        'status': 'candidate',
+                        'title': 'coarse legacy date only',
+                        'date': '2026-07-21',
+                    },
+                ]
+            }
+        ),
+        encoding='utf-8',
+    )
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+
+    summary = mod.pitfall_summary(start, end)
+
+    assert [entry['p_id'] for entry in summary['changes']] == ['P1']

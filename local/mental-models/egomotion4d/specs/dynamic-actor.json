@@ -1,0 +1,16 @@
+{
+  "source_query": "Generate a concise current-only Egomotion4D precision-first dynamic actor guardrail from the dedicated authoritative source below. The first character must be # and the first line must be an Egomotion4D heading; no preamble or counting statement. Cover D76,D91,D92 plus the frozen camera-only, no-GT, identity-first, frame-local raw-depth, kinematics-first, observability-gated box, actor-frame motion compensation, evaluator-only reference and precision-over-coverage constraints. Preserve every no-claim boundary. Do not include task timelines, unlisted D numbers, P-ids, UUIDs, Phase3/4DGS history or frame-local detector IDs as stable identity. The final line must be undecorated plain text END_DYNAMIC_ACTOR.",
+  "tags": ["egomotion4d", "hmm-dynamic-actor-current"],
+  "max_tokens": 3072,
+  "required_anchors": ["D76", "D91", "D92"],
+  "required_terminal_marker": "END_DYNAMIC_ACTOR",
+  "require_source_facts": false,
+  "required_prefix": "# Egomotion4D",
+  "inline_source_files": true,
+  "source_fact_retry_contract_version": 1,
+  "adjudicator_contract_version": 4,
+  "benchmark_file": "questions-dynamic-actor.json",
+  "smoke_ids": ["DA01", "DA03", "DA05", "DA08"],
+  "source_files": ["sources/dynamic_actor_current_evidence.md"],
+  "source_document_id": "egomotion4d-hmm-dynamic-actor-current-v1"
+}
