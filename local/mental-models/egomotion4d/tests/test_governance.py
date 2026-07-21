@@ -365,6 +365,126 @@ def test_refresh_evidence_bundle_recomputes_changed_sources(tmp_path, monkeypatc
     assert refreshed["per_model"][logical_id]["evidence_sha256"] != "old"
 
 
+def test_refresh_evidence_bundle_rejects_unmarked_current_evidence(
+    tmp_path, monkeypatch, daily
+):
+    logical_id = "egomotion4d-dynamic-actor"
+    source = tmp_path / "dynamic_actor_current_evidence.md"
+    source.write_text("D92 manually maintained copy", encoding="utf-8")
+    root = tmp_path / "mental-models" / "egomotion4d"
+    root.mkdir(parents=True)
+    (root / "evidence_bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    logical_id: {
+                        "d_ids": ["D92"],
+                        "sources": {
+                            "curated": {"path": str(source), "sha256": "stale"}
+                        },
+                        "evidence_sha256": "old",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    with pytest.raises(ValueError, match="derived build input contract"):
+        daily._refresh_evidence_bundle()
+
+
+def test_refresh_evidence_bundle_accepts_registered_current_evidence(
+    tmp_path, monkeypatch, daily
+):
+    logical_id = "egomotion4d-dynamic-actor"
+    source_dir = tmp_path / "sources"
+    source_dir.mkdir()
+    source = source_dir / "dynamic_actor_current_evidence.md"
+    source.write_text("D92 derived snapshot", encoding="utf-8")
+    (source_dir / "derived-build-inputs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    source.name: {
+                        "authority": "kg-current-evidence",
+                        "replaceable": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    root = tmp_path / "mental-models" / "egomotion4d"
+    root.mkdir(parents=True)
+    (root / "evidence_bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    logical_id: {
+                        "d_ids": ["D92"],
+                        "sources": {
+                            "curated": {"path": str(source), "sha256": "stale"}
+                        },
+                        "evidence_sha256": "old",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    refreshed = daily._refresh_evidence_bundle()
+
+    assert refreshed["per_model"][logical_id]["sources"]["curated"]["sha256"] == (
+        hashlib.sha256(source.read_bytes()).hexdigest()
+    )
+
+
+def test_refresh_evidence_bundle_derives_decision_scope_from_spec(
+    tmp_path, monkeypatch, daily
+):
+    logical_id = "egomotion4d-research-guardrails"
+    root = tmp_path / "mental-models" / "egomotion4d"
+    specs = root / "specs"
+    specs.mkdir(parents=True)
+    (specs / "research-guardrails.json").write_text(
+        json.dumps({"decision_ids": ["D19", "D43", "D76", "D79", "D80"]}),
+        encoding="utf-8",
+    )
+    (root / "evidence_bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    logical_id: {
+                        "d_ids": ["D19", "D43"],
+                        "sources": {},
+                        "evidence_sha256": "old",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    refreshed = daily._refresh_evidence_bundle()
+
+    assert refreshed["per_model"][logical_id]["d_ids"] == [
+        "D19",
+        "D43",
+        "D76",
+        "D79",
+        "D80",
+    ]
+
+
 @pytest.mark.parametrize(
     ("stage_a", "adjudicate", "smoke", "expected"),
     [(1, None, None, 1), (2, None, 0, 0), (0, 2, 0, 2), (0, 0, 0, 0), (0, 3, 0, 3)],
@@ -449,6 +569,10 @@ def test_render_mental_model_index_uses_registry_truth(daily):
     assert "model-blocked" in rendered
     assert "REJECT" in rendered
     assert "current/model-blocked.md" not in rendered
+    assert "Knowledge Ownership" in rendered
+    assert "authoritative project truth" in rendered
+    assert "reproducible derived build inputs" in rendered
+    assert "must not be maintained as a third truth store" in rendered
 
 
 def test_research_digest_validation_rejects_noncanonical_action_and_line_counts(daily):

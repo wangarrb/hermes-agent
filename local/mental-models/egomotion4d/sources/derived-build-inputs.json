@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "policy": "Derived, replaceable mental-model build inputs. KG/current evidence owns truth; conclusions must be written there first.",
+  "sources": {
+    "dynamic_actor_current_evidence.md": {
+      "authority": "kg-current-evidence",
+      "replaceable": true,
+      "anchors": ["D76", "D91", "D92"]
+    },
+    "guardrails_current_evidence.md": {
+      "authority": "kg-current-evidence",
+      "replaceable": true,
+      "anchors": ["D19-D43", "D76", "D79", "D80"]
+    },
+    "pose_gauge_current_evidence.md": {
+      "authority": "kg-current-evidence",
+      "replaceable": true,
+      "anchors": ["D19-D25", "D36", "D61-D63", "D70", "D72", "D76"]
+    },
+    "static_surface_current_evidence.md": {
+      "authority": "kg-current-evidence",
+      "replaceable": true,
+      "anchors": ["D64", "D69", "D72", "D76-D89"]
+    }
+  }
+}

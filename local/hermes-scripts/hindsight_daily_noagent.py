@@ -627,16 +627,55 @@ def _canonical_evidence_sha(entry: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+CURRENT_EVIDENCE_BUILD_INPUT_MANIFEST = "derived-build-inputs.json"
+
+
+def _validate_current_evidence_build_input(path: Path) -> None:
+    """Reject curated current-evidence files that can masquerade as a truth store."""
+    if not path.name.endswith("_current_evidence.md"):
+        return
+    manifest_path = path.parent / CURRENT_EVIDENCE_BUILD_INPUT_MANIFEST
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        contract = manifest["sources"][path.name]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"{path}: missing derived build input contract in {manifest_path}"
+        ) from exc
+    if (
+        manifest.get("schema_version") != 1
+        or contract.get("authority") != "kg-current-evidence"
+        or contract.get("replaceable") is not True
+    ):
+        raise ValueError(f"{path}: invalid derived build input contract")
+
+
 def _refresh_evidence_bundle() -> dict:
     """Refresh source hashes and deterministic identities without changing acceptance."""
     path = HERMES_HOME / "mental-models" / "egomotion4d" / "evidence_bundle.json"
     bundle = json.loads(path.read_text(encoding="utf-8"))
-    for entry in bundle.get("per_model", {}).values():
+    for logical_id, entry in bundle.get("per_model", {}).items():
+        spec_name = logical_id.removeprefix("egomotion4d-") + ".json"
+        spec_path = path.parent / "specs" / spec_name
+        if spec_path.is_file():
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            decision_ids = spec.get("decision_ids")
+            if decision_ids is not None:
+                if not isinstance(decision_ids, list) or not all(
+                    isinstance(item, str) and re.fullmatch(r"D\d+", item)
+                    for item in decision_ids
+                ):
+                    raise ValueError(
+                        f"{spec_path}: decision_ids must contain only D<number> strings"
+                    )
+                entry["d_ids"] = list(dict.fromkeys(decision_ids))
         for source in entry.get("sources", {}).values():
             source_path = Path(source["path"])
             if not source_path.is_file():
                 raise FileNotFoundError(source_path)
-            source["sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            source_bytes = source_path.read_bytes()
+            _validate_current_evidence_build_input(source_path)
+            source["sha256"] = hashlib.sha256(source_bytes).hexdigest()
         entry["evidence_sha256"] = _canonical_evidence_sha(entry)
     bundle["schema_version"] = 2
     bundle["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -697,7 +736,23 @@ def _render_mental_model_index(registry: dict, generated_date: str) -> str:
             "2. The relevant accepted model under `exports/current/`.",
             "3. Canonical algorithm pitfalls in `pitfall-catalog.md`.",
             "",
-            "Daily maintenance reports are audit evidence, not a second current-truth store.",
+            "## Knowledge Ownership",
+            "",
+            "- The KG is the authoritative project truth: decisions, evidence, metrics, "
+            "artifacts, scope and supersession.",
+            "- Accepted mental models are bounded, prompt-ready consumption caches. "
+            "They summarize selected D/P anchors and never override the KG.",
+            "- `sources/*_current_evidence.md` are reproducible derived build inputs, "
+            "not authored conclusions. They may be replaced from current KG/evidence "
+            "and must not be maintained as a third truth store.",
+            "- `pitfall-catalog.md` owns detailed algorithm-pitfall lifecycle; models "
+            "carry only concise routing summaries and P identifiers.",
+            "- Daily maintenance reports record deltas and audit evidence, not current truth.",
+            "",
+            "Write or revise a conclusion in the KG first. Rebuild the source snapshot, "
+            "adjudicate the candidate against current KG evidence, and publish only on "
+            "PASS_PUBLISH. A conflict rejects the candidate and preserves the previous "
+            "accepted model; it never rewrites the KG.",
         ]
     )
     return "\n".join(lines) + "\n"

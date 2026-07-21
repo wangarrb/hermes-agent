@@ -34,6 +34,12 @@
     "D42",
     "D43"
   ],
+  "decision_ids": [
+    "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26",
+    "D27", "D28", "D29", "D30", "D31", "D32", "D33", "D35",
+    "D36", "D37", "D38", "D39", "D40", "D41", "D42", "D43",
+    "D76", "D79", "D80"
+  ],
   "required_terminal_marker": "END_GUARDRAILS",
   "adjudicator_contract_version": 3,
   "source_files": [
