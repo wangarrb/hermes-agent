@@ -1,4 +1,6 @@
 {
+  "output_language": "zh-CN",
+  "language_contract_revision": 2,
   "source_query": "Generate a concise current-only Egomotion4D pose, gauge and pose-depth coupling guardrail from the dedicated authoritative source below. The first character must be # and the first line must be an Egomotion4D heading; no preamble or counting statement. Output exactly one compact bullet for each of D19,D20,D21,D22,D24,D25,D36,D61,D62,D63,D70,D72,D76 in that order. Preserve diagnostic versus promotion-safe boundaries and explain why canonical gauge, copied scale and frontend declarations are not metric provenance. Do not include task timelines, unlisted D numbers, P-ids, UUIDs, Phase3, GTSAM implementation details or 4DGS. The final line must be undecorated plain text END_POSE_GAUGE.",
   "tags": ["egomotion4d", "hmm-pose-gauge-current"],
   "max_tokens": 3072,

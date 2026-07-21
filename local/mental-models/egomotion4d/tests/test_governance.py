@@ -310,6 +310,49 @@ def test_render_model_source_query_binds_inline_source_hash(
     assert "BEGIN AUTHORITATIVE SOURCE" in query
 
 
+def test_render_model_source_query_appends_simplified_chinese_contract(
+    tmp_path, monkeypatch, daily
+):
+    root = tmp_path / "mental-models" / "egomotion4d"
+    (root / "specs").mkdir(parents=True)
+    (root / "specs" / "static-surface.json").write_text(
+        json.dumps(
+            {
+                "source_query": "Generate bounded output.",
+                "output_language": "zh-CN",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    query = daily._render_model_source_query("egomotion4d-static-surface")
+
+    assert "必须使用简体中文输出" in query
+    assert "技术标识符" in query
+
+
+def test_candidate_completeness_rejects_non_chinese_when_required(daily):
+    requirements = {
+        "required_anchors": ["D64"],
+        "output_language": "zh-CN",
+    }
+
+    assert daily._candidate_completeness_errors(
+        "# Egomotion4D Static Surface\n- D64: English only.",
+        requirements,
+        source_fact_count=1,
+    ) == ["output language must be Simplified Chinese"]
+    assert daily._candidate_completeness_errors(
+        (
+            "# Egomotion4D 静态面约束\n"
+            "- D64：必须使用简体中文完整说明当前结论、适用边界、禁止项和下一步条件。"
+        ),
+        requirements,
+        source_fact_count=1,
+    ) == []
+
+
 def test_refresh_watermark_separates_accepted_and_rejected_candidates(daily):
     evidence_sha = "e" * 64
 

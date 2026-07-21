@@ -1,4 +1,6 @@
 {
+  "output_language": "zh-CN",
+  "language_contract_revision": 2,
   "source_query": "Generate a concise current-only Egomotion4D static SurfacePatch guardrail from the dedicated curated source. The first character of the response must be # and the first line must be an Egomotion4D heading; no preamble or counting statement is allowed. Output exactly one compact bullet for each of D64,D69,D72,D76,D77,D79,D80,D82,D83,D84,D85,D86,D87,D88,D89, in that order. Each bullet must preserve the source's result class, claim boundary, prohibition and next allowed action; do not invent or generalize reopen conditions. Do not add a derived PASS summary, route table, P-id, UUID, task timeline, unlisted D number, Phase3, GTSAM, 4DGS or implementation status. A higher D number never implicitly supersedes a listed current D. The final line must be the undecorated plain text END_STATIC_SURFACE with no markdown around it.",
   "tags": ["egomotion4d", "hmm-static-surface-current"],
   "max_tokens": 4096,

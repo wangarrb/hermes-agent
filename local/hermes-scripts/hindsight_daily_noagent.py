@@ -851,16 +851,22 @@ def _model_generation_requirements(logical_id: str) -> dict:
         "required_terminal_marker": spec.get("required_terminal_marker", ""),
         "require_source_facts": bool(spec.get("require_source_facts", False)),
         "required_prefix": spec.get("required_prefix", ""),
+        "output_language": spec.get("output_language", ""),
     }
 
 
 def _render_model_source_query(logical_id: str) -> str:
     spec = _model_generation_spec(logical_id)
     query = spec.get("source_query", "")
-    if not spec.get("inline_source_files"):
-        return query
-    root = HERMES_HOME / "mental-models" / "egomotion4d"
     sections = [query.rstrip()]
+    if spec.get("output_language") == "zh-CN":
+        sections.append(
+            "输出语言合同：必须使用简体中文输出正文。D 编号、代码符号、schema "
+            "字段和必要的英文技术标识符可以原样保留；不得输出全英文正文。"
+        )
+    if not spec.get("inline_source_files"):
+        return "\n\n".join(sections).rstrip() + "\n"
+    root = HERMES_HOME / "mental-models" / "egomotion4d"
     for relative_path in spec.get("source_files", []):
         relative = Path(relative_path)
         if relative.is_absolute() or ".." in relative.parts:
@@ -938,6 +944,10 @@ def _candidate_completeness_errors(
     required_prefix = requirements.get("required_prefix", "")
     if required_prefix and not content.startswith(required_prefix):
         errors.append(f"invalid content prefix: expected {required_prefix}")
+    if requirements.get("output_language") == "zh-CN":
+        cjk_count = sum("\u4e00" <= char <= "\u9fff" for char in content)
+        if cjk_count < 20:
+            errors.append("output language must be Simplified Chinese")
     return errors
 
 
