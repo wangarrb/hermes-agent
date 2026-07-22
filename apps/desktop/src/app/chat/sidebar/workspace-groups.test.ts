@@ -68,7 +68,9 @@ describe('workspaceGroupsFor', () => {
   })
 })
 
-const info = (over: Partial<HermesWorktreeInfo> & Pick<HermesWorktreeInfo, 'repoRoot' | 'worktreeRoot'>): HermesWorktreeInfo => ({
+const info = (
+  over: Partial<HermesWorktreeInfo> & Pick<HermesWorktreeInfo, 'repoRoot' | 'worktreeRoot'>
+): HermesWorktreeInfo => ({
   branch: null,
   isMainWorktree: false,
   ...over
@@ -89,7 +91,12 @@ describe('workspaceTreeFor', () => {
   it('git metadata is authoritative — worktrees group by repoRoot regardless of directory naming', () => {
     const resolver: WorktreeResolver = cwd => {
       if (cwd === '/www/hermes-agent') {
-        return info({ repoRoot: '/www/hermes-agent', worktreeRoot: '/www/hermes-agent', isMainWorktree: true, branch: 'main' })
+        return info({
+          repoRoot: '/www/hermes-agent',
+          worktreeRoot: '/www/hermes-agent',
+          isMainWorktree: true,
+          branch: 'main'
+        })
       }
 
       if (cwd === '/elsewhere/ha-rtl') {

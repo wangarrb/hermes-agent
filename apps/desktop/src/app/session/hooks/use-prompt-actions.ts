@@ -58,8 +58,8 @@ import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
 import type {
-  ClientSessionState,
   BrowserManageResponse,
+  ClientSessionState,
   FileAttachResponse,
   HandoffFailResponse,
   HandoffRequestResponse,
@@ -166,9 +166,7 @@ function imageFilenameFromPath(filePath: string): string {
 // Remote gateway: the local composer-image file lives on THIS machine's disk,
 // not the gateway's, so read the bytes here and upload them via
 // image.attach_bytes. Returns null when the file can't be read.
-async function readImageForRemoteAttach(
-  filePath: string
-): Promise<{ contentBase64: string; filename: string } | null> {
+async function readImageForRemoteAttach(filePath: string): Promise<{ contentBase64: string; filename: string } | null> {
   const dataUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 
@@ -1378,6 +1376,7 @@ export function usePromptActions({
 
   const cancelRun = useCallback(async () => {
     const sessionId = activeSessionId || activeSessionIdRef.current
+
     const releaseBusy = () => {
       setMutableRef(busyRef, false)
       setBusy(false)
@@ -1387,13 +1386,8 @@ export function usePromptActions({
 
     const finalizeMessages = (messages: ChatMessage[], streamId?: string | null) =>
       messages
-        .filter(
-          message =>
-            !((message.pending || message.id === streamId) && !chatMessageText(message).trim())
-        )
-        .map(message =>
-          message.pending || message.id === streamId ? { ...message, pending: false } : message
-        )
+        .filter(message => !((message.pending || message.id === streamId) && !chatMessageText(message).trim()))
+        .map(message => (message.pending || message.id === streamId ? { ...message, pending: false } : message))
 
     if (!sessionId) {
       releaseBusy()
@@ -1711,7 +1705,12 @@ export function usePromptActions({
         /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
 
       try {
-        await submitRewindPrompt(sessionId, text, isFailedTurn ? undefined : visibleUserOrdinal(messages, sourceIndex), wasRunning)
+        await submitRewindPrompt(
+          sessionId,
+          text,
+          isFailedTurn ? undefined : visibleUserOrdinal(messages, sourceIndex),
+          wasRunning
+        )
       } catch (err) {
         let surfaced = err
 

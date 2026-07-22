@@ -188,7 +188,9 @@ export const Thread: FC<{
 }) => {
   const messageComponents = useMemo(
     () => ({
-      AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />,
+      AssistantMessage: () => (
+        <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />
+      ),
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
       UserMessage: () => <UserMessage onCancel={onCancel} onRestoreToMessage={onRestoreToMessage} />

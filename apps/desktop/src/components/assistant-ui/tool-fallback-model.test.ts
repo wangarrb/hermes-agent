@@ -35,8 +35,7 @@ describe('buildToolView image handling', () => {
 })
 
 describe('buildToolView terminal exit-code status', () => {
-  const terminal = (result: Record<string, unknown>) =>
-    buildToolView(part({ result, toolName: 'terminal' }), '')
+  const terminal = (result: Record<string, unknown>) => buildToolView(part({ result, toolName: 'terminal' }), '')
 
   // A non-zero exit code with real output is not a failure (grep no-match,
   // diff differences, piped commands surfacing the last stage's code, etc.) —

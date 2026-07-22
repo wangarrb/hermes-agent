@@ -12,7 +12,13 @@ import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { $activeGatewayProfile, $newChatProfile, $profiles, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $profiles,
+  ensureGatewayProfile,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $currentCwd,
   $currentFastMode,
@@ -51,7 +57,13 @@ import {
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { reportBackendContract } from '@/store/updates'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionResumeResponse,
+  SessionRuntimeInfo,
+  UsageStats
+} from '@/types/hermes'
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../types'
@@ -284,15 +296,7 @@ async function resolveStoredSession(storedSessionId: string): Promise<SessionInf
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    | 'branch'
-    | 'cwd'
-    | 'fast'
-    | 'model'
-    | 'personality'
-    | 'provider'
-    | 'reasoningEffort'
-    | 'serviceTier'
-    | 'yolo'
+    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
   >
 >
 
@@ -709,6 +713,7 @@ export function useSessionActions({
           ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
+
         // The rejection is consumed by the `await` below; this guard only
         // keeps it from surfacing as unhandled while the prefetch settles.
         resumePromise.catch(() => undefined)
