@@ -40,7 +40,6 @@ _STATUS_ICONS = {
     "scheduled":"⏱",
     "blocked":  "⊘",
     "done":     "✓",
-    "stale":    "↻",
     "archived": "—",
 }
 
@@ -81,8 +80,6 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
-        "generation": t.generation,
-        "rework_hold": t.rework_hold,
     }
 
 
@@ -482,24 +479,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Atomically return a task and invalidate its descendants",
     )
     p_return.add_argument("task_id")
-    p_return.add_argument(
-        "--reason", required=True,
-        help="Concrete rejection reason stored on the task and pause controls",
-    )
-    p_return.add_argument(
-        "--assignee", default=None,
-        help="Optionally reassign the returned task",
-    )
+    p_return.add_argument("--reason", required=True)
+    p_return.add_argument("--assignee", default=None)
 
     p_control_ack = sub.add_parser(
         "control-ack",
         help="Acknowledge a cooperative interactive-listener control",
     )
     p_control_ack.add_argument("control_id", type=int)
-    p_control_ack.add_argument(
-        "--receiver", default=None,
-        help="Receiver identity (default: current profile)",
-    )
+    p_control_ack.add_argument("--receiver", default=None)
 
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
@@ -549,6 +537,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
 
+    # --- attach / attachments / attach-rm ---
+    p_attach = sub.add_parser("attach", help="Attach a local file to a task")
+    p_attach.add_argument("task_id")
+    p_attach.add_argument("path", help="Path to the local file to attach")
+    p_attach.add_argument("--content-type", default=None,
+                          help="MIME type (default: guessed from the file extension)")
+    p_attach.add_argument("--name", default=None,
+                          help="Stored filename (default: the source file's basename)")
+    p_attach.add_argument("--author", default=None,
+                          help="uploaded_by label (default: $HERMES_PROFILE or 'user')")
+
+    p_attachments = sub.add_parser("attachments", help="List a task's attachments")
+    p_attachments.add_argument("task_id")
+    p_attachments.add_argument("--json", action="store_true")
+
+    p_attach_rm = sub.add_parser("attach-rm", help="Delete an attachment by id")
+    p_attach_rm.add_argument("attachment_id", type=int)
+
     p_complete = sub.add_parser("complete", help="Mark one or more tasks done")
     p_complete.add_argument("task_ids", nargs="+",
                             help="One or more task ids (only --result applies to all of them)")
@@ -559,18 +565,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
-    p_complete.add_argument("--run-id", type=int, default=None,
-                            help="Expected active run id (defaults to worker env)")
-    p_complete.add_argument("--generation", type=int, default=None,
-                            help="Expected task generation (defaults to worker env)")
-    p_complete.add_argument(
-        "--allow-no-change", action="store_true",
-        help="Allow an unchanged workspace for an analysis-only rework",
-    )
-    p_complete.add_argument(
-        "--no-change-reason", default=None,
-        help="Required justification for --allow-no-change",
-    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -593,23 +587,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
-    # Fork customization: kanban update CLI (upstream only has p_edit for completed tasks)
-    p_update = sub.add_parser(
-        "update",
-        help="Update mutable fields (title/body/priority/assignee) on a task; --reopen for done tasks",
-    )
-    p_update.add_argument("task_id")
-    p_update.add_argument("--title", default=None, help="New task title")
-    p_update.add_argument("--body", default=None, help="New task body (replaces entirely)")
-    p_update.add_argument("--priority", type=int, default=None, help="New priority tiebreaker")
-    p_update.add_argument("--assignee", default=None, help="Reassign to a different profile")
-    p_update.add_argument(
-        "--reopen",
-        action="store_true",
-        default=False,
-        help="Return a done task and descendants for rework (target waits in todo)",
-    )
-
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -625,10 +602,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
-    p_block.add_argument("--run-id", type=int, default=None,
-                         help="Expected active run id (defaults to worker env)")
-    p_block.add_argument("--generation", type=int, default=None,
-                         help="Expected task generation (defaults to worker env)")
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -636,7 +609,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
-    p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
+    p_unblock = sub.add_parser(
+        "unblock",
+        help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
+    )
     p_unblock.add_argument(
         "--reason",
         default=None,
@@ -1013,9 +989,11 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
+            "attach":   _cmd_attach,
+            "attachments": _cmd_attachments,
+            "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
-            "update":   _cmd_update,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -1600,10 +1578,6 @@ def _cmd_show(args: argparse.Namespace) -> int:
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
     print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
-    print(
-        f"  generation:{task.generation}"
-        + (" (waiting for pause ACK)" if task.rework_hold else "")
-    )
 
     # Diagnostics section — surface active distress signals at the top
     # of show output so CLI users see them before scrolling through
@@ -1733,30 +1707,23 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
 
 
 def _cmd_return_for_rework(args: argparse.Namespace) -> int:
-    actor = _profile_author()
     with kb.connect_closing() as conn:
         result = kb.return_task_for_rework(
             conn,
             args.task_id,
-            actor=actor,
+            actor=_profile_author(),
             reason=args.reason,
-            assignee=getattr(args, "assignee", None),
+            assignee=args.assignee,
         )
-        task = kb.get_task(conn, args.task_id)
     controls = ", ".join(f"control={cid}" for cid in result.control_ids)
-    suffix = f"; {controls}" if controls else ""
-    print(
-        f"Returned {args.task_id} for rework at generation "
-        f"{result.generation}; status={task.status if task else 'todo'}{suffix}"
-    )
+    print(f"Returned {args.task_id} for rework at generation {result.generation}" + (f"; {controls}" if controls else ""))
     return 0
 
 
 def _cmd_control_ack(args: argparse.Namespace) -> int:
-    receiver = getattr(args, "receiver", None) or _profile_author()
     with kb.connect_closing() as conn:
         ok = kb.ack_control_message(
-            conn, args.control_id, receiver=receiver,
+            conn, args.control_id, receiver=args.receiver or _profile_author()
         )
     if not ok:
         print(f"unknown control: {args.control_id}", file=sys.stderr)
@@ -1951,22 +1918,88 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_attach(args: argparse.Namespace) -> int:
+    """Attach a local file to a task.
+
+    Reads the file off disk, writes it under the task's attachments dir,
+    and records the metadata row via the shared ``store_attachment_bytes``
+    path (same code the dashboard upload and the agent tool use), so the
+    25 MB cap and name-sanitisation behave identically everywhere.
+    """
+    import mimetypes
+
+    src = Path(args.path).expanduser()
+    if not src.is_file():
+        print(f"kanban: no such file: {src}", file=sys.stderr)
+        return 1
+    data = src.read_bytes()
+    name = args.name or src.name
+    content_type = args.content_type or mimetypes.guess_type(name)[0]
+    uploaded_by = args.author or _profile_author()
+    try:
+        with kb.connect_closing() as conn:
+            att_id = kb.store_attachment_bytes(
+                conn,
+                args.task_id,
+                name,
+                data,
+                content_type=content_type,
+                uploaded_by=uploaded_by,
+            )
+    except kb.AttachmentTooLarge as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
+    print(f"Attached {name} to {args.task_id} (attachment {att_id}, {len(data)} bytes)")
+    return 0
+
+
+def _cmd_attachments(args: argparse.Namespace) -> int:
+    """List a task's attachments."""
+    with kb.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        atts = kb.list_attachments(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps([
+            {
+                "id": a.id,
+                "filename": a.filename,
+                "content_type": a.content_type,
+                "size": a.size,
+                "uploaded_by": a.uploaded_by,
+                "stored_path": a.stored_path,
+                "created_at": a.created_at,
+            }
+            for a in atts
+        ], indent=2))
+        return 0
+    if not atts:
+        print(f"No attachments on {args.task_id}")
+        return 0
+    print(f"Attachments on {args.task_id}:")
+    for a in atts:
+        ct = a.content_type or "-"
+        print(f"  [{a.id}] {a.filename}  ({a.size} bytes, {ct}, by {a.uploaded_by or '-'})")
+        print(f"        {a.stored_path}")
+    return 0
+
+
+def _cmd_attach_rm(args: argparse.Namespace) -> int:
+    """Delete an attachment by id (removes the row and the on-disk blob)."""
+    with kb.connect_closing() as conn:
+        removed = kb.delete_attachment(conn, args.attachment_id)
+    if removed is None:
+        print(f"no such attachment: {args.attachment_id}", file=sys.stderr)
+        return 1
+    print(f"Deleted attachment {args.attachment_id} ({removed.filename}) from {removed.task_id}")
+    return 0
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-def _worker_generation_for(task_id: str) -> Optional[int]:
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
-        return None
-    raw = os.environ.get("HERMES_KANBAN_GENERATION")
     if not raw:
         return None
     try:
@@ -1994,20 +2027,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if len(ids) > 1 and any(
-        (
-            getattr(args, "run_id", None) is not None,
-            getattr(args, "generation", None) is not None,
-            bool(getattr(args, "allow_no_change", False)),
-            bool(getattr(args, "no_change_reason", None)),
-        )
-    ):
-        print(
-            "kanban: run/generation/no-change fences are per-task and cannot "
-            "be used with multiple ids",
-            file=sys.stderr,
-        )
-        return 2
     metadata = None
     if raw_meta:
         try:
@@ -2020,30 +2039,59 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # Goal-mode pre-completion judge gate (mirrors the gate in
+            # tools/kanban_tools.py:_handle_complete — Issue #38367).
+            # Without this, a goal_mode worker can call
+            # `hermes kanban complete <id>` from the terminal tool and
+            # bypass the auxiliary judge that the tool-call path enforces.
+            task = kb.get_task(conn, tid)
+            if task and task.goal_mode:
+                judge_available = False
+                try:
+                    from agent.auxiliary_client import get_text_auxiliary_client
+                    _client, _model = get_text_auxiliary_client("goal_judge")
+                    judge_available = _client is not None and bool(_model)
+                except Exception:
+                    pass
+                if judge_available:
+                    from hermes_cli.goals import judge_goal
+                    verdict = "done"
+                    reason = ""
+                    try:
+                        # judge_goal returns (verdict, reason, parse_failed,
+                        # wait_directive, transport_failed) — see
+                        # hermes_cli/goals.py. Unpacking fewer raises
+                        # ValueError into the fail-open handler below,
+                        # silently disabling the gate.
+                        verdict, reason, _, _, _ = judge_goal(
+                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                            last_response=(summary or args.result or "").strip(),
+                        )
+                    except Exception as judge_exc:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "goal judge check failed, allowing completion: %s",
+                            judge_exc,
+                            exc_info=True,
+                        )
+                    if verdict != "done":
+                        print(
+                            f"kanban: goal completion of {tid} rejected by judge: {reason}. "
+                            f"Provide evidence matching the task's acceptance criteria.",
+                            file=sys.stderr,
+                        )
+                        failed.append(tid)
+                        continue
+
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=(
-                    getattr(args, "run_id", None)
-                    if getattr(args, "run_id", None) is not None
-                    else _worker_run_id_for(tid)
-                ),
-                expected_generation=(
-                    getattr(args, "generation", None)
-                    if getattr(args, "generation", None) is not None
-                    else _worker_generation_for(tid)
-                ),
-                allow_no_change=bool(getattr(args, "allow_no_change", False)),
-                no_change_reason=getattr(args, "no_change_reason", None),
+                expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(
-                    f"cannot complete {tid} (unknown/terminal task or stale "
-                    "run/generation fence)",
-                    file=sys.stderr,
-                )
+                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2077,57 +2125,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
-# Fork customization: kanban update command
-def _cmd_update(args: argparse.Namespace) -> int:
-    """Update mutable fields on a task; --reopen returns done→todo."""
-    # At least one field or --reopen must be specified
-    if not any([
-        args.title, args.body, args.priority is not None,
-        args.assignee, args.reopen,
-    ]):
-        print("kanban update: specify at least one of --title --body --priority --assignee or --reopen", file=sys.stderr)
-        return 2
-
-    with kb.connect_closing() as conn:
-        ok = kb.update_task(
-            conn,
-            args.task_id,
-            title=args.title,
-            body=args.body,
-            priority=args.priority,
-            assignee=args.assignee,
-            reopen=args.reopen,
-        )
-        if not ok:
-            print(f"cannot update {args.task_id} (unknown id, archived, or done without --reopen)", file=sys.stderr)
-            return 1
-
-    parts = []
-    if args.title:    parts.append("title")
-    if args.body:     parts.append("body")
-    if args.priority is not None: parts.append(f"priority={args.priority}")
-    if args.assignee: parts.append(f"assignee={args.assignee}")
-    if args.reopen:   parts.append("reopened")
-    desc = ", ".join(parts) or "no-op"
-    print(f"Updated {args.task_id}: {desc}")
-    return 0
-
-
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
-    if len(ids) > 1 and (
-        getattr(args, "run_id", None) is not None
-        or getattr(args, "generation", None) is not None
-    ):
-        print(
-            "kanban: --run-id/--generation are per-task and cannot be used "
-            "with bulk --ids",
-            file=sys.stderr,
-        )
-        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2138,23 +2140,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=(
-                    getattr(args, "run_id", None)
-                    if getattr(args, "run_id", None) is not None
-                    else _worker_run_id_for(tid)
-                ),
-                expected_generation=(
-                    getattr(args, "generation", None)
-                    if getattr(args, "generation", None) is not None
-                    else _worker_generation_for(tid)
-                ),
+                expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(
-                    f"cannot block {tid} (invalid state or stale "
-                    "run/generation fence)",
-                    file=sys.stderr,
-                )
+                print(f"cannot block {tid}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
@@ -2618,10 +2607,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in (
-        "triage", "todo", "scheduled", "ready", "running", "blocked",
-        "review", "stale", "done",
-    ):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
@@ -2956,6 +2942,7 @@ Common subcommands:
   `stats`               Per-status / per-assignee counts
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
+  `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign

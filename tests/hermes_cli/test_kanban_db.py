@@ -195,56 +195,17 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
-        tables = {
-            row["name"]
-            for row in migrated.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
-    assert "generation" in task_columns
-    assert "rework_hold" in task_columns
-    assert "rework_baseline_fingerprint" in task_columns
-    assert {"task_control_messages", "task_control_holds"} <= tables
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
-
-
-def test_reinitialization_does_not_refresh_dependency_generation_snapshot(
-    kanban_home,
-):
-    with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        child = kb.create_task(conn, title="child", parents=[parent])
-        conn.execute(
-            "UPDATE tasks SET generation = generation + 1 WHERE id = ?",
-            (parent,),
-        )
-        conn.commit()
-        before = conn.execute(
-            "SELECT parent_generation FROM task_links "
-            "WHERE parent_id = ? AND child_id = ?",
-            (parent, child),
-        ).fetchone()["parent_generation"]
-
-    kb.init_db()
-    with kb.connect() as conn:
-        after = conn.execute(
-            "SELECT parent_generation FROM task_links "
-            "WHERE parent_id = ? AND child_id = ?",
-            (parent, child),
-        ).fetchone()["parent_generation"]
-
-    assert before == 1
-    assert after == before
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +229,18 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
         assert kb.get_task(conn, c).status == "todo"
         kb.complete_task(conn, p, result="ok")
         assert kb.get_task(conn, c).status == "ready"
+
+
+def test_dependency_link_stamps_parent_generation(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        link = conn.execute(
+            "SELECT parent_generation FROM task_links "
+            "WHERE parent_id = ? AND child_id = ?",
+            (parent, child),
+        ).fetchone()
+    assert link["parent_generation"] == 1
 
 
 def test_create_task_unknown_parent_errors(kanban_home):
@@ -1918,6 +1891,30 @@ def test_respawn_guard_recent_success(kanban_home):
     assert reason == "recent_success"
 
 
+def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
+    """An explicit re-queue after a recent success (operator done->ready,
+    promote, unblock, reclaim) is a deliberate re-run and must bypass the
+    recent_success guard — otherwise a manual done->ready just sits there
+    until the window elapses."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rerun-me", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        # Baseline: a recent completion defers the respawn.
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+        # Operator drags done -> ready: a 'status' event after completion.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (t, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
     with kb.connect() as conn:
@@ -2376,6 +2373,175 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
         assert ws.is_dir()
         kb.complete_task(conn, t, result="ok")
     assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
+
+
+def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
+    """Completion artifacts from scratch workspaces survive workspace cleanup."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render chart")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "chart.png"
+        artifact.write_bytes(b"png-bytes")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(artifact)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+        run = kb.latest_run(conn, t)
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert persisted.exists(), "artifact copy should survive scratch cleanup"
+    assert persisted.parent == kb.task_attachments_dir(t)
+    assert persisted.name == "chart.png"
+    assert persisted.read_bytes() == b"png-bytes"
+    assert str(persisted) != str(artifact)
+    assert run is not None
+    assert run.metadata["artifacts"] == [str(persisted)]
+    with kb.connect() as conn:
+        attachments = kb.list_attachments(conn, t)
+    assert [(a.filename, a.stored_path) for a in attachments] == [
+        ("chart.png", str(persisted.resolve()))
+    ]
+
+
+def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
+    """A declared scratch deliverable must not disappear behind a false Done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="missing report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        missing = ws / "report.md"
+
+        with pytest.raises(kb.ArtifactPreservationError, match="unavailable"):
+            kb.complete_task(
+                conn,
+                t,
+                result="report complete",
+                metadata={"artifacts": [str(missing)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+    assert ws.exists(), "failed completion must keep scratch available for retry"
+
+
+def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):
+    """Summary-only workers keep the file they tell the user was delivered."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        report = ws / "report.md"
+        report.write_text("legacy deliverable", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            summary=f"Task complete — delivered {report}",
+        )
+        run = kb.latest_run(conn, t)
+
+    persisted = Path(run.metadata["artifacts"][0])
+    assert not ws.exists()
+    assert persisted.read_text(encoding="utf-8") == "legacy deliverable"
+    assert persisted.parent == kb.task_attachments_dir(t)
+
+
+def test_complete_task_leaves_non_scratch_artifact_paths_unchanged(
+    kanban_home,
+    tmp_path,
+):
+    """Only artifacts inside the managed scratch workspace are copied."""
+    external = tmp_path / "report.md"
+    external.write_text("keep me here", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(external)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        run = kb.latest_run(conn, t)
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert external.exists()
+    assert completed.payload["artifacts"] == [str(external)]
+    assert run is not None
+    assert run.metadata["artifacts"] == [str(external)]
+
+
+def test_complete_task_persists_duplicate_scratch_artifact_names(kanban_home):
+    """Scratch artifact persistence does not overwrite duplicate basenames."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render reports")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        first = ws / "a" / "report.txt"
+        second = ws / "b" / "report.txt"
+        first.parent.mkdir(parents=True)
+        second.parent.mkdir(parents=True)
+        first.write_text("first", encoding="utf-8")
+        second.write_text("second", encoding="utf-8")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(first), str(second)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        persisted = [Path(p) for p in completed.payload["artifacts"]]
+
+    assert not ws.exists(), "scratch workspace should still be cleaned up"
+    assert [p.name for p in persisted] == ["report.txt", "report_1.txt"]
+    assert [p.read_text(encoding="utf-8") for p in persisted] == ["first", "second"]
+    assert all(p.parent == kb.task_attachments_dir(t) for p in persisted)
+
+
+def test_complete_task_persists_board_scratch_artifacts_to_board_attachments(kanban_home):
+    """Board scratch artifacts are copied under that board's attachment root."""
+    kb.create_board("work-proj")
+
+    with kb.connect(board="work-proj") as conn:
+        t = kb.create_task(conn, title="board chart", board="work-proj")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task, board="work-proj")
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "chart.png"
+        artifact.write_bytes(b"board-png")
+
+        assert kb.complete_task(
+            conn,
+            t,
+            result="ok",
+            metadata={"artifacts": [str(artifact)]},
+        )
+
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+
+    assert not ws.exists(), "board scratch workspace should still be cleaned up"
+    assert persisted.exists()
+    assert persisted.parent == kb.task_attachments_dir(t, board="work-proj")
 
 
 def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_path):
@@ -2990,7 +3156,6 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
-        assert env["HERMES_KANBAN_GENERATION"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -3135,6 +3300,42 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
+
+
+def test_connect_defaults_to_delete_journal_mode(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+def test_connect_allows_explicit_wal_opt_in(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "WAL")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_connect_reuses_delete_mode_while_another_reader_is_active(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    first = kb.connect(db_path=db_path)
+    try:
+        first.execute("BEGIN")
+        first.execute("SELECT count(*) FROM tasks").fetchone()
+        second = kb.connect(db_path=db_path)
+        try:
+            assert second.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        finally:
+            second.close()
+    finally:
+        first.rollback()
+        first.close()
 
 
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
@@ -4370,44 +4571,8 @@ def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog
 
 
 # ---------------------------------------------------------------------------
-# Connection pragmas (journal mode, secure_delete, cell_size_check, synchronous=FULL)
+# Connection pragmas (secure_delete, cell_size_check, synchronous=FULL)
 # ---------------------------------------------------------------------------
-
-
-def test_connect_defaults_to_delete_journal_mode(tmp_path, monkeypatch):
-    db_path = tmp_path / "kanban.db"
-    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
-    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path=db_path) as conn:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
-
-
-def test_connect_allows_explicit_wal_opt_in(tmp_path, monkeypatch):
-    db_path = tmp_path / "kanban.db"
-    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "WAL")
-    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with kb.connect(db_path=db_path) as conn:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-
-
-def test_connect_reuses_delete_mode_while_another_reader_is_active(
-    tmp_path, monkeypatch
-):
-    db_path = tmp_path / "kanban.db"
-    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
-    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    first = kb.connect(db_path=db_path)
-    try:
-        first.execute("BEGIN")
-        first.execute("SELECT count(*) FROM tasks").fetchone()
-        second = kb.connect(db_path=db_path)
-        try:
-            assert second.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
-        finally:
-            second.close()
-    finally:
-        first.rollback()
-        first.close()
 
 
 def test_connect_sets_secure_delete_on(tmp_path):

@@ -763,12 +763,12 @@ def _reclaim_current(state: ListenerState) -> None:
 
 def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
     """Check health of kanban watcher subprocesses for all panes.
-    
+
     This is called periodically from the coordinator's /listen-kanban loop.
     It detects when a pane's watcher subprocess has died but the launcher
     is still alive (stale state). Prints a warning so the operator can
     restart the watcher manually.
-    
+
     Args:
         board: The kanban board slug (e.g., "egomotion4d")
         interval_seconds: How often to run the check (default 180s)
@@ -777,18 +777,18 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
     import re as _re
     import time as _time
     from hermes_cli.colors import Colors as C
-    
+
     # Find all launcher and watcher processes for this board
     roles = {"coordinator", "planner", "implementer", "critic"}
     pane_info = {}
-    
+
     def _read_cmd(pid):
         try:
             raw = open(f"/proc/{pid}/cmdline", "rb").read()
             return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)
         except OSError:
             return ""
-    
+
     def _read_env(pid):
         try:
             raw = open(f"/proc/{pid}/environ", "rb").read()
@@ -801,7 +801,7 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
             return env
         except OSError:
             return {}
-    
+
     try:
         for name in _os.listdir("/proc"):
             if not name.isdigit():
@@ -810,7 +810,7 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
             cmd = _read_cmd(pid)
             if not cmd:
                 continue
-            
+
             # Launcher processes: --auto-start without --watch-child
             if "kanban_interactive" in cmd and "--auto-start" in cmd and "--watch-child" not in cmd:
                 env = _read_env(pid)
@@ -829,7 +829,7 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
                     pane_info[profile]["agent"] = "codex"
                 elif "deepseek_kanban_interactive" in cmd:
                     pane_info[profile]["agent"] = "deepseek"
-            
+
             # Watcher processes: --watch-child
             if "kanban_interactive" in cmd and "--watch-child" in cmd:
                 env = _read_env(pid)
@@ -842,7 +842,7 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
                 if profile not in pane_info:
                     pane_info[profile] = {"launcher_pid": None, "watcher_pid": None, "agent": ""}
                 pane_info[profile]["watcher_pid"] = pid
-        
+
         # coordinator (hermes) doesn't have launcher/watcher subprocess
         for name in _os.listdir("/proc"):
             if not name.isdigit():
@@ -857,10 +857,10 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
                     if "coordinator" not in pane_info:
                         pane_info["coordinator"] = {"launcher_pid": pid, "watcher_pid": pid, "agent": "hermes"}
                     break
-        
+
         # Find anomalies: launcher alive but watcher dead
         anomalies = {p: i for p, i in pane_info.items() if i["launcher_pid"] and not i["watcher_pid"]}
-        
+
         if anomalies:
             _print(f"{C.RED}WATCHER HEALTH CHECK: {len(anomalies)} pane(s) missing watcher subprocess!{C.RESET}")
             for profile, info in sorted(anomalies.items()):
@@ -870,7 +870,7 @@ def _check_watcher_health(board: str, interval_seconds: float = 180.0) -> None:
             # Only log on success if there are panes to check
             if pane_info:
                 _print(f"watcher health check OK ({len(pane_info)} panes)")
-    
+
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("watcher health check failed: %s", exc)

@@ -25,11 +25,15 @@ def test_delayed_old_listener_callback_cannot_complete_new_run(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="implementer")
         first = kb.claim_task(conn, task_id, claimer="listener-v1")
+        assert first is not None
         returned = kb.return_task_for_rework(
             conn, task_id, actor="reviewer", reason="retry"
         )
-        kb.ack_control_message(conn, returned.control_ids[0], receiver="listener-v1")
+        assert kb.ack_control_message(
+            conn, returned.control_ids[0], receiver="listener-v1"
+        )
         second = kb.claim_task(conn, task_id, claimer="listener-v2")
+        assert second is not None
         now = int(time.time())
         conn.execute(
             "UPDATE task_runs SET summary = ?, started_at = ?, ended_at = ? "
@@ -51,5 +55,6 @@ def test_delayed_old_listener_callback_cannot_complete_new_run(kanban_home):
     with kb.connect() as conn:
         task = kb.get_task(conn, task_id)
 
+    assert task is not None
     assert task.status == "running"
     assert task.current_run_id == second.current_run_id

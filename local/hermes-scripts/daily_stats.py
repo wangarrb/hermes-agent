@@ -113,7 +113,7 @@ def parse_model_usage(target_date):
 
 def parse_codex_usage(target_date):
     """Parse Codex/CodeWhale rollout jsonl for token usage (cumulative, need delta).
-    
+
     token_count events carry per-session cumulative totals. Different sessions
     have independent counters starting from 0, so we must compute deltas per-session
     first, then sum across sessions for the target date.
@@ -121,7 +121,7 @@ def parse_codex_usage(target_date):
     codex_base = Path('/home/wyr/.codex/sessions')
     cw_base = Path('/home/wyr/.codewhale/sessions')
     all_session_files = []
-    
+
     # Collect from both Codex and CodeWhale session dirs
     for base in [codex_base, cw_base]:
         if not base.exists():
@@ -136,11 +136,11 @@ def parse_codex_usage(target_date):
                 continue
             for session_file in month_dir.glob('rollout-*.jsonl'):
                 all_session_files.append(session_file)
-    
+
     # Collect per-session first/last token_count per date
     # Key: (session_file, date) -> {first, last}
     session_date_entries = {}
-    
+
     for session_file in all_session_files:
         try:
             with open(session_file) as f:
@@ -170,14 +170,14 @@ def parse_codex_usage(target_date):
                         pass
         except Exception:
             pass
-    
+
     # For each session, compute delta for target_date
     # Delta = last - first for that session on that date (per-session cumulative is monotonic)
     total_input = 0
     total_cached = 0
     total_output = 0
     found_any = False
-    
+
     for (sf, date), entries in session_date_entries.items():
         if date != target_date:
             continue
@@ -187,12 +187,12 @@ def parse_codex_usage(target_date):
         total_input += last['input'] - first['input']
         total_cached += last['cached'] - first['cached']
         total_output += last['output'] - first['output']
-    
+
     if not found_any:
         return None
-    
+
     real_input = total_input - total_cached
-    
+
     return {
         'model': 'gpt-5.5',
         'input': real_input,

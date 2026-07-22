@@ -251,12 +251,12 @@ class HolographicMemoryProvider(MemoryProvider):
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
-        # Close the SQLite connection deterministically instead of leaking it
-        # to GC. MemoryStore opens its connection with check_same_thread=False
-        # (store.py), so without an explicit close() the sqlite3.Connection's
-        # fd is released by refcount/GC at a non-deterministic time on a
-        # non-deterministic thread, churning a DB fd through the kernel's free
-        # pool on every session teardown. close() already exists and is cheap.
+        # Release the shared SQLite connection deterministically on the
+        # caller's thread. Dropping the reference alone leaves fd finalization
+        # to GC, which keeps the connection (and its write lock) alive on a
+        # long-running gateway and prolongs the "database is locked" contention
+        # this store's shared-connection refcounting is meant to eliminate.
+        # close() is idempotent and refcount-guarded, so siblings stay safe.
         if self._store is not None:
             try:
                 self._store.close()
@@ -375,39 +375,29 @@ class HolographicMemoryProvider(MemoryProvider):
         ]
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
-            re.compile(r'\bthe\s+(?:project|team)\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
         _CN_PREF_PATTERNS = [
             re.compile(r'我(?:喜欢|偏好|习惯|常用|想要|需要|用)(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'我的(?:默认|常用|偏好|首选)(?:\w+)?是(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'我(?:总是|从不|通常|一般)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'记住[：:]?\s*(.+)'),
-            re.compile(r'记得[：:]?\s*(.+)'),
-            re.compile(r'别忘了(.+)'),
-            re.compile(r'不要忘(.+)'),
-            re.compile(r'先记下[：:]?\s*(.+)'),
-            re.compile(r'记下来[：:]?\s*(.+)'),
-            re.compile(r'提醒我(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'以后(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'重要[：:]?\s*(.+)'),
-            re.compile(r'注意[：:]?\s*(.+)'),
+            re.compile(r'记住[：:]?\s*(.+)'), re.compile(r'记得[：:]?\s*(.+)'),
+            re.compile(r'别忘了(.+)'), re.compile(r'不要忘(.+)'),
+            re.compile(r'先记下[：:]?\s*(.+)'), re.compile(r'记下来[：:]?\s*(.+)'),
+            re.compile(r'提醒我(.+?)(?:[，。！？\n]|$)'), re.compile(r'以后(.+?)(?:[，。！？\n]|$)'),
+            re.compile(r'重要[：:]?\s*(.+)'), re.compile(r'注意[：:]?\s*(.+)'),
         ]
         _CN_DECISION_PATTERNS = [
             re.compile(r'(?:我们|项目|团队)(?:决定|选择|确定|约定)(?:了)?(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'项目(?:使用|需要|要求|采用)(.+?)(?:[，。！？\n]|$)'),
             re.compile(r'(?:最终|最终决定)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'我们约定(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'规定[：:]?\s*(.+)'),
+            re.compile(r'我们约定(.+?)(?:[，。！？\n]|$)'), re.compile(r'规定[：:]?\s*(.+)'),
         ]
         _CN_LEARNING_PATTERNS = [
-            re.compile(r'(?:发现|学到|经验|教训)[：:]?\s*(.+)'),
-            re.compile(r'(?:原来|其实)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'(?:问题|错误|坑|陷阱)[：:]?\s*(.+)'),
-            re.compile(r'纠正[：:]?\s*(.+)'),
-            re.compile(r'修改[为成](.+)'),
-            re.compile(r'(?:应该|必须|一定要)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'不(?:要|能|能再)(.+?)(?:[，。！？\n]|$)'),
-            re.compile(r'(?:错误|不对)(.+?)(?:[，。！？\n]|$)'),
+            re.compile(r'(?:发现|学到|经验|教训)[：:]?\s*(.+)'), re.compile(r'(?:原来|其实)(.+?)(?:[，。！？\n]|$)'),
+            re.compile(r'(?:问题|错误|坑|陷阱)[：:]?\s*(.+)'), re.compile(r'纠正[：:]?\s*(.+)'),
+            re.compile(r'修改[为成](.+)'), re.compile(r'(?:应该|必须|一定要)(.+?)(?:[，。！？\n]|$)'),
+            re.compile(r'不(?:要|能|能再)(.+?)(?:[，。！？\n]|$)'), re.compile(r'(?:错误|不对)(.+?)(?:[，。！？\n]|$)'),
         ]
 
         extracted = 0
@@ -436,32 +426,20 @@ class HolographicMemoryProvider(MemoryProvider):
                         pass
                     break
 
-            for pattern in _CN_PREF_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="user_pref")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
-
-            for pattern in _CN_DECISION_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="project")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
-
-            for pattern in _CN_LEARNING_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="tool")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
+            store = self._store
+            if store:
+                for patterns, category in (
+                    (_CN_DECISION_PATTERNS, "project"),
+                    (_CN_PREF_PATTERNS, "user_pref"),
+                    (_CN_LEARNING_PATTERNS, "tool"),
+                ):
+                    if any(pattern.search(content) for pattern in patterns):
+                        try:
+                            store.add_fact(content[:400], category=category)
+                            extracted += 1
+                        except Exception:
+                            pass
+                        break
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)

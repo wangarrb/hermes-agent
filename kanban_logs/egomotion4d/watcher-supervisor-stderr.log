@@ -1,0 +1,67 @@
+[2026-07-19 23:27:47] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 23:28:17] tracking: pid=4117610 profile=coordinator
+[2026-07-19 23:28:17] tracking: pid=4117627 profile=planner
+[2026-07-19 23:28:17] tracking: pid=4117649 profile=reviewer
+[2026-07-19 23:28:17] tracking: pid=4117673 profile=implementer
+[2026-07-19 23:28:17] tracking: pid=4117704 profile=critic
+[2026-07-19 23:28:17] tracking: pid=4117745 profile=planner
+[2026-07-19 23:28:17] tracking: pid=4117753 profile=critic
+[2026-07-20 17:46:19] watcher died: pid=4117673 profile=implementer rc=unknown; will restart
+[2026-07-20 17:46:24]   restarted: pid=1100271 profile=implementer (attempt 1/5)
+[2026-07-20 17:46:54] tracking: pid=1100128 profile=implementer
+[2026-07-20 17:46:56] stopped duplicate supervisor watcher: pid=1100271 board=egomotion4d profile=implementer pane=1
+[2026-07-20 18:20:57] watcher died: pid=1100128 profile=implementer rc=unknown; will restart
+[2026-07-20 18:20:57]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-20 18:20:57] tracking: pid=1133924 profile=implementer
+[2026-07-20 18:25:27] watcher died: pid=4117610 profile=coordinator rc=unknown; will restart
+[2026-07-20 18:25:27]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-20 18:25:27] tracking: pid=1138639 profile=coordinator
+[2026-07-21 11:04:27] watcher died: pid=1138639 profile=coordinator rc=unknown; will restart
+[2026-07-21 11:04:27]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-21 11:04:27] tracking: pid=2179401 profile=coordinator
+[2026-07-21 11:04:57] watcher died: pid=1133924 profile=implementer rc=unknown; will restart
+[2026-07-21 11:04:57]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-21 11:04:57] tracking: pid=2179783 profile=implementer
+[2026-07-21 11:21:58] watcher died: pid=2179783 profile=implementer rc=unknown; will restart
+[2026-07-21 11:21:58]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-21 11:21:58] tracking: pid=2194049 profile=implementer
+[2026-07-21 12:01:29] watcher died: pid=2194049 profile=implementer rc=unknown; will restart
+[2026-07-21 12:01:29]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-21 12:01:29] tracking: pid=2231598 profile=implementer
+[2026-07-21 14:17:03] watcher died: pid=2179401 profile=coordinator rc=unknown; will restart
+[2026-07-21 14:17:08]   restarted: pid=2369650 profile=coordinator (attempt 1/5)
+[2026-07-21 14:18:08] tracking: pid=2370209 profile=coordinator
+[2026-07-21 14:18:10] stopped duplicate supervisor watcher: pid=2369650 board=egomotion4d profile=coordinator pane=4
+[2026-07-21 15:58:43] watcher died: pid=2370209 profile=coordinator rc=unknown; will restart
+[2026-07-21 15:58:44]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-21 15:58:44] tracking: pid=2518979 profile=coordinator
+[2026-07-21 23:21:57] watcher died: pid=2518979 profile=coordinator rc=unknown; will restart
+[2026-07-21 23:21:57]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-21 23:21:57] tracking: pid=3009559 profile=coordinator
+[2026-07-22 09:12:45] watcher died: pid=3009559 profile=coordinator rc=unknown; will restart
+[2026-07-22 09:12:45]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-22 09:12:45] tracking: pid=3635772 profile=coordinator
+[2026-07-22 15:59:28] watcher died: pid=4117649 profile=reviewer rc=unknown; will restart
+[2026-07-22 15:59:28] FATAL: unhandled exception in main loop: [Errno 2] No such file or directory: '/home/wyr/.hermes/hermes-agent/kanban_logs/egomotion4d/watcher-supervisor.log'
+Traceback (most recent call last):
+  File "/home/wyr/bin/kanban-watcher-supervisor.py", line 261, in main
+    log(f"watcher died: pid={pid} profile={profile} rc=unknown; will restart")
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wyr/bin/kanban-watcher-supervisor.py", line 235, in log
+    with open(log_path, "a") as f:
+         ~~~~^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/home/wyr/.hermes/hermes-agent/kanban_logs/egomotion4d/watcher-supervisor.log'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/wyr/bin/kanban-watcher-supervisor.py", line 374, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/wyr/bin/kanban-watcher-supervisor.py", line 361, in main
+    log(f"FATAL: unhandled exception in main loop: {exc}")
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wyr/bin/kanban-watcher-supervisor.py", line 235, in log
+    with open(log_path, "a") as f:
+         ~~~~^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/home/wyr/.hermes/hermes-agent/kanban_logs/egomotion4d/watcher-supervisor.log'

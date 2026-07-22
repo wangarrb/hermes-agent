@@ -1,0 +1,476 @@
+[2026-07-16 15:09:16] supervisor started: session=kanban-egomotion4d poll=1.0s
+[2026-07-16 15:09:16] tracking: pid=2994754 profile=planner
+[2026-07-16 15:09:16] tracking: pid=2994796 profile=planner
+[2026-07-16 15:09:16] tracking: pid=2998203 profile=critic
+[2026-07-16 15:09:16] tracking: pid=2998305 profile=critic
+[2026-07-16 15:09:16] tracking: pid=3593731 profile=coordinator
+[2026-07-16 15:09:16] tracking: pid=3593763 profile=coordinator
+[2026-07-16 15:10:14] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-16 15:10:14] tracking: pid=2994754 profile=planner
+[2026-07-16 15:10:14] tracking: pid=2994796 profile=planner
+[2026-07-16 15:10:14] tracking: pid=2998203 profile=critic
+[2026-07-16 15:10:14] tracking: pid=2998305 profile=critic
+[2026-07-16 15:10:14] tracking: pid=3593731 profile=coordinator
+[2026-07-16 15:10:14] tracking: pid=3593763 profile=coordinator
+[2026-07-16 15:22:09] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-16 15:22:09] tracking: pid=2998203 profile=critic
+[2026-07-16 15:22:09] tracking: pid=2998305 profile=critic
+[2026-07-16 15:22:09] tracking: pid=3593731 profile=coordinator
+[2026-07-16 15:22:09] tracking: pid=3593763 profile=coordinator
+[2026-07-16 15:34:39] watcher died: pid=2998203 profile=critic rc=unknown; will restart
+[2026-07-16 15:34:44]   restarted: pid=3652105 profile=critic (attempt 1/5)
+[2026-07-16 15:34:44] watcher died: pid=2998305 profile=critic rc=unknown; will restart
+[2026-07-16 17:33:31] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-16 17:33:31] tracking: pid=3652105 profile=critic
+[2026-07-16 17:33:31] tracking: pid=3656277 profile=critic
+[2026-07-16 17:33:31] tracking: pid=3722091 profile=planner
+[2026-07-16 17:33:31] tracking: pid=3722243 profile=critic
+[2026-07-16 17:33:31] tracking: pid=3723112 profile=critic
+[2026-07-16 17:33:31] tracking: pid=3723120 profile=planner
+[2026-07-16 17:44:10] supervisor started: session=kanban-egomotion4d poll=10.0s
+[2026-07-16 17:44:10] tracking: pid=3652105 profile=critic
+[2026-07-16 17:44:10] tracking: pid=3656277 profile=critic
+[2026-07-16 17:44:10] tracking: pid=3722091 profile=planner
+[2026-07-16 17:44:10] tracking: pid=3722243 profile=critic
+[2026-07-16 17:44:10] tracking: pid=3723112 profile=critic
+[2026-07-16 17:44:10] tracking: pid=3723120 profile=planner
+[2026-07-16 17:52:09] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-16 17:52:09] tracking: pid=3652105 profile=critic
+[2026-07-16 17:52:09] tracking: pid=3656277 profile=critic
+[2026-07-16 17:52:09] tracking: pid=3722091 profile=planner
+[2026-07-16 17:52:09] tracking: pid=3722243 profile=critic
+[2026-07-16 17:52:09] tracking: pid=3723112 profile=critic
+[2026-07-16 17:52:09] tracking: pid=3723120 profile=planner
+[2026-07-16 18:12:32] watcher died: pid=3722091 profile=planner rc=unknown; will restart
+[2026-07-16 18:12:37]   restarted: pid=3792385 profile=planner (attempt 1/5)
+[2026-07-16 18:12:37] watcher died: pid=3722243 profile=critic rc=unknown; will restart
+[2026-07-16 18:12:39] watcher died: pid=3722091 profile=planner rc=unknown; will restart
+[2026-07-16 18:12:39]   skipping restart: pid=3722091 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-16 18:12:39] watcher died: pid=3722243 profile=critic rc=unknown; will restart
+[2026-07-16 18:12:39]   skipping restart: pid=3722243 profile=critic is a conda wrapper (launcher manages it)
+[2026-07-16 18:12:39] watcher died: pid=3723112 profile=critic rc=unknown; will restart
+[2026-07-16 18:12:42]   restarted: pid=3792527 profile=critic (attempt 1/5)
+[2026-07-16 18:12:42] watcher died: pid=3723112 profile=critic rc=unknown; will restart
+[2026-07-17 16:35:30] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-17 16:35:30] tracking: pid=476159 profile=planner
+[2026-07-17 16:35:30] tracking: pid=476303 profile=critic
+[2026-07-17 16:35:30] tracking: pid=477856 profile=critic
+[2026-07-17 16:35:30] tracking: pid=477857 profile=planner
+[2026-07-17 16:36:51] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-17 16:36:51] tracking: pid=476159 profile=planner
+[2026-07-17 16:36:51] tracking: pid=476186 profile=reviewer
+[2026-07-17 16:36:51] tracking: pid=476303 profile=critic
+[2026-07-17 16:36:51] tracking: pid=477856 profile=critic
+[2026-07-17 16:36:51] tracking: pid=477857 profile=planner
+[2026-07-17 16:36:51] tracking: pid=776065 profile=coordinator
+[2026-07-17 16:36:51] tracking: pid=779123 profile=implementer
+[2026-07-17 16:42:41] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-17 16:42:41] tracking: pid=476159 profile=planner
+[2026-07-17 16:42:41] tracking: pid=476186 profile=reviewer
+[2026-07-17 16:42:41] tracking: pid=476303 profile=critic
+[2026-07-17 16:42:41] tracking: pid=477856 profile=critic
+[2026-07-17 16:42:41] tracking: pid=477857 profile=planner
+[2026-07-17 16:42:41] tracking: pid=776065 profile=coordinator
+[2026-07-17 16:42:41] tracking: pid=779123 profile=implementer
+[2026-07-17 16:50:42] watcher died: pid=776065 profile=coordinator rc=unknown; will restart
+[2026-07-17 16:50:42]   skipping restart: pid=776065 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-17 16:50:42] tracking: pid=802860 profile=coordinator
+[2026-07-17 17:02:12] watcher died: pid=476186 profile=reviewer rc=unknown; will restart
+[2026-07-17 17:02:12]   skipping restart: pid=476186 profile=reviewer is a conda wrapper (launcher manages it)
+[2026-07-17 18:14:44] tracking: pid=885166 profile=reviewer
+[2026-07-17 18:21:14] watcher died: pid=476159 profile=planner rc=unknown; will restart
+[2026-07-17 18:21:14]   skipping restart: pid=476159 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-17 18:21:14] watcher died: pid=477857 profile=planner rc=unknown; will restart
+[2026-07-17 18:21:19]   restarted: pid=895330 profile=planner (attempt 1/5)
+[2026-07-17 18:29:02] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-17 18:29:32] tracking: pid=901736 profile=coordinator
+[2026-07-17 18:29:32] tracking: pid=901754 profile=planner
+[2026-07-17 18:29:32] tracking: pid=901788 profile=reviewer
+[2026-07-17 18:29:32] tracking: pid=901789 profile=implementer
+[2026-07-17 18:29:32] tracking: pid=901806 profile=critic
+[2026-07-17 18:29:32] tracking: pid=903116 profile=planner
+[2026-07-17 18:29:32] tracking: pid=903117 profile=critic
+[2026-07-17 18:41:33] watcher died: pid=901736 profile=coordinator rc=unknown; will restart
+[2026-07-17 18:41:33]   skipping restart: pid=901736 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-17 18:41:33] tracking: pid=916347 profile=coordinator
+[2026-07-17 20:42:36] watcher died: pid=901789 profile=implementer rc=unknown; will restart
+[2026-07-17 20:42:37]   skipping restart: pid=901789 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-17 20:42:37] tracking: pid=1032995 profile=implementer
+[2026-07-17 23:29:12] watcher died: pid=916347 profile=coordinator rc=unknown; will restart
+[2026-07-17 23:29:12]   skipping restart: pid=916347 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-17 23:35:12] tracking: pid=1216082 profile=coordinator
+[2026-07-18 00:29:14] watcher died: pid=1216082 profile=coordinator rc=unknown; will restart
+[2026-07-18 00:29:14]   skipping restart: pid=1216082 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 00:46:14] watcher died: pid=1032995 profile=implementer rc=unknown; will restart
+[2026-07-18 00:46:14]   skipping restart: pid=1032995 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 00:46:14] tracking: pid=1288222 profile=implementer
+[2026-07-18 00:51:45] watcher died: pid=901754 profile=planner rc=unknown; will restart
+[2026-07-18 00:51:45]   skipping restart: pid=901754 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-18 00:51:45] watcher died: pid=901788 profile=reviewer rc=unknown; will restart
+[2026-07-18 00:51:45]   skipping restart: pid=901788 profile=reviewer is a conda wrapper (launcher manages it)
+[2026-07-18 00:51:45] watcher died: pid=901806 profile=critic rc=unknown; will restart
+[2026-07-18 00:51:45]   skipping restart: pid=901806 profile=critic is a conda wrapper (launcher manages it)
+[2026-07-18 00:51:45] watcher died: pid=903116 profile=planner rc=unknown; will restart
+[2026-07-18 00:51:50]   restarted: pid=1293511 profile=planner (attempt 1/5)
+[2026-07-18 00:51:50] watcher died: pid=903117 profile=critic rc=unknown; will restart
+[2026-07-18 00:51:55]   restarted: pid=1293518 profile=critic (attempt 1/5)
+[2026-07-18 00:51:55] watcher died: pid=1288222 profile=implementer rc=unknown; will restart
+[2026-07-18 00:51:55]   skipping restart: pid=1288222 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 00:55:17] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-18 00:55:47] tracking: pid=1295265 profile=planner
+[2026-07-18 00:55:47] tracking: pid=1295276 profile=reviewer
+[2026-07-18 00:55:47] tracking: pid=1295288 profile=critic
+[2026-07-18 00:55:47] tracking: pid=1295340 profile=implementer
+[2026-07-18 00:56:17] tracking: pid=1296829 profile=critic
+[2026-07-18 00:56:17] tracking: pid=1296830 profile=planner
+[2026-07-18 00:58:47] watcher died: pid=1295265 profile=planner rc=unknown; will restart
+[2026-07-18 00:58:47]   skipping restart: pid=1295265 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-18 00:58:47] watcher died: pid=1295276 profile=reviewer rc=unknown; will restart
+[2026-07-18 00:58:47]   skipping restart: pid=1295276 profile=reviewer is a conda wrapper (launcher manages it)
+[2026-07-18 00:58:47] watcher died: pid=1295288 profile=critic rc=unknown; will restart
+[2026-07-18 00:58:47]   skipping restart: pid=1295288 profile=critic is a conda wrapper (launcher manages it)
+[2026-07-18 00:58:47] watcher died: pid=1295340 profile=implementer rc=unknown; will restart
+[2026-07-18 00:58:47]   skipping restart: pid=1295340 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 00:58:47] watcher died: pid=1296829 profile=critic rc=unknown; will restart
+[2026-07-18 00:58:52] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-18 00:59:22] tracking: pid=1299735 profile=planner
+[2026-07-18 00:59:23] tracking: pid=1299749 profile=critic
+[2026-07-18 00:59:23] tracking: pid=1299753 profile=reviewer
+[2026-07-18 00:59:23] tracking: pid=1299855 profile=implementer
+[2026-07-18 01:00:23] tracking: pid=1301983 profile=critic
+[2026-07-18 01:00:23] tracking: pid=1301984 profile=planner
+[2026-07-18 01:01:23] watcher died: pid=1299855 profile=implementer rc=unknown; will restart
+[2026-07-18 01:01:23]   skipping restart: pid=1299855 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 01:01:23] tracking: pid=1303334 profile=coordinator
+[2026-07-18 01:06:23] tracking: pid=1308058 profile=implementer
+[2026-07-18 01:10:53] watcher died: pid=1303334 profile=coordinator rc=unknown; will restart
+[2026-07-18 01:10:53]   skipping restart: pid=1303334 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 01:44:24] watcher died: pid=1308058 profile=implementer rc=unknown; will restart
+[2026-07-18 01:44:24]   skipping restart: pid=1308058 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 01:44:24] tracking: pid=1340407 profile=implementer
+[2026-07-18 01:49:24] watcher died: pid=1340407 profile=implementer rc=unknown; will restart
+[2026-07-18 01:49:24]   skipping restart: pid=1340407 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 01:49:24] tracking: pid=1344362 profile=coordinator
+[2026-07-18 01:49:24] tracking: pid=1344740 profile=implementer
+[2026-07-18 01:53:24] watcher died: pid=1344362 profile=coordinator rc=unknown; will restart
+[2026-07-18 01:53:25]   skipping restart: pid=1344362 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 09:31:47] watcher died: pid=1299735 profile=planner rc=unknown; will restart
+[2026-07-18 09:31:47]   skipping restart: pid=1299735 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-18 09:31:47] watcher died: pid=1301984 profile=planner rc=unknown; will restart
+[2026-07-18 09:31:52]   restarted: pid=1762566 profile=planner (attempt 1/5)
+[2026-07-18 09:32:02] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-18 09:32:02] tracking: pid=1762566 profile=planner
+[2026-07-18 09:32:32] tracking: pid=1762866 profile=coordinator
+[2026-07-18 09:32:32] tracking: pid=1762883 profile=planner
+[2026-07-18 09:32:32] tracking: pid=1762897 profile=reviewer
+[2026-07-18 09:32:32] tracking: pid=1762925 profile=critic
+[2026-07-18 09:32:32] tracking: pid=1762927 profile=implementer
+[2026-07-18 09:33:02] tracking: pid=1765118 profile=critic
+[2026-07-18 09:33:02] tracking: pid=1765119 profile=planner
+[2026-07-18 10:03:03] watcher died: pid=1762927 profile=implementer rc=unknown; will restart
+[2026-07-18 10:03:03]   skipping restart: pid=1762927 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 10:03:03] tracking: pid=1800906 profile=implementer
+[2026-07-18 10:10:03] watcher died: pid=1762866 profile=coordinator rc=unknown; will restart
+[2026-07-18 10:10:03]   skipping restart: pid=1762866 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 10:10:03] tracking: pid=1808439 profile=coordinator
+[2026-07-18 10:22:34] watcher died: pid=1808439 profile=coordinator rc=unknown; will restart
+[2026-07-18 10:22:34]   skipping restart: pid=1808439 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 10:22:34] tracking: pid=1821145 profile=coordinator
+[2026-07-18 10:43:36] watcher died: pid=1762566 profile=planner rc=unknown; will restart
+[2026-07-18 10:43:41]   restarted: pid=1845284 profile=planner (attempt 1/5)
+[2026-07-18 10:43:41] watcher died: pid=1762883 profile=planner rc=unknown; will restart
+[2026-07-18 10:43:41]   skipping restart: pid=1762883 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-18 10:43:41] watcher died: pid=1762897 profile=reviewer rc=unknown; will restart
+[2026-07-18 10:43:41]   skipping restart: pid=1762897 profile=reviewer is a conda wrapper (launcher manages it)
+[2026-07-18 10:43:41] watcher died: pid=1762925 profile=critic rc=unknown; will restart
+[2026-07-18 10:43:41]   skipping restart: pid=1762925 profile=critic is a conda wrapper (launcher manages it)
+[2026-07-18 10:43:41] watcher died: pid=1765118 profile=critic rc=unknown; will restart
+[2026-07-18 10:43:46]   restarted: pid=1845389 profile=critic (attempt 1/5)
+[2026-07-18 10:43:46] watcher died: pid=1765119 profile=planner rc=unknown; will restart
+[2026-07-18 10:43:48] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-18 10:43:48] tracking: pid=1845284 profile=planner
+[2026-07-18 10:43:48] tracking: pid=1845389 profile=critic
+[2026-07-18 10:44:18] tracking: pid=1845547 profile=planner
+[2026-07-18 10:44:18] tracking: pid=1845593 profile=reviewer
+[2026-07-18 10:44:18] tracking: pid=1845626 profile=critic
+[2026-07-18 10:44:18] tracking: pid=1845684 profile=implementer
+[2026-07-18 10:44:18] tracking: pid=1845757 profile=planner
+[2026-07-18 10:44:18] tracking: pid=1845946 profile=critic
+[2026-07-18 10:44:18] tracking: pid=1846799 profile=coordinator
+[2026-07-18 10:44:48] watcher died: pid=1846799 profile=coordinator rc=unknown; will restart
+[2026-07-18 10:44:49]   skipping restart: pid=1846799 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 10:46:49] tracking: pid=1850222 profile=coordinator
+[2026-07-18 11:03:21] watcher died: pid=1845684 profile=implementer rc=unknown; will restart
+[2026-07-18 11:03:21]   skipping restart: pid=1845684 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 11:03:51] tracking: pid=1869021 profile=implementer
+[2026-07-18 11:35:48] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-18 11:36:18] tracking: pid=1899910 profile=coordinator
+[2026-07-18 11:36:18] tracking: pid=1899932 profile=planner
+[2026-07-18 11:36:18] tracking: pid=1899938 profile=reviewer
+[2026-07-18 11:36:18] tracking: pid=1899949 profile=implementer
+[2026-07-18 11:36:18] tracking: pid=1899985 profile=critic
+[2026-07-18 11:36:18] tracking: pid=1900009 profile=planner
+[2026-07-18 11:36:18] tracking: pid=1900035 profile=critic
+[2026-07-18 11:38:18] watcher died: pid=1899949 profile=implementer rc=unknown; will restart
+[2026-07-18 11:38:18]   skipping restart: pid=1899949 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 11:38:18] tracking: pid=1904305 profile=implementer
+[2026-07-18 11:46:18] tracking: pid=1912479 profile=implementer
+[2026-07-18 11:46:18] tracking: pid=1912703 profile=?
+[2026-07-18 11:46:48] watcher died: pid=1912703 profile=? rc=unknown; will restart
+[2026-07-18 11:46:54]   restarted: pid=1913461 profile=? (attempt 1/5)
+[2026-07-18 11:47:24] watcher died: pid=1904305 profile=implementer rc=unknown; will restart
+[2026-07-18 11:47:24]   skipping restart: pid=1904305 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 11:47:24] watcher died: pid=1913461 profile=? rc=unknown; will restart
+[2026-07-18 11:47:29]   restarted: pid=1914017 profile=? (attempt 2/5)
+[2026-07-18 11:47:59] watcher died: pid=1914017 profile=? rc=unknown; will restart
+[2026-07-18 11:48:04]   restarted: pid=1914557 profile=? (attempt 3/5)
+[2026-07-18 11:48:34] watcher died: pid=1912479 profile=implementer rc=unknown; will restart
+[2026-07-18 11:48:34]   skipping restart: pid=1912479 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 11:48:34] watcher died: pid=1914557 profile=? rc=unknown; will restart
+[2026-07-18 11:48:39]   restarted: pid=1915109 profile=? (attempt 4/5)
+[2026-07-18 11:48:39] tracking: pid=1915032 profile=?
+[2026-07-18 11:49:09] watcher died: pid=1915109 profile=? rc=unknown; will restart
+[2026-07-18 11:49:14]   restarted: pid=1915985 profile=? (attempt 5/5)
+[2026-07-18 11:49:14] watcher died: pid=1915032 profile=? rc=unknown; will restart
+[2026-07-18 11:49:14]   giving up on profile=?: exceeded max_restarts=5
+[2026-07-18 11:49:14] tracking: pid=1915073 profile=implementer
+[2026-07-18 11:49:44] watcher died: pid=1915985 profile=? rc=unknown; will restart
+[2026-07-18 11:49:44]   giving up on profile=?: exceeded max_restarts=5
+[2026-07-18 13:39:47] watcher died: pid=1915073 profile=implementer rc=unknown; will restart
+[2026-07-18 13:39:47]   skipping restart: pid=1915073 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 13:39:47] tracking: pid=2033749 profile=?
+[2026-07-18 13:39:47] tracking: pid=2033808 profile=implementer
+[2026-07-18 13:40:17] watcher died: pid=2033749 profile=? rc=unknown; will restart
+[2026-07-18 13:40:17]   giving up on profile=?: exceeded max_restarts=5
+[2026-07-18 14:01:47] watcher died: pid=2033808 profile=implementer rc=unknown; will restart
+[2026-07-18 14:01:47]   skipping restart: pid=2033808 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-18 14:30:48] watcher died: pid=1899910 profile=coordinator rc=unknown; will restart
+[2026-07-18 14:30:48]   skipping restart: pid=1899910 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 14:30:48] watcher died: pid=1899938 profile=reviewer rc=unknown; will restart
+[2026-07-18 14:30:48]   skipping restart: pid=1899938 profile=reviewer is a conda wrapper (launcher manages it)
+[2026-07-18 14:31:18] watcher died: pid=1899932 profile=planner rc=unknown; will restart
+[2026-07-18 14:31:18]   skipping restart: pid=1899932 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-18 14:31:18] watcher died: pid=1899985 profile=critic rc=unknown; will restart
+[2026-07-18 14:31:18]   skipping restart: pid=1899985 profile=critic is a conda wrapper (launcher manages it)
+[2026-07-18 14:31:18] watcher died: pid=1900009 profile=planner rc=unknown; will restart
+[2026-07-18 14:31:23]   restarted: pid=2081625 profile=planner (attempt 1/5)
+[2026-07-18 14:31:23] watcher died: pid=1900035 profile=critic rc=unknown; will restart
+[2026-07-18 14:31:28]   restarted: pid=2081684 profile=critic (attempt 1/5)
+[2026-07-18 14:32:58] watcher died: pid=2081625 profile=planner rc=unknown; will restart
+[2026-07-18 14:33:03]   restarted: pid=2082875 profile=planner (attempt 2/5)
+[2026-07-18 14:33:03] watcher died: pid=2081684 profile=critic rc=unknown; will restart
+[2026-07-18 14:33:08]   restarted: pid=2082953 profile=critic (attempt 2/5)
+[2026-07-18 14:34:38] watcher died: pid=2082875 profile=planner rc=unknown; will restart
+[2026-07-18 14:34:43]   restarted: pid=2084141 profile=planner (attempt 3/5)
+[2026-07-18 14:34:43] watcher died: pid=2082953 profile=critic rc=unknown; will restart
+[2026-07-18 14:34:48]   restarted: pid=2084201 profile=critic (attempt 3/5)
+[2026-07-18 14:36:18] watcher died: pid=2084141 profile=planner rc=unknown; will restart
+[2026-07-18 14:36:23]   restarted: pid=2085355 profile=planner (attempt 4/5)
+[2026-07-18 14:36:23] watcher died: pid=2084201 profile=critic rc=unknown; will restart
+[2026-07-18 14:36:28]   restarted: pid=2085415 profile=critic (attempt 4/5)
+[2026-07-18 14:37:58] watcher died: pid=2085355 profile=planner rc=unknown; will restart
+[2026-07-18 14:38:03]   restarted: pid=2086610 profile=planner (attempt 5/5)
+[2026-07-18 14:38:03] watcher died: pid=2085415 profile=critic rc=unknown; will restart
+[2026-07-18 14:38:08]   restarted: pid=2086687 profile=critic (attempt 5/5)
+[2026-07-18 14:39:38] watcher died: pid=2086610 profile=planner rc=unknown; will restart
+[2026-07-18 14:39:38]   giving up on profile=planner: exceeded max_restarts=5
+[2026-07-18 14:39:38] watcher died: pid=2086687 profile=critic rc=unknown; will restart
+[2026-07-18 14:39:38]   giving up on profile=critic: exceeded max_restarts=5
+[2026-07-18 14:47:27] tracking: pid=2093585 profile=implementer
+[2026-07-18 14:52:27] tracking: pid=2100042 profile=implementer
+[2026-07-18 18:58:04] tracking: pid=2340379 profile=coordinator
+[2026-07-18 18:58:04] tracking: pid=2340380 profile=coordinator
+[2026-07-18 18:58:34] watcher died: pid=2340379 profile=coordinator rc=unknown; will restart
+[2026-07-18 18:58:34]   skipping restart: pid=2340379 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 18:58:34] watcher died: pid=2340380 profile=coordinator rc=unknown; will restart
+[2026-07-18 18:58:34]   skipping restart: pid=2340380 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-18 18:59:34] tracking: pid=2341970 profile=implementer
+[2026-07-19 00:27:47] watcher died: pid=2093585 profile=implementer rc=unknown; will restart
+[2026-07-19 00:27:47]   skipping restart: pid=2093585 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-19 00:27:47] watcher died: pid=2100042 profile=implementer rc=unknown; will restart
+[2026-07-19 00:27:47]   skipping restart: pid=2100042 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-19 00:27:51] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 00:28:21] tracking: pid=2692609 profile=coordinator
+[2026-07-19 00:28:21] tracking: pid=2692631 profile=planner
+[2026-07-19 00:28:21] tracking: pid=2692637 profile=reviewer
+[2026-07-19 00:28:21] tracking: pid=2692656 profile=implementer
+[2026-07-19 00:28:21] tracking: pid=2692696 profile=critic
+[2026-07-19 00:28:21] tracking: pid=2692705 profile=planner
+[2026-07-19 00:28:21] tracking: pid=2692711 profile=critic
+[2026-07-19 02:01:54] watcher died: pid=2692637 profile=reviewer rc=unknown; will restart
+[2026-07-19 02:01:54]   skipping restart: pid=2692637 profile=reviewer is a conda wrapper (launcher manages it)
+[2026-07-19 02:02:24] watcher died: pid=2692631 profile=planner rc=unknown; will restart
+[2026-07-19 02:02:24]   skipping restart: pid=2692631 profile=planner is a conda wrapper (launcher manages it)
+[2026-07-19 02:02:24] watcher died: pid=2692696 profile=critic rc=unknown; will restart
+[2026-07-19 02:02:24]   skipping restart: pid=2692696 profile=critic is a conda wrapper (launcher manages it)
+[2026-07-19 02:02:24] watcher died: pid=2692705 profile=planner rc=unknown; will restart
+[2026-07-19 02:02:29]   restarted: pid=2783709 profile=planner (attempt 1/5)
+[2026-07-19 02:02:29] watcher died: pid=2692711 profile=critic rc=unknown; will restart
+[2026-07-19 02:02:34]   restarted: pid=2783787 profile=critic (attempt 1/5)
+[2026-07-19 02:03:34] watcher died: pid=2783709 profile=planner rc=unknown; will restart
+[2026-07-19 02:03:39]   restarted: pid=2784891 profile=planner (attempt 2/5)
+[2026-07-19 02:04:09] watcher died: pid=2783787 profile=critic rc=unknown; will restart
+[2026-07-19 02:04:14]   restarted: pid=2785716 profile=critic (attempt 2/5)
+[2026-07-19 02:04:44] watcher died: pid=2784891 profile=planner rc=unknown; will restart
+[2026-07-19 02:04:49]   restarted: pid=2786380 profile=planner (attempt 3/5)
+[2026-07-19 02:05:19] watcher died: pid=2785716 profile=critic rc=unknown; will restart
+[2026-07-19 02:05:24]   restarted: pid=2786926 profile=critic (attempt 3/5)
+[2026-07-19 02:05:54] watcher died: pid=2692609 profile=coordinator rc=unknown; will restart
+[2026-07-19 02:05:54]   skipping restart: pid=2692609 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-19 02:05:54] watcher died: pid=2692656 profile=implementer rc=unknown; will restart
+[2026-07-19 02:05:54]   skipping restart: pid=2692656 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-19 02:05:54] watcher died: pid=2786380 profile=planner rc=unknown; will restart
+[2026-07-19 02:05:59]   restarted: pid=2787655 profile=planner (attempt 4/5)
+[2026-07-19 02:05:59] watcher died: pid=2786926 profile=critic rc=unknown; will restart
+[2026-07-19 02:06:04]   restarted: pid=2787726 profile=critic (attempt 4/5)
+[2026-07-19 02:06:04] tracking: pid=2787076 profile=coordinator
+[2026-07-19 02:06:04] tracking: pid=2787093 profile=implementer
+[2026-07-19 02:07:34] watcher died: pid=2787726 profile=critic rc=unknown; will restart
+[2026-07-19 02:07:39]   restarted: pid=2789546 profile=critic (attempt 5/5)
+[2026-07-19 02:10:09] watcher died: pid=2787655 profile=planner rc=unknown; will restart
+[2026-07-19 02:10:14]   restarted: pid=2792059 profile=planner (attempt 5/5)
+[2026-07-19 02:10:14] watcher died: pid=2789546 profile=critic rc=unknown; will restart
+[2026-07-19 02:10:14]   giving up on profile=critic: exceeded max_restarts=5
+[2026-07-19 02:11:44] watcher died: pid=2792059 profile=planner rc=unknown; will restart
+[2026-07-19 02:11:44]   giving up on profile=planner: exceeded max_restarts=5
+[2026-07-19 02:16:14] watcher died: pid=2787076 profile=coordinator rc=unknown; will restart
+[2026-07-19 02:16:14]   skipping restart: pid=2787076 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-19 02:16:14] watcher died: pid=2787093 profile=implementer rc=unknown; will restart
+[2026-07-19 02:16:14]   skipping restart: pid=2787093 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-19 02:16:14] tracking: pid=2798199 profile=implementer
+[2026-07-19 02:16:14] tracking: pid=2798200 profile=coordinator
+[2026-07-19 02:20:52] supervisor not found, restarting...
+[2026-07-19 02:20:52] restarted: pid=2803724
+[2026-07-19 02:20:53] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 02:20:53] tracking: pid=2798199 profile=implementer
+[2026-07-19 02:20:53] tracking: pid=2798200 profile=coordinator
+[2026-07-19 02:21:23] tracking: pid=2804168 profile=planner
+[2026-07-19 02:21:23] tracking: pid=2804222 profile=critic
+[2026-07-19 02:21:23] tracking: pid=2804250 profile=reviewer
+[2026-07-19 02:21:53] watcher died: pid=2798200 profile=coordinator rc=unknown; will restart
+[2026-07-19 02:21:53]   skipping restart: pid=2798200 profile=coordinator is a conda wrapper (launcher manages it)
+[2026-07-19 02:22:23] watcher died: pid=2798199 profile=implementer rc=unknown; will restart
+[2026-07-19 02:22:23]   skipping restart: pid=2798199 profile=implementer is a conda wrapper (launcher manages it)
+[2026-07-19 02:26:37] supervisor not found, restarting...
+[2026-07-19 02:26:37] restarted: pid=2811837
+[2026-07-19 02:26:37] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 02:26:37] tracking: pid=2804168 profile=planner
+[2026-07-19 02:26:37] tracking: pid=2804222 profile=critic
+[2026-07-19 02:26:37] tracking: pid=2804250 profile=reviewer
+[2026-07-19 02:27:07] tracking: pid=2812044 profile=implementer
+[2026-07-19 02:27:07] tracking: pid=2812089 profile=coordinator
+[2026-07-19 02:28:07] watcher died: pid=2812044 profile=implementer rc=unknown; will restart
+[2026-07-19 02:28:12]   restarted: pid=2814069 profile=implementer (attempt 1/5)
+[2026-07-19 02:28:12] tracking: pid=2813666 profile=?
+[2026-07-19 02:28:42] watcher died: pid=2813666 profile=? rc=unknown; will restart
+[2026-07-19 02:28:47]   restarted: pid=2814834 profile=? (attempt 1/5)
+[2026-07-19 02:29:47] watcher died: pid=2814834 profile=? rc=unknown; will restart
+[2026-07-19 02:29:52]   restarted: pid=2816061 profile=? (attempt 2/5)
+[2026-07-19 02:30:52] watcher died: pid=2816061 profile=? rc=unknown; will restart
+[2026-07-19 02:30:57]   restarted: pid=2817460 profile=? (attempt 3/5)
+[2026-07-19 02:31:57] watcher died: pid=2817460 profile=? rc=unknown; will restart
+[2026-07-19 02:32:02]   restarted: pid=2818822 profile=? (attempt 4/5)
+[2026-07-19 02:33:02] watcher died: pid=2818822 profile=? rc=unknown; will restart
+[2026-07-19 02:33:07]   restarted: pid=2820398 profile=? (attempt 5/5)
+[2026-07-19 02:34:07] watcher died: pid=2820398 profile=? rc=unknown; will restart
+[2026-07-19 02:34:07]   giving up on profile=?: exceeded max_restarts=5
+[2026-07-19 09:27:19] tracking: pid=3278550 profile=implementer
+[2026-07-19 10:49:51] watcher died: pid=3278550 profile=implementer rc=unknown; will restart
+[2026-07-19 10:49:56]   restarted: pid=3376693 profile=implementer (attempt 2/5)
+[2026-07-19 10:50:26] tracking: pid=3376949 profile=implementer
+[2026-07-19 11:03:27] tracking: pid=3391491 profile=coordinator
+[2026-07-19 11:06:57] watcher died: pid=3376949 profile=implementer rc=unknown; will restart
+[2026-07-19 11:07:02]   restarted: pid=3395648 profile=implementer (attempt 3/5)
+[2026-07-19 11:07:02] watcher died: pid=3391491 profile=coordinator rc=unknown; will restart
+[2026-07-19 11:07:07]   restarted: pid=3395741 profile=coordinator (attempt 1/5)
+[2026-07-19 11:07:07] tracking: pid=3395436 profile=implementer
+[2026-07-19 11:07:37] tracking: pid=3395858 profile=coordinator
+[2026-07-19 04:22:54] supervisor not found, restarting...
+[2026-07-19 04:22:54] restarted: pid=3483388
+[2026-07-19 04:22:54] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 04:22:54] tracking: pid=2804168 profile=planner
+[2026-07-19 04:22:54] tracking: pid=2804222 profile=critic
+[2026-07-19 04:22:54] tracking: pid=2804250 profile=reviewer
+[2026-07-19 04:22:54] tracking: pid=3482780 profile=implementer
+[2026-07-19 04:22:54] tracking: pid=3482903 profile=coordinator
+[2026-07-19 04:22:54] tracking: pid=3483380 profile=?
+[2026-07-19 04:23:24] watcher died: pid=3483380 profile=? rc=unknown; will restart
+[2026-07-19 04:23:29]   restarted: pid=3484056 profile=? (attempt 1/5)
+[2026-07-19 04:23:59] watcher died: pid=3484056 profile=? rc=unknown; will restart
+[2026-07-19 04:24:04]   restarted: pid=3484710 profile=? (attempt 2/5)
+[2026-07-19 04:24:34] watcher died: pid=3484710 profile=? rc=unknown; will restart
+[2026-07-19 04:24:39]   restarted: pid=3485318 profile=? (attempt 3/5)
+[2026-07-19 04:25:09] watcher died: pid=3485318 profile=? rc=unknown; will restart
+[2026-07-19 04:25:14]   restarted: pid=3485949 profile=? (attempt 4/5)
+[2026-07-19 04:25:44] watcher died: pid=3485949 profile=? rc=unknown; will restart
+[2026-07-19 04:25:49]   restarted: pid=3486660 profile=? (attempt 5/5)
+[2026-07-19 04:26:19] watcher died: pid=3486660 profile=? rc=unknown; will restart
+[2026-07-19 04:26:19]   giving up on profile=?: exceeded max_restarts=5
+[2026-07-19 09:58:26] watcher died: pid=3482903 profile=coordinator rc=unknown; will restart
+[2026-07-19 09:58:32]   restarted: pid=3791015 profile=coordinator (attempt 1/5)
+[2026-07-19 09:58:32] tracking: pid=3790904 profile=coordinator
+[2026-07-19 09:59:02] watcher died: pid=3790904 profile=coordinator rc=unknown; will restart
+[2026-07-19 09:59:07]   restarted: pid=3791533 profile=coordinator (attempt 2/5)
+[2026-07-19 10:18:07] tracking: pid=3811234 profile=coordinator
+[2026-07-19 19:09:04] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 19:09:04] tracking: pid=2804168 profile=planner
+[2026-07-19 19:09:04] tracking: pid=2804222 profile=critic
+[2026-07-19 19:09:04] tracking: pid=2804250 profile=reviewer
+[2026-07-19 19:09:05] tracking: pid=3482780 profile=implementer
+[2026-07-19 19:09:05] tracking: pid=3811234 profile=coordinator
+[2026-07-19 19:17:07] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 19:17:07] tracking: pid=2804168 profile=planner
+[2026-07-19 19:17:07] tracking: pid=2804222 profile=critic
+[2026-07-19 19:17:07] tracking: pid=2804250 profile=reviewer
+[2026-07-19 19:17:07] tracking: pid=3482780 profile=implementer
+[2026-07-19 19:17:07] tracking: pid=3811234 profile=coordinator
+[2026-07-19 22:37:12] watcher died: pid=3811234 profile=coordinator rc=unknown; will restart
+[2026-07-19 22:37:17]   restarted: pid=4069559 profile=coordinator (attempt 1/5)
+[2026-07-19 22:37:47] watcher died: pid=3482780 profile=implementer rc=unknown; will restart
+[2026-07-19 22:37:47]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-19 22:37:47] tracking: pid=4069454 profile=coordinator
+[2026-07-19 22:37:47] tracking: pid=4069938 profile=implementer
+[2026-07-19 22:37:49] stopped duplicate supervisor watcher: pid=4069559 board=egomotion4d profile=coordinator pane=4
+[2026-07-19 23:27:47] supervisor started: session=kanban-egomotion4d poll=30.0s
+[2026-07-19 23:28:17] tracking: pid=4117610 profile=coordinator
+[2026-07-19 23:28:17] tracking: pid=4117627 profile=planner
+[2026-07-19 23:28:17] tracking: pid=4117649 profile=reviewer
+[2026-07-19 23:28:17] tracking: pid=4117673 profile=implementer
+[2026-07-19 23:28:17] tracking: pid=4117704 profile=critic
+[2026-07-19 23:28:17] tracking: pid=4117745 profile=planner
+[2026-07-19 23:28:17] tracking: pid=4117753 profile=critic
+[2026-07-20 17:46:19] watcher died: pid=4117673 profile=implementer rc=unknown; will restart
+[2026-07-20 17:46:24]   restarted: pid=1100271 profile=implementer (attempt 1/5)
+[2026-07-20 17:46:54] tracking: pid=1100128 profile=implementer
+[2026-07-20 17:46:56] stopped duplicate supervisor watcher: pid=1100271 board=egomotion4d profile=implementer pane=1
+[2026-07-20 18:20:57] watcher died: pid=1100128 profile=implementer rc=unknown; will restart
+[2026-07-20 18:20:57]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-20 18:20:57] tracking: pid=1133924 profile=implementer
+[2026-07-20 18:25:27] watcher died: pid=4117610 profile=coordinator rc=unknown; will restart
+[2026-07-20 18:25:27]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-20 18:25:27] tracking: pid=1138639 profile=coordinator
+[2026-07-21 11:04:27] watcher died: pid=1138639 profile=coordinator rc=unknown; will restart
+[2026-07-21 11:04:27]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-21 11:04:27] tracking: pid=2179401 profile=coordinator
+[2026-07-21 11:04:57] watcher died: pid=1133924 profile=implementer rc=unknown; will restart
+[2026-07-21 11:04:57]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-21 11:04:57] tracking: pid=2179783 profile=implementer
+[2026-07-21 11:21:58] watcher died: pid=2179783 profile=implementer rc=unknown; will restart
+[2026-07-21 11:21:58]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-21 11:21:58] tracking: pid=2194049 profile=implementer
+[2026-07-21 12:01:29] watcher died: pid=2194049 profile=implementer rc=unknown; will restart
+[2026-07-21 12:01:29]   skipping restart: profile=implementer already has a live watcher for the same board/session/pane
+[2026-07-21 12:01:29] tracking: pid=2231598 profile=implementer
+[2026-07-21 14:17:03] watcher died: pid=2179401 profile=coordinator rc=unknown; will restart
+[2026-07-21 14:17:08]   restarted: pid=2369650 profile=coordinator (attempt 1/5)
+[2026-07-21 14:18:08] tracking: pid=2370209 profile=coordinator
+[2026-07-21 14:18:10] stopped duplicate supervisor watcher: pid=2369650 board=egomotion4d profile=coordinator pane=4
+[2026-07-21 15:58:43] watcher died: pid=2370209 profile=coordinator rc=unknown; will restart
+[2026-07-21 15:58:44]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-21 15:58:44] tracking: pid=2518979 profile=coordinator
+[2026-07-21 23:21:57] watcher died: pid=2518979 profile=coordinator rc=unknown; will restart
+[2026-07-21 23:21:57]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-21 23:21:57] tracking: pid=3009559 profile=coordinator
+[2026-07-22 09:12:45] watcher died: pid=3009559 profile=coordinator rc=unknown; will restart
+[2026-07-22 09:12:45]   skipping restart: profile=coordinator already has a live watcher for the same board/session/pane
+[2026-07-22 09:12:45] tracking: pid=3635772 profile=coordinator

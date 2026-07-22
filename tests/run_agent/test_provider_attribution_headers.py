@@ -43,6 +43,25 @@ def test_routermint_base_url_applies_user_agent_header(mock_openai):
 
 
 @patch("run_agent.OpenAI")
+def test_cch_base_url_applies_codex_user_agent(mock_openai):
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://cch.jmadas.com/v1",
+        model="gpt-5.6",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    agent._apply_client_headers_for_base_url("https://cch.jmadas.com/v1")
+
+    assert agent._client_kwargs["default_headers"] == {
+        "User-Agent": "openai-codex/0.121.0",
+    }
+
+
+@patch("run_agent.OpenAI")
 def test_nvidia_cloud_base_url_applies_billing_origin_header(mock_openai):
     mock_openai.return_value = MagicMock()
     agent = AIAgent(

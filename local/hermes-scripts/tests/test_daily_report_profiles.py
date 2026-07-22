@@ -56,6 +56,46 @@ def test_hermes_model_usage_aggregates_default_and_profile_state_dbs(tmp_path):
     assert by_profile['planner']['input_tokens'] == 300
 
 
+def test_hermes_model_usage_prefers_per_call_agent_log_over_startup_model(tmp_path):
+    mod = load_module('daily_report_per_call_model')
+    start = datetime(2026, 5, 18, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 19, 0, 0, tzinfo=timezone.utc)
+    inside_window = datetime(2026, 5, 18, 3, 0, tzinfo=timezone.utc).timestamp()
+
+    mod.HERMES_HOME = tmp_path
+    mod.STATE_DB = tmp_path / 'state.db'
+    mod.PROFILE_DIR = tmp_path / 'profiles'
+    make_state_db(
+        mod.STATE_DB,
+        session_id='default-session',
+        model='startup-model',
+        msg_ts=inside_window,
+        started_at=inside_window,
+        calls=1,
+        input_tokens=999,
+    )
+    agent_log = tmp_path / 'logs' / 'agent.log'
+    agent_log.parent.mkdir()
+    agent_log.write_text(
+        '2026-05-18 03:00:00 [abc123] API call #1: '
+        'model=actual-per-call-model provider=openai in=100 out=20 '
+        'total=120 latency=0.1s cache=30/0\n',
+        encoding='utf-8',
+    )
+
+    assert mod.hermes_model_usage(start, end) == [{
+        'profile': 'default',
+        'model': 'actual-per-call-model',
+        'sessions': 1,
+        'turns': 0,
+        'calls': 1,
+        'input_tokens': 100,
+        'cache_read_tokens': 30,
+        'cache_write_tokens': 0,
+        'output_tokens': 20,
+    }]
+
+
 def test_mental_model_rows_report_exact_readiness_and_window_change(tmp_path):
     mod = load_module('daily_report_models')
     registry = {
