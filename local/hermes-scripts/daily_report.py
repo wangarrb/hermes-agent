@@ -450,25 +450,39 @@ def parse_codex_usage(target_date: str) -> dict | None:
     token_count events carry per-session cumulative totals. Different sessions
     have independent counters starting from 0, so we must compute deltas per-session
     first, then sum across sessions for the target date.
+
+    Returns a dict with per-source breakdown:
+      {
+        'sources': {
+            'Codex': {'input': N, 'cached': N, 'output': N},
+            'CodeWhale': {'input': N, 'cached': N, 'output': N},
+            'Codex(kanban)': {'input': N, 'cached': N, 'output': N},
+        },
+        'total': {'input': N, 'cached': N, 'output': N},
+      }
     """
     codex_base = Path('/home/wyr/.codex/sessions')
     cw_base = Path('/home/wyr/.codewhale/sessions')
     codex_kanban_base = Path('/home/wyr/.codex-kanban')
-    all_session_files = []
 
-    # Collect from Codex global sessions, CodeWhale sessions, and
-    # per-role Codex kanban sessions (start-kanban.sh uses per-role CODEX_HOME)
-    scan_dirs = [codex_base, cw_base]
+    # Map each scan dir to a source label
+    source_dirs: list[tuple[str, Path]] = [
+        ('Codex', codex_base),
+        ('CodeWhale', cw_base),
+    ]
     if codex_kanban_base.exists():
         for role_dir in sorted(codex_kanban_base.iterdir()):
             role_sessions = role_dir / 'sessions'
             if role_sessions.is_dir():
-                scan_dirs.append(role_sessions)
+                source_dirs.append(('Codex(kanban)', role_sessions))
 
-    for base in scan_dirs:
+    # Collect per-session first/last token_count per date, per source
+    # key = (source, session_file, date)
+    session_date_entries: dict[tuple, dict] = {}
+
+    for source_label, base in source_dirs:
         if not base.exists():
             continue
-        # Scan all available year/month/day dirs
         for year_dir in sorted(base.glob('2026/*')):
             if not year_dir.is_dir():
                 continue
@@ -476,67 +490,71 @@ def parse_codex_usage(target_date: str) -> dict | None:
                 if not day_dir.is_dir():
                     continue
                 for session_file in day_dir.glob('rollout-*.jsonl'):
-                    all_session_files.append(session_file)
-
-    # Collect per-session first/last token_count per date
-    session_date_entries: dict[tuple, dict] = {}
-
-    for session_file in all_session_files:
-        try:
-            with open(session_file) as f:
-                for line in f:
                     try:
-                        d = json.loads(line)
-                        ts = d.get('timestamp', '')
-                        if not ts or ts[:10] < '2026-05-01':
-                            continue
-                        if d.get('type') == 'event_msg':
-                            payload = d.get('payload', {})
-                            if isinstance(payload, dict) and payload.get('type') == 'token_count':
-                                info = payload.get('info', {})
-                                total = info.get('total_token_usage', {})
-                                date = ts[:10]
-                                entry = {
-                                    'input': total.get('input_tokens', 0),
-                                    'cached': total.get('cached_input_tokens', 0),
-                                    'output': total.get('output_tokens', 0),
-                                }
-                                key = (str(session_file), date)
-                                if key not in session_date_entries:
-                                    session_date_entries[key] = {'first': entry, 'last': entry}
-                                else:
-                                    session_date_entries[key]['last'] = entry
+                        with open(session_file) as f:
+                            for line in f:
+                                try:
+                                    d = json.loads(line)
+                                    ts = d.get('timestamp', '')
+                                    if not ts or ts[:10] < '2026-05-01':
+                                        continue
+                                    if d.get('type') == 'event_msg':
+                                        payload = d.get('payload', {})
+                                        if isinstance(payload, dict) and payload.get('type') == 'token_count':
+                                            info = payload.get('info', {})
+                                            total = info.get('total_token_usage', {})
+                                            date = ts[:10]
+                                            entry = {
+                                                'input': total.get('input_tokens', 0),
+                                                'cached': total.get('cached_input_tokens', 0),
+                                                'output': total.get('output_tokens', 0),
+                                            }
+                                            key = (source_label, str(session_file), date)
+                                            if key not in session_date_entries:
+                                                session_date_entries[key] = {'first': entry, 'last': entry}
+                                            else:
+                                                session_date_entries[key]['last'] = entry
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
-        except Exception:
-            pass
-
-    total_input = 0
-    total_cached = 0
-    total_output = 0
-    found_any = False
 
     from datetime import datetime, timedelta
     target_dt = datetime.strptime(target_date, '%Y-%m-%d')
     prev_date = (target_dt - timedelta(days=1)).strftime('%Y-%m-%d')
-    for (sf, date), entries in session_date_entries.items():
+
+    sources: dict[str, dict[str, int]] = {}
+    found_any = False
+
+    for (source_label, _sf, date), entries in session_date_entries.items():
         if date not in (target_date, prev_date):
             continue
         found_any = True
         first = entries['first']
         last = entries['last']
-        total_input += last['input'] - first['input']
-        total_cached += last['cached'] - first['cached']
-        total_output += last['output'] - first['output']
+        d_input = last['input'] - first['input']
+        d_cached = last['cached'] - first['cached']
+        d_output = last['output'] - first['output']
+        if source_label not in sources:
+            sources[source_label] = {'input': 0, 'cached': 0, 'output': 0}
+        sources[source_label]['input'] += d_input
+        sources[source_label]['cached'] += d_cached
+        sources[source_label]['output'] += d_output
 
     if not found_any:
         return None
 
-    return {
-        'input': total_input - total_cached,
-        'cached': total_cached,
-        'output': total_output,
-    }
+    total = {'input': 0, 'cached': 0, 'output': 0}
+    for s in sources.values():
+        total['input'] += s['input']
+        total['cached'] += s['cached']
+        total['output'] += s['output']
+    # net input = total input - cached (same as before)
+    for s in sources.values():
+        s['input'] = s['input'] - s['cached']
+    total['input'] = total['input'] - total['cached']
+
+    return {'sources': sources, 'total': total}
 
 
 def docker_env() -> dict[str, str]:
@@ -892,12 +910,23 @@ def main() -> int:
     codex_usage = parse_codex_usage(report_date_str)
     if codex_usage:
         print("注：输入(增量) = 真实新输入 = prompt - cache；Cache读为累计 cached_input_tokens。")
-        print_table(
-            ["来源", "输入", "Cache读", "输出"],
-            [
-                ["Codex + CodeWhale", fmt_tok(codex_usage['input']), fmt_tok(codex_usage['cached']), fmt_tok(codex_usage['output'])],
-            ],
-        )
+        rows = []
+        for source_label, stats in codex_usage['sources'].items():
+            rows.append([
+                source_label,
+                fmt_tok(stats['input']),
+                fmt_tok(stats['cached']),
+                fmt_tok(stats['output']),
+            ])
+        # Add total row
+        t = codex_usage['total']
+        rows.append([
+            "合计",
+            fmt_tok(t['input']),
+            fmt_tok(t['cached']),
+            fmt_tok(t['output']),
+        ])
+        print_table(["来源", "输入", "Cache读", "输出"], rows)
     else:
         print("未采集到外部 CLI Agent 调用记录。")
     print()
@@ -927,6 +956,26 @@ def main() -> int:
     print()
 
     print("【Hindsight LLM 用量（日志可见精确值；容器重建前日志可能无法回溯）】")
+    # Check if docker logs cover the full reporting window
+    _container_started_str = ""
+    try:
+        _cs_code, _cs_out, _ = run("docker inspect hindsight --format '{{.State.StartedAt}}'", timeout=10)
+        if _cs_code == 0 and _cs_out.strip():
+            _container_started_str = _cs_out.strip()
+    except Exception:
+        pass
+    if _container_started_str:
+        try:
+            from datetime import datetime as _dt
+            _cst = _dt.fromisoformat(_container_started_str).astimezone(now.tzinfo)
+            if _cst > start:
+                _gap = _cst - start
+                _gap_h = int(_gap.total_seconds() // 3600)
+                _gap_m = int((_gap.total_seconds() % 3600) // 60)
+                print(f"⚠️ 容器于 {_cst.strftime('%Y-%m-%d %H:%M')} 启动，晚于统计窗口起点 {start.strftime('%m-%d %H:%M')}，"
+                      f"缺 {_gap_h}h{_gap_m}m 日志（LLM 用量偏少）。")
+        except Exception:
+            pass
     if llm_usage:
         print_table(
             ["模型", "scope", "调用", "输入", "输出", "总tokens", "耗时"],
