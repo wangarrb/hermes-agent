@@ -398,7 +398,23 @@ def _assist_candidate_ready(conn, args: argparse.Namespace, task: kb.Task,
 
 def _select_ready_candidate(conn, args: argparse.Namespace, *, default_profile: str = "implementer") -> kb.Task | None:
     policy = worker_runtime.claim_policy_from_args(args, default_profile=default_profile)
-    return worker_runtime.select_ready_candidate(conn, policy=policy)
+    for assignee in policy.claim_assignees:
+        ready = kb.list_tasks(
+            conn,
+            assignee=assignee,
+            status="ready",
+            limit=worker_runtime.listener_policy.READY_TASK_SCAN_LIMIT,
+        )
+        for task in ready:
+            if not kb.role_policy_candidate_allowed(
+                conn, task, actor_role=policy.profile,
+            ):
+                continue
+            if worker_runtime.assist_candidate_ready(
+                conn, policy=policy, task=task, assignee=assignee,
+            ):
+                return task
+    return None
 
 
 # ──────────────────────────────────────────────

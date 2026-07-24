@@ -940,6 +940,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- role-policy ---
+    p_role_policy = sub.add_parser(
+        "role-policy",
+        help="Activate and inspect a board-scoped role lifecycle policy",
+    )
+    role_policy_sub = p_role_policy.add_subparsers(dest="role_policy_action")
+    p_role_policy_activate = role_policy_sub.add_parser(
+        "activate",
+        help="Atomically bind a validated role policy to the current board",
+    )
+    p_role_policy_activate.add_argument("path")
+    p_role_policy_activate.add_argument("--json", action="store_true")
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -1074,6 +1087,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "context":  _cmd_context,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
+            "role-policy": _cmd_role_policy,
             "gc":       _cmd_gc,
         }
         handler = handlers.get(action)
@@ -1366,6 +1380,26 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
     )
+    return 0
+
+
+def _cmd_role_policy(args: argparse.Namespace) -> int:
+    action = getattr(args, "role_policy_action", None)
+    if action != "activate":
+        print("kanban role-policy: expected `activate <path>`", file=sys.stderr)
+        return 2
+    metadata = kb.activate_board_role_policy(
+        getattr(args, "board", None),
+        args.path,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            "Activated role policy "
+            f"{metadata['role_policy_path']} "
+            f"(sha256={metadata['role_policy_content_sha']})"
+        )
     return 0
 
 

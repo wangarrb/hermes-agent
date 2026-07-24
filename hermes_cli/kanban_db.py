@@ -92,6 +92,7 @@ from typing import Any, Iterable, Optional
 from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli import kanban_reservations as reservations
 from hermes_cli import kanban_delivery as delivery
+from hermes_cli import kanban_role_policy as role_policy
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -711,6 +712,82 @@ def write_board_metadata(
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def activate_board_role_policy(
+    board: Optional[str],
+    policy_path: Path | str,
+) -> dict[str, Any]:
+    """Validate and atomically bind one role policy to a board."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    policy = role_policy.load_role_policy(policy_path)
+    metadata = role_policy.activated_metadata(read_board_metadata(slug), policy)
+    if not metadata.get("created_at"):
+        metadata["created_at"] = int(time.time())
+    path = board_metadata_path(slug)
+    role_policy.atomic_write_metadata(path, metadata)
+    return read_board_metadata(slug)
+
+
+def enforced_board_role_policy(
+    board: Optional[str] = None,
+) -> Optional[role_policy.RolePolicy]:
+    slug = _normalize_board_slug(board) or get_current_board()
+    return role_policy.enforced_policy_from_metadata(read_board_metadata(slug))
+
+
+def assert_role_policy_operation(
+    conn: sqlite3.Connection,
+    operation: str,
+    *,
+    task_ids: Iterable[str] = (),
+    target_roles: Iterable[Optional[str]] = (),
+    actor_role: Optional[str] = None,
+    board: Optional[str] = None,
+) -> None:
+    """Central guard shared by DB mutations, CLI, and listeners."""
+    policy = enforced_board_role_policy(board)
+    if policy is None:
+        return
+    roles = list(target_roles)
+    ids = tuple(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT assignee FROM tasks WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        roles.extend(row["assignee"] for row in rows)
+    resolved_actor = actor_role
+    if resolved_actor is None:
+        resolved_actor = (
+            os.environ.get("HERMES_PROFILE_NAME")
+            or os.environ.get("HERMES_PROFILE")
+        )
+    role_policy.assert_operation_allowed(
+        policy,
+        operation,
+        actor_role=resolved_actor,
+        target_roles=roles,
+    )
+
+
+def role_policy_candidate_allowed(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    actor_role: Optional[str] = None,
+) -> bool:
+    try:
+        assert_role_policy_operation(
+            conn,
+            "claim",
+            task_ids=(task.id,),
+            actor_role=actor_role,
+        )
+    except role_policy.RolePolicyDenied:
+        return False
+    return True
 
 
 def create_board(
@@ -2707,6 +2784,9 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    assert_role_policy_operation(
+        conn, "create", target_roles=(assignee,), actor_role=created_by,
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3080,6 +3160,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    assert_role_policy_operation(
+        conn, "assign", task_ids=(task_id,), target_roles=(profile,),
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -3111,6 +3194,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # ---------------------------------------------------------------------------
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+    assert_role_policy_operation(
+        conn, "link", task_ids=(parent_id, child_id),
+    )
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -3166,6 +3252,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    assert_role_policy_operation(
+        conn, "unlink", task_ids=(parent_id, child_id),
+    )
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -3311,6 +3400,9 @@ def return_task_for_rework(
         raise ValueError("return-for-rework actor is required")
     if not reason:
         raise ValueError("return-for-rework reason is required")
+    assert_role_policy_operation(
+        conn, "return-for-rework", task_ids=(task_id,), actor_role=actor,
+    )
 
     initial = get_task(conn, task_id)
     if initial is None or initial.status == "archived":
@@ -3648,6 +3740,14 @@ def ack_control_message(
 ) -> bool:
     """Idempotently ACK a control and release its root after final ACK."""
     receiver = (receiver or "").strip() or "unknown"
+    policy_row = conn.execute(
+        "SELECT task_id FROM task_control_messages WHERE id = ?",
+        (int(control_id),),
+    ).fetchone()
+    if policy_row is not None:
+        assert_role_policy_operation(
+            conn, "control", task_ids=(policy_row["task_id"],),
+        )
     now = int(time.time())
     released_roots: list[str] = []
     with write_txn(conn):
@@ -3738,6 +3838,9 @@ def add_comment(
     expected_generation: Optional[int] = None,
     expected_claim_lock: Optional[str] = None,
 ) -> int:
+    assert_role_policy_operation(
+        conn, "comment", task_ids=(task_id,), actor_role=author,
+    )
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -4638,6 +4741,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        assert_role_policy_operation(
+            conn, "claim", task_ids=(task_id,), actor_role=claimer,
+        )
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4823,6 +4929,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        assert_role_policy_operation(
+            conn, "claim", task_ids=(task_id,), actor_role=claimer,
+        )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5353,6 +5462,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    assert_role_policy_operation(conn, "complete", task_ids=(task_id,))
     task_before = get_task(conn, task_id)
     if task_before is None:
         return False
@@ -6046,6 +6156,7 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    assert_role_policy_operation(conn, "edit", task_ids=(task_id,))
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
@@ -6140,6 +6251,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    assert_role_policy_operation(conn, "block", task_ids=(task_id,))
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -6404,6 +6516,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    assert_role_policy_operation(conn, "unblock", task_ids=(task_id,))
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -6775,6 +6888,7 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    assert_role_policy_operation(conn, "archive", task_ids=(task_id,))
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
