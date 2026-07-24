@@ -16,7 +16,7 @@ ROLE_PANE_MAP = {
     "planner":     "terminal_0",
     "implementer": "terminal_1",
     "reviewer":    "terminal_2",
-    "critic":      "terminal_3",
+    "designer":    "terminal_3",
     "coordinator": "terminal_4",
 }
 
