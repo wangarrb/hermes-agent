@@ -52,9 +52,10 @@ import re
 board = os.environ.get("BOARD_FILTER", "")
 self_pid = os.getpid()
 
-roles = {"coordinator", "planner", "implementer", "critic", "reviewer"}
-hermes_re = re.compile(r"\bhermes\b.*\s-p\s+(coordinator|planner|implementer|critic|reviewer)\b")
+roles = {"coordinator", "planner", "implementer", "designer", "reviewer"}
+hermes_re = re.compile(r"\bhermes\b.*\s-p\s+(coordinator|planner|implementer|designer|reviewer)\b")
 listener_re = re.compile(r"(codex-kanban-interactive|codex_kanban_interactive\.py|codex-kanban-listen|codex_kanban_listener\.py|codewhale-kanban-interactive|codewhale_kanban_interactive\.py|deepseek-kanban-interactive|deepseek_kanban_interactive\.py|deepseek-kanban-listen|deepseek_kanban_listener\.py|reasonix-kanban-interactive|reasonix_kanban_interactive\.py|claude-kanban-interactive|claude_kanban_interactive\.py)")
+profile_arg_re = re.compile(r"(?:--profile(?:=|\s+)|\s-p\s+)([A-Za-z0-9._-]+)(?=\s|$)")
 board_arg_re = re.compile(r"(?:--board(?:=|\s+)|HERMES_KANBAN_BOARD=)" + re.escape(board) + r"(?=\s|$)") if board else None
 
 def read_cmd(pid: int) -> str:
@@ -105,7 +106,11 @@ for name in os.listdir("/proc"):
             reason = "hermes-kanban-profile"
     elif listener_re.search(cmd):
         env = read_env(pid)
-        if board_matches(cmd, env):
+        profile = env.get("HERMES_KANBAN_PROFILE", "")
+        profile_match = profile_arg_re.search(cmd)
+        if not profile and profile_match:
+            profile = profile_match.group(1)
+        if profile in roles and board_matches(cmd, env):
             reason = "kanban-listener"
     else:
         env = read_env(pid)
