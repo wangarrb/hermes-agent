@@ -156,7 +156,9 @@ def test_missing_review_blocks_implementer_but_not_designer(kanban_home, tmp_pat
             kb.complete_task(conn, implementer_id, metadata={"task_type": "code"})
 
         designer_id = kb.create_task(
-            conn, title="direct design implementation", assignee="designer"
+            conn, title="direct design implementation", assignee="designer",
+            workspace_kind="worktree", workspace_path=str(tmp_path / "designer-wt"),
+            base_commit="a" * 40, branch_name="designer/test",
         )
         assert kb.complete_task(conn, designer_id, metadata={"task_type": "code"})
 

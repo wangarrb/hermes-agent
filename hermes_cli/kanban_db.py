@@ -2790,6 +2790,25 @@ def create_task(
     )
     if not title or not title.strip():
         raise ValueError("title is required")
+    # Designer tasks require explicit worktree isolation to prevent cross-workspace
+    # contamination. base_commit anchors sync target; workspace_path must be the
+    # designer worktree, not the main repo.
+    if assignee == "designer":
+        if workspace_kind != "worktree":
+            raise ValueError(
+                "designer tasks require workspace_kind=worktree, "
+                f"got {workspace_kind!r}; use dir/scratch only for non-designer review tasks"
+            )
+        if not base_commit:
+            raise ValueError(
+                "designer tasks require explicit base_commit (main repo HEAD SHA); "
+                "set it to the main repo current HEAD at task creation time"
+            )
+        if not workspace_path:
+            raise ValueError(
+                "designer tasks require explicit workspace_path "
+                "(default: /home/wyr/code/Egomotion4D-designer)"
+            )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
