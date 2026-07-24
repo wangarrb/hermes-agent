@@ -92,6 +92,7 @@ from typing import Any, Iterable, Optional
 from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli import kanban_reservations as reservations
 from hermes_cli import kanban_delivery as delivery
+from hermes_cli import kanban_independent_review as independent_review
 from hermes_cli import kanban_role_policy as role_policy
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -5468,6 +5469,21 @@ def complete_task(
         return False
     if expected_generation is not None and int(expected_generation) != int(task_before.generation):
         return False
+    try:
+        metadata = independent_review.validate_completion(task_before, metadata)
+    except independent_review.IndependentReviewError as exc:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_independent_review",
+                {
+                    "generation": task_before.generation,
+                    "reason": str(exc),
+                },
+                run_id=task_before.current_run_id,
+            )
+        raise
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected

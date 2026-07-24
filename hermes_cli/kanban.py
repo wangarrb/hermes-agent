@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_independent_review as independent_review
 from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
@@ -2324,13 +2325,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except independent_review.IndependentReviewError as exc:
+                failed.append(tid)
+                print(
+                    f"kanban: completion of {tid} blocked by independent review: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
