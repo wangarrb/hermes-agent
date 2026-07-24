@@ -2122,9 +2122,7 @@ Evaluate the candidate. Is it safe to publish as the new active version?"""
     # INITIAL/REJECT/ESCALATE content stays quarantined.
     export_dir = Path("/home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/exports")
     current_dir = export_dir / "current"
-    history_dir = export_dir / "history"
     current_dir.mkdir(parents=True, exist_ok=True)
-    history_dir.mkdir(parents=True, exist_ok=True)
 
     for logical_id, model in registry.get("models", {}).items():
         accepted = _accepted_revision(model)
@@ -2169,22 +2167,21 @@ Evaluate the candidate. Is it safe to publish as the new active version?"""
                 f"-->\n\n"
             )
 
-            # Immutable history: keyed by logical_id (not A/B slot) + content_sha.
-            # Date is in file metadata, not filename. Dedup by content_sha.
-            content_sha_short = content_sha[:12]
-            history_file = history_dir / f"{logical_id}-{content_sha_short}.md"
-            if history_file.exists():
-                print(f"  History exists: {history_file.name} (same content_sha, no new revision)")
-            else:
-                with open(history_file, "w") as f:
-                    f.write(metadata_header + content)
-                print(f"  History: {history_file.name} ({len(content)} chars)")
+            # Visible last-updated timestamp (ISO → readable)
+            _ts_raw = accepted.get("accepted_at", "")
+            try:
+                from datetime import datetime as _dt
+                _parsed = _dt.fromisoformat(_ts_raw.replace("Z", "+00:00"))
+                _ts_display = _parsed.strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                _ts_display = _ts_raw
+            updated_line = f"> **最后更新**: {_ts_display}\n\n"
 
             # Atomic current/ consumer view
             current_file = current_dir / f"{logical_id}.md"
             tmp_current = current_dir / f".{logical_id}.tmp"
             with open(tmp_current, "w") as f:
-                f.write(metadata_header + content)
+                f.write(metadata_header + updated_line + content)
             os.rename(str(tmp_current), str(current_file))
             print(f"  Current: {current_file.name} ({len(content)} chars)")
 

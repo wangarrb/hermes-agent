@@ -605,6 +605,7 @@ class BaseInteractiveListener:
         continue_session: bool = False,
         model: str | None = None,
         sandbox: str | None = None,
+        provider: str | None = None,
         extra_args: list[str] | None = None,
     ) -> list[str]:
         """Build the command list to launch the TUI process."""
@@ -1582,6 +1583,7 @@ class BaseInteractiveListener:
             workspace, continue_session=continue_session,
             model=args.model if hasattr(args, "model") else None,
             sandbox=args.sandbox if hasattr(args, "sandbox") else None,
+            provider=args.provider if hasattr(args, "provider") else None,
             extra_args=getattr(args, f"{self.agent_slug}_arg", None) or [],
         )
 
@@ -1642,6 +1644,7 @@ class BaseInteractiveListener:
         parser.add_argument("--ttl", type=int, default=listener_policy.LISTENER_HEALTH_CLAIM_TTL_SECONDS, help="Claim TTL (seconds)")
         parser.add_argument("--model", default=None, help="Optional model override")
         parser.add_argument("--sandbox", default=None, help="Optional sandbox override")
+        parser.add_argument("--provider", default=None, help="Optional provider override (e.g. xunfei-relay, openai)")
         parser.add_argument("--assist-claim-delay-s", type=float, default=0.0, help="Delay before claiming secondary assignees")
         parser.add_argument("--assist-claim-delay-for", action="append", default=[], help="Per-assignee assist delay")
         parser.add_argument("--previous-worker-delay-s", type=float,

@@ -30,11 +30,12 @@ usage() {
   -p, --planner-agent <agent>      planner 使用的 agent，默认 hermes
   -r, --reviewer-agent <agent>     reviewer 使用的 agent，默认 codex
   -i, --implementer-agent <agent>  implementer 使用的 agent，默认 hermes
-  -d, --designer-agent <agent>     designer 使用的 agent，默认 hermes
+  -d, --designer-agent <agent>     designer 使用的 agent，默认 hermes；传 none 则不创建 designer pane（4 窗口布局）
 
 支持的 agent:
   hermes
   codex          （interactive Codex + Kanban watcher）
+codex-custom   （interactive Codex + Kanban watcher，强制用 xunfei-relay provider）
   codewhale      （interactive CodeWhale + Kanban watcher，原 deepseek-tui）
   claude         （interactive Claude Code + Kanban watcher）
   deepseek-reasonix （interactive Reasonix + Kanban watcher）
@@ -95,6 +96,10 @@ normalize_agent() {
             echo "hermes" ;;
         codex|codex-tui|codex-interactive)
             echo "codex" ;;
+        codex-custom)
+            echo "codex-custom" ;;
+        none)
+            echo "none" ;;
         codewhale)
             echo "codewhale" ;;
         reasonix|deepseek-reasonix)
@@ -113,7 +118,9 @@ agent_is_used() {
     [ "$PLANNER_AGENT" = "$target" ] || \
     [ "$IMPLEMENTER_AGENT" = "$target" ] || \
     [ "$DESIGNER_AGENT" = "$target" ] || \
-    [ "$REVIEWER_AGENT" = "$target" ]
+    [ "$REVIEWER_AGENT" = "$target" ] || \
+        # codex-custom counts as codex for model/sandbox config
+        { [ "$target" = "codex" ] && { [ "$COORDINATOR_AGENT" = "codex-custom" ] || [ "$PLANNER_AGENT" = "codex-custom" ] || [ "$IMPLEMENTER_AGENT" = "codex-custom" ] || [ "$DESIGNER_AGENT" = "codex-custom" ] || [ "$REVIEWER_AGENT" = "codex-custom" ]; }; }
 }
 
 shell_quote() {
@@ -848,7 +855,7 @@ build_role_command() {
             continue_script_q="$(shell_quote "$SCRIPT_DIR/hermes-kanban-continue")"
             printf 'sleep %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s HERMES_KANBAN_WATCHER_SCRIPT=%s%s%s %s -p %s' "$stagger_s" "$workspace_q" "$board_q" "$claim_q" "$watcher_script_q" "$assist_delay_env" "$hermes_toolsets_env" "$continue_script_q" "$role_q"
             ;;
-        codex)
+        codex|codex-custom)
             # Per-role CODEX_HOME: each codex pane gets its own
             # session directory so 'codex resume --last' resumes the correct
             # session for THAT role, not the global most-recent one.
@@ -874,6 +881,9 @@ build_role_command() {
                 cmd+=" --sandbox ${sandbox_q}"
             fi
             cmd+=" --auto-start"
+            if [ "$agent" = "codex-custom" ]; then
+                cmd+=" --provider xunfei-relay"
+            fi
             printf 'sleep %s && %s' "$stagger_s" "$cmd"
             ;;
         codewhale)
@@ -896,6 +906,9 @@ build_role_command() {
             fi
             cmd+=" $(deepseek_continue_flag_for_role "$role")"
             cmd+=" --auto-start"
+            if [ "$agent" = "codex-custom" ]; then
+                cmd+=" --provider xunfei-relay"
+            fi
             printf 'sleep %s && %s' "$stagger_s" "$cmd"
             ;;
         deepseek-reasonix)
@@ -908,6 +921,9 @@ build_role_command() {
             fi
             cmd+=" $(deepseek_continue_flag_for_role "$role")"
             cmd+=" --auto-start"
+            if [ "$agent" = "codex-custom" ]; then
+                cmd+=" --provider xunfei-relay"
+            fi
             printf 'sleep %s && %s' "$stagger_s" "$cmd"
             ;;
         claude)
@@ -916,6 +932,9 @@ build_role_command() {
             cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CLAUDE_KANBAN_WORKSPACE=${workspace_q} ${claude_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             cmd+=" --auto-start"
+            if [ "$agent" = "codex-custom" ]; then
+                cmd+=" --provider xunfei-relay"
+            fi
             printf 'sleep %s && %s' "$stagger_s" "$cmd"
             ;;
         *)
@@ -951,7 +970,9 @@ mkdir -p "$LAYOUT_DIR"
     printf '        }\n'
     printf '        pane split_direction="vertical" size="50%%" {\n'
     write_pane "            " "implementer" "$IMPLEMENTER_AGENT"
-    write_pane "            " "designer" "$DESIGNER_AGENT"
+    if [ "$DESIGNER_AGENT" != "none" ]; then
+        write_pane "            " "designer" "$DESIGNER_AGENT"
+    fi
     write_pane "            " "coordinator" "$COORDINATOR_AGENT"
     printf '        }\n'
     printf '    }\n'
@@ -960,7 +981,12 @@ mkdir -p "$LAYOUT_DIR"
 
 echo "启动 kanban 5 分窗口 (board=${BOARD}, session=${SESSION_NAME})..."
 echo "  planner-${PLANNER_AGENT} | reviewer-${REVIEWER_AGENT}"
-echo "  implementer-${IMPLEMENTER_AGENT} | designer-${DESIGNER_AGENT} | coordinator-${COORDINATOR_AGENT}"
+if [ "$DESIGNER_AGENT" = "none" ]; then
+    echo "  implementer-${IMPLEMENTER_AGENT} | coordinator-${COORDINATOR_AGENT}"
+    echo "  (designer skipped: -d none)"
+else
+    echo "  implementer-${IMPLEMENTER_AGENT} | designer-${DESIGNER_AGENT} | coordinator-${COORDINATOR_AGENT}"
+fi
 echo "  workspace: ${WORKSPACE}"
 echo "  designer workspace: ${DESIGNER_WORKSPACE}"
 echo "  Task delivery: ${TASK_DELIVERY}"
@@ -1005,6 +1031,7 @@ kill_old_listener() {
     fi
 }
 for role in planner implementer designer coordinator reviewer; do
+[ "$role" = "designer" ] && [ "$DESIGNER_AGENT" = "none" ] && continue
     kill_old_listener "$role"
 done
 
