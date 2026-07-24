@@ -6814,6 +6814,102 @@ def set_branch_name(
     return cur.rowcount == 1
 
 
+def _persist_task_lifecycle_contract(
+    conn: sqlite3.Connection,
+    task: Task,
+    contract: dict[str, Any],
+) -> None:
+    """Persist lifecycle metadata only while the task generation is current."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET workspace_path = ?,
+                   branch_name = ?,
+                   base_commit = ?,
+                   workspace_contract_json = ?
+             WHERE id = ? AND generation = ?
+            """,
+            (
+                contract["worktree"],
+                contract["branch"],
+                contract["base_commit"],
+                workspace_contract.dumps_contract(contract),
+                task.id,
+                task.generation,
+            ),
+        )
+    if cur.rowcount != 1:
+        raise workspace_contract.WorkspaceContractError(
+            f"task generation changed while persisting lifecycle contract: {task.id}"
+        )
+
+
+def prepare_task_worktree(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_branch: str,
+    upstream: str = "origin",
+    base_commit: Optional[str] = None,
+    role: Optional[str] = None,
+) -> dict[str, Any]:
+    """Prepare and persist a task generation in its long-lived worktree."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if task.workspace_kind != "worktree" or not task.workspace_path:
+        raise workspace_contract.WorkspaceContractError(
+            f"task {task_id} does not declare a worktree workspace"
+        )
+    contract = workspace_contract.prepare_generation_worktree(
+        task,
+        task.workspace_path,
+        source_branch=source_branch,
+        upstream=upstream,
+        base_commit=base_commit,
+        role=role,
+    )
+    _persist_task_lifecycle_contract(conn, task, contract)
+    return contract
+
+
+def freeze_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Freeze and persist the current generation's delivery identities."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if not task.workspace_path:
+        raise workspace_contract.WorkspaceContractError(
+            f"task {task_id} has no workspace path"
+        )
+    contract = workspace_contract.freeze_delivery(task, task.workspace_path)
+    _persist_task_lifecycle_contract(conn, task, contract)
+    return contract
+
+
+def release_task_worktree_lease(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Release a frozen worktree lease while preserving its delivery branch."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if not task.workspace_path:
+        raise workspace_contract.WorkspaceContractError(
+            f"task {task_id} has no workspace path"
+        )
+    contract = workspace_contract.release_worktree_lease(
+        task, task.workspace_path,
+    )
+    _persist_task_lifecycle_contract(conn, task, contract)
+    return contract
+
+
 # ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,
