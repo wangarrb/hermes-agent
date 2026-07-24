@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import struct
+import subprocess
 import tempfile
 import textwrap
 import time
@@ -1468,6 +1469,34 @@ class WeixinAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
+
+        # ── @角色 消息拦截：直接注入 zellij pane ──
+        if event.message_type == MessageType.TEXT and text:
+            m = re.match(r'@(planner|implementer|reviewer|critic|coordinator)\s+(.+)', text, re.DOTALL)
+            if m:
+                role, msg = m.group(1), m.group(2).strip()
+                logger.info("[%s] @mention inject: role=%s msg=%s", self.name, role, msg[:80])
+                try:
+                    result = await asyncio.to_thread(
+                        lambda: subprocess.run(
+                            ["python3", "/home/wyr/.hermes/hermes-agent-pre-v019-20260722-153835/scripts/wechat_inject.py",
+                             "--role", role, "--message", msg, "--timeout", "300"],
+                            capture_output=True, text=True, timeout=310
+                        )
+                    )
+                    reply = result.stdout.strip() or "[无输出]"
+                    if result.returncode != 0:
+                        reply = "当前正忙，请稍后重试"
+                except Exception as e:
+                    reply = f"注入失败: {e}"
+                # 直接回复，不走 agent
+                await self._send_with_retry(
+                    chat_id=source.chat_id,
+                    content=reply[:4000],
+                    reply_to=_reply_anchor_for_event(event),
+                )
+                return
+
         if event.message_type == MessageType.TEXT:
             self._enqueue_text_event(event)
         else:
