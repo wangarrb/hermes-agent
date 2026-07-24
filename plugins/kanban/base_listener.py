@@ -130,11 +130,25 @@ def _skip_reclaim_signal(pid: int, signum: int) -> None:  # noqa: ARG001
 
 
 def _reclaim_task_without_signaling_worker(
-    conn: Any, task_id: str, *, reason: str
+    conn: Any,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: int | None = None,
+    expected_generation: int | None = None,
+    expected_claim_lock: str | None = None,
 ) -> bool:
     """Reclaim a task without sending SIGTERM to its worker process."""
     try:
-        return kb.reclaim_task(conn, task_id, reason=reason, signal_fn=_skip_reclaim_signal)
+        return kb.reclaim_task(
+            conn,
+            task_id,
+            reason=reason,
+            signal_fn=_skip_reclaim_signal,
+            expected_run_id=expected_run_id,
+            expected_generation=expected_generation,
+            expected_claim_lock=expected_claim_lock,
+        )
     except Exception:
         return False
 
@@ -149,12 +163,16 @@ def _cleanup_active_claim(
         with kb.connect(board=board) as conn:
             status, _ = _task_status(conn, task_id)
             if status == "running":
-                kb.reclaim_task(
+                reclaimed = kb.reclaim_task(
                     conn, task_id,
                     reason="watcher exited while task still running",
                     signal_fn=_skip_reclaim_signal,
+                    expected_run_id=run_id,
                 )
-                log_line(log_path, f"reclaimed {task_id} on watcher exit")
+                if reclaimed:
+                    log_line(log_path, f"reclaimed {task_id} on watcher exit")
+                else:
+                    log_line(log_path, f"skipped stale reclaim for {task_id} on watcher exit")
     except Exception as exc:
         log_line(log_path, f"cleanup reclaim failed: {exc}")
 
@@ -465,7 +483,8 @@ def reclaim_orphaned_running_task(
     reclaimed = False
     try:
         rows = conn.execute(
-            "SELECT id, worker_pid, workspace_path FROM tasks WHERE status='running'"
+            "SELECT id, worker_pid, workspace_path, current_run_id, generation, "
+            "claim_lock FROM tasks WHERE status='running'"
         ).fetchall()
         for row in rows:
             pid = row["worker_pid"]
@@ -474,7 +493,14 @@ def reclaim_orphaned_running_task(
                 if ws and not _workspace_matches(ws, workspace):
                     continue
                 reason = f"orphaned running task {row['id']} old_pid={pid}"
-                ok = _reclaim_task_without_signaling_worker(conn, row["id"], reason=reason)
+                ok = _reclaim_task_without_signaling_worker(
+                    conn,
+                    row["id"],
+                    reason=reason,
+                    expected_run_id=row["current_run_id"],
+                    expected_generation=row["generation"],
+                    expected_claim_lock=row["claim_lock"],
+                )
                 if ok:
                     reclaimed = True
                     log_line(log_path, reason)
@@ -954,11 +980,21 @@ class BaseInteractiveListener:
             claimed = kb.claim_task(conn, candidate.id, ttl_seconds=args.ttl, claimer=self._claim_lock())
             if claimed is None:
                 return None, None
+            claim_run_id = claimed.current_run_id
+            claim_generation = claimed.generation
+            claim_lock = claimed.claim_lock
         except Exception as exc:
             log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
             return None, None
 
+        claim_fence = {
+            "expected_run_id": claim_run_id,
+            "expected_generation": claim_generation,
+            "expected_claim_lock": claim_lock,
+        }
         try:
+            if claim_run_id is None or not claim_lock:
+                raise RuntimeError("claimed task has incomplete run identity")
             task_workspace = kb.resolve_workspace(claimed, board=board)
             expected_branch = claimed.branch_name
             if claimed.workspace_kind == "worktree":
@@ -967,9 +1003,15 @@ class BaseInteractiveListener:
                     raise RuntimeError(
                         f"could not resolve actual branch for worktree {task_workspace}"
                     )
-            kb.set_workspace_path(conn, claimed.id, task_workspace)
+            if not kb.set_workspace_path(
+                conn, claimed.id, task_workspace, **claim_fence,
+            ):
+                raise RuntimeError("stale claim while persisting workspace")
             if claimed.workspace_kind == "worktree":
-                kb.set_branch_name(conn, claimed.id, expected_branch)
+                if not kb.set_branch_name(
+                    conn, claimed.id, expected_branch, **claim_fence,
+                ):
+                    raise RuntimeError("stale claim while persisting branch")
             resolved_claimed = kb.get_task(conn, claimed.id)
             if resolved_claimed is None:
                 raise RuntimeError("claimed task disappeared after workspace resolution")
@@ -988,26 +1030,46 @@ class BaseInteractiveListener:
                 )
             if (
                 resolved_claimed.status != "running"
-                or resolved_claimed.current_run_id != claimed.current_run_id
-                or resolved_claimed.generation != claimed.generation
+                or resolved_claimed.current_run_id != claim_run_id
+                or resolved_claimed.generation != claim_generation
+                or resolved_claimed.claim_lock != claim_lock
                 or resolved_claimed.branch_name != expected_branch
             ):
                 raise RuntimeError(
                     "task run/branch/generation identity changed after workspace resolution"
                 )
             claimed = resolved_claimed
-            try:
-                kb._set_worker_pid(conn, claimed.id, os.getpid())  # type: ignore[attr-defined]
-            except Exception:
-                pass
             context = kb.build_worker_context(conn, claimed.id)
+            if not kb._set_worker_pid(  # type: ignore[attr-defined]
+                conn, claimed.id, os.getpid(), **claim_fence,
+            ):
+                raise RuntimeError("stale claim while persisting listener pid")
+            prompt_path = write_task_prompt(
+                agent_name=self.agent_name, agent_slug=self.agent_slug,
+                board=board, profile=pane_profile,
+                task_id=claimed.id,
+                task_assignee=getattr(claimed, "assignee", None) or pane_profile,
+                task_title=claimed.title,
+                context=context, workspace=task_workspace,
+                run_id=claim_run_id,
+                generation=claim_generation,
+            )
+            prompt_claim = kb.get_task(conn, claimed.id)
+            if (
+                prompt_claim is None
+                or prompt_claim.status != "running"
+                or prompt_claim.current_run_id != claim_run_id
+                or prompt_claim.generation != claim_generation
+                or prompt_claim.claim_lock != claim_lock
+            ):
+                raise RuntimeError("stale claim after writing task prompt")
         except Exception as exc:
             reason = (
                 f"{self.agent_slug}-interactive workspace resolution/identity failed: "
                 f"{type(exc).__name__}: {exc}"
             )
             reclaimed = _reclaim_task_without_signaling_worker(
-                conn, claimed.id, reason=reason,
+                conn, claimed.id, reason=reason, **claim_fence,
             )
             log_line(
                 log_path,
@@ -1016,17 +1078,6 @@ class BaseInteractiveListener:
             )
             return None, None
 
-        prompt_path = write_task_prompt(
-            agent_name=self.agent_name, agent_slug=self.agent_slug,
-            board=board, profile=pane_profile,
-            task_id=claimed.id,
-            task_assignee=getattr(claimed, "assignee", None) or pane_profile,
-            task_title=claimed.title,
-            context=context, workspace=task_workspace,
-            run_id=claimed.current_run_id,
-            generation=claimed.generation,
-        )
-
         # Post-claim idle confirmation
         if not self.on_claim_post_confirm(args, log_path):
             log_line(log_path, f"idle confirmation failed; aborting injection for {claimed.id}")
@@ -1034,6 +1085,7 @@ class BaseInteractiveListener:
                 _reclaim_task_without_signaling_worker(
                     conn, claimed.id,
                     reason=f"{self.agent_slug}-interactive pane not stably idle before injection",
+                    **claim_fence,
                 )
             except Exception:
                 pass
@@ -1058,6 +1110,7 @@ class BaseInteractiveListener:
                 _reclaim_task_without_signaling_worker(
                     conn, claimed.id,
                     reason=f"{self.agent_slug}-interactive zellij injection failed",
+                    **claim_fence,
                 )
             except Exception:
                 pass
@@ -1068,16 +1121,23 @@ class BaseInteractiveListener:
 
         # Post-inject DB ops
         try:
-            kb.add_comment(
+            comment_id = kb.add_comment(
                 conn, claimed.id,
                 f"{self.agent_slug}-interactive-listener",
                 f"Injected into Zellij pane {zellij_pane_id}; prompt file: {prompt_path}",
+                **claim_fence,
             )
-            kb.heartbeat_worker(
+            heartbeat_ok = kb.heartbeat_worker(
                 conn, claimed.id,
                 note=f"{self.agent_slug}-interactive injected prompt: {prompt_path}",
-                expected_run_id=claimed.current_run_id,
+                **claim_fence,
             )
+            if not comment_id or not heartbeat_ok:
+                log_line(
+                    log_path,
+                    f"post-inject metadata skipped for stale claim {claimed.id} "
+                    f"run={claim_run_id}",
+                )
         except Exception as exc:
             log_line(log_path, f"post-inject DB op failed (non-fatal): {exc}")
 
@@ -1087,7 +1147,7 @@ class BaseInteractiveListener:
             log_path=log_path,
         )
         log_line(log_path, f"claimed+injected {claimed.id}: {claimed.title} prompt={prompt_path}")
-        return claimed.id, claimed.current_run_id
+        return claimed.id, claim_run_id
 
     # ── watcher_main ──
     def watcher_main(self, args: argparse.Namespace) -> int:

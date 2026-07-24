@@ -3619,17 +3619,32 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
         if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ?" + fence_sql,
+            [task_id, *fence_params],
         ).fetchone():
+            if fence_sql:
+                return 0
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -4573,6 +4588,9 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -4583,28 +4601,35 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state or no longer matches an optional expected claim fence.
+    Omitting all expected values preserves the operator-driven legacy API.
     """
-    row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row:
-        return False
-    if row["status"] != "running" and row["claim_lock"] is None:
-        # Nothing to reclaim — already ready / blocked / done.
-        return False
-    prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
     )
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id, generation "
+            "FROM tasks WHERE id = ?" + fence_sql,
+            [task_id, *fence_params],
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] != "running" and row["claim_lock"] is None:
+            # Nothing to reclaim — already ready / blocked / done.
+            return False
+        prev_lock = row["claim_lock"]
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND claim_lock IS ?" + fence_sql,
+            [task_id, prev_lock, *fence_params],
         )
         if cur.rowcount != 1:
             return False
@@ -4628,11 +4653,14 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
+        # Operator intervention means the old failure budget is stale. Keep
+        # this reset in the same claim-fenced transaction so a replacement
+        # run cannot start between reclaim and counter cleanup.
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ?",
+            (task_id,),
+        )
     return True
 
 
@@ -6623,24 +6651,71 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def _claim_fence_clause(
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> tuple[str, list[Any]]:
+    """Build optional task-claim CAS predicates for metadata updates."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if expected_run_id is not None:
+        clauses.append("current_run_id = ?")
+        params.append(int(expected_run_id))
+    if expected_generation is not None:
+        clauses.append("generation = ?")
+        params.append(int(expected_generation))
+    if expected_claim_lock is not None:
+        clauses.append("claim_lock IS ?")
+        params.append(str(expected_claim_lock))
+    return (" AND " + " AND ".join(clauses) if clauses else "", params)
+
+
 def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> None:
+    conn: sqlite3.Connection,
+    task_id: str,
+    path: Path | str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist a workspace path, optionally fenced to one immutable claim."""
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?" + fence_sql,
+            [str(path), task_id, *fence_params],
         )
+    return cur.rowcount == 1
 
 
 def set_branch_name(
-    conn: sqlite3.Connection, task_id: str, branch_name: str
-) -> None:
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch_name: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist a branch name, optionally fenced to one immutable claim."""
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET branch_name = ? WHERE id = ?",
-            (str(branch_name), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET branch_name = ? WHERE id = ?" + fence_sql,
+            [str(branch_name), task_id, *fence_params],
         )
+    return cur.rowcount == 1
 
 
 # ---------------------------------------------------------------------------
@@ -7096,6 +7171,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -7108,19 +7185,17 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
-                (now, task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
-            )
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running'" + fence_sql,
+            [now, task_id, *fence_params],
+        )
         if cur.rowcount != 1:
             return False
         run_id = (
@@ -7925,25 +8000,47 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    the drawer. Optional expected values fence interactive-listener updates
+    to the claim that initiated them.
     """
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?" + fence_sql,
+            [int(pid), task_id, *fence_params],
         )
-        run_id = _current_run_id(conn, task_id)
+        if cur.rowcount != 1:
+            return False
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
+        )
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                "UPDATE task_runs SET worker_pid = ? "
+                "WHERE id = ? AND ended_at IS NULL",
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
