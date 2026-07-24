@@ -29,7 +29,7 @@ usage() {
   -p, --planner-agent <agent>      planner 使用的 agent，默认 hermes
   -r, --reviewer-agent <agent>     reviewer 使用的 agent，默认 codex
   -i, --implementer-agent <agent>  implementer 使用的 agent，默认 hermes
-  -c, --critic-agent <agent>       critic 使用的 agent，默认 hermes
+  -c, --critic-agent <agent>       critic 使用的 agent，默认 hermes；传 none 则不创建 critic pane（4 窗口布局）
 
 支持的 agent:
   hermes
@@ -88,6 +88,8 @@ normalize_agent() {
     raw="${raw,,}"
     raw="${raw//_/-}"
     case "$raw" in
+        none)
+            echo "none" ;;
         hermes|h)
             echo "hermes" ;;
         codex|codex-tui|codex-interactive)
@@ -99,7 +101,7 @@ normalize_agent() {
         claude|claude-code)
             echo "claude" ;;
         *)
-            echo "错误: 不支持的 agent: ${1:-<empty>}；支持 hermes/codex/codewhale/deepseek-reasonix/claude" >&2
+            echo "错误: 不支持的 agent: ${1:-<empty>}；支持 hermes/codex/codewhale/deepseek-reasonix/claude/none" >&2
             return 1 ;;
     esac
 }
@@ -903,7 +905,9 @@ mkdir -p "$LAYOUT_DIR"
     printf '        }\n'
     printf '        pane split_direction="vertical" size="50%%" {\n'
     write_pane "            " "implementer" "$IMPLEMENTER_AGENT"
-    write_pane "            " "critic" "$CRITIC_AGENT"
+    if [ "$CRITIC_AGENT" != "none" ]; then
+        write_pane "            " "critic" "$CRITIC_AGENT"
+    fi
     write_pane "            " "coordinator" "$COORDINATOR_AGENT"
     printf '        }\n'
     printf '    }\n'
@@ -912,7 +916,12 @@ mkdir -p "$LAYOUT_DIR"
 
 echo "启动 kanban 5 分窗口 (board=${BOARD}, session=${SESSION_NAME})..."
 echo "  planner-${PLANNER_AGENT} | reviewer-${REVIEWER_AGENT}"
-echo "  implementer-${IMPLEMENTER_AGENT} | critic-${CRITIC_AGENT} | coordinator-${COORDINATOR_AGENT}"
+if [ "$CRITIC_AGENT" = "none" ]; then
+    echo "  implementer-${IMPLEMENTER_AGENT} | coordinator-${COORDINATOR_AGENT}"
+    echo "  (critic 已跳过: -c none)"
+else
+    echo "  implementer-${IMPLEMENTER_AGENT} | critic-${CRITIC_AGENT} | coordinator-${COORDINATOR_AGENT}"
+fi
 echo "  workspace: ${WORKSPACE}"
 echo "  Task delivery: ${TASK_DELIVERY}"
 if agent_is_used codex; then
@@ -956,6 +965,8 @@ kill_old_listener() {
     fi
 }
 for role in planner implementer critic coordinator reviewer; do
+    # Skip critic cleanup when critic is not used (CRITIC_AGENT=none)
+    [ "$role" = "critic" ] && [ "$CRITIC_AGENT" = "none" ] && continue
     kill_old_listener "$role"
 done
 
