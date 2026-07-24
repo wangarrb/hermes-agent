@@ -47,6 +47,19 @@ from hermes_cli import kanban_db as kb  # noqa: E402
 from hermes_cli import kanban_listener_policy as listener_policy  # noqa: E402
 from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
 
+try:  # Package import in tests and installed Hermes entry points.
+    from .role_context import (  # type: ignore[import-not-found]
+        DEFAULT_PROFILES_ROOT,
+        DEFAULT_SHARED_SKILLS_ROOT,
+        render_effective_role_context as _render_effective_role_context,
+    )
+except ImportError:  # Direct listener scripts put plugins/kanban on sys.path.
+    from role_context import (  # type: ignore[no-redef]
+        DEFAULT_PROFILES_ROOT,
+        DEFAULT_SHARED_SKILLS_ROOT,
+        render_effective_role_context as _render_effective_role_context,
+    )
+
 
 # ──────────────────────────────────────────────
 # Exceptions / globals
@@ -577,6 +590,7 @@ class BaseInteractiveListener:
     # ── Identity (subclass must override) ──
     agent_name: str = ""
     agent_slug: str = ""
+    role_context_backend: str = ""
 
     # ── Idle/busy markers for screen-based detection ──
     # Empty tuple = no screen-based idle detection (always accept).
@@ -612,6 +626,30 @@ class BaseInteractiveListener:
     def pane_label(self, task_id: str | None = None) -> str:
         """Return the zellij pane title."""
         raise NotImplementedError
+
+    def render_effective_role_context(
+        self,
+        *,
+        board: str,
+        workspace: Path,
+        pane_profile: str,
+        task: Any,
+        output_path: Path,
+        profiles_root: Path = DEFAULT_PROFILES_ROOT,
+        shared_skills_root: Path = DEFAULT_SHARED_SKILLS_ROOT,
+        backend: str | None = None,
+    ) -> str:
+        """Render the common task-assignee role context for this backend."""
+        return _render_effective_role_context(
+            board=board,
+            workspace=workspace,
+            pane_profile=pane_profile,
+            task=task,
+            output_path=output_path,
+            profiles_root=profiles_root,
+            shared_skills_root=shared_skills_root,
+            backend=backend or self.role_context_backend or self.agent_slug,
+        )
 
     # ── Optional hooks (default: no-op / basic) ──
 
@@ -1101,6 +1139,25 @@ class BaseInteractiveListener:
                 )
             claimed = resolved_claimed
             context = kb.build_worker_context(conn, claimed.id)
+            if self.role_context_backend:
+                role_context_path = (
+                    prompt_dir(
+                        task_workspace,
+                        board,
+                        pane_profile,
+                        agent_slug=self.agent_slug,
+                    )
+                    / f"task-{claimed.id}"
+                    / "role-context.json"
+                )
+                role_context = self.render_effective_role_context(
+                    board=board,
+                    workspace=task_workspace,
+                    pane_profile=pane_profile,
+                    task=claimed,
+                    output_path=role_context_path,
+                )
+                context = f"{context}\n\n{role_context}"
             if not kb._set_worker_pid(  # type: ignore[attr-defined]
                 conn, claimed.id, os.getpid(), **claim_fence,
             ):

@@ -220,6 +220,7 @@ def _should_restart_watcher(returncode: int | None, *, reasonix_alive: bool = Tr
 class ReasonixInteractiveListener(BaseInteractiveListener):
     agent_name = "Reasonix"
     agent_slug = "reasonix"
+    role_context_backend = "reasonix"
 
     idle_markers = _REASONIX_IDLE_MARKERS
     busy_markers = _REASONIX_BUSY_MARKERS
