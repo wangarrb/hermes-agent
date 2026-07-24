@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_workspace_contract as workspace_contract
+from hermes_cli import kanban_reservations as reservations
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -1354,6 +1355,30 @@ CREATE TABLE IF NOT EXISTS task_control_holds (
     PRIMARY KEY (control_id, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_scope_reservations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    generation    INTEGER NOT NULL,
+    base_commit   TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    status        TEXT NOT NULL CHECK (
+        status IN ('active', 'released', 'integrated', 'abandoned')
+    ),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS task_reservation_scopes (
+    reservation_id INTEGER NOT NULL,
+    scope_kind     TEXT NOT NULL CHECK (scope_kind IN ('write', 'artifact')),
+    scope          TEXT NOT NULL,
+    PRIMARY KEY (reservation_id, scope_kind, scope),
+    FOREIGN KEY (reservation_id) REFERENCES task_scope_reservations(id)
+        ON DELETE CASCADE
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1398,6 +1423,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_controls_delivery     ON task_control_messages(status, target_profile, created_at);
 CREATE INDEX IF NOT EXISTS idx_controls_return       ON task_control_messages(return_task_id, status);
 CREATE INDEX IF NOT EXISTS idx_control_holds_task    ON task_control_holds(task_id, control_id);
+CREATE INDEX IF NOT EXISTS idx_reservations_task     ON task_scope_reservations(task_id, generation, status);
+CREATE INDEX IF NOT EXISTS idx_reservations_status   ON task_scope_reservations(status, id);
+CREATE INDEX IF NOT EXISTS idx_reservation_scopes    ON task_reservation_scopes(scope_kind, scope, reservation_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -4270,17 +4298,322 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _scope_reservation_from_row(
+    row: sqlite3.Row,
+) -> reservations.ScopeReservation:
+    try:
+        manifest = json.loads(row["manifest_json"])
+    except (TypeError, ValueError) as exc:
+        raise reservations.ReservationError(
+            f"invalid stored reservation manifest for reservation {row['id']}"
+        ) from exc
+    return reservations.ScopeReservation(
+        id=int(row["id"]),
+        task_id=str(row["task_id"]),
+        generation=int(row["generation"]),
+        base_commit=str(row["base_commit"]),
+        manifest_hash=str(row["manifest_hash"]),
+        write_set=tuple(manifest.get("write_set") or ()),
+        artifact_namespace=manifest.get("artifact_namespace"),
+        status=str(row["status"]),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
+def get_scope_reservation(
+    conn: sqlite3.Connection,
+    reservation_id: int,
+) -> Optional[reservations.ScopeReservation]:
+    row = conn.execute(
+        "SELECT * FROM task_scope_reservations WHERE id = ?",
+        (int(reservation_id),),
+    ).fetchone()
+    return _scope_reservation_from_row(row) if row is not None else None
+
+
+def _abandon_superseded_reservations(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> None:
+    stale = conn.execute(
+        """
+        SELECT r.id, r.task_id, r.generation
+          FROM task_scope_reservations r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.status = 'active'
+           AND (
+               r.generation != t.generation
+               OR r.base_commit != COALESCE(t.base_commit, '')
+           )
+        """
+    ).fetchall()
+    for row in stale:
+        conn.execute(
+            "UPDATE task_scope_reservations "
+            "SET status = 'abandoned', updated_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (now, int(row["id"])),
+        )
+        _append_event(
+            conn,
+            str(row["task_id"]),
+            "reservation_abandoned",
+            {
+                "reservation_id": int(row["id"]),
+                "generation": int(row["generation"]),
+                "reason": "task_identity_superseded",
+            },
+        )
+
+
+def reserve_task_scopes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    write_set: Iterable[str],
+    artifact_namespace: Optional[str],
+    expected_generation: Optional[int] = None,
+    expected_base_commit: Optional[str] = None,
+) -> reservations.ScopeReservation:
+    """Atomically reserve canonical write and artifact scopes for a task."""
+    now = int(time.time())
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT id, generation, base_commit FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            raise KeyError(f"task not found: {task_id}")
+        generation = int(task_row["generation"])
+        base_commit = str(task_row["base_commit"] or "").strip()
+        if expected_generation is not None and generation != int(expected_generation):
+            raise reservations.ReservationError(
+                f"task generation changed: expected {expected_generation}, "
+                f"actual {generation}"
+            )
+        if (
+            expected_base_commit is not None
+            and base_commit != str(expected_base_commit).strip()
+        ):
+            raise reservations.ReservationError(
+                f"task base changed: expected {expected_base_commit}, "
+                f"actual {base_commit or '<missing>'}"
+            )
+        manifest = reservations.reservation_manifest(
+            task_id=task_id,
+            generation=generation,
+            base_commit=base_commit,
+            write_set=write_set,
+            artifact_namespace=artifact_namespace,
+        )
+        manifest_hash = reservations.manifest_hash(manifest)
+
+        _abandon_superseded_reservations(conn, now=now)
+        existing = conn.execute(
+            "SELECT * FROM task_scope_reservations WHERE manifest_hash = ?",
+            (manifest_hash,),
+        ).fetchone()
+        if existing is not None:
+            reservation = _scope_reservation_from_row(existing)
+            if reservation.status == "active":
+                return reservation
+            raise reservations.ReservationError(
+                f"reservation manifest {manifest_hash} is already "
+                f"{reservation.status}"
+            )
+
+        prior = conn.execute(
+            "SELECT * FROM task_scope_reservations "
+            "WHERE task_id = ? AND generation = ? AND base_commit = ? "
+            "AND status = 'active' LIMIT 1",
+            (task_id, generation, base_commit),
+        ).fetchone()
+        if prior is not None:
+            owner = _scope_reservation_from_row(prior)
+            raise reservations.ReservationError(
+                f"task {task_id} generation {generation} already has active "
+                f"reservation {owner.id} with manifest {owner.manifest_hash}"
+            )
+
+        active_scopes = conn.execute(
+            """
+            SELECT r.id, r.task_id, r.generation, s.scope_kind, s.scope
+              FROM task_scope_reservations r
+              JOIN task_reservation_scopes s ON s.reservation_id = r.id
+             WHERE r.status = 'active'
+             ORDER BY r.id, s.scope_kind, s.scope
+            """
+        ).fetchall()
+        requested_writes = tuple(manifest["write_set"])
+        requested_artifact = manifest["artifact_namespace"]
+        for owned in active_scopes:
+            owned_kind = str(owned["scope_kind"])
+            owned_scope = str(owned["scope"])
+            candidates = (
+                requested_writes
+                if owned_kind == "write"
+                else ((requested_artifact,) if requested_artifact else ())
+            )
+            overlap = (
+                reservations.path_scopes_overlap
+                if owned_kind == "write"
+                else reservations.artifact_scopes_overlap
+            )
+            for requested_scope in candidates:
+                if overlap(owned_scope, requested_scope):
+                    raise reservations.ReservationConflictError(
+                        owner_task_id=str(owned["task_id"]),
+                        owner_generation=int(owned["generation"]),
+                        owner_reservation_id=int(owned["id"]),
+                        scope_kind=owned_kind,
+                        owner_scope=owned_scope,
+                        requested_scope=requested_scope,
+                    )
+
+        manifest_json = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO task_scope_reservations (
+                task_id, generation, base_commit, manifest_hash,
+                manifest_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+            """,
+            (
+                task_id,
+                generation,
+                base_commit,
+                manifest_hash,
+                manifest_json,
+                now,
+                now,
+            ),
+        )
+        reservation_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO task_reservation_scopes "
+            "(reservation_id, scope_kind, scope) VALUES (?, 'write', ?)",
+            [(reservation_id, scope) for scope in requested_writes],
+        )
+        if requested_artifact:
+            conn.execute(
+                "INSERT INTO task_reservation_scopes "
+                "(reservation_id, scope_kind, scope) "
+                "VALUES (?, 'artifact', ?)",
+                (reservation_id, requested_artifact),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "reservation_active",
+            {
+                "reservation_id": reservation_id,
+                "generation": generation,
+                "base_commit": base_commit,
+                "manifest_hash": manifest_hash,
+            },
+        )
+        created = get_scope_reservation(conn, reservation_id)
+        assert created is not None
+        return created
+
+
+def transition_task_reservation(
+    conn: sqlite3.Connection,
+    reservation_id: int,
+    *,
+    status: str,
+    task_id: str,
+    expected_generation: int,
+) -> reservations.ScopeReservation:
+    """Move an active reservation to one explicit terminal state."""
+    target_status = str(status).strip().lower()
+    if target_status not in reservations.RESERVATION_STATUSES - {"active"}:
+        raise reservations.ReservationError(
+            f"invalid reservation terminal status: {status!r}"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM task_scope_reservations WHERE id = ? AND task_id = ?",
+            (int(reservation_id), task_id),
+        ).fetchone()
+        if row is None:
+            raise reservations.ReservationError(
+                f"reservation {reservation_id} is not owned by task {task_id}"
+            )
+        current = _scope_reservation_from_row(row)
+        task_row = conn.execute(
+            "SELECT generation, base_commit FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task_row is None
+            or current.generation != int(expected_generation)
+            or int(task_row["generation"]) != int(expected_generation)
+            or str(task_row["base_commit"] or "") != current.base_commit
+        ):
+            raise reservations.ReservationError(
+                f"reservation {reservation_id} task identity is stale"
+            )
+        if current.status == target_status:
+            return current
+        if current.status != "active":
+            raise reservations.ReservationError(
+                f"reservation {reservation_id} is already {current.status}"
+            )
+        conn.execute(
+            "UPDATE task_scope_reservations SET status = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (target_status, now, int(reservation_id)),
+        )
+        _append_event(
+            conn,
+            task_id,
+            f"reservation_{target_status}",
+            {
+                "reservation_id": int(reservation_id),
+                "generation": current.generation,
+                "base_commit": current.base_commit,
+            },
+        )
+        transitioned = get_scope_reservation(conn, reservation_id)
+        assert transitioned is not None
+        return transitioned
+
+
+def release_task_reservation(
+    conn: sqlite3.Connection,
+    reservation_id: int,
+    *,
+    task_id: str,
+    expected_generation: int,
+) -> reservations.ScopeReservation:
+    return transition_task_reservation(
+        conn,
+        reservation_id,
+        status="released",
+        task_id=task_id,
+        expected_generation=expected_generation,
+    )
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    require_reservation: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). Writable dispatchers can
+    set ``require_reservation`` to enforce an active reservation matching the
+    task's current generation and base before the claim is admitted.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -4312,6 +4645,29 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        if require_reservation:
+            active_reservation = conn.execute(
+                """
+                SELECT 1
+                  FROM tasks t
+                  JOIN task_scope_reservations r
+                    ON r.task_id = t.id
+                   AND r.generation = t.generation
+                   AND r.base_commit = t.base_commit
+                   AND r.status = 'active'
+                 WHERE t.id = ?
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active_reservation is None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "active_write_reservation_required"},
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
