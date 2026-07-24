@@ -330,3 +330,90 @@ def test_prompt_write_failure_reclaims_original_claim_without_injecting(
     log_text = listener._log_path.read_text(encoding="utf-8")
     assert "PermissionError: read-only prompt dir" in log_text
     assert "reclaimed=True" in log_text
+
+
+def test_cleanup_active_claim_does_not_reclaim_replacement_run(
+    kanban_home, tmp_path,
+):
+    log_path = tmp_path / "cleanup.log"
+    with kb.connect() as conn:
+        task_id = _ready_worktree_task(conn)
+        run1 = kb.claim_task(conn, task_id, ttl_seconds=900, claimer="shared-lock")
+        assert run1 is not None
+        assert kb.reclaim_task(
+            conn,
+            task_id,
+            signal_fn=lambda pid, sig: None,
+            expected_run_id=run1.current_run_id,
+            expected_generation=run1.generation,
+            expected_claim_lock=run1.claim_lock,
+        )
+        run2 = kb.claim_task(conn, task_id, ttl_seconds=900, claimer="shared-lock")
+        assert run2 is not None
+
+    bl._cleanup_active_claim(
+        board="default",
+        task_id=task_id,
+        expected_run_id=run1.current_run_id,
+        expected_generation=run1.generation,
+        expected_claim_lock=run1.claim_lock,
+        log_path=log_path,
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        persisted_run2 = kb.get_run(conn, run2.current_run_id)
+
+    assert task.status == "running"
+    assert task.current_run_id == run2.current_run_id
+    assert task.claim_lock == run2.claim_lock
+    assert persisted_run2.status == "running"
+    assert persisted_run2.ended_at is None
+    assert "skipped stale reclaim" in log_path.read_text(encoding="utf-8")
+
+
+def test_old_claim_heartbeats_do_not_refresh_replacement_run(kanban_home):
+    with kb.connect() as conn:
+        task_id = _ready_worktree_task(conn)
+        run1 = kb.claim_task(conn, task_id, ttl_seconds=900, claimer="shared-lock")
+        assert run1 is not None
+        assert kb.reclaim_task(
+            conn,
+            task_id,
+            signal_fn=lambda pid, sig: None,
+            expected_run_id=run1.current_run_id,
+            expected_generation=run1.generation,
+            expected_claim_lock=run1.claim_lock,
+        )
+        run2 = kb.claim_task(conn, task_id, ttl_seconds=900, claimer="shared-lock")
+        assert run2 is not None
+        before_task = kb.get_task(conn, task_id)
+        before_run = kb.get_run(conn, run2.current_run_id)
+
+        assert not kb.heartbeat_claim(
+            conn,
+            task_id,
+            ttl_seconds=1800,
+            claimer="shared-lock",
+            expected_run_id=run1.current_run_id,
+            expected_generation=run1.generation,
+            expected_claim_lock=run1.claim_lock,
+        )
+        assert not kb.heartbeat_worker(
+            conn,
+            task_id,
+            note="stale listener",
+            expected_run_id=run1.current_run_id,
+            expected_generation=run1.generation,
+            expected_claim_lock=run1.claim_lock,
+        )
+
+        after_task = kb.get_task(conn, task_id)
+        after_run = kb.get_run(conn, run2.current_run_id)
+
+    assert after_task.status == "running"
+    assert after_task.current_run_id == run2.current_run_id
+    assert after_task.claim_expires == before_task.claim_expires
+    assert after_task.last_heartbeat_at == before_task.last_heartbeat_at
+    assert after_run.claim_expires == before_run.claim_expires
+    assert after_run.last_heartbeat_at == before_run.last_heartbeat_at

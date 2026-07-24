@@ -4411,6 +4411,9 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
@@ -4418,18 +4421,28 @@ def heartbeat_claim(
     few minutes to keep ownership.
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
-    lock = claimer or _claimer_id()
+    lock = expected_claim_lock or claimer or _claimer_id()
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=lock,
+    )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
-            (expires, task_id, lock),
+            "WHERE id = ? AND status = 'running'" + fence_sql,
+            [expires, task_id, *fence_params],
         )
         if cur.rowcount == 1:
-            run_id = _current_run_id(conn, task_id)
+            run_id = (
+                int(expected_run_id)
+                if expected_run_id is not None
+                else _current_run_id(conn, task_id)
+            )
             if run_id is not None:
                 conn.execute(
-                    "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                    "UPDATE task_runs SET claim_expires = ? "
+                    "WHERE id = ? AND ended_at IS NULL",
                     (expires, run_id),
                 )
             return True
