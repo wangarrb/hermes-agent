@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
 
@@ -69,6 +70,11 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "base_commit": t.base_commit,
+        "target_branch": t.target_branch,
+        "generation": t.generation,
+        "common_dir": t.common_dir,
+        "workspace_contract": t.workspace_contract,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -315,6 +321,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--base-commit", default=None,
+                          help="Immutable base commit for a worktree task")
+    p_create.add_argument("--target-branch", default=None,
+                          help="Integration target branch for a worktree task")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1353,6 +1363,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if branch_name and ws_kind != "worktree":
         print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
         return 2
+    if (
+        getattr(args, "base_commit", None)
+        or getattr(args, "target_branch", None)
+    ) and ws_kind != "worktree":
+        print(
+            "kanban: --base-commit and --target-branch require --workspace worktree",
+            file=sys.stderr,
+        )
+        return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1366,30 +1385,36 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                base_commit=getattr(args, "base_commit", None),
+                target_branch=getattr(args, "target_branch", None),
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1556,6 +1581,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.base_commit:
+        print(f"  base:      {task.base_commit}")
+    if task.target_branch:
+        print(f"  target:    {task.target_branch}")
+    if task.common_dir:
+        print(f"  common-dir: {task.common_dir}")
+    if task.workspace_contract:
+        print(
+            "  workspace-contract: "
+            + workspace_contract.dumps_contract(task.workspace_contract)
+        )
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:

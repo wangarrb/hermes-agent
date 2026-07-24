@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -856,6 +857,9 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    base_commit: Optional[str] = None
+    target_branch: Optional[str] = None
+    workspace_contract_json: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -925,6 +929,19 @@ class Task:
     # reject an unchanged implementation being re-submitted after review.
     rework_baseline_fingerprint: Optional[str] = None
 
+    @property
+    def workspace_contract(self) -> Optional[dict[str, Any]]:
+        return workspace_contract.contract_for_task(self)
+
+    @property
+    def common_dir(self) -> Optional[str]:
+        contract = self.workspace_contract
+        return (
+            str(contract["common_dir"])
+            if contract and contract.get("common_dir")
+            else None
+        )
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
@@ -951,6 +968,13 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            base_commit=row["base_commit"] if "base_commit" in keys else None,
+            target_branch=row["target_branch"] if "target_branch" in keys else None,
+            workspace_contract_json=(
+                row["workspace_contract_json"]
+                if "workspace_contract_json" in keys
+                else None
+            ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1172,6 +1196,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
+    base_commit          TEXT,
+    target_branch        TEXT,
+    workspace_contract_json TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -1974,6 +2001,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "base_commit" not in cols:
+        _add_column_if_missing(conn, "tasks", "base_commit", "base_commit TEXT")
+    if "target_branch" not in cols:
+        _add_column_if_missing(conn, "tasks", "target_branch", "target_branch TEXT")
+    if "workspace_contract_json" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_contract_json",
+            "workspace_contract_json TEXT",
+        )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -2581,6 +2619,8 @@ def create_task(
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    base_commit: Optional[str] = None,
+    target_branch: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -2635,6 +2675,15 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    branch_template = branch_name
+    base_commit = str(base_commit or "").strip() or None
+    target_branch = str(target_branch or "").strip() or None
+    if target_branch is not None:
+        target_branch = workspace_contract.validate_branch_name(target_branch)
+    if (base_commit or target_branch) and workspace_kind != "worktree":
+        raise ValueError(
+            "base_commit and target_branch are only valid for worktree workspaces"
+        )
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2764,6 +2813,14 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        resolved_branch_name = branch_template
+        if branch_template:
+            resolved_branch_name = workspace_contract.render_branch_template(
+                branch_template,
+                task_id=task_id,
+                generation=1,
+                assignee=assignee,
+            )
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -2807,24 +2864,25 @@ def create_task(
                         workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
-                    if not branch_name:
+                    if not resolved_branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
-                            branch_name = _pdb.branch_name_for(
+                            resolved_branch_name = _pdb.branch_name_for(
                                 project_obj, task_id, title=title or ""
                             )
                         except Exception:
-                            branch_name = None
+                            resolved_branch_name = None
 
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, base_commit, target_branch,
+                        workspace_contract_json, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2837,7 +2895,10 @@ def create_task(
                         now,
                         workspace_kind,
                         workspace_path,
-                        branch_name,
+                        resolved_branch_name,
+                        base_commit,
+                        target_branch,
+                        None,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -2865,7 +2926,9 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
-                        "branch_name": branch_name,
+                        "branch_name": resolved_branch_name,
+                        "base_commit": base_commit,
+                        "target_branch": target_branch,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                     },
@@ -6531,6 +6594,11 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _validate_declared_workspace_contract(task: Task, path: Path) -> None:
+    if task.base_commit or task.target_branch or task.workspace_contract_json:
+        workspace_contract.validate_or_resolve_contract(task, path)
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -6572,6 +6640,7 @@ def _resolve_worktree_workspace(
             )
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
+        _validate_declared_workspace_contract(task, target)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6584,12 +6653,14 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        _validate_declared_workspace_contract(task, requested_resolved)
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
+        _validate_declared_workspace_contract(task, target)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6599,6 +6670,7 @@ def _resolve_worktree_workspace(
             "and does not point at a git repo root"
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
+    _validate_declared_workspace_contract(task, requested)
     return requested, branch_name
 
 
@@ -6695,6 +6767,16 @@ def set_workspace_path(
     expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Persist a workspace path, optionally fenced to one immutable claim."""
+    task = get_task(conn, task_id)
+    contract_data: Optional[dict[str, Any]] = None
+    contract_json = task.workspace_contract_json if task else None
+    canonical_base = task.base_commit if task else None
+    if task and task.workspace_kind == "worktree" and (
+        task.base_commit or task.target_branch or task.workspace_contract_json
+    ):
+        contract_data = workspace_contract.validate_or_resolve_contract(task, path)
+        contract_json = workspace_contract.dumps_contract(contract_data)
+        canonical_base = contract_data["base_commit"]
     fence_sql, fence_params = _claim_fence_clause(
         expected_run_id=expected_run_id,
         expected_generation=expected_generation,
@@ -6702,8 +6784,9 @@ def set_workspace_path(
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?" + fence_sql,
-            [str(path), task_id, *fence_params],
+            "UPDATE tasks SET workspace_path = ?, workspace_contract_json = ?, "
+            "base_commit = ? WHERE id = ?" + fence_sql,
+            [str(path), contract_json, canonical_base, task_id, *fence_params],
         )
     return cur.rowcount == 1
 
@@ -9312,6 +9395,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.workspace_contract is not None:
+        lines.append(
+            "Workspace contract: "
+            + workspace_contract.dumps_contract(task.workspace_contract)
+        )
     lines.append("")
 
     if task.body and task.body.strip():
