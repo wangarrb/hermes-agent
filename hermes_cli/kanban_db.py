@@ -91,6 +91,7 @@ from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli import kanban_reservations as reservations
+from hermes_cli import kanban_delivery as delivery
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -861,6 +862,8 @@ class Task:
     base_commit: Optional[str] = None
     target_branch: Optional[str] = None
     workspace_contract_json: Optional[str] = None
+    delivery_state: Optional[str] = None
+    delivery_json: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -943,6 +946,10 @@ class Task:
             else None
         )
 
+    @property
+    def delivery(self) -> Optional[delivery.DeliveryRecord]:
+        return delivery.parse_delivery(self.delivery_state, self.delivery_json)
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
@@ -975,6 +982,12 @@ class Task:
                 row["workspace_contract_json"]
                 if "workspace_contract_json" in keys
                 else None
+            ),
+            delivery_state=(
+                row["delivery_state"] if "delivery_state" in keys else None
+            ),
+            delivery_json=(
+                row["delivery_json"] if "delivery_json" in keys else None
             ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
@@ -1200,6 +1213,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     base_commit          TEXT,
     target_branch        TEXT,
     workspace_contract_json TEXT,
+    delivery_state       TEXT,
+    delivery_json        TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -2040,6 +2055,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "workspace_contract_json",
             "workspace_contract_json TEXT",
         )
+    if "delivery_state" not in cols:
+        _add_column_if_missing(conn, "tasks", "delivery_state", "delivery_state TEXT")
+    if "delivery_json" not in cols:
+        _add_column_if_missing(conn, "tasks", "delivery_json", "delivery_json TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -4738,6 +4757,38 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if require_reservation:
+            writable_task = get_task(conn, task_id)
+            delivery_record = writable_task.delivery if writable_task else None
+            if (
+                delivery_record is not None
+                and delivery_record.state == "prepared"
+                and delivery_record.generation == writable_task.generation
+            ):
+                running_delivery = delivery_record.with_state("running")
+                conn.execute(
+                    "UPDATE tasks SET delivery_state = 'running', delivery_json = ? "
+                    "WHERE id = ? AND generation = ? AND delivery_state = 'prepared'",
+                    (
+                        delivery.dumps_delivery(running_delivery),
+                        task_id,
+                        writable_task.generation,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "delivery_running",
+                    {
+                        "from_state": "prepared",
+                        "to_state": "running",
+                        "actor": lock,
+                        "source": "claim",
+                        "generation": writable_task.generation,
+                        "reservation_id": delivery_record.reservation_id,
+                    },
+                    run_id=run_id,
+                )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -7264,6 +7315,483 @@ def release_task_worktree_lease(
     )
     _persist_task_lifecycle_contract(conn, task, contract)
     return contract
+
+
+def get_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[delivery.DeliveryRecord]:
+    task = get_task(conn, task_id)
+    return task.delivery if task is not None else None
+
+
+def _reject_delivery_operation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    message: str,
+    payload: dict[str, Any],
+    error_type: type[delivery.DeliveryError],
+) -> None:
+    with write_txn(conn):
+        _append_event(conn, task_id, kind, {**payload, "reason": message})
+    raise error_type(message)
+
+
+def _transition_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    target_state: str,
+    actor: str,
+    source: str,
+    transform: Any,
+    side_effect: Any = None,
+    event_payload: Optional[dict[str, Any]] = None,
+) -> delivery.DeliveryRecord:
+    rejected: Optional[str] = None
+    result: Optional[delivery.DeliveryRecord] = None
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        current = task.delivery
+        stored_state = current.state if current is not None else None
+        previous_generation = current.generation if current is not None else None
+        superseded = bool(
+            current is not None and current.generation < task.generation
+        )
+        effective_current = None if superseded and target_state == "prepared" else current
+        current_state = (
+            effective_current.state if effective_current is not None else None
+        )
+        if (
+            current is not None
+            and current.generation > task.generation
+        ):
+            rejected = (
+                f"delivery generation {current.generation} is newer than "
+                f"task generation {task.generation}"
+            )
+        elif not delivery.transition_allowed(current_state, target_state):
+            rejected = (
+                f"delivery transition {current_state or '<none>'} -> "
+                f"{target_state} is not allowed"
+            )
+        elif current is not None and current.generation != task.generation and not superseded:
+            rejected = (
+                f"delivery generation {current.generation} does not match "
+                f"task generation {task.generation}"
+            )
+        else:
+            result = transform(task, effective_current)
+            if side_effect is not None:
+                side_effect(conn, task, effective_current, result)
+            cur = conn.execute(
+                "UPDATE tasks SET delivery_state = ?, delivery_json = ? "
+                "WHERE id = ? AND generation = ? AND delivery_state IS ?",
+                (
+                    target_state,
+                    delivery.dumps_delivery(result),
+                    task_id,
+                    task.generation,
+                    stored_state,
+                ),
+            )
+            if cur.rowcount != 1:
+                rejected = "task delivery identity changed during transition"
+                result = None
+        if rejected:
+            _append_event(
+                conn,
+                task_id,
+                "delivery_transition_rejected",
+                {
+                    "from_state": current_state,
+                    "to_state": target_state,
+                    "actor": actor,
+                    "source": source,
+                    "reason": rejected,
+                },
+            )
+        else:
+            if superseded:
+                _append_event(
+                    conn,
+                    task_id,
+                    "delivery_superseded",
+                    {
+                        "previous_state": stored_state,
+                        "previous_generation": previous_generation,
+                        "generation": task.generation,
+                        "actor": actor,
+                        "source": source,
+                    },
+                )
+            details: dict[str, Any] = dict(event_payload or {})
+            details["reservation_id"] = result.reservation_id
+            if result.delivery_sha:
+                details["delivery_sha"] = result.delivery_sha
+                details["delivery_tree"] = result.delivery_tree
+            if result.authorization:
+                details["authorization"] = dict(result.authorization)
+            _append_event(
+                conn,
+                task_id,
+                f"delivery_{target_state}",
+                {
+                    "from_state": current_state,
+                    "to_state": target_state,
+                    "actor": actor,
+                    "source": source,
+                    "generation": result.generation,
+                    **details,
+                },
+            )
+    if rejected:
+        raise delivery.DeliveryTransitionError(rejected)
+    assert result is not None
+    return result
+
+
+def prepare_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_contract: dict[str, Any],
+    reservation_id: int,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    reservation = get_scope_reservation(conn, reservation_id)
+    problems: list[str] = []
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if str(workspace_contract.get("task_id")) != task_id:
+        problems.append("workspace contract task mismatch")
+    if int(workspace_contract.get("generation", -1)) != task.generation:
+        problems.append("workspace contract generation mismatch")
+    if workspace_contract.get("base_commit") != task.base_commit:
+        problems.append("workspace contract base mismatch")
+    if reservation is None or reservation.status != "active":
+        problems.append("active scope reservation is required")
+    elif (
+        reservation.task_id != task_id
+        or reservation.generation != task.generation
+        or reservation.base_commit != task.base_commit
+    ):
+        problems.append("scope reservation task identity mismatch")
+    if problems:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_transition_rejected",
+            message="; ".join(problems),
+            payload={
+                "from_state": task.delivery_state,
+                "to_state": "prepared",
+                "actor": actor,
+                "source": source,
+            },
+            error_type=delivery.DeliveryTransitionError,
+        )
+
+    def transform(current_task: Task, current: Any) -> delivery.DeliveryRecord:
+        return delivery.DeliveryRecord(
+            state="prepared",
+            task_id=current_task.id,
+            generation=current_task.generation,
+            base_commit=str(current_task.base_commit),
+            reservation_id=int(reservation_id),
+            workspace_contract=dict(workspace_contract),
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="prepared",
+        actor=actor,
+        source=source,
+        transform=transform,
+    )
+
+
+def start_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="running",
+        actor=actor,
+        source=source,
+        transform=lambda task, current: current.with_state("running"),
+    )
+
+
+def mark_task_delivered(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_contract: dict[str, Any],
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    try:
+        delivery.validate_frozen_contract(task, workspace_contract)
+    except delivery.DeliveryError as exc:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_transition_rejected",
+            message=str(exc),
+            payload={
+                "from_state": task.delivery_state,
+                "to_state": "delivered",
+                "actor": actor,
+                "source": source,
+            },
+            error_type=delivery.DeliveryTransitionError,
+        )
+
+    def transform(current_task: Task, current: delivery.DeliveryRecord) -> delivery.DeliveryRecord:
+        return current.with_state(
+            "delivered",
+            workspace_contract=dict(workspace_contract),
+            delivery_sha=str(workspace_contract["delivery_commit"]),
+            delivery_tree=str(workspace_contract["delivery_tree"]),
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="delivered",
+        actor=actor,
+        source=source,
+        transform=transform,
+    )
+
+
+def accept_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="accepted",
+        actor=actor,
+        source=source,
+        transform=lambda task, current: current.with_state(
+            "accepted",
+            accepted_by=actor,
+            accepted_source=source,
+            accepted_delivery_sha=current.delivery_sha,
+            accepted_delivery_tree=current.delivery_tree,
+        ),
+    )
+
+
+def authorize_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    integrator: str,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    current = task.delivery if task is not None else None
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if source not in delivery.USER_AUTHORIZATION_SOURCES:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message="authorization requires an explicit user source",
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+    if not str(actor or "").strip():
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message="authorization actor is required",
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+    if current is None or current.state != "accepted":
+        return _transition_task_delivery(
+            conn,
+            task_id,
+            target_state="authorized",
+            actor=actor,
+            source=source,
+            transform=lambda current_task, record: record,
+        )
+    if not delivery.acceptance_matches(current):
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message="accepted review does not match current delivery identity",
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+    try:
+        auth_tuple = delivery.authorization_tuple(
+            task, current, integrator=integrator,
+        )
+    except delivery.DeliveryAuthorizationError as exc:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message=str(exc),
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="authorized",
+        actor=actor,
+        source=source,
+        transform=lambda current_task, record: record.with_state(
+            "authorized",
+            authorization=auth_tuple,
+            authorization_actor=actor,
+            authorization_source=source,
+        ),
+    )
+
+
+def integrate_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    integrator: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    record = task.delivery if task is not None else None
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    problems: list[str] = []
+    if record is None or record.state != "authorized":
+        problems.append("delivery must be authorized before integration")
+    else:
+        if (
+            not delivery.acceptance_matches(record)
+            or record.authorization_source not in delivery.USER_AUTHORIZATION_SOURCES
+        ):
+            problems.append("accepted review/user authorization refs are missing")
+        problems.extend(
+            delivery.integration_mismatches(task, record, integrator=integrator)
+        )
+        reservation = get_scope_reservation(conn, record.reservation_id)
+        if (
+            reservation is None
+            or reservation.status != "active"
+            or reservation.task_id != task.id
+            or reservation.generation != task.generation
+            or reservation.base_commit != task.base_commit
+        ):
+            problems.append("active matching scope reservation is required")
+    if problems:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_integration_rejected",
+            message="; ".join(problems),
+            payload={"actor": integrator, "source": "integration"},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+
+    def side_effect(
+        transaction: sqlite3.Connection,
+        current_task: Task,
+        current: delivery.DeliveryRecord,
+        updated: delivery.DeliveryRecord,
+    ) -> None:
+        now = int(time.time())
+        cur = transaction.execute(
+            "UPDATE task_scope_reservations SET status = 'integrated', updated_at = ? "
+            "WHERE id = ? AND task_id = ? AND generation = ? "
+            "AND base_commit = ? AND status = 'active'",
+            (
+                now,
+                current.reservation_id,
+                current_task.id,
+                current_task.generation,
+                current_task.base_commit,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise delivery.DeliveryAuthorizationError(
+                "scope reservation changed during integration"
+            )
+        _append_event(
+            transaction,
+            current_task.id,
+            "reservation_integrated",
+            {"reservation_id": current.reservation_id},
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="integrated",
+        actor=integrator,
+        source="integration",
+        transform=lambda current_task, current: current.with_state("integrated"),
+        side_effect=side_effect,
+    )
+
+
+def abandon_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> delivery.DeliveryRecord:
+    def side_effect(
+        transaction: sqlite3.Connection,
+        current_task: Task,
+        current: delivery.DeliveryRecord,
+        updated: delivery.DeliveryRecord,
+    ) -> None:
+        transaction.execute(
+            "UPDATE task_scope_reservations SET status = 'abandoned', updated_at = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'active'",
+            (int(time.time()), current.reservation_id, current_task.id),
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="abandoned",
+        actor=actor,
+        source="workflow",
+        transform=lambda current_task, current: current.with_state("abandoned"),
+        side_effect=side_effect,
+        event_payload={"reason": reason},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -75,6 +75,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "generation": t.generation,
         "common_dir": t.common_dir,
         "workspace_contract": t.workspace_contract,
+        "delivery_state": t.delivery_state,
+        "delivery": t.delivery.to_dict() if t.delivery else None,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -449,6 +451,48 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="VALUE",
         help="With --state-type: keep runs whose column equals this value",
     )
+
+    p_prepare = sub.add_parser("prepare", help="Prepare delivery workspace and scopes")
+    p_prepare.add_argument("task_id")
+    p_prepare.add_argument("--source-branch", default=None)
+    p_prepare.add_argument("--upstream", default="origin")
+    p_prepare.add_argument("--write-set", action="append", required=True)
+    p_prepare.add_argument("--artifact-namespace", required=True)
+    p_prepare.add_argument("--actor", default=None)
+    p_prepare.add_argument("--source", default="workflow")
+    p_prepare.add_argument("--json", action="store_true")
+
+    p_freeze = sub.add_parser("freeze", help="Freeze a running delivery")
+    p_freeze.add_argument("task_id")
+    p_freeze.add_argument("--actor", default=None)
+    p_freeze.add_argument("--source", default="worker")
+    p_freeze.add_argument("--json", action="store_true")
+
+    p_accept = sub.add_parser("accept", help="Accept a delivered revision")
+    p_accept.add_argument("task_id")
+    p_accept.add_argument("--actor", default=None)
+    p_accept.add_argument("--source", default="review")
+    p_accept.add_argument("--json", action="store_true")
+
+    p_authorize = sub.add_parser("authorize", help="Authorize immutable delivery SHAs")
+    p_authorize.add_argument("task_id")
+    p_authorize.add_argument("--integrator", required=True)
+    p_authorize.add_argument("--actor", required=True)
+    p_authorize.add_argument(
+        "--source", required=True, choices=("interactive", "manual", "user"),
+    )
+    p_authorize.add_argument("--json", action="store_true")
+
+    p_integrate = sub.add_parser("integrate", help="Record authorized integration")
+    p_integrate.add_argument("task_id")
+    p_integrate.add_argument("--integrator", required=True)
+    p_integrate.add_argument("--json", action="store_true")
+
+    p_abandon = sub.add_parser("abandon", help="Abandon a delivery generation")
+    p_abandon.add_argument("task_id")
+    p_abandon.add_argument("--actor", default=None)
+    p_abandon.add_argument("--reason", required=True)
+    p_abandon.add_argument("--json", action="store_true")
 
     # --- assign ---
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
@@ -988,6 +1032,12 @@ def kanban_command(args: argparse.Namespace) -> int:
             "list":     _cmd_list,
             "ls":       _cmd_list,
             "show":     _cmd_show,
+            "prepare":  _cmd_prepare_delivery,
+            "freeze":   _cmd_freeze_delivery,
+            "accept":   _cmd_accept_delivery,
+            "authorize": _cmd_authorize_delivery,
+            "integrate": _cmd_integrate_delivery,
+            "abandon":  _cmd_abandon_delivery,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
@@ -1532,10 +1582,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        task_delivery = task.delivery
 
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
+            "delivery": task_delivery.to_dict() if task_delivery else None,
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
@@ -1592,6 +1644,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "  workspace-contract: "
             + workspace_contract.dumps_contract(task.workspace_contract)
         )
+    if task_delivery:
+        print(f"  delivery: {task_delivery.state}")
+        if task_delivery.authorization:
+            print(
+                "  authorization: "
+                + json.dumps(task_delivery.authorization, sort_keys=True)
+            )
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
@@ -1689,6 +1748,109 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+    return 0
+
+
+def _print_delivery(record: Any, *, as_json: bool) -> None:
+    payload = record.to_dict()
+    if as_json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"Delivery {record.task_id}: {record.state}")
+
+
+def _cmd_prepare_delivery(args: argparse.Namespace) -> int:
+    actor = args.actor or _profile_author()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            raise ValueError(f"no such task: {args.task_id}")
+        source_branch = args.source_branch or task.target_branch
+        if not source_branch:
+            raise ValueError("--source-branch is required when task has no target branch")
+        contract = kb.prepare_task_worktree(
+            conn,
+            task.id,
+            source_branch=source_branch,
+            upstream=args.upstream,
+        )
+        reservation = kb.reserve_task_scopes(
+            conn,
+            task.id,
+            write_set=args.write_set,
+            artifact_namespace=args.artifact_namespace,
+            expected_generation=task.generation,
+            expected_base_commit=contract["base_commit"],
+        )
+        record = kb.prepare_task_delivery(
+            conn,
+            task.id,
+            workspace_contract=contract,
+            reservation_id=reservation.id,
+            actor=actor,
+            source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_freeze_delivery(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        contract = kb.freeze_task_delivery(conn, args.task_id)
+        record = kb.mark_task_delivered(
+            conn,
+            args.task_id,
+            workspace_contract=contract,
+            actor=args.actor or _profile_author(),
+            source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_accept_delivery(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        record = kb.accept_task_delivery(
+            conn,
+            args.task_id,
+            actor=args.actor or _profile_author(),
+            source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_authorize_delivery(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        record = kb.authorize_task_delivery(
+            conn,
+            args.task_id,
+            integrator=args.integrator,
+            actor=args.actor,
+            source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_integrate_delivery(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        record = kb.integrate_task_delivery(
+            conn, args.task_id, integrator=args.integrator,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_abandon_delivery(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        record = kb.abandon_task_delivery(
+            conn,
+            args.task_id,
+            actor=args.actor or _profile_author(),
+            reason=args.reason,
+        )
+    _print_delivery(record, as_json=args.json)
     return 0
 
 
@@ -1918,7 +2080,16 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        before_claim = kb.get_task(conn, args.task_id)
+        require_reservation = bool(
+            before_claim and before_claim.delivery_state == "prepared"
+        )
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            require_reservation=require_reservation,
+        )
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
