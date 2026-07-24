@@ -1493,7 +1493,6 @@ class WeixinAdapter(BasePlatformAdapter):
                 await self._send_with_retry(
                     chat_id=source.chat_id,
                     content=reply[:4000],
-                    reply_to=_reply_anchor_for_event(event),
                 )
                 return
 
