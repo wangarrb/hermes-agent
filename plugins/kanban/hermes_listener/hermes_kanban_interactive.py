@@ -97,6 +97,7 @@ _HERMES_QUEUED_INPUT_MARKERS = ()
 class HermesInteractiveListener(BaseInteractiveListener):
     agent_name = "Hermes"
     agent_slug = "hermes"
+    role_context_backend = "hermes"
 
     idle_markers = _HERMES_IDLE_MARKERS
     busy_markers = _HERMES_BUSY_MARKERS

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import sys
 from pathlib import Path
 
@@ -23,63 +22,18 @@ def load_module():
     return module
 
 
-def test_same_role_without_task_skills_adds_no_context(tmp_path: Path) -> None:
+def test_wrapper_reexports_shared_effective_role_renderer() -> None:
     module = load_module()
 
-    assert module.render_role_context(
-        board="board",
-        workspace=tmp_path,
-        pane_profile="planner",
-        task_assignee="planner",
-        task_skills=[],
-        profiles_root=tmp_path / "profiles",
-        shared_skills_root=tmp_path / "skills",
-    ) == ""
+    assert module.render_role_context is module.render_effective_role_context
 
 
-def test_assist_role_loads_declared_profile_and_project_prompt(tmp_path: Path) -> None:
+def test_wrapper_delegates_directly_to_upstream_listener(tmp_path, monkeypatch) -> None:
     module = load_module()
-    profiles = tmp_path / "profiles"
-    implementer = profiles / "implementer"
-    (implementer / "skills" / "delivery").mkdir(parents=True)
-    (implementer / "role-context.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "role": "implementer",
-                "description": "Implement the frozen delivery contract.",
-                "skills": [
-                    {"name": "delivery", "path": "skills/delivery/SKILL.md"}
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    (implementer / "skills" / "delivery" / "SKILL.md").write_text(
-        "# Delivery\nRun focused tests.\n", encoding="utf-8"
-    )
-    prompt = (
-        tmp_path
-        / ".hermes-kanban"
-        / "board"
-        / "implementer"
-        / "kanban-system-prompt.md"
-    )
-    prompt.parent.mkdir(parents=True)
-    prompt.write_text("Implementer project contract.\n", encoding="utf-8")
+    called = []
+    fake = type("Upstream", (), {"main": lambda self, args: called.append(args) or 7})()
+    monkeypatch.setitem(sys.modules, "hermes_kanban_interactive", fake)
+    monkeypatch.setattr(module, "DEFAULT_HERMES_KANBAN_ROOT", tmp_path)
 
-    rendered = module.render_role_context(
-        board="board",
-        workspace=tmp_path,
-        pane_profile="coordinator",
-        task_assignee="implementer",
-        task_skills=[],
-        profiles_root=profiles,
-        shared_skills_root=tmp_path / "shared-skills",
-    )
-
-    assert "effective_role=implementer assist=true" in rendered
-    assert "Implement the frozen delivery contract." in rendered
-    assert "Run focused tests." in rendered
-    assert "Implementer project contract." in rendered
-    assert "BLOCK_ASSIST_ROLE_CONTEXT" not in rendered
+    assert module.main(["--profile", "planner"]) == 7
+    assert called == [["--profile", "planner"]]

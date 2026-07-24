@@ -47,6 +47,19 @@ from hermes_cli import kanban_db as kb  # noqa: E402
 from hermes_cli import kanban_listener_policy as listener_policy  # noqa: E402
 from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
 
+try:  # Package import in tests and installed Hermes entry points.
+    from .role_context import (  # type: ignore[import-not-found]
+        DEFAULT_PROFILES_ROOT,
+        DEFAULT_SHARED_SKILLS_ROOT,
+        render_effective_role_context as _render_effective_role_context,
+    )
+except ImportError:  # Direct listener scripts put plugins/kanban on sys.path.
+    from role_context import (  # type: ignore[no-redef]
+        DEFAULT_PROFILES_ROOT,
+        DEFAULT_SHARED_SKILLS_ROOT,
+        render_effective_role_context as _render_effective_role_context,
+    )
+
 
 # ──────────────────────────────────────────────
 # Exceptions / globals
@@ -119,6 +132,24 @@ def _task_status(conn: Any, task_id: str) -> tuple[str | None, int | None]:
     return row["status"], row["current_run_id"]
 
 
+def _task_claim_state(
+    conn: Any, task_id: str,
+) -> tuple[str | None, int | None, int | None, str | None]:
+    row = conn.execute(
+        "SELECT status, current_run_id, generation, claim_lock "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None, None, None, None
+    return (
+        row["status"],
+        row["current_run_id"],
+        row["generation"],
+        row["claim_lock"],
+    )
+
+
 def _workspace_matches(row_workspace: str | None, workspace: Path) -> bool:
     if not row_workspace:
         return False
@@ -130,31 +161,59 @@ def _skip_reclaim_signal(pid: int, signum: int) -> None:  # noqa: ARG001
 
 
 def _reclaim_task_without_signaling_worker(
-    conn: Any, task_id: str, *, reason: str
+    conn: Any,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: int | None = None,
+    expected_generation: int | None = None,
+    expected_claim_lock: str | None = None,
 ) -> bool:
     """Reclaim a task without sending SIGTERM to its worker process."""
     try:
-        return kb.reclaim_task(conn, task_id, reason=reason, signal_fn=_skip_reclaim_signal)
+        return kb.reclaim_task(
+            conn,
+            task_id,
+            reason=reason,
+            signal_fn=_skip_reclaim_signal,
+            expected_run_id=expected_run_id,
+            expected_generation=expected_generation,
+            expected_claim_lock=expected_claim_lock,
+        )
     except Exception:
         return False
 
 
 def _cleanup_active_claim(
-    *, board: str, task_id: str | None, run_id: int | None, log_path: Path
+    *,
+    board: str,
+    task_id: str | None,
+    expected_run_id: int | None = None,
+    expected_generation: int | None = None,
+    expected_claim_lock: str | None = None,
+    run_id: int | None = None,
+    log_path: Path,
 ) -> None:
     """On watcher exit, if a task is still running, reclaim it."""
     if not task_id:
         return
+    claim_run_id = expected_run_id if expected_run_id is not None else run_id
     try:
         with kb.connect(board=board) as conn:
             status, _ = _task_status(conn, task_id)
             if status == "running":
-                kb.reclaim_task(
+                reclaimed = kb.reclaim_task(
                     conn, task_id,
                     reason="watcher exited while task still running",
                     signal_fn=_skip_reclaim_signal,
+                    expected_run_id=claim_run_id,
+                    expected_generation=expected_generation,
+                    expected_claim_lock=expected_claim_lock,
                 )
-                log_line(log_path, f"reclaimed {task_id} on watcher exit")
+                if reclaimed:
+                    log_line(log_path, f"reclaimed {task_id} on watcher exit")
+                else:
+                    log_line(log_path, f"skipped stale reclaim for {task_id} on watcher exit")
     except Exception as exc:
         log_line(log_path, f"cleanup reclaim failed: {exc}")
 
@@ -352,7 +411,23 @@ def _assist_candidate_ready(conn, args: argparse.Namespace, task: kb.Task,
 
 def _select_ready_candidate(conn, args: argparse.Namespace, *, default_profile: str = "implementer") -> kb.Task | None:
     policy = worker_runtime.claim_policy_from_args(args, default_profile=default_profile)
-    return worker_runtime.select_ready_candidate(conn, policy=policy)
+    for assignee in policy.claim_assignees:
+        ready = kb.list_tasks(
+            conn,
+            assignee=assignee,
+            status="ready",
+            limit=worker_runtime.listener_policy.READY_TASK_SCAN_LIMIT,
+        )
+        for task in ready:
+            if not kb.role_policy_candidate_allowed(
+                conn, task, actor_role=policy.profile,
+            ):
+                continue
+            if worker_runtime.assist_candidate_ready(
+                conn, policy=policy, task=task, assignee=assignee,
+            ):
+                return task
+    return None
 
 
 # ──────────────────────────────────────────────
@@ -465,7 +540,8 @@ def reclaim_orphaned_running_task(
     reclaimed = False
     try:
         rows = conn.execute(
-            "SELECT id, worker_pid, workspace_path FROM tasks WHERE status='running'"
+            "SELECT id, worker_pid, workspace_path, current_run_id, generation, "
+            "claim_lock FROM tasks WHERE status='running'"
         ).fetchall()
         for row in rows:
             pid = row["worker_pid"]
@@ -474,7 +550,14 @@ def reclaim_orphaned_running_task(
                 if ws and not _workspace_matches(ws, workspace):
                     continue
                 reason = f"orphaned running task {row['id']} old_pid={pid}"
-                ok = _reclaim_task_without_signaling_worker(conn, row["id"], reason=reason)
+                ok = _reclaim_task_without_signaling_worker(
+                    conn,
+                    row["id"],
+                    reason=reason,
+                    expected_run_id=row["current_run_id"],
+                    expected_generation=row["generation"],
+                    expected_claim_lock=row["claim_lock"],
+                )
                 if ok:
                     reclaimed = True
                     log_line(log_path, reason)
@@ -507,6 +590,7 @@ class BaseInteractiveListener:
     # ── Identity (subclass must override) ──
     agent_name: str = ""
     agent_slug: str = ""
+    role_context_backend: str = ""
 
     # ── Idle/busy markers for screen-based detection ──
     # Empty tuple = no screen-based idle detection (always accept).
@@ -542,6 +626,30 @@ class BaseInteractiveListener:
     def pane_label(self, task_id: str | None = None) -> str:
         """Return the zellij pane title."""
         raise NotImplementedError
+
+    def render_effective_role_context(
+        self,
+        *,
+        board: str,
+        workspace: Path,
+        pane_profile: str,
+        task: Any,
+        output_path: Path,
+        profiles_root: Path = DEFAULT_PROFILES_ROOT,
+        shared_skills_root: Path = DEFAULT_SHARED_SKILLS_ROOT,
+        backend: str | None = None,
+    ) -> str:
+        """Render the common task-assignee role context for this backend."""
+        return _render_effective_role_context(
+            board=board,
+            workspace=workspace,
+            pane_profile=pane_profile,
+            task=task,
+            output_path=output_path,
+            profiles_root=profiles_root,
+            shared_skills_root=shared_skills_root,
+            backend=backend or self.role_context_backend or self.agent_slug,
+        )
 
     # ── Optional hooks (default: no-op / basic) ──
 
@@ -646,6 +754,22 @@ class BaseInteractiveListener:
         self._api_retry_count: int = 0       # per-task API failure retry counter
         self._api_retry_first_at: float | None = None  # when first API-idle was seen
         self._active_control_id: int | None = None
+        self._active_task_id: str | None = None
+        self._active_run_id: int | None = None
+        self._active_generation: int | None = None
+        self._active_claim_lock: str | None = None
+
+    def _remember_active_claim(self, task: kb.Task) -> None:
+        self._active_task_id = task.id
+        self._active_run_id = task.current_run_id
+        self._active_generation = task.generation
+        self._active_claim_lock = task.claim_lock
+
+    def _clear_active_claim_identity(self) -> None:
+        self._active_task_id = None
+        self._active_run_id = None
+        self._active_generation = None
+        self._active_claim_lock = None
 
     # ── API failure retry on idle ──
     # When agent goes idle mid-task due to API error, inject "继续"
@@ -925,7 +1049,6 @@ class BaseInteractiveListener:
         self, args: argparse.Namespace, *, log_path: Path, conn: Any | None = None,
     ) -> tuple[str | None, int | None]:
         board = self._board
-        workspace = self._workspace
         pane_profile = self._profile
 
         # Every backend reaches this shared path, including subclasses with a
@@ -955,27 +1078,124 @@ class BaseInteractiveListener:
             claimed = kb.claim_task(conn, candidate.id, ttl_seconds=args.ttl, claimer=self._claim_lock())
             if claimed is None:
                 return None, None
-            kb.set_workspace_path(conn, claimed.id, workspace)
-            claimed = kb.get_task(conn, claimed.id) or claimed
-            try:
-                kb._set_worker_pid(conn, claimed.id, os.getpid())  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            context = kb.build_worker_context(conn, claimed.id)
+            claim_run_id = claimed.current_run_id
+            claim_generation = claimed.generation
+            claim_lock = claimed.claim_lock
+            self._remember_active_claim(claimed)
         except Exception as exc:
             log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
             return None, None
 
-        prompt_path = write_task_prompt(
-            agent_name=self.agent_name, agent_slug=self.agent_slug,
-            board=board, profile=pane_profile,
-            task_id=claimed.id,
-            task_assignee=getattr(claimed, "assignee", None) or pane_profile,
-            task_title=claimed.title,
-            context=context, workspace=workspace,
-            run_id=claimed.current_run_id,
-            generation=claimed.generation,
-        )
+        claim_fence = {
+            "expected_run_id": claim_run_id,
+            "expected_generation": claim_generation,
+            "expected_claim_lock": claim_lock,
+        }
+        try:
+            if claim_run_id is None or not claim_lock:
+                raise RuntimeError("claimed task has incomplete run identity")
+            task_workspace = kb.resolve_workspace(claimed, board=board)
+            expected_branch = claimed.branch_name
+            if claimed.workspace_kind == "worktree":
+                expected_branch = kb._git_current_branch(Path(task_workspace))  # type: ignore[attr-defined]
+                if not expected_branch:
+                    raise RuntimeError(
+                        f"could not resolve actual branch for worktree {task_workspace}"
+                    )
+            if not kb.set_workspace_path(
+                conn, claimed.id, task_workspace, **claim_fence,
+            ):
+                raise RuntimeError("stale claim while persisting workspace")
+            if claimed.workspace_kind == "worktree":
+                if not kb.set_branch_name(
+                    conn, claimed.id, expected_branch, **claim_fence,
+                ):
+                    raise RuntimeError("stale claim while persisting branch")
+            resolved_claimed = kb.get_task(conn, claimed.id)
+            if resolved_claimed is None:
+                raise RuntimeError("claimed task disappeared after workspace resolution")
+            persisted_workspace = (
+                Path(resolved_claimed.workspace_path or "")
+                .expanduser()
+                .resolve(strict=False)
+            )
+            expected_workspace = (
+                Path(task_workspace).expanduser().resolve(strict=False)
+            )
+            if persisted_workspace != expected_workspace:
+                raise RuntimeError(
+                    f"workspace identity mismatch: resolved={expected_workspace} "
+                    f"persisted={persisted_workspace}"
+                )
+            if (
+                resolved_claimed.status != "running"
+                or resolved_claimed.current_run_id != claim_run_id
+                or resolved_claimed.generation != claim_generation
+                or resolved_claimed.claim_lock != claim_lock
+                or resolved_claimed.branch_name != expected_branch
+            ):
+                raise RuntimeError(
+                    "task run/branch/generation identity changed after workspace resolution"
+                )
+            claimed = resolved_claimed
+            context = kb.build_worker_context(conn, claimed.id)
+            if self.role_context_backend:
+                role_context_path = (
+                    prompt_dir(
+                        task_workspace,
+                        board,
+                        pane_profile,
+                        agent_slug=self.agent_slug,
+                    )
+                    / f"task-{claimed.id}"
+                    / "role-context.json"
+                )
+                role_context = self.render_effective_role_context(
+                    board=board,
+                    workspace=task_workspace,
+                    pane_profile=pane_profile,
+                    task=claimed,
+                    output_path=role_context_path,
+                )
+                context = f"{context}\n\n{role_context}"
+            if not kb._set_worker_pid(  # type: ignore[attr-defined]
+                conn, claimed.id, os.getpid(), **claim_fence,
+            ):
+                raise RuntimeError("stale claim while persisting listener pid")
+            prompt_path = write_task_prompt(
+                agent_name=self.agent_name, agent_slug=self.agent_slug,
+                board=board, profile=pane_profile,
+                task_id=claimed.id,
+                task_assignee=getattr(claimed, "assignee", None) or pane_profile,
+                task_title=claimed.title,
+                context=context, workspace=task_workspace,
+                run_id=claim_run_id,
+                generation=claim_generation,
+            )
+            prompt_claim = kb.get_task(conn, claimed.id)
+            if (
+                prompt_claim is None
+                or prompt_claim.status != "running"
+                or prompt_claim.current_run_id != claim_run_id
+                or prompt_claim.generation != claim_generation
+                or prompt_claim.claim_lock != claim_lock
+            ):
+                raise RuntimeError("stale claim after writing task prompt")
+        except Exception as exc:
+            reason = (
+                f"{self.agent_slug}-interactive workspace resolution/identity failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            reclaimed = _reclaim_task_without_signaling_worker(
+                conn, claimed.id, reason=reason, **claim_fence,
+            )
+            log_line(
+                log_path,
+                f"task {claimed.id} workspace resolution/identity failed; "
+                f"reclaimed={reclaimed}; {type(exc).__name__}: {exc}",
+            )
+            self._clear_active_claim_identity()
+            return None, None
 
         # Post-claim idle confirmation
         if not self.on_claim_post_confirm(args, log_path):
@@ -984,9 +1204,11 @@ class BaseInteractiveListener:
                 _reclaim_task_without_signaling_worker(
                     conn, claimed.id,
                     reason=f"{self.agent_slug}-interactive pane not stably idle before injection",
+                    **claim_fence,
                 )
             except Exception:
                 pass
+            self._clear_active_claim_identity()
             return None, None
 
         task_assignee = getattr(claimed, "assignee", None) or pane_profile
@@ -1008,9 +1230,11 @@ class BaseInteractiveListener:
                 _reclaim_task_without_signaling_worker(
                     conn, claimed.id,
                     reason=f"{self.agent_slug}-interactive zellij injection failed",
+                    **claim_fence,
                 )
             except Exception:
                 pass
+            self._clear_active_claim_identity()
             return None, None
 
         # Hook: subclass post-inject actions (e.g. extra Enter for queued-input TUIs)
@@ -1018,16 +1242,23 @@ class BaseInteractiveListener:
 
         # Post-inject DB ops
         try:
-            kb.add_comment(
+            comment_id = kb.add_comment(
                 conn, claimed.id,
                 f"{self.agent_slug}-interactive-listener",
                 f"Injected into Zellij pane {zellij_pane_id}; prompt file: {prompt_path}",
+                **claim_fence,
             )
-            kb.heartbeat_worker(
+            heartbeat_ok = kb.heartbeat_worker(
                 conn, claimed.id,
                 note=f"{self.agent_slug}-interactive injected prompt: {prompt_path}",
-                expected_run_id=claimed.current_run_id,
+                **claim_fence,
             )
+            if not comment_id or not heartbeat_ok:
+                log_line(
+                    log_path,
+                    f"post-inject metadata skipped for stale claim {claimed.id} "
+                    f"run={claim_run_id}",
+                )
         except Exception as exc:
             log_line(log_path, f"post-inject DB op failed (non-fatal): {exc}")
 
@@ -1037,7 +1268,7 @@ class BaseInteractiveListener:
             log_path=log_path,
         )
         log_line(log_path, f"claimed+injected {claimed.id}: {claimed.title} prompt={prompt_path}")
-        return claimed.id, claimed.current_run_id
+        return claimed.id, claim_run_id
 
     # ── watcher_main ──
     def watcher_main(self, args: argparse.Namespace) -> int:
@@ -1133,6 +1364,8 @@ class BaseInteractiveListener:
 
         active_task: str | None = None
         active_run_id: int | None = None
+        active_generation: int | None = None
+        active_claim_lock: str | None = None
         last_hb = 0.0
 
         try:
@@ -1148,7 +1381,12 @@ class BaseInteractiveListener:
 
                 if active_task:
                     try:
-                        status, current_run_id = _task_status(conn, active_task)
+                        (
+                            status,
+                            current_run_id,
+                            current_generation,
+                            current_claim_lock,
+                        ) = _task_claim_state(conn, active_task)
                     except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                         consecutive_db_errors += 1
                         log_line(log_path, f"DB error checking task status: {exc}; will retry")
@@ -1156,22 +1394,55 @@ class BaseInteractiveListener:
                         continue
                     consecutive_db_errors = 0
 
-                    if status == "running" and (active_run_id is None or current_run_id == active_run_id):
+                    if (
+                        status == "running"
+                        and current_run_id == active_run_id
+                        and current_generation == active_generation
+                        and current_claim_lock == active_claim_lock
+                    ):
                         # Hook: subclass may do progress watch / idle reclaim / etc
                         self.on_task_running_monitor(args, conn, active_task, log_path)
 
                         if now - last_hb >= max(15.0, min(float(args.ttl) / 3.0, 120.0)):
                             try:
-                                kb.heartbeat_claim(conn, active_task, ttl_seconds=args.ttl, claimer=self._claim_lock())
-                                kb.heartbeat_worker(
+                                claim_heartbeat_ok = kb.heartbeat_claim(
+                                    conn, active_task,
+                                    ttl_seconds=args.ttl,
+                                    claimer=self._claim_lock(),
+                                    expected_run_id=active_run_id,
+                                    expected_generation=active_generation,
+                                    expected_claim_lock=active_claim_lock,
+                                )
+                                worker_heartbeat_ok = claim_heartbeat_ok and kb.heartbeat_worker(
                                     conn, active_task,
                                     note=f"{self.agent_slug}-interactive waiting for complete/block from {self.agent_name} TUI",
                                     expected_run_id=active_run_id,
+                                    expected_generation=active_generation,
+                                    expected_claim_lock=active_claim_lock,
                                 )
                             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                                 consecutive_db_errors += 1
                                 log_line(log_path, f"DB error on heartbeat: {exc}")
                             else:
+                                if not claim_heartbeat_ok or not worker_heartbeat_ok:
+                                    log_line(
+                                        log_path,
+                                        f"active claim became stale during heartbeat: "
+                                        f"{active_task} run={active_run_id}",
+                                    )
+                                    active_task = None
+                                    active_run_id = None
+                                    active_generation = None
+                                    active_claim_lock = None
+                                    self._clear_active_claim_identity()
+                                    last_hb = 0.0
+                                    zellij_rename_pane(
+                                        session=zellij_session,
+                                        pane_id=str(zellij_pane_id),
+                                        name=self.pane_label(),
+                                        log_path=log_path,
+                                    )
+                                    continue
                                 last_hb = now
                         time.sleep(min(poll_s, 5.0))
                         continue
@@ -1179,6 +1450,9 @@ class BaseInteractiveListener:
                     log_line(log_path, f"active task left running state: {active_task} status={status} run={current_run_id}")
                     active_task = None
                     active_run_id = None
+                    active_generation = None
+                    active_claim_lock = None
+                    self._clear_active_claim_identity()
                     last_hb = 0.0
                     zellij_rename_pane(
                         session=zellij_session, pane_id=str(zellij_pane_id),
@@ -1191,11 +1465,16 @@ class BaseInteractiveListener:
                 reclaim_orphaned_running_task(args, log_path=log_path, conn=conn)
                 active_task, active_run_id = self.claim_and_inject_one(args, log_path=log_path, conn=conn)
                 if active_task:
+                    active_generation = self._active_generation
+                    active_claim_lock = self._active_claim_lock
                     consecutive_db_errors = 0
                     last_hb = 0.0
                     if args.once:
                         continue
                 else:
+                    active_generation = None
+                    active_claim_lock = None
+                    self._clear_active_claim_identity()
                     if args.once:
                         log_line(log_path, "no ready task; exiting --once")
                         return 0
@@ -1206,7 +1485,15 @@ class BaseInteractiveListener:
                     _conn.close()
                 except Exception:
                     pass
-            _cleanup_active_claim(board=board, task_id=active_task, run_id=active_run_id, log_path=log_path)
+            _cleanup_active_claim(
+                board=board,
+                task_id=active_task,
+                expected_run_id=active_run_id,
+                expected_generation=active_generation,
+                expected_claim_lock=active_claim_lock,
+                log_path=log_path,
+            )
+            self._clear_active_claim_identity()
         log_line(log_path, "interactive watcher stopped")
         return 0
 

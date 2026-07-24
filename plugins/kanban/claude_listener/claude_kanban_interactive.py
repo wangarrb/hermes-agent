@@ -93,6 +93,7 @@ _CLAUDE_QUEUED_INPUT_MARKERS = ()
 class ClaudeInteractiveListener(BaseInteractiveListener):
     agent_name = "Claude"
     agent_slug = "claude"
+    role_context_backend = "claude"
 
     # Idle markers are preliminary — may need adjustment
     idle_markers = _CLAUDE_IDLE_MARKERS

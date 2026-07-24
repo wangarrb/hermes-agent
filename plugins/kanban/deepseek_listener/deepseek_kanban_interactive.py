@@ -545,6 +545,7 @@ def _send_operate_command(
 class CodeWhaleInteractiveListener(BaseInteractiveListener):
     agent_name = "CodeWhale"
     agent_slug = "codewhale"
+    role_context_backend = "codewhale"
 
     idle_markers = _DEEPSEEK_IDLE_MARKERS
     busy_markers = _DEEPSEEK_BUSY_MARKERS

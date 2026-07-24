@@ -42,6 +42,7 @@ from base_listener import (  # noqa: E402
 class CodexInteractiveListener(BaseInteractiveListener):
     agent_name = "Codex"
     agent_slug = "codex"
+    role_context_backend = "codex"
 
     # ── Idle/busy markers ──
     # Codex CLI uses › (U+203A) as its prompt symbol since v0.9+

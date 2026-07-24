@@ -89,6 +89,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli import kanban_workspace_contract as workspace_contract
+from hermes_cli import kanban_reservations as reservations
+from hermes_cli import kanban_delivery as delivery
+from hermes_cli import kanban_role_policy as role_policy
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -710,6 +714,82 @@ def write_board_metadata(
     return meta
 
 
+def activate_board_role_policy(
+    board: Optional[str],
+    policy_path: Path | str,
+) -> dict[str, Any]:
+    """Validate and atomically bind one role policy to a board."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    policy = role_policy.load_role_policy(policy_path)
+    metadata = role_policy.activated_metadata(read_board_metadata(slug), policy)
+    if not metadata.get("created_at"):
+        metadata["created_at"] = int(time.time())
+    path = board_metadata_path(slug)
+    role_policy.atomic_write_metadata(path, metadata)
+    return read_board_metadata(slug)
+
+
+def enforced_board_role_policy(
+    board: Optional[str] = None,
+) -> Optional[role_policy.RolePolicy]:
+    slug = _normalize_board_slug(board) or get_current_board()
+    return role_policy.enforced_policy_from_metadata(read_board_metadata(slug))
+
+
+def assert_role_policy_operation(
+    conn: sqlite3.Connection,
+    operation: str,
+    *,
+    task_ids: Iterable[str] = (),
+    target_roles: Iterable[Optional[str]] = (),
+    actor_role: Optional[str] = None,
+    board: Optional[str] = None,
+) -> None:
+    """Central guard shared by DB mutations, CLI, and listeners."""
+    policy = enforced_board_role_policy(board)
+    if policy is None:
+        return
+    roles = list(target_roles)
+    ids = tuple(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT assignee FROM tasks WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        roles.extend(row["assignee"] for row in rows)
+    resolved_actor = actor_role
+    if resolved_actor is None:
+        resolved_actor = (
+            os.environ.get("HERMES_PROFILE_NAME")
+            or os.environ.get("HERMES_PROFILE")
+        )
+    role_policy.assert_operation_allowed(
+        policy,
+        operation,
+        actor_role=resolved_actor,
+        target_roles=roles,
+    )
+
+
+def role_policy_candidate_allowed(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    actor_role: Optional[str] = None,
+) -> bool:
+    try:
+        assert_role_policy_operation(
+            conn,
+            "claim",
+            task_ids=(task.id,),
+            actor_role=actor_role,
+        )
+    except role_policy.RolePolicyDenied:
+        return False
+    return True
+
+
 def create_board(
     slug: str,
     *,
@@ -856,6 +936,11 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    base_commit: Optional[str] = None
+    target_branch: Optional[str] = None
+    workspace_contract_json: Optional[str] = None
+    delivery_state: Optional[str] = None
+    delivery_json: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -925,6 +1010,23 @@ class Task:
     # reject an unchanged implementation being re-submitted after review.
     rework_baseline_fingerprint: Optional[str] = None
 
+    @property
+    def workspace_contract(self) -> Optional[dict[str, Any]]:
+        return workspace_contract.contract_for_task(self)
+
+    @property
+    def common_dir(self) -> Optional[str]:
+        contract = self.workspace_contract
+        return (
+            str(contract["common_dir"])
+            if contract and contract.get("common_dir")
+            else None
+        )
+
+    @property
+    def delivery(self) -> Optional[delivery.DeliveryRecord]:
+        return delivery.parse_delivery(self.delivery_state, self.delivery_json)
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
@@ -951,6 +1053,19 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            base_commit=row["base_commit"] if "base_commit" in keys else None,
+            target_branch=row["target_branch"] if "target_branch" in keys else None,
+            workspace_contract_json=(
+                row["workspace_contract_json"]
+                if "workspace_contract_json" in keys
+                else None
+            ),
+            delivery_state=(
+                row["delivery_state"] if "delivery_state" in keys else None
+            ),
+            delivery_json=(
+                row["delivery_json"] if "delivery_json" in keys else None
+            ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1172,6 +1287,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
+    base_commit          TEXT,
+    target_branch        TEXT,
+    workspace_contract_json TEXT,
+    delivery_state       TEXT,
+    delivery_json        TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -1327,6 +1447,30 @@ CREATE TABLE IF NOT EXISTS task_control_holds (
     PRIMARY KEY (control_id, task_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_scope_reservations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    generation    INTEGER NOT NULL,
+    base_commit   TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    status        TEXT NOT NULL CHECK (
+        status IN ('active', 'released', 'integrated', 'abandoned')
+    ),
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS task_reservation_scopes (
+    reservation_id INTEGER NOT NULL,
+    scope_kind     TEXT NOT NULL CHECK (scope_kind IN ('write', 'artifact')),
+    scope          TEXT NOT NULL,
+    PRIMARY KEY (reservation_id, scope_kind, scope),
+    FOREIGN KEY (reservation_id) REFERENCES task_scope_reservations(id)
+        ON DELETE CASCADE
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1371,6 +1515,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_controls_delivery     ON task_control_messages(status, target_profile, created_at);
 CREATE INDEX IF NOT EXISTS idx_controls_return       ON task_control_messages(return_task_id, status);
 CREATE INDEX IF NOT EXISTS idx_control_holds_task    ON task_control_holds(task_id, control_id);
+CREATE INDEX IF NOT EXISTS idx_reservations_task     ON task_scope_reservations(task_id, generation, status);
+CREATE INDEX IF NOT EXISTS idx_reservations_status   ON task_scope_reservations(status, id);
+CREATE INDEX IF NOT EXISTS idx_reservation_scopes    ON task_reservation_scopes(scope_kind, scope, reservation_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -1974,6 +2121,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "base_commit" not in cols:
+        _add_column_if_missing(conn, "tasks", "base_commit", "base_commit TEXT")
+    if "target_branch" not in cols:
+        _add_column_if_missing(conn, "tasks", "target_branch", "target_branch TEXT")
+    if "workspace_contract_json" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_contract_json",
+            "workspace_contract_json TEXT",
+        )
+    if "delivery_state" not in cols:
+        _add_column_if_missing(conn, "tasks", "delivery_state", "delivery_state TEXT")
+    if "delivery_json" not in cols:
+        _add_column_if_missing(conn, "tasks", "delivery_json", "delivery_json TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -2581,6 +2743,8 @@ def create_task(
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    base_commit: Optional[str] = None,
+    target_branch: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -2620,6 +2784,9 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    assert_role_policy_operation(
+        conn, "create", target_roles=(assignee,), actor_role=created_by,
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2635,6 +2802,15 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    branch_template = branch_name
+    base_commit = str(base_commit or "").strip() or None
+    target_branch = str(target_branch or "").strip() or None
+    if target_branch is not None:
+        target_branch = workspace_contract.validate_branch_name(target_branch)
+    if (base_commit or target_branch) and workspace_kind != "worktree":
+        raise ValueError(
+            "base_commit and target_branch are only valid for worktree workspaces"
+        )
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2764,6 +2940,14 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        resolved_branch_name = branch_template
+        if branch_template:
+            resolved_branch_name = workspace_contract.render_branch_template(
+                branch_template,
+                task_id=task_id,
+                generation=1,
+                assignee=assignee,
+            )
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -2807,24 +2991,25 @@ def create_task(
                         workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
-                    if not branch_name:
+                    if not resolved_branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
-                            branch_name = _pdb.branch_name_for(
+                            resolved_branch_name = _pdb.branch_name_for(
                                 project_obj, task_id, title=title or ""
                             )
                         except Exception:
-                            branch_name = None
+                            resolved_branch_name = None
 
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, base_commit, target_branch,
+                        workspace_contract_json, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2837,7 +3022,10 @@ def create_task(
                         now,
                         workspace_kind,
                         workspace_path,
-                        branch_name,
+                        resolved_branch_name,
+                        base_commit,
+                        target_branch,
+                        None,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -2865,7 +3053,9 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
-                        "branch_name": branch_name,
+                        "branch_name": resolved_branch_name,
+                        "base_commit": base_commit,
+                        "target_branch": target_branch,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                     },
@@ -2970,6 +3160,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    assert_role_policy_operation(
+        conn, "assign", task_ids=(task_id,), target_roles=(profile,),
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -3001,6 +3194,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # ---------------------------------------------------------------------------
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+    assert_role_policy_operation(
+        conn, "link", task_ids=(parent_id, child_id),
+    )
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -3056,6 +3252,9 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    assert_role_policy_operation(
+        conn, "unlink", task_ids=(parent_id, child_id),
+    )
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -3201,6 +3400,9 @@ def return_task_for_rework(
         raise ValueError("return-for-rework actor is required")
     if not reason:
         raise ValueError("return-for-rework reason is required")
+    assert_role_policy_operation(
+        conn, "return-for-rework", task_ids=(task_id,), actor_role=actor,
+    )
 
     initial = get_task(conn, task_id)
     if initial is None or initial.status == "archived":
@@ -3538,6 +3740,14 @@ def ack_control_message(
 ) -> bool:
     """Idempotently ACK a control and release its root after final ACK."""
     receiver = (receiver or "").strip() or "unknown"
+    policy_row = conn.execute(
+        "SELECT task_id FROM task_control_messages WHERE id = ?",
+        (int(control_id),),
+    ).fetchone()
+    if policy_row is not None:
+        assert_role_policy_operation(
+            conn, "control", task_ids=(policy_row["task_id"],),
+        )
     now = int(time.time())
     released_roots: list[str] = []
     with write_txn(conn):
@@ -3619,17 +3829,35 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> int:
+    assert_role_policy_operation(
+        conn, "comment", task_ids=(task_id,), actor_role=author,
+    )
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
         if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            "SELECT 1 FROM tasks WHERE id = ?" + fence_sql,
+            [task_id, *fence_params],
         ).fetchone():
+            if fence_sql:
+                return 0
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -4192,22 +4420,330 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _scope_reservation_from_row(
+    row: sqlite3.Row,
+) -> reservations.ScopeReservation:
+    try:
+        manifest = json.loads(row["manifest_json"])
+    except (TypeError, ValueError) as exc:
+        raise reservations.ReservationError(
+            f"invalid stored reservation manifest for reservation {row['id']}"
+        ) from exc
+    return reservations.ScopeReservation(
+        id=int(row["id"]),
+        task_id=str(row["task_id"]),
+        generation=int(row["generation"]),
+        base_commit=str(row["base_commit"]),
+        manifest_hash=str(row["manifest_hash"]),
+        write_set=tuple(manifest.get("write_set") or ()),
+        artifact_namespace=manifest.get("artifact_namespace"),
+        status=str(row["status"]),
+        created_at=int(row["created_at"]),
+        updated_at=int(row["updated_at"]),
+    )
+
+
+def get_scope_reservation(
+    conn: sqlite3.Connection,
+    reservation_id: int,
+) -> Optional[reservations.ScopeReservation]:
+    row = conn.execute(
+        "SELECT * FROM task_scope_reservations WHERE id = ?",
+        (int(reservation_id),),
+    ).fetchone()
+    return _scope_reservation_from_row(row) if row is not None else None
+
+
+def _abandon_superseded_reservations(
+    conn: sqlite3.Connection,
+    *,
+    now: int,
+) -> None:
+    stale = conn.execute(
+        """
+        SELECT r.id, r.task_id, r.generation
+          FROM task_scope_reservations r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE r.status = 'active'
+           AND (
+               r.generation != t.generation
+               OR r.base_commit != COALESCE(t.base_commit, '')
+           )
+        """
+    ).fetchall()
+    for row in stale:
+        conn.execute(
+            "UPDATE task_scope_reservations "
+            "SET status = 'abandoned', updated_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (now, int(row["id"])),
+        )
+        _append_event(
+            conn,
+            str(row["task_id"]),
+            "reservation_abandoned",
+            {
+                "reservation_id": int(row["id"]),
+                "generation": int(row["generation"]),
+                "reason": "task_identity_superseded",
+            },
+        )
+
+
+def reserve_task_scopes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    write_set: Iterable[str],
+    artifact_namespace: Optional[str],
+    expected_generation: Optional[int] = None,
+    expected_base_commit: Optional[str] = None,
+) -> reservations.ScopeReservation:
+    """Atomically reserve canonical write and artifact scopes for a task."""
+    now = int(time.time())
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT id, generation, base_commit FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            raise KeyError(f"task not found: {task_id}")
+        generation = int(task_row["generation"])
+        base_commit = str(task_row["base_commit"] or "").strip()
+        if expected_generation is not None and generation != int(expected_generation):
+            raise reservations.ReservationError(
+                f"task generation changed: expected {expected_generation}, "
+                f"actual {generation}"
+            )
+        if (
+            expected_base_commit is not None
+            and base_commit != str(expected_base_commit).strip()
+        ):
+            raise reservations.ReservationError(
+                f"task base changed: expected {expected_base_commit}, "
+                f"actual {base_commit or '<missing>'}"
+            )
+        manifest = reservations.reservation_manifest(
+            task_id=task_id,
+            generation=generation,
+            base_commit=base_commit,
+            write_set=write_set,
+            artifact_namespace=artifact_namespace,
+        )
+        manifest_hash = reservations.manifest_hash(manifest)
+
+        _abandon_superseded_reservations(conn, now=now)
+        existing = conn.execute(
+            "SELECT * FROM task_scope_reservations WHERE manifest_hash = ?",
+            (manifest_hash,),
+        ).fetchone()
+        if existing is not None:
+            reservation = _scope_reservation_from_row(existing)
+            if reservation.status == "active":
+                return reservation
+            raise reservations.ReservationError(
+                f"reservation manifest {manifest_hash} is already "
+                f"{reservation.status}"
+            )
+
+        prior = conn.execute(
+            "SELECT * FROM task_scope_reservations "
+            "WHERE task_id = ? AND generation = ? AND base_commit = ? "
+            "AND status = 'active' LIMIT 1",
+            (task_id, generation, base_commit),
+        ).fetchone()
+        if prior is not None:
+            owner = _scope_reservation_from_row(prior)
+            raise reservations.ReservationError(
+                f"task {task_id} generation {generation} already has active "
+                f"reservation {owner.id} with manifest {owner.manifest_hash}"
+            )
+
+        active_scopes = conn.execute(
+            """
+            SELECT r.id, r.task_id, r.generation, s.scope_kind, s.scope
+              FROM task_scope_reservations r
+              JOIN task_reservation_scopes s ON s.reservation_id = r.id
+             WHERE r.status = 'active'
+             ORDER BY r.id, s.scope_kind, s.scope
+            """
+        ).fetchall()
+        requested_writes = tuple(manifest["write_set"])
+        requested_artifact = manifest["artifact_namespace"]
+        for owned in active_scopes:
+            owned_kind = str(owned["scope_kind"])
+            owned_scope = str(owned["scope"])
+            candidates = (
+                requested_writes
+                if owned_kind == "write"
+                else ((requested_artifact,) if requested_artifact else ())
+            )
+            overlap = (
+                reservations.path_scopes_overlap
+                if owned_kind == "write"
+                else reservations.artifact_scopes_overlap
+            )
+            for requested_scope in candidates:
+                if overlap(owned_scope, requested_scope):
+                    raise reservations.ReservationConflictError(
+                        owner_task_id=str(owned["task_id"]),
+                        owner_generation=int(owned["generation"]),
+                        owner_reservation_id=int(owned["id"]),
+                        scope_kind=owned_kind,
+                        owner_scope=owned_scope,
+                        requested_scope=requested_scope,
+                    )
+
+        manifest_json = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO task_scope_reservations (
+                task_id, generation, base_commit, manifest_hash,
+                manifest_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+            """,
+            (
+                task_id,
+                generation,
+                base_commit,
+                manifest_hash,
+                manifest_json,
+                now,
+                now,
+            ),
+        )
+        reservation_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO task_reservation_scopes "
+            "(reservation_id, scope_kind, scope) VALUES (?, 'write', ?)",
+            [(reservation_id, scope) for scope in requested_writes],
+        )
+        if requested_artifact:
+            conn.execute(
+                "INSERT INTO task_reservation_scopes "
+                "(reservation_id, scope_kind, scope) "
+                "VALUES (?, 'artifact', ?)",
+                (reservation_id, requested_artifact),
+            )
+        _append_event(
+            conn,
+            task_id,
+            "reservation_active",
+            {
+                "reservation_id": reservation_id,
+                "generation": generation,
+                "base_commit": base_commit,
+                "manifest_hash": manifest_hash,
+            },
+        )
+        created = get_scope_reservation(conn, reservation_id)
+        assert created is not None
+        return created
+
+
+def transition_task_reservation(
+    conn: sqlite3.Connection,
+    reservation_id: int,
+    *,
+    status: str,
+    task_id: str,
+    expected_generation: int,
+) -> reservations.ScopeReservation:
+    """Move an active reservation to one explicit terminal state."""
+    target_status = str(status).strip().lower()
+    if target_status not in reservations.RESERVATION_STATUSES - {"active"}:
+        raise reservations.ReservationError(
+            f"invalid reservation terminal status: {status!r}"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM task_scope_reservations WHERE id = ? AND task_id = ?",
+            (int(reservation_id), task_id),
+        ).fetchone()
+        if row is None:
+            raise reservations.ReservationError(
+                f"reservation {reservation_id} is not owned by task {task_id}"
+            )
+        current = _scope_reservation_from_row(row)
+        task_row = conn.execute(
+            "SELECT generation, base_commit FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task_row is None
+            or current.generation != int(expected_generation)
+            or int(task_row["generation"]) != int(expected_generation)
+            or str(task_row["base_commit"] or "") != current.base_commit
+        ):
+            raise reservations.ReservationError(
+                f"reservation {reservation_id} task identity is stale"
+            )
+        if current.status == target_status:
+            return current
+        if current.status != "active":
+            raise reservations.ReservationError(
+                f"reservation {reservation_id} is already {current.status}"
+            )
+        conn.execute(
+            "UPDATE task_scope_reservations SET status = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (target_status, now, int(reservation_id)),
+        )
+        _append_event(
+            conn,
+            task_id,
+            f"reservation_{target_status}",
+            {
+                "reservation_id": int(reservation_id),
+                "generation": current.generation,
+                "base_commit": current.base_commit,
+            },
+        )
+        transitioned = get_scope_reservation(conn, reservation_id)
+        assert transitioned is not None
+        return transitioned
+
+
+def release_task_reservation(
+    conn: sqlite3.Connection,
+    reservation_id: int,
+    *,
+    task_id: str,
+    expected_generation: int,
+) -> reservations.ScopeReservation:
+    return transition_task_reservation(
+        conn,
+        reservation_id,
+        status="released",
+        task_id=task_id,
+        expected_generation=expected_generation,
+    )
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    require_reservation: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). Writable dispatchers can
+    set ``require_reservation`` to enforce an active reservation matching the
+    task's current generation and base before the claim is admitted.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        assert_role_policy_operation(
+            conn, "claim", task_ids=(task_id,), actor_role=claimer,
+        )
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4234,6 +4770,29 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        if require_reservation:
+            active_reservation = conn.execute(
+                """
+                SELECT 1
+                  FROM tasks t
+                  JOIN task_scope_reservations r
+                    ON r.task_id = t.id
+                   AND r.generation = t.generation
+                   AND r.base_commit = t.base_commit
+                   AND r.status = 'active'
+                 WHERE t.id = ?
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if active_reservation is None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "active_write_reservation_required"},
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4304,6 +4863,38 @@ def claim_task(
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if require_reservation:
+            writable_task = get_task(conn, task_id)
+            delivery_record = writable_task.delivery if writable_task else None
+            if (
+                delivery_record is not None
+                and delivery_record.state == "prepared"
+                and delivery_record.generation == writable_task.generation
+            ):
+                running_delivery = delivery_record.with_state("running")
+                conn.execute(
+                    "UPDATE tasks SET delivery_state = 'running', delivery_json = ? "
+                    "WHERE id = ? AND generation = ? AND delivery_state = 'prepared'",
+                    (
+                        delivery.dumps_delivery(running_delivery),
+                        task_id,
+                        writable_task.generation,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "delivery_running",
+                    {
+                        "from_state": "prepared",
+                        "to_state": "running",
+                        "actor": lock,
+                        "source": "claim",
+                        "generation": writable_task.generation,
+                        "reservation_id": delivery_record.reservation_id,
+                    },
+                    run_id=run_id,
+                )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4338,6 +4929,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        assert_role_policy_operation(
+            conn, "claim", task_ids=(task_id,), actor_role=claimer,
+        )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4396,6 +4990,9 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
@@ -4403,18 +5000,28 @@ def heartbeat_claim(
     few minutes to keep ownership.
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
-    lock = claimer or _claimer_id()
+    lock = expected_claim_lock or claimer or _claimer_id()
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=lock,
+    )
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
-            (expires, task_id, lock),
+            "WHERE id = ? AND status = 'running'" + fence_sql,
+            [expires, task_id, *fence_params],
         )
         if cur.rowcount == 1:
-            run_id = _current_run_id(conn, task_id)
+            run_id = (
+                int(expected_run_id)
+                if expected_run_id is not None
+                else _current_run_id(conn, task_id)
+            )
             if run_id is not None:
                 conn.execute(
-                    "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                    "UPDATE task_runs SET claim_expires = ? "
+                    "WHERE id = ? AND ended_at IS NULL",
                     (expires, run_id),
                 )
             return True
@@ -4573,6 +5180,9 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -4583,28 +5193,35 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state or no longer matches an optional expected claim fence.
+    Omitting all expected values preserves the operator-driven legacy API.
     """
-    row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if not row:
-        return False
-    if row["status"] != "running" and row["claim_lock"] is None:
-        # Nothing to reclaim — already ready / blocked / done.
-        return False
-    prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
     )
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id, generation "
+            "FROM tasks WHERE id = ?" + fence_sql,
+            [task_id, *fence_params],
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] != "running" and row["claim_lock"] is None:
+            # Nothing to reclaim — already ready / blocked / done.
+            return False
+        prev_lock = row["claim_lock"]
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND claim_lock IS ?" + fence_sql,
+            [task_id, prev_lock, *fence_params],
         )
         if cur.rowcount != 1:
             return False
@@ -4628,11 +5245,14 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
+        # Operator intervention means the old failure budget is stale. Keep
+        # this reset in the same claim-fenced transaction so a replacement
+        # run cannot start between reclaim and counter cleanup.
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ?",
+            (task_id,),
+        )
     return True
 
 
@@ -4842,6 +5462,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    assert_role_policy_operation(conn, "complete", task_ids=(task_id,))
     task_before = get_task(conn, task_id)
     if task_before is None:
         return False
@@ -5535,6 +6156,7 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    assert_role_policy_operation(conn, "edit", task_ids=(task_id,))
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
@@ -5629,6 +6251,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    assert_role_policy_operation(conn, "block", task_ids=(task_id,))
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -5893,6 +6516,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    assert_role_policy_operation(conn, "unblock", task_ids=(task_id,))
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -6264,6 +6888,7 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    assert_role_policy_operation(conn, "archive", task_ids=(task_id,))
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -6490,6 +7115,11 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _validate_declared_workspace_contract(task: Task, path: Path) -> None:
+    if task.base_commit or task.target_branch or task.workspace_contract_json:
+        workspace_contract.validate_or_resolve_contract(task, path)
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -6531,6 +7161,7 @@ def _resolve_worktree_workspace(
             )
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
+        _validate_declared_workspace_contract(task, target)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6543,12 +7174,14 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        _validate_declared_workspace_contract(task, requested_resolved)
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
+        _validate_declared_workspace_contract(task, target)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6558,6 +7191,7 @@ def _resolve_worktree_workspace(
             "and does not point at a git repo root"
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
+    _validate_declared_workspace_contract(task, requested)
     return requested, branch_name
 
 
@@ -6623,24 +7257,655 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def _claim_fence_clause(
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> tuple[str, list[Any]]:
+    """Build optional task-claim CAS predicates for metadata updates."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if expected_run_id is not None:
+        clauses.append("current_run_id = ?")
+        params.append(int(expected_run_id))
+    if expected_generation is not None:
+        clauses.append("generation = ?")
+        params.append(int(expected_generation))
+    if expected_claim_lock is not None:
+        clauses.append("claim_lock IS ?")
+        params.append(str(expected_claim_lock))
+    return (" AND " + " AND ".join(clauses) if clauses else "", params)
+
+
 def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> None:
+    conn: sqlite3.Connection,
+    task_id: str,
+    path: Path | str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist a workspace path, optionally fenced to one immutable claim."""
+    task = get_task(conn, task_id)
+    contract_data: Optional[dict[str, Any]] = None
+    contract_json = task.workspace_contract_json if task else None
+    canonical_base = task.base_commit if task else None
+    if task and task.workspace_kind == "worktree" and (
+        task.base_commit or task.target_branch or task.workspace_contract_json
+    ):
+        contract_data = workspace_contract.validate_or_resolve_contract(task, path)
+        contract_json = workspace_contract.dumps_contract(contract_data)
+        canonical_base = contract_data["base_commit"]
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_path = ?, workspace_contract_json = ?, "
+            "base_commit = ? WHERE id = ?" + fence_sql,
+            [str(path), contract_json, canonical_base, task_id, *fence_params],
         )
+    return cur.rowcount == 1
 
 
 def set_branch_name(
-    conn: sqlite3.Connection, task_id: str, branch_name: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch_name: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist a branch name, optionally fenced to one immutable claim."""
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET branch_name = ? WHERE id = ?" + fence_sql,
+            [str(branch_name), task_id, *fence_params],
+        )
+    return cur.rowcount == 1
+
+
+def _persist_task_lifecycle_contract(
+    conn: sqlite3.Connection,
+    task: Task,
+    contract: dict[str, Any],
+) -> None:
+    """Persist lifecycle metadata only while the task generation is current."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET workspace_path = ?,
+                   branch_name = ?,
+                   base_commit = ?,
+                   workspace_contract_json = ?
+             WHERE id = ? AND generation = ?
+            """,
+            (
+                contract["worktree"],
+                contract["branch"],
+                contract["base_commit"],
+                workspace_contract.dumps_contract(contract),
+                task.id,
+                task.generation,
+            ),
+        )
+    if cur.rowcount != 1:
+        raise workspace_contract.WorkspaceContractError(
+            f"task generation changed while persisting lifecycle contract: {task.id}"
+        )
+
+
+def prepare_task_worktree(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_branch: str,
+    upstream: str = "origin",
+    base_commit: Optional[str] = None,
+    role: Optional[str] = None,
+) -> dict[str, Any]:
+    """Prepare and persist a task generation in its long-lived worktree."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if task.workspace_kind != "worktree" or not task.workspace_path:
+        raise workspace_contract.WorkspaceContractError(
+            f"task {task_id} does not declare a worktree workspace"
+        )
+    contract = workspace_contract.prepare_generation_worktree(
+        task,
+        task.workspace_path,
+        source_branch=source_branch,
+        upstream=upstream,
+        base_commit=base_commit,
+        role=role,
+    )
+    _persist_task_lifecycle_contract(conn, task, contract)
+    return contract
+
+
+def freeze_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Freeze and persist the current generation's delivery identities."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if not task.workspace_path:
+        raise workspace_contract.WorkspaceContractError(
+            f"task {task_id} has no workspace path"
+        )
+    contract = workspace_contract.freeze_delivery(task, task.workspace_path)
+    _persist_task_lifecycle_contract(conn, task, contract)
+    return contract
+
+
+def release_task_worktree_lease(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Release a frozen worktree lease while preserving its delivery branch."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if not task.workspace_path:
+        raise workspace_contract.WorkspaceContractError(
+            f"task {task_id} has no workspace path"
+        )
+    contract = workspace_contract.release_worktree_lease(
+        task, task.workspace_path,
+    )
+    _persist_task_lifecycle_contract(conn, task, contract)
+    return contract
+
+
+def get_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[delivery.DeliveryRecord]:
+    task = get_task(conn, task_id)
+    return task.delivery if task is not None else None
+
+
+def _reject_delivery_operation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    message: str,
+    payload: dict[str, Any],
+    error_type: type[delivery.DeliveryError],
 ) -> None:
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET branch_name = ? WHERE id = ?",
-            (str(branch_name), task_id),
+        _append_event(conn, task_id, kind, {**payload, "reason": message})
+    raise error_type(message)
+
+
+def _transition_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    target_state: str,
+    actor: str,
+    source: str,
+    transform: Any,
+    side_effect: Any = None,
+    event_payload: Optional[dict[str, Any]] = None,
+) -> delivery.DeliveryRecord:
+    rejected: Optional[str] = None
+    result: Optional[delivery.DeliveryRecord] = None
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        current = task.delivery
+        stored_state = current.state if current is not None else None
+        previous_generation = current.generation if current is not None else None
+        superseded = bool(
+            current is not None and current.generation < task.generation
         )
+        effective_current = None if superseded and target_state == "prepared" else current
+        current_state = (
+            effective_current.state if effective_current is not None else None
+        )
+        if (
+            current is not None
+            and current.generation > task.generation
+        ):
+            rejected = (
+                f"delivery generation {current.generation} is newer than "
+                f"task generation {task.generation}"
+            )
+        elif not delivery.transition_allowed(current_state, target_state):
+            rejected = (
+                f"delivery transition {current_state or '<none>'} -> "
+                f"{target_state} is not allowed"
+            )
+        elif current is not None and current.generation != task.generation and not superseded:
+            rejected = (
+                f"delivery generation {current.generation} does not match "
+                f"task generation {task.generation}"
+            )
+        else:
+            result = transform(task, effective_current)
+            if side_effect is not None:
+                side_effect(conn, task, effective_current, result)
+            cur = conn.execute(
+                "UPDATE tasks SET delivery_state = ?, delivery_json = ? "
+                "WHERE id = ? AND generation = ? AND delivery_state IS ?",
+                (
+                    target_state,
+                    delivery.dumps_delivery(result),
+                    task_id,
+                    task.generation,
+                    stored_state,
+                ),
+            )
+            if cur.rowcount != 1:
+                rejected = "task delivery identity changed during transition"
+                result = None
+        if rejected:
+            _append_event(
+                conn,
+                task_id,
+                "delivery_transition_rejected",
+                {
+                    "from_state": current_state,
+                    "to_state": target_state,
+                    "actor": actor,
+                    "source": source,
+                    "reason": rejected,
+                },
+            )
+        else:
+            if superseded:
+                _append_event(
+                    conn,
+                    task_id,
+                    "delivery_superseded",
+                    {
+                        "previous_state": stored_state,
+                        "previous_generation": previous_generation,
+                        "generation": task.generation,
+                        "actor": actor,
+                        "source": source,
+                    },
+                )
+            details: dict[str, Any] = dict(event_payload or {})
+            details["reservation_id"] = result.reservation_id
+            if result.delivery_sha:
+                details["delivery_sha"] = result.delivery_sha
+                details["delivery_tree"] = result.delivery_tree
+            if result.authorization:
+                details["authorization"] = dict(result.authorization)
+            _append_event(
+                conn,
+                task_id,
+                f"delivery_{target_state}",
+                {
+                    "from_state": current_state,
+                    "to_state": target_state,
+                    "actor": actor,
+                    "source": source,
+                    "generation": result.generation,
+                    **details,
+                },
+            )
+    if rejected:
+        raise delivery.DeliveryTransitionError(rejected)
+    assert result is not None
+    return result
+
+
+def prepare_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_contract: dict[str, Any],
+    reservation_id: int,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    reservation = get_scope_reservation(conn, reservation_id)
+    problems: list[str] = []
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if str(workspace_contract.get("task_id")) != task_id:
+        problems.append("workspace contract task mismatch")
+    if int(workspace_contract.get("generation", -1)) != task.generation:
+        problems.append("workspace contract generation mismatch")
+    if workspace_contract.get("base_commit") != task.base_commit:
+        problems.append("workspace contract base mismatch")
+    if reservation is None or reservation.status != "active":
+        problems.append("active scope reservation is required")
+    elif (
+        reservation.task_id != task_id
+        or reservation.generation != task.generation
+        or reservation.base_commit != task.base_commit
+    ):
+        problems.append("scope reservation task identity mismatch")
+    if problems:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_transition_rejected",
+            message="; ".join(problems),
+            payload={
+                "from_state": task.delivery_state,
+                "to_state": "prepared",
+                "actor": actor,
+                "source": source,
+            },
+            error_type=delivery.DeliveryTransitionError,
+        )
+
+    def transform(current_task: Task, current: Any) -> delivery.DeliveryRecord:
+        return delivery.DeliveryRecord(
+            state="prepared",
+            task_id=current_task.id,
+            generation=current_task.generation,
+            base_commit=str(current_task.base_commit),
+            reservation_id=int(reservation_id),
+            workspace_contract=dict(workspace_contract),
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="prepared",
+        actor=actor,
+        source=source,
+        transform=transform,
+    )
+
+
+def start_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="running",
+        actor=actor,
+        source=source,
+        transform=lambda task, current: current.with_state("running"),
+    )
+
+
+def mark_task_delivered(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_contract: dict[str, Any],
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    try:
+        delivery.validate_frozen_contract(task, workspace_contract)
+    except delivery.DeliveryError as exc:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_transition_rejected",
+            message=str(exc),
+            payload={
+                "from_state": task.delivery_state,
+                "to_state": "delivered",
+                "actor": actor,
+                "source": source,
+            },
+            error_type=delivery.DeliveryTransitionError,
+        )
+
+    def transform(current_task: Task, current: delivery.DeliveryRecord) -> delivery.DeliveryRecord:
+        return current.with_state(
+            "delivered",
+            workspace_contract=dict(workspace_contract),
+            delivery_sha=str(workspace_contract["delivery_commit"]),
+            delivery_tree=str(workspace_contract["delivery_tree"]),
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="delivered",
+        actor=actor,
+        source=source,
+        transform=transform,
+    )
+
+
+def accept_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="accepted",
+        actor=actor,
+        source=source,
+        transform=lambda task, current: current.with_state(
+            "accepted",
+            accepted_by=actor,
+            accepted_source=source,
+            accepted_delivery_sha=current.delivery_sha,
+            accepted_delivery_tree=current.delivery_tree,
+        ),
+    )
+
+
+def authorize_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    integrator: str,
+    actor: str,
+    source: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    current = task.delivery if task is not None else None
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    if source not in delivery.USER_AUTHORIZATION_SOURCES:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message="authorization requires an explicit user source",
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+    if not str(actor or "").strip():
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message="authorization actor is required",
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+    if current is None or current.state != "accepted":
+        return _transition_task_delivery(
+            conn,
+            task_id,
+            target_state="authorized",
+            actor=actor,
+            source=source,
+            transform=lambda current_task, record: record,
+        )
+    if not delivery.acceptance_matches(current):
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message="accepted review does not match current delivery identity",
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+    try:
+        auth_tuple = delivery.authorization_tuple(
+            task, current, integrator=integrator,
+        )
+    except delivery.DeliveryAuthorizationError as exc:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_authorization_rejected",
+            message=str(exc),
+            payload={"actor": actor, "source": source, "integrator": integrator},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="authorized",
+        actor=actor,
+        source=source,
+        transform=lambda current_task, record: record.with_state(
+            "authorized",
+            authorization=auth_tuple,
+            authorization_actor=actor,
+            authorization_source=source,
+        ),
+    )
+
+
+def integrate_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    integrator: str,
+) -> delivery.DeliveryRecord:
+    task = get_task(conn, task_id)
+    record = task.delivery if task is not None else None
+    if task is None:
+        raise KeyError(f"task not found: {task_id}")
+    problems: list[str] = []
+    if record is None or record.state != "authorized":
+        problems.append("delivery must be authorized before integration")
+    else:
+        if (
+            not delivery.acceptance_matches(record)
+            or record.authorization_source not in delivery.USER_AUTHORIZATION_SOURCES
+        ):
+            problems.append("accepted review/user authorization refs are missing")
+        problems.extend(
+            delivery.integration_mismatches(task, record, integrator=integrator)
+        )
+        reservation = get_scope_reservation(conn, record.reservation_id)
+        if (
+            reservation is None
+            or reservation.status != "active"
+            or reservation.task_id != task.id
+            or reservation.generation != task.generation
+            or reservation.base_commit != task.base_commit
+        ):
+            problems.append("active matching scope reservation is required")
+    if problems:
+        _reject_delivery_operation(
+            conn,
+            task_id,
+            kind="delivery_integration_rejected",
+            message="; ".join(problems),
+            payload={"actor": integrator, "source": "integration"},
+            error_type=delivery.DeliveryAuthorizationError,
+        )
+
+    def side_effect(
+        transaction: sqlite3.Connection,
+        current_task: Task,
+        current: delivery.DeliveryRecord,
+        updated: delivery.DeliveryRecord,
+    ) -> None:
+        now = int(time.time())
+        cur = transaction.execute(
+            "UPDATE task_scope_reservations SET status = 'integrated', updated_at = ? "
+            "WHERE id = ? AND task_id = ? AND generation = ? "
+            "AND base_commit = ? AND status = 'active'",
+            (
+                now,
+                current.reservation_id,
+                current_task.id,
+                current_task.generation,
+                current_task.base_commit,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise delivery.DeliveryAuthorizationError(
+                "scope reservation changed during integration"
+            )
+        _append_event(
+            transaction,
+            current_task.id,
+            "reservation_integrated",
+            {"reservation_id": current.reservation_id},
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="integrated",
+        actor=integrator,
+        source="integration",
+        transform=lambda current_task, current: current.with_state("integrated"),
+        side_effect=side_effect,
+    )
+
+
+def abandon_task_delivery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> delivery.DeliveryRecord:
+    def side_effect(
+        transaction: sqlite3.Connection,
+        current_task: Task,
+        current: delivery.DeliveryRecord,
+        updated: delivery.DeliveryRecord,
+    ) -> None:
+        transaction.execute(
+            "UPDATE task_scope_reservations SET status = 'abandoned', updated_at = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'active'",
+            (int(time.time()), current.reservation_id, current_task.id),
+        )
+
+    return _transition_task_delivery(
+        conn,
+        task_id,
+        target_state="abandoned",
+        actor=actor,
+        source="workflow",
+        transform=lambda current_task, current: current.with_state("abandoned"),
+        side_effect=side_effect,
+        event_payload={"reason": reason},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -7096,6 +8361,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -7108,19 +8375,17 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
-                (now, task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
-            )
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running'" + fence_sql,
+            [now, task_id, *fence_params],
+        )
         if cur.rowcount != 1:
             return False
         run_id = (
@@ -7925,25 +9190,47 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    the drawer. Optional expected values fence interactive-listener updates
+    to the claim that initiated them.
     """
+    fence_sql, fence_params = _claim_fence_clause(
+        expected_run_id=expected_run_id,
+        expected_generation=expected_generation,
+        expected_claim_lock=expected_claim_lock,
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?" + fence_sql,
+            [int(pid), task_id, *fence_params],
         )
-        run_id = _current_run_id(conn, task_id)
+        if cur.rowcount != 1:
+            return False
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
+        )
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                "UPDATE task_runs SET worker_pid = ? "
+                "WHERE id = ? AND ended_at IS NULL",
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9202,6 +10489,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.workspace_contract is not None:
+        lines.append(
+            "Workspace contract: "
+            + workspace_contract.dumps_contract(task.workspace_contract)
+        )
     lines.append("")
 
     if task.body and task.body.strip():
