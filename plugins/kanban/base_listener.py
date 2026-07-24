@@ -925,7 +925,6 @@ class BaseInteractiveListener:
         self, args: argparse.Namespace, *, log_path: Path, conn: Any | None = None,
     ) -> tuple[str | None, int | None]:
         board = self._board
-        workspace = self._workspace
         pane_profile = self._profile
 
         # Every backend reaches this shared path, including subclasses with a
@@ -955,15 +954,66 @@ class BaseInteractiveListener:
             claimed = kb.claim_task(conn, candidate.id, ttl_seconds=args.ttl, claimer=self._claim_lock())
             if claimed is None:
                 return None, None
-            kb.set_workspace_path(conn, claimed.id, workspace)
-            claimed = kb.get_task(conn, claimed.id) or claimed
+        except Exception as exc:
+            log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
+            return None, None
+
+        try:
+            task_workspace = kb.resolve_workspace(claimed, board=board)
+            expected_branch = claimed.branch_name
+            if claimed.workspace_kind == "worktree":
+                expected_branch = kb._git_current_branch(Path(task_workspace))  # type: ignore[attr-defined]
+                if not expected_branch:
+                    raise RuntimeError(
+                        f"could not resolve actual branch for worktree {task_workspace}"
+                    )
+            kb.set_workspace_path(conn, claimed.id, task_workspace)
+            if claimed.workspace_kind == "worktree":
+                kb.set_branch_name(conn, claimed.id, expected_branch)
+            resolved_claimed = kb.get_task(conn, claimed.id)
+            if resolved_claimed is None:
+                raise RuntimeError("claimed task disappeared after workspace resolution")
+            persisted_workspace = (
+                Path(resolved_claimed.workspace_path or "")
+                .expanduser()
+                .resolve(strict=False)
+            )
+            expected_workspace = (
+                Path(task_workspace).expanduser().resolve(strict=False)
+            )
+            if persisted_workspace != expected_workspace:
+                raise RuntimeError(
+                    f"workspace identity mismatch: resolved={expected_workspace} "
+                    f"persisted={persisted_workspace}"
+                )
+            if (
+                resolved_claimed.status != "running"
+                or resolved_claimed.current_run_id != claimed.current_run_id
+                or resolved_claimed.generation != claimed.generation
+                or resolved_claimed.branch_name != expected_branch
+            ):
+                raise RuntimeError(
+                    "task run/branch/generation identity changed after workspace resolution"
+                )
+            claimed = resolved_claimed
             try:
                 kb._set_worker_pid(conn, claimed.id, os.getpid())  # type: ignore[attr-defined]
             except Exception:
                 pass
             context = kb.build_worker_context(conn, claimed.id)
         except Exception as exc:
-            log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
+            reason = (
+                f"{self.agent_slug}-interactive workspace resolution/identity failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            reclaimed = _reclaim_task_without_signaling_worker(
+                conn, claimed.id, reason=reason,
+            )
+            log_line(
+                log_path,
+                f"task {claimed.id} workspace resolution/identity failed; "
+                f"reclaimed={reclaimed}; {type(exc).__name__}: {exc}",
+            )
             return None, None
 
         prompt_path = write_task_prompt(
@@ -972,7 +1022,7 @@ class BaseInteractiveListener:
             task_id=claimed.id,
             task_assignee=getattr(claimed, "assignee", None) or pane_profile,
             task_title=claimed.title,
-            context=context, workspace=workspace,
+            context=context, workspace=task_workspace,
             run_id=claimed.current_run_id,
             generation=claimed.generation,
         )
