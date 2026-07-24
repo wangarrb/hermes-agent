@@ -1,8 +1,8 @@
 #!/bin/bash
 # 启动 kanban 5分窗口。角色固定，底层 agent 可切换。
-# 默认布局：左上planner=hermes,右上reviewer=codex,左下implementer=hermes,中下critic=hermes,右下coordinator=hermes
+# 默认布局：左上planner=hermes,右上reviewer=codex,左下implementer=hermes,中下designer=hermes,右下coordinator=hermes
 # 默认任务交付：inject（通过 Zellij 注入）；self-poll 已移除
-# 双角色用法：--assist-role coordinator:implementer --assist-role critic:implementer
+# 双角色用法：--assist-role coordinator:implementer --assist-role designer:implementer
 
 SOURCE_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
@@ -22,6 +22,7 @@ usage() {
 核心参数:
   -b, --board <board>              Kanban board 名称，例如 egomotion4d
   -w, --workspace <path>           工作目录，默认 $HOME/code/Egomotion4D
+  --designer-workspace <path>      designer 工作目录，默认 /home/wyr/code/Egomotion4D-designer
   -n, --dry-run                    只生成并打印 zellij layout，不启动/不清理
 
 角色 -> agent 映射（默认就是当前常用配置）:
@@ -29,7 +30,7 @@ usage() {
   -p, --planner-agent <agent>      planner 使用的 agent，默认 hermes
   -r, --reviewer-agent <agent>     reviewer 使用的 agent，默认 codex
   -i, --implementer-agent <agent>  implementer 使用的 agent，默认 hermes
-  -c, --critic-agent <agent>       critic 使用的 agent，默认 hermes；传 none 则不创建 critic pane（4 窗口布局）
+  -d, --designer-agent <agent>     designer 使用的 agent，默认 hermes
 
 支持的 agent:
   hermes
@@ -46,8 +47,8 @@ Agent 参数:
   --deepseek-continue-policy <p>   CodeWhale 会话续接策略：auto/primary-only/all/none，默认 auto。
                                    auto/primary-only: 只有一个 codewhale pane 时继续旧会话；
                                    多个 codewhale pane 时仅 primary 继续，其他 fresh。
-  --deepseek-continue-primary <r>  覆盖 continue primary 角色（默认自动选 implementer > planner > coordinator > critic）。
-                                   设为 critic 可让 critic pane 继续旧会话而非 implementer。
+  --deepseek-continue-primary <r>  覆盖 continue primary 角色（默认自动选 designer > implementer > reviewer > planner > coordinator）。
+                                   设为 designer 可让 designer pane 继续旧会话而非 implementer。
   --idle-pane-reclaim-s <sec>      CodeWhale pane 连续空闲多久后回收 running 任务；默认 bridge=600
   --hermes-toolsets <sets>         Hermes pane 的 toolsets，默认 file,terminal,skills,todo,memory,search,web,browser,cronjob,delegation,session_search,vision,clarify,code_execution；
                                    设为 all 或空值表示不限制。toolsets 是会话启动时固定的，不能运行中热加载。
@@ -67,8 +68,8 @@ Zellij:
 
 示例:
   start-kanban.sh -b egomotion4d
-  start-kanban.sh -b egomotion4d -i codewhale -p codex -c hermes
-  start-kanban.sh -b egomotion4d -p hermes -i codex -c codewhale -r claude -n
+  start-kanban.sh -b egomotion4d -i codewhale -p codex -d hermes
+  start-kanban.sh -b egomotion4d -p hermes -i codex -d codewhale -r claude -n
   start-kanban.sh -b egomotion4d --deepseek-provider opencode-go --deepseek-model deepseek-v4-pro
 EOF
     exit "$status"
@@ -111,7 +112,7 @@ agent_is_used() {
     [ "$COORDINATOR_AGENT" = "$target" ] || \
     [ "$PLANNER_AGENT" = "$target" ] || \
     [ "$IMPLEMENTER_AGENT" = "$target" ] || \
-    [ "$CRITIC_AGENT" = "$target" ] || \
+    [ "$DESIGNER_AGENT" = "$target" ] || \
     [ "$REVIEWER_AGENT" = "$target" ]
 }
 
@@ -133,10 +134,11 @@ clean_session_name() {
 
 BOARD=""
 WORKSPACE="${KANBAN_WORKSPACE:-${CODEWHALE_KANBAN_WORKSPACE:-${CODEX_KANBAN_WORKSPACE:-${DEEPSEEK_KANBAN_WORKSPACE:-${REAL_HOME}/code/Egomotion4D}}}}"
+DESIGNER_WORKSPACE="${KANBAN_DESIGNER_WORKSPACE:-${REAL_HOME}/code/Egomotion4D-designer}"
 COORDINATOR_AGENT="${KANBAN_COORDINATOR_AGENT:-hermes}"
 PLANNER_AGENT="${KANBAN_PLANNER_AGENT:-hermes}"
 IMPLEMENTER_AGENT="${KANBAN_IMPLEMENTER_AGENT:-hermes}"
-CRITIC_AGENT="${KANBAN_CRITIC_AGENT:-hermes}"
+DESIGNER_AGENT="${KANBAN_DESIGNER_AGENT:-hermes}"
 REVIEWER_AGENT="${KANBAN_REVIEWER_AGENT:-codex}"
 DEEPSEEK_PROVIDER="${DEEPSEEK_KANBAN_PROVIDER:-openrouter}"
 DEEPSEEK_MODEL="${DEEPSEEK_KANBAN_MODEL:-}"
@@ -156,12 +158,12 @@ CLEAN=1
 COORDINATOR_ASSISTS=""
 PLANNER_ASSISTS=""
 IMPLEMENTER_ASSISTS=""
-CRITIC_ASSISTS=""
+DESIGNER_ASSISTS=""
 REVIEWER_ASSISTS=""
 COORDINATOR_ASSIST_DELAYS=""
 PLANNER_ASSIST_DELAYS=""
 IMPLEMENTER_ASSIST_DELAYS=""
-CRITIC_ASSIST_DELAYS=""
+DESIGNER_ASSIST_DELAYS=""
 REVIEWER_ASSIST_DELAYS=""
 GLOBAL_ASSIST_PROFILE_DELAYS=""
 
@@ -169,10 +171,10 @@ validate_role_name() {
     local kind="$1"
     local role="$2"
     case "$role" in
-        coordinator|planner|implementer|critic|reviewer)
+        coordinator|planner|implementer|designer|reviewer)
             return 0 ;;
         *)
-            echo "错误: $kind 只能是 coordinator/planner/implementer/critic/reviewer，不能是: ${role:-<empty>}" >&2
+            echo "错误: $kind 只能是 coordinator/planner/implementer/designer/reviewer，不能是: ${role:-<empty>}" >&2
             exit 1 ;;
     esac
 }
@@ -292,8 +294,8 @@ add_assist_role_delay() {
             PLANNER_ASSIST_DELAYS="$(append_assist_delay "$PLANNER_ASSIST_DELAYS" "$target_spec")" ;;
         implementer)
             IMPLEMENTER_ASSIST_DELAYS="$(append_assist_delay "$IMPLEMENTER_ASSIST_DELAYS" "$target_spec")" ;;
-        critic)
-            CRITIC_ASSIST_DELAYS="$(append_assist_delay "$CRITIC_ASSIST_DELAYS" "$target_spec")" ;;
+        designer)
+            DESIGNER_ASSIST_DELAYS="$(append_assist_delay "$DESIGNER_ASSIST_DELAYS" "$target_spec")" ;;
         reviewer)
             REVIEWER_ASSIST_DELAYS="$(append_assist_delay "$REVIEWER_ASSIST_DELAYS" "$target_spec")" ;;
         *)
@@ -318,8 +320,8 @@ add_assist_role() {
             PLANNER_ASSISTS="$(append_csv_unique "$PLANNER_ASSISTS" "$assist")" ;;
         implementer)
             IMPLEMENTER_ASSISTS="$(append_csv_unique "$IMPLEMENTER_ASSISTS" "$assist")" ;;
-        critic)
-            CRITIC_ASSISTS="$(append_csv_unique "$CRITIC_ASSISTS" "$assist")" ;;
+        designer)
+            DESIGNER_ASSISTS="$(append_csv_unique "$DESIGNER_ASSISTS" "$assist")" ;;
         reviewer)
             REVIEWER_ASSISTS="$(append_csv_unique "$REVIEWER_ASSISTS" "$assist")" ;;
     esac
@@ -331,14 +333,19 @@ while [[ $# -gt 0 ]]; do
             need_value "$1" "${2:-}"; BOARD="$2"; shift 2 ;;
         -w|--workspace)
             need_value "$1" "${2:-}"; WORKSPACE="$2"; shift 2 ;;
+        --designer-workspace)
+            need_value "$1" "${2:-}"; DESIGNER_WORKSPACE="$2"; shift 2 ;;
         -o|--coordinator-agent)
             need_value "$1" "${2:-}"; COORDINATOR_AGENT="$2"; shift 2 ;;
         -p|--planner-agent)
             need_value "$1" "${2:-}"; PLANNER_AGENT="$2"; shift 2 ;;
         -i|--implementer-agent)
             need_value "$1" "${2:-}"; IMPLEMENTER_AGENT="$2"; shift 2 ;;
+        -d|--designer-agent)
+            need_value "$1" "${2:-}"; DESIGNER_AGENT="$2"; shift 2 ;;
         -c|--critic-agent)
-            need_value "$1" "${2:-}"; CRITIC_AGENT="$2"; shift 2 ;;
+            echo "错误: $1 已移除；critic pane 已迁移为 designer，请使用 --designer-agent。历史 critic 数据不会被修改。" >&2
+            exit 2 ;;
         -r|--reviewer-agent)
             need_value "$1" "${2:-}"; REVIEWER_AGENT="$2"; shift 2 ;;
         --deepseek-provider)
@@ -374,7 +381,8 @@ while [[ $# -gt 0 ]]; do
         --planner-assist)
             need_value "$1" "${2:-}"; add_assist_role "planner:$2"; shift 2 ;;
         --critic-assist)
-            need_value "$1" "${2:-}"; add_assist_role "critic:$2"; shift 2 ;;
+            echo "错误: --critic-assist 已移除；请迁移到 --assist-role designer:<assignee>。" >&2
+            exit 2 ;;
         --session-name)
             need_value "$1" "${2:-}"; SESSION_NAME="$2"; shift 2 ;;
         --no-clean)
@@ -410,8 +418,23 @@ fi
 COORDINATOR_AGENT="$(normalize_agent "$COORDINATOR_AGENT")"
 PLANNER_AGENT="$(normalize_agent "$PLANNER_AGENT")"
 IMPLEMENTER_AGENT="$(normalize_agent "$IMPLEMENTER_AGENT")"
-CRITIC_AGENT="$(normalize_agent "$CRITIC_AGENT")"
+DESIGNER_AGENT="$(normalize_agent "$DESIGNER_AGENT")"
 REVIEWER_AGENT="$(normalize_agent "$REVIEWER_AGENT")"
+
+if [ -n "$DEEPSEEK_CONTINUE_PRIMARY" ]; then
+    validate_role_name "continue primary role" "$DEEPSEEK_CONTINUE_PRIMARY"
+    case "$DEEPSEEK_CONTINUE_PRIMARY" in
+        coordinator) continue_primary_agent="$COORDINATOR_AGENT" ;;
+        planner) continue_primary_agent="$PLANNER_AGENT" ;;
+        reviewer) continue_primary_agent="$REVIEWER_AGENT" ;;
+        implementer) continue_primary_agent="$IMPLEMENTER_AGENT" ;;
+        designer) continue_primary_agent="$DESIGNER_AGENT" ;;
+    esac
+    if [ "$continue_primary_agent" != "codewhale" ] && [ "$continue_primary_agent" != "deepseek-reasonix" ]; then
+        echo "错误: continue primary role $DEEPSEEK_CONTINUE_PRIMARY 未使用 codewhale/deepseek-reasonix" >&2
+        exit 1
+    fi
+fi
 
 DEEPSEEK_CONTINUE_POLICY="${DEEPSEEK_CONTINUE_POLICY,,}"
 case "$DEEPSEEK_CONTINUE_POLICY" in
@@ -442,6 +465,11 @@ if [ ! -d "$WORKSPACE" ]; then
     exit 1
 fi
 WORKSPACE="$(readlink -f "$WORKSPACE")"
+if [ ! -d "$DESIGNER_WORKSPACE" ]; then
+    echo "错误: designer workspace 不存在: $DESIGNER_WORKSPACE" >&2
+    exit 1
+fi
+DESIGNER_WORKSPACE="$(readlink -f "$DESIGNER_WORKSPACE")"
 
 if ! command -v zellij >/dev/null 2>&1; then
     echo "错误: 找不到 zellij" >&2
@@ -478,20 +506,21 @@ deepseek_pane_count() {
     [ "$COORDINATOR_AGENT" = "codewhale" ] && n=$((n + 1))
     [ "$PLANNER_AGENT" = "codewhale" ] && n=$((n + 1))
     [ "$IMPLEMENTER_AGENT" = "codewhale" ] && n=$((n + 1))
-    [ "$CRITIC_AGENT" = "codewhale" ] && n=$((n + 1))
+    [ "$DESIGNER_AGENT" = "codewhale" ] && n=$((n + 1))
     [ "$REVIEWER_AGENT" = "codewhale" ] && n=$((n + 1))
     [ "$COORDINATOR_AGENT" = "deepseek-reasonix" ] && n=$((n + 1))
     [ "$PLANNER_AGENT" = "deepseek-reasonix" ] && n=$((n + 1))
     [ "$IMPLEMENTER_AGENT" = "deepseek-reasonix" ] && n=$((n + 1))
-    [ "$CRITIC_AGENT" = "deepseek-reasonix" ] && n=$((n + 1))
+    [ "$DESIGNER_AGENT" = "deepseek-reasonix" ] && n=$((n + 1))
     [ "$REVIEWER_AGENT" = "deepseek-reasonix" ] && n=$((n + 1))
     printf '%s' "$n"
 }
 
 deepseek_primary_role() {
-    # critic 优先续接旧会话：critic 需要完整的上下文来做审查判断
-    if [ "$CRITIC_AGENT" = "codewhale" ] || [ "$CRITIC_AGENT" = "deepseek-reasonix" ]; then
-        printf '%s' "critic"
+    if [ -n "$DEEPSEEK_CONTINUE_PRIMARY" ]; then
+        printf '%s' "$DEEPSEEK_CONTINUE_PRIMARY"
+    elif [ "$DESIGNER_AGENT" = "codewhale" ] || [ "$DESIGNER_AGENT" = "deepseek-reasonix" ]; then
+        printf '%s' "designer"
     elif [ "$IMPLEMENTER_AGENT" = "codewhale" ] || [ "$IMPLEMENTER_AGENT" = "deepseek-reasonix" ]; then
         printf '%s' "implementer"
     elif [ "$REVIEWER_AGENT" = "codewhale" ] || [ "$REVIEWER_AGENT" = "deepseek-reasonix" ]; then
@@ -501,7 +530,7 @@ deepseek_primary_role() {
     elif [ "$COORDINATOR_AGENT" = "codewhale" ] || [ "$COORDINATOR_AGENT" = "deepseek-reasonix" ]; then
         printf '%s' "coordinator"
     else
-        printf '%s' "critic"
+        printf '%s' "designer"
     fi
 }
 
@@ -543,9 +572,10 @@ board = os.environ.get("BOARD_FILTER", "")
 board_b = board.encode()
 self_pid = os.getpid()
 
-roles = {"coordinator", "planner", "implementer", "critic", "reviewer"}
-hermes_re = re.compile(r"\bhermes\b.*\s-p\s+(coordinator|planner|implementer|critic|reviewer)\b")
+roles = {"coordinator", "planner", "implementer", "designer", "reviewer"}
+hermes_re = re.compile(r"\bhermes\b.*\s-p\s+(coordinator|planner|implementer|designer|reviewer)\b")
 listener_re = re.compile(r"(codex-kanban-interactive|codex_kanban_interactive\.py|codex-kanban-listen|codex_kanban_listener\.py|codewhale-kanban-interactive|codewhale_kanban_interactive\.py|deepseek-kanban-interactive|deepseek_kanban_interactive\.py|deepseek-kanban-listen|deepseek_kanban_listener\.py|reasonix-kanban-interactive|reasonix_kanban_interactive\.py|claude-kanban-interactive|claude_kanban_interactive\.py|hermes-kanban-role-context-listener\.py)")
+profile_arg_re = re.compile(r"(?:--profile(?:=|\s+)|\s-p\s+)([A-Za-z0-9._-]+)(?=\s|$)")
 board_arg_re = re.compile(r"(?:--board(?:=|\s+)|HERMES_KANBAN_BOARD=)" + re.escape(board) + r"(?=\s|$)") if board else None
 
 def read_cmd(pid: int) -> str:
@@ -596,7 +626,11 @@ for name in os.listdir("/proc"):
             reason = "hermes-kanban-profile"
     elif listener_re.search(cmd):
         env = read_env(pid)
-        if board_matches(cmd, env):
+        profile = env.get("HERMES_KANBAN_PROFILE", "")
+        profile_match = profile_arg_re.search(cmd)
+        if not profile and profile_match:
+            profile = profile_match.group(1)
+        if profile in roles and board_matches(cmd, env):
             reason = "kanban-listener"
     else:
         env = read_env(pid)
@@ -675,18 +709,19 @@ if [ "$DRY_RUN" != "1" ] && [ "$CLEAN" = "1" ]; then
     # dies, orphaned MCP processes linger forever.  Since start-kanban.sh is
     # already killing the old session + all workers, the old MCP processes are
     # guaranteed to be stale.  Kill them before spawning fresh ones.
-    ws_basename=""
-    ws_basename="$(basename "$WORKSPACE")"
-    for mcp_re in "serena.*start-mcp-server.*${ws_basename}" "repowise.*mcp.*${ws_basename}"; do
-        stale_mcp="$(pgrep -f "$mcp_re" 2>/dev/null || true)"
-        if [ -n "$stale_mcp" ]; then
-            echo "  killing stale MCP processes: $(echo "$stale_mcp" | tr '\n' ' ')"
-            echo "$stale_mcp" | xargs kill 2>/dev/null || true
-            sleep 0.5
-            # SIGKILL any survivors
-            survivor="$(pgrep -f "$mcp_re" 2>/dev/null || true)"
-            [ -n "$survivor" ] && echo "$survivor" | xargs kill -9 2>/dev/null || true
-        fi
+    for workspace_root in "$WORKSPACE" "$DESIGNER_WORKSPACE"; do
+        ws_basename="$(basename "$workspace_root")"
+        for mcp_re in "serena.*start-mcp-server.*${ws_basename}" "repowise.*mcp.*${ws_basename}"; do
+            stale_mcp="$(pgrep -f "$mcp_re" 2>/dev/null || true)"
+            if [ -n "$stale_mcp" ]; then
+                echo "  killing stale MCP processes: $(echo "$stale_mcp" | tr '\n' ' ')"
+                echo "$stale_mcp" | xargs kill 2>/dev/null || true
+                sleep 0.5
+                # SIGKILL any survivors
+                survivor="$(pgrep -f "$mcp_re" 2>/dev/null || true)"
+                [ -n "$survivor" ] && echo "$survivor" | xargs kill -9 2>/dev/null || true
+            fi
+        done
     done
     if [ -n "$target_sessions" ]; then
         echo "发现同名 zellij session，将只清理这些 session:"
@@ -731,13 +766,23 @@ append_assist_delay_args() {
     printf '%s' "$cmd"
 }
 
+workspace_for_role() {
+    local role="$1"
+    if [ "$role" = "designer" ]; then
+        printf '%s' "$DESIGNER_WORKSPACE"
+    else
+        printf '%s' "$WORKSPACE"
+    fi
+}
+
 build_role_command() {
     local role="$1"
     local agent="$2"
-    local board_q role_q workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q
+    local board_q role_q role_workspace workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q
     board_q="$(shell_quote "$BOARD")"
     role_q="$(shell_quote "$role")"
-    workspace_q="$(shell_quote "$WORKSPACE")"
+    role_workspace="$(workspace_for_role "$role")"
+    workspace_q="$(shell_quote "$role_workspace")"
     codex_q="$(shell_quote "$CODEX_INTERACTIVE")"
     provider_q="$(shell_quote "$DEEPSEEK_PROVIDER")"
 
@@ -748,7 +793,7 @@ build_role_command() {
         planner)    stagger_s=0.5 ;;
         reviewer)   stagger_s=0.75 ;;
         implementer) stagger_s=1.0 ;;
-        critic)     stagger_s=1.5 ;;
+        designer)   stagger_s=1.5 ;;
     esac
 
     case "$role" in
@@ -761,9 +806,9 @@ build_role_command() {
         implementer)
             claim_assignees="$(claim_assignees_for_role "$role" "$IMPLEMENTER_ASSISTS")"
             assist_delays="$IMPLEMENTER_ASSIST_DELAYS" ;;
-        critic)
-            claim_assignees="$(claim_assignees_for_role "$role" "$CRITIC_ASSISTS")"
-            assist_delays="$CRITIC_ASSIST_DELAYS" ;;
+        designer)
+            claim_assignees="$(claim_assignees_for_role "$role" "$DESIGNER_ASSISTS")"
+            assist_delays="$DESIGNER_ASSIST_DELAYS" ;;
         reviewer)
             claim_assignees="$(claim_assignees_for_role "$role" "$REVIEWER_ASSISTS")"
             assist_delays="$REVIEWER_ASSIST_DELAYS" ;;
@@ -804,7 +849,7 @@ build_role_command() {
             printf 'sleep %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s HERMES_KANBAN_WATCHER_SCRIPT=%s%s%s %s -p %s' "$stagger_s" "$workspace_q" "$board_q" "$claim_q" "$watcher_script_q" "$assist_delay_env" "$hermes_toolsets_env" "$continue_script_q" "$role_q"
             ;;
         codex)
-            # Per-role CODEX_HOME: each codex pane (planner/critic) gets its own
+            # Per-role CODEX_HOME: each codex pane gets its own
             # session directory so 'codex resume --last' resumes the correct
             # session for THAT role, not the global most-recent one.
             # Shared files (config, auth, skills) are symlinked from ~/.codex.
@@ -884,10 +929,11 @@ write_pane() {
     local indent="$1"
     local role="$2"
     local agent="$3"
-    local name cmd
+    local name cmd role_workspace
     name="${role}-${agent}"
     cmd="$(build_role_command "$role" "$agent")"
-    printf '%spane name=%s command="bash" cwd=%s {\n' "$indent" "$(kdl_string "$name")" "$(kdl_string "$WORKSPACE")"
+    role_workspace="$(workspace_for_role "$role")"
+    printf '%spane name=%s command="bash" cwd=%s {\n' "$indent" "$(kdl_string "$name")" "$(kdl_string "$role_workspace")"
     printf '%s    args "-lc" %s\n' "$indent" "$(kdl_string "$cmd")"
     printf '%s}\n' "$indent"
 }
@@ -905,9 +951,7 @@ mkdir -p "$LAYOUT_DIR"
     printf '        }\n'
     printf '        pane split_direction="vertical" size="50%%" {\n'
     write_pane "            " "implementer" "$IMPLEMENTER_AGENT"
-    if [ "$CRITIC_AGENT" != "none" ]; then
-        write_pane "            " "critic" "$CRITIC_AGENT"
-    fi
+    write_pane "            " "designer" "$DESIGNER_AGENT"
     write_pane "            " "coordinator" "$COORDINATOR_AGENT"
     printf '        }\n'
     printf '    }\n'
@@ -916,13 +960,9 @@ mkdir -p "$LAYOUT_DIR"
 
 echo "启动 kanban 5 分窗口 (board=${BOARD}, session=${SESSION_NAME})..."
 echo "  planner-${PLANNER_AGENT} | reviewer-${REVIEWER_AGENT}"
-if [ "$CRITIC_AGENT" = "none" ]; then
-    echo "  implementer-${IMPLEMENTER_AGENT} | coordinator-${COORDINATOR_AGENT}"
-    echo "  (critic 已跳过: -c none)"
-else
-    echo "  implementer-${IMPLEMENTER_AGENT} | critic-${CRITIC_AGENT} | coordinator-${COORDINATOR_AGENT}"
-fi
+echo "  implementer-${IMPLEMENTER_AGENT} | designer-${DESIGNER_AGENT} | coordinator-${COORDINATOR_AGENT}"
 echo "  workspace: ${WORKSPACE}"
+echo "  designer workspace: ${DESIGNER_WORKSPACE}"
 echo "  Task delivery: ${TASK_DELIVERY}"
 if agent_is_used codex; then
     echo "  Codex model/sandbox: ${CODEX_MODEL:-auto}/${CODEX_SANDBOX:-auto}"
@@ -964,9 +1004,7 @@ kill_old_listener() {
         fi
     fi
 }
-for role in planner implementer critic coordinator reviewer; do
-    # Skip critic cleanup when critic is not used (CRITIC_AGENT=none)
-    [ "$role" = "critic" ] && [ "$CRITIC_AGENT" = "none" ] && continue
+for role in planner implementer designer coordinator reviewer; do
     kill_old_listener "$role"
 done
 
