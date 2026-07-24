@@ -188,6 +188,26 @@ def contract_for_task(task: Any) -> dict[str, Any] | None:
     """Return the stored contract annotated against the task's current identity."""
     contract = parse_contract(getattr(task, "workspace_contract_json", None))
     if contract is None:
+        workspace_kind = getattr(task, "workspace_kind", "scratch") or "scratch"
+        if workspace_kind in ("dir", "scratch"):
+            workspace_path = getattr(task, "workspace_path", None) or ""
+            return {
+                "version": CONTRACT_VERSION,
+                "valid": True,
+                "mismatches": [],
+                "repository": "",
+                "worktree": str(Path(workspace_path).expanduser().resolve(strict=False)) if workspace_path else "",
+                "common_dir": "",
+                "base_commit": getattr(task, "base_commit", None) or "",
+                "branch": getattr(task, "branch_name", None) or "",
+                "task_id": str(task.id),
+                "generation": int(task.generation),
+                "target_branch": getattr(task, "target_branch", None) or "",
+                "write_set": None,
+                "artifact_namespace": None,
+                "auto_generated": True,
+                "workspace_kind": workspace_kind,
+            }
         return None
     result = dict(contract)
     mismatches: list[str] = []
