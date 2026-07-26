@@ -1472,7 +1472,8 @@ class WeixinAdapter(BasePlatformAdapter):
 
         # ── @角色 消息拦截：直接注入 zellij pane ──
         if event.message_type == MessageType.TEXT and text:
-            m = re.match(r'@(planner|implementer|reviewer|designer|coordinator)\s+(.+)', text, re.DOTALL)
+            stripped = text.strip()
+            m = re.match(r'@(planner|implementer|reviewer|designer|coordinator)\s+(.+)', stripped, re.DOTALL)
             if m:
                 role, msg = m.group(1), m.group(2).strip()
                 logger.info("[%s] @mention inject: role=%s msg=%s", self.name, role, msg[:80])
