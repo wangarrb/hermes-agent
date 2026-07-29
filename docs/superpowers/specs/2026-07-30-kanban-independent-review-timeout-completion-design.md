@@ -29,6 +29,12 @@ timeout duration, or equivalent evidence. The completion record is normalized
 to a stored `TIMEOUT` review outcome. This path does not require a PASS review
 artifact or Git delivery lifecycle binding.
 
+`TIMEOUT` means a review was started and reached its configured deadline
+without returning a verdict. Cancellation, execution error, skipped review,
+or absence of review evidence are not timeouts. If any known reviewer result
+contains `FAIL` or `REWORK`, that negative verdict takes precedence over
+timeout metadata and completion remains blocked.
+
 Normal independent-review behavior is unchanged:
 
 - `PASS` uses the existing bound `independent_review.v1` artifact.
@@ -47,5 +53,9 @@ delivery for rework.
 - An implementer completion with `TIMEOUT` plus a non-empty note bypasses the
   PASS artifact gate and stores normalized timeout evidence.
 - `TIMEOUT` without a note is rejected.
+- Cancellation, execution error, skipped review, and missing evidence cannot
+  use the timeout path.
+- A known `FAIL` or `REWORK` outcome remains blocked even when timeout metadata
+  is also supplied.
 - Existing missing-artifact and non-PASS verdict tests remain unchanged.
 - Non-implementer completion behavior remains unchanged.
