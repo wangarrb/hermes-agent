@@ -11,6 +11,7 @@ from typing import Any, Mapping, MutableMapping, Sequence
 
 
 SCHEMA = "independent_review.v1"
+TIMEOUT_SCHEMA = "independent_review_timeout.v1"
 OPT_OUT_TASK_TYPES = frozenset({"plan", "research", "readonly"})
 EMPTY_DIFF_TREE_SHA256 = hashlib.sha256(b"").hexdigest()
 REQUIRED_FIELDS = frozenset(
@@ -161,6 +162,17 @@ def validate_completion(
         return metadata
     if metadata is None:
         raise IndependentReviewError("independent review artifact is required")
+
+    if str(metadata.get("independent_review_outcome") or "").strip().upper() == "TIMEOUT":
+        note = str(metadata.get("independent_review_note") or "").strip()
+        if not note:
+            raise IndependentReviewError("independent review timeout note is required")
+        metadata["independent_review"] = {
+            "schema": TIMEOUT_SCHEMA,
+            "verdict": "TIMEOUT",
+            "note": note,
+        }
+        return metadata
 
     _path, payload, review_sha = _load_review(
         metadata.get("independent_review_artifact")

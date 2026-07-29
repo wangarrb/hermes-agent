@@ -92,6 +92,43 @@ def test_valid_review_is_bound_and_persisted_on_completion(kanban_home, tmp_path
         assert stored["independent_review_sha256"] == _sha(review_path)
 
 
+def test_explicit_review_timeout_allows_implementer_completion(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        task_id = _create_implementer_task(conn, tmp_path)
+        metadata = {
+            "task_type": "code",
+            "independent_review_outcome": "TIMEOUT",
+            "independent_review_note": "deleg_18fcb8ba timed out after 600s",
+        }
+
+        assert kb.complete_task(conn, task_id, summary="done", metadata=metadata)
+
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        stored = json.loads(run["metadata"])
+        assert stored["independent_review"] == {
+            "schema": "independent_review_timeout.v1",
+            "verdict": "TIMEOUT",
+            "note": "deleg_18fcb8ba timed out after 600s",
+        }
+
+
+def test_explicit_review_timeout_requires_note(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        task_id = _create_implementer_task(conn, tmp_path)
+        with pytest.raises(review.IndependentReviewError, match="timeout note"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={
+                    "task_type": "code",
+                    "independent_review_outcome": "TIMEOUT",
+                },
+            )
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     [
