@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli.goals import judge_goal, kanban_goal_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -635,8 +637,48 @@ def _auto_complete_if_still_running(state: ListenerState) -> None:
                     elapsed_val = (last_run["ended_at"] or 0) - (last_run["started_at"] or 0) if last_run else 0
                     reclaim_reason = f"auto-retry: run too short ({elapsed_val}s < {MIN_PRODUCTIVE_SECONDS}s), likely API error"
                 elif has_real_summary:
-                    # Case 3: agent produced real output but forgot kanban_complete()
-                    # → safe to auto-complete, preserve the agent's summary
+                    # Case 3: agent produced real output but forgot the explicit
+                    # lifecycle transition. Goal tasks must still satisfy their
+                    # north-star judge; reviewer tasks must publish an explicit
+                    # verdict/handback rather than letting an arbitrary summary
+                    # become the final result.
+                    if task.goal_mode:
+                        try:
+                            verdict, reason, _, _, _ = judge_goal(
+                                kanban_goal_text(task.title, task.body or ""),
+                                last_run["summary"],
+                            )
+                        except Exception as exc:
+                            verdict = "continue"
+                            reason = f"goal judge error: {type(exc).__name__}"
+                        if verdict != "done":
+                            kb.reclaim_task(
+                                conn,
+                                tid,
+                                reason=f"goal continuation: {reason}",
+                            )
+                            print(
+                                f"{C.DIM}[kanban-listener] kept goal task {tid} "
+                                f"open ({reason}){C.RESET}"
+                            )
+                            return
+                    elif task.assignee == "reviewer":
+                        kb.reclaim_task(
+                            conn,
+                            tid,
+                            reason=(
+                                "reviewer returned to idle without explicit "
+                                "verdict/complete lifecycle"
+                            ),
+                        )
+                        print(
+                            f"{C.DIM}[kanban-listener] kept reviewer task {tid} "
+                            f"open for explicit verdict/handback{C.RESET}"
+                        )
+                        return
+
+                    # Plain task, or goal task judged complete: preserve the
+                    # existing safety-net completion behavior.
                     completed = kb.complete_task(
                         conn, tid,
                         result="auto-completed by listener safety net",

@@ -1658,6 +1658,26 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "kanban_block with the reason instead."
 )
 
+KANBAN_GOAL_COMPLETION_RUBRIC = (
+    "KANBAN NORTH-STAR COMPLETION RUBRIC (authoritative for this task):\n"
+    "- Return DONE only when the task body success/verification condition is "
+    "satisfied with concrete evidence in the completion summary.\n"
+    "- An intermediate NO_CLAIM, partial artifact, diagnosis, plan, or ordinary "
+    "blocker is CONTINUE when the task body says the owner must keep progressing.\n"
+    "- Treat the objective as unachievable or terminal only when the task body "
+    "explicitly permits that terminal state, or the summary cites durable "
+    "reviewer or user terminal authorization. Waiting for a reviewer decision "
+    "is not DONE.\n"
+)
+
+
+def kanban_goal_text(title: str, body: str) -> str:
+    """Return a strict, idempotently wrapped Kanban goal for the judge."""
+    task_text = "\n\n".join(part for part in (title.strip(), body.strip()) if part)
+    if task_text.startswith(KANBAN_GOAL_COMPLETION_RUBRIC):
+        return task_text
+    return f"{KANBAN_GOAL_COMPLETION_RUBRIC}\nTask:\n{task_text}".strip()
+
 
 def run_kanban_goal_loop(
     *,
@@ -1709,6 +1729,7 @@ def run_kanban_goal_loop(
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
 
+    judge_goal_text = kanban_goal_text("", goal_text)
     last_response = first_response or ""
     # The first turn already consumed one unit of budget.
     turns_used = 1
@@ -1737,7 +1758,9 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(
+            judge_goal_text, last_response
+        )
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -1797,6 +1820,8 @@ __all__ = [
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KANBAN_GOAL_COMPLETION_RUBRIC",
+    "kanban_goal_text",
     "DEFAULT_MAX_TURNS",
     "load_goal",
     "save_goal",

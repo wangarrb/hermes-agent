@@ -58,3 +58,66 @@ def test_delayed_old_listener_callback_cannot_complete_new_run(kanban_home):
     assert task is not None
     assert task.status == "running"
     assert task.current_run_id == second.current_run_id
+
+
+def test_goal_summary_is_reclaimed_when_judge_says_continue(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="north star",
+            body="Intermediate NO_CLAIM is not completion.",
+            assignee="planner",
+            goal_mode=True,
+        )
+        run = kb.claim_task(conn, task_id, claimer="listener")
+        assert run is not None
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET summary=?, started_at=?, ended_at=? WHERE id=?",
+            ("NO_CLAIM intermediate", now - 120, now, run.current_run_id),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(
+        listener,
+        "judge_goal",
+        lambda *args, **kwargs: (
+            "continue", "north star not met", False, None, False,
+        ),
+    )
+    state = listener.ListenerState(board="default", current_task_id=task_id)
+    state.current_run_id = run.current_run_id
+    state.current_generation = run.generation
+    listener._auto_complete_if_still_running(state)
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+
+
+def test_reviewer_summary_without_explicit_lifecycle_is_reclaimed(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="review", assignee="reviewer",
+        )
+        run = kb.claim_task(conn, task_id, claimer="listener")
+        assert run is not None
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET summary=?, started_at=?, ended_at=? WHERE id=?",
+            ("analysis only", now - 120, now, run.current_run_id),
+        )
+        conn.commit()
+
+    state = listener.ListenerState(board="default", current_task_id=task_id)
+    state.current_run_id = run.current_run_id
+    state.current_generation = run.generation
+    listener._auto_complete_if_still_running(state)
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"

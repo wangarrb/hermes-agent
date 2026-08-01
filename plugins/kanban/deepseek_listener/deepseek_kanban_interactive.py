@@ -87,6 +87,7 @@ _DEEPSEEK_IDLE_MARKERS = (
     "输入消息",
     "· 空闲",
     "❯ ",
+    "› ",
     "kanban_task_boundary",
 )
 _DEEPSEEK_BUSY_MARKERS = (
@@ -101,6 +102,7 @@ _STEERING_MARKER = "steering"
 _STEERING_COOLDOWN_S = 30.0
 _FULL_ACCESS_RETRY_S = 5.0
 _POST_INJECT_CONFIRM_S = 1.5
+_POST_INJECT_MAX_RETRIES = 3
 _last_steering_dismiss_at: dict[str, float] = {}
 
 
@@ -185,15 +187,27 @@ def _screen_fingerprint(screen: str) -> str:
 
 
 def _has_queued_kanban_prompt(screen: str) -> bool:
-    """Return whether CodeWhale still shows the injected prompt in its composer."""
+    """Return whether CodeWhale still shows an unsent prompt in its composer.
+
+    CodeWhale enters "草稿" (draft) mode when text has been typed into the
+    composer but not yet submitted.  We detect this by checking for the
+    "草稿" marker in the tail while no busy marker is present.
+
+    We also check for the kanban_task_boundary marker as a secondary signal,
+    but it may be outside the tail window due to CodeWhale's long scrollback,
+    so the "草稿" check is the primary trigger.
+    """
     tail = _tail_nonempty_lines(screen, limit=20)
     tail_lower = "\n".join(tail).lower()
     if any(marker in tail_lower for marker in _DEEPSEEK_BUSY_MARKERS):
         return False
-    return any(
-        "❯" in line and "kanban_task_boundary" in line.lower()
-        for line in tail
-    )
+    # Primary: "草稿" (draft mode) means text is in composer but not sent
+    if "草稿" in tail_lower:
+        return True
+    # Secondary: both prompt symbol and kanban_task_boundary visible in tail
+    has_prompt_symbol = any("❯" in line or "›" in line for line in tail)
+    has_boundary = "kanban_task_boundary" in tail_lower
+    return has_prompt_symbol and has_boundary
 
 
 def _auto_dismiss_steering(
@@ -603,32 +617,47 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         self, args: argparse.Namespace, *,
         zellij_session: str, zellij_pane_id: str, log_path: Path,
     ) -> None:
-        """Submit a CodeWhale prompt that remained queued after the first Enter."""
-        time.sleep(_POST_INJECT_CONFIRM_S)
-        screen = zellij_dump_screen(
-            session=zellij_session,
-            pane_id=zellij_pane_id,
-            log_path=log_path,
-        )
-        if not screen or not _has_queued_kanban_prompt(screen):
-            return
+        """Submit a CodeWhale prompt that remained queued after the first Enter.
+
+        CodeWhale TUI sometimes does not submit on the first CR (raw byte 13).
+        Retry up to _POST_INJECT_MAX_RETRIES times, checking the screen each
+        time for the queued prompt.  Stop as soon as the prompt is gone (sent)
+        or a busy marker appears (agent started processing).
+        """
         cmd_base = (
             ["zellij", "--session", zellij_session, "action"]
             if zellij_session
             else ["zellij", "action"]
         )
-        subprocess.run(
-            cmd_base + ["write", "-p", zellij_pane_id, "13"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-        )
-        log_line(
-            log_path,
-            "codewhale post-inject: queued Kanban prompt remained; sent raw Enter",
-        )
+        for attempt in range(1, _POST_INJECT_MAX_RETRIES + 1):
+            time.sleep(_POST_INJECT_CONFIRM_S)
+            screen = zellij_dump_screen(
+                session=zellij_session,
+                pane_id=zellij_pane_id,
+                log_path=log_path,
+            )
+            if not screen:
+                return
+            if not _has_queued_kanban_prompt(screen):
+                if attempt > 1:
+                    log_line(
+                        log_path,
+                        f"codewhale post-inject: queued prompt cleared after {attempt} Enter(s)",
+                    )
+                return
+            # Prompt still queued — send another Enter
+            subprocess.run(
+                cmd_base + ["write", "-p", zellij_pane_id, "13"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            log_line(
+                log_path,
+                f"codewhale post-inject: queued Kanban prompt remained; sent raw Enter (attempt {attempt}/{_POST_INJECT_MAX_RETRIES})",
+            )
 
     # ── Override: on_claim_pre_check with steering dismiss ──
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
@@ -823,6 +852,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
                 "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "OPENROUTER_BASE_URL",
                 "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
                 "NOVITA_BASE_URL", "NOVITA_MODEL", "NOVITA_API_KEY",
+                "OPENCODE_GO_API_KEY",
             ):
                 env.pop(key, None)
             env.pop("DEEPSEEK_YOLO", None)
@@ -1344,7 +1374,6 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         parser.add_argument("--task-boundary-delay-s", type=float, default=8.0, help="Delay after task leaves running before claiming next")
         parser.add_argument("--task-timeout-s", type=float, default=listener_policy.INTERACTIVE_TASK_TIMEOUT_SECONDS, help="Reclaim task after this many seconds of TUI inactivity")
         parser.add_argument("--idle-pane-reclaim-s", type=float, default=listener_policy.INTERACTIVE_IDLE_PANE_RECLAIM_SECONDS, help="Reclaim running task after pane stays idle this many seconds")
-        parser.add_argument("--provider", default=None, help="Provider override: openrouter/topenrouter or opencode-go")
         parser.add_argument("--yolo", action="store_true", default=True, help="Auto-approve all tools (default: True)")
         parser.add_argument("--no-yolo", dest="yolo", action="store_false", help="Disable YOLO mode")
         parser.add_argument("--deepseek-tui-bin", default="codewhale", help="CodeWhale dispatcher binary (default: codewhale)")

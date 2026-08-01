@@ -34,7 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_goal
+from hermes_cli.goals import judge_goal, kanban_goal_text
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -621,7 +621,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     # which the defensive handler below swallows, leaving
                     # verdict="done" and silently disabling the gate.
                     verdict, reason, _, _, _ = judge_goal(
-                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                        goal=kanban_goal_text(task.title, task.body or ""),
                         last_response=(summary or result or "").strip(),
                     )
                 except Exception as judge_exc:

@@ -70,7 +70,7 @@ def test_codewhale_post_inject_submits_queued_prompt_with_raw_enter(
     commands: list[list[str]] = []
     screen = """\
 cw auto · operate · Full Access
-────────────────────────────────────────────
+─────────────────────────────────────────────
 ❯ kanban_task_boundary 请读取 /tmp/task.md 中的 Kanban 任务并执行。
 """
     monkeypatch.setattr(
@@ -92,18 +92,19 @@ cw auto · operate · Full Access
         log_path=tmp_path / "listener.log",
     )
 
-    assert commands == [
-        [
-            "zellij",
-            "--session",
-            "kanban-test",
-            "action",
-            "write",
-            "-p",
-            "7",
-            "13",
-        ]
+    # on_post_inject retries up to _POST_INJECT_MAX_RETRIES times when the
+    # queued prompt stays visible — each retry sends a raw CR (byte 13).
+    expected_cmd = [
+        "zellij",
+        "--session",
+        "kanban-test",
+        "action",
+        "write",
+        "-p",
+        "7",
+        "13",
     ]
+    assert commands == [expected_cmd] * deepseek_kanban_interactive._POST_INJECT_MAX_RETRIES
 
 
 def test_codewhale_post_inject_does_not_resubmit_busy_prompt(

@@ -73,18 +73,18 @@ _HERMES_IDLE_MARKERS = (
     "planner ❯",
     "coordinator ❯",
     "reviewer ❯",
+    "designer ❯",
 )
 
 _HERMES_BUSY_MARKERS = (
     "activity: thinking",
-    "running",
-    "executing",
+    "ruminating",
     "preparing terminal",
-    "💻 $",
     "💻 preparing terminal",
-    "work kanban",
-    "kanban --board",
-    "msg=interrupt",
+    "preparing process",
+    "preparing read_file",
+    "preparing write_file",
+    "⚙ wait ",
 )
 
 _HERMES_QUEUED_INPUT_MARKERS = ()
@@ -196,10 +196,11 @@ class HermesInteractiveListener(BaseInteractiveListener):
         tail_lines = _tail_nonempty_lines(screen, limit=20)
         tail = "\n".join(tail_lines).lower()
 
-        # Idle marker must be in the LAST line (prompt at bottom), not just
-        # anywhere in tail — › can appear in tool output, scrollback, etc.
-        # Additionally, the line must be a BARE prompt (marker + whitespace only).
-        # If the user is typing, the line looks like "❯ some text…" and is NOT idle.
+        # Idle marker must be in the LAST line (prompt/status bar at bottom),
+        # not just anywhere in tail — › can appear in tool output and scrollback.
+        # Hermes has two valid idle renderings: the legacy bare role prompt and
+        # the current static "⚕ ❯ msg=interrupt · ..." command-hint bar.
+        # Transient activity above that bar still wins through busy_markers.
         last_line = tail_lines[-1] if tail_lines else ""
         has_idle = self._is_truly_idle_line(last_line)
         has_busy = any(m.lower() in tail for m in self.busy_markers)
@@ -207,6 +208,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
             # Pane is busy or not showing idle prompt — reset retry state
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._reset_idle_followup()
             return
 
         # Check for API error in the tail (Hermes error boxes are wide)
@@ -214,6 +216,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if not has_error:
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._handle_idle_task_followup(args, conn, task_id, log_path)
             return
 
         # API error confirmed in last 5 lines — retry with backoff
@@ -259,19 +262,22 @@ class HermesInteractiveListener(BaseInteractiveListener):
     # inject into a pane where the user is composing input.
     _DECORATIVE_LINE_RE = re.compile(r'^[─═│┃┤├┬┴┼┌┐└┘╭╰╮╯╚╝─┄┈╶╨╺╻╼╽╾╿┣┡┢┥┙┛┝┟┠┞]+$')
 
-    # Pattern: idle marker at start of line, followed by optional whitespace only.
-    # Matches: "❯ ", "› ", "planner ❯ ", "coordinator ❯  "
+    # Pattern: either a legacy bare role prompt or the exact current Hermes
+    # command-hint status bar.  Arbitrary text after the prompt remains busy.
+    # Matches: "❯ ", "planner ❯ ",
+    #          "⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
     # Does NOT match: "❯ some text", "❯/steer 记住…"
     _IDLE_ONLY_RE = re.compile(
         r'^(?:'
-        r'(?:coordinator|planner|implementer|critic|reviewer)\s*'
-        r')?'
-        r'[›❯]'
-        r'\s*$'
+        r'(?:(?:coordinator|planner|implementer|critic|reviewer|designer)\s*)?[›❯]\s*'
+        r'|'
+        r'⚕\s*[›❯]\s+msg=interrupt\s*·\s*/queue\s*·\s*/bg\s*'
+        r'·\s*/steer\s*·\s*Ctrl\+C\s+cancel\s*'
+        r')$'
     )
 
     def _is_truly_idle_line(self, line: str) -> bool:
-        """Return True only if the line is a bare prompt with no user input."""
+        """Return True only for a known idle prompt/status rendering."""
         return bool(self._IDLE_ONLY_RE.match(line.strip()))
 
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:

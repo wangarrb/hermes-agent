@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -67,6 +68,13 @@ except ImportError:  # Direct listener scripts put plugins/kanban on sys.path.
 
 _STOP = False
 
+_REVIEWER_CHECKPOINT_PENDING_RE = re.compile(
+    r"\bREVIEWER_CHECKPOINT_PENDING\s+(t_[0-9A-Za-z]+)\b"
+)
+_REVIEWER_CHECKPOINT_OPEN_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "review",
+}
+
 
 def _handle_stop(signum: int, frame: Any) -> None:  # noqa: ARG001
     global _STOP
@@ -76,6 +84,20 @@ def _handle_stop(signum: int, frame: Any) -> None:  # noqa: ARG001
 def stop_requested() -> bool:
     """Return the shared watcher stop flag for listener-specific loops."""
     return _STOP
+
+
+def _has_open_reviewer_checkpoint(conn: Any, origin_task_id: str) -> bool:
+    """Return whether the origin goal explicitly waits on an open review card."""
+    for comment in reversed(kb.list_comments(conn, origin_task_id)):
+        for reviewer_task_id in _REVIEWER_CHECKPOINT_PENDING_RE.findall(comment.body):
+            task = kb.get_task(conn, reviewer_task_id)
+            if (
+                task is not None
+                and task.assignee == "reviewer"
+                and task.status in _REVIEWER_CHECKPOINT_OPEN_STATUSES
+            ):
+                return True
+    return False
 
 
 # ──────────────────────────────────────────────
@@ -326,7 +348,7 @@ def zellij_inject(*, session: str, pane_id: str, text: str, log_path: Path) -> b
         )
         time.sleep(0.8)
         subprocess.run(
-            cmd_base + ["send-keys", "-p", str(pane_id), "Enter"],
+            cmd_base + ["write", "-p", str(pane_id), "13"],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         return True
@@ -712,13 +734,16 @@ class BaseInteractiveListener:
             # cycle starts fresh
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._reset_idle_followup()
             return
 
         # Pane is idle while task is running — check for API error
-        self.check_api_failure_retry(
+        if self.check_api_failure_retry(
             session=zellij_session, pane_id=zellij_pane_id, screen=screen,
             task_id=task_id, log_path=log_path,
-        )
+        ):
+            return
+        self._handle_idle_task_followup(args, conn, task_id, log_path)
 
     def on_watcher_loop_idle(
         self, args: argparse.Namespace, conn: Any, log_path: Path,
@@ -759,6 +784,94 @@ class BaseInteractiveListener:
         self._active_run_id: int | None = None
         self._active_generation: int | None = None
         self._active_claim_lock: str | None = None
+        self._idle_followup_task_id: str | None = None
+        self._idle_followup_since: float | None = None
+        self._idle_followup_sent: bool = False
+
+    # An idle prompt is a safe input boundary, but brief idle flashes occur
+    # between tool calls.  Require a stable idle interval before injecting.
+    IDLE_FOLLOWUP_GRACE_S: float = 15.0
+
+    def _reset_idle_followup(self) -> None:
+        self._idle_followup_task_id = None
+        self._idle_followup_since = None
+        self._idle_followup_sent = False
+
+    def _handle_idle_task_followup(
+        self,
+        args: argparse.Namespace,
+        conn: Any,
+        task_id: str,
+        log_path: Path,
+    ) -> bool:
+        """Check goal completion/reviewer lifecycle once per stable idle episode.
+
+        Goal work gets a neutral completion question: normal idle may mean the
+        agent believes it is done, so do not presuppose that it must continue.
+        API/model failure recovery remains the only path that injects a bare
+        continuation.  Reviewer work gets one lifecycle reminder so a written
+        analysis cannot leave the card running forever.  Ordinary tasks keep
+        the existing behavior.
+        """
+        try:
+            task = kb.get_task(conn, task_id)
+        except Exception as exc:
+            log_line(log_path, f"idle followup task lookup failed for {task_id}: {exc}")
+            return False
+        if task is None or task.status != "running":
+            self._reset_idle_followup()
+            return False
+
+        if task.goal_mode:
+            if _has_open_reviewer_checkpoint(conn, task_id):
+                self._reset_idle_followup()
+                return True
+            marker = "GOAL_COMPLETION_CHECK"
+            text = (
+                f"[{marker}] Kanban task {task_id}: 任务都完成了吗？"
+                "请依据任务的北极星目标、durable history 和实际证据检查。"
+                "若已全部完成，更新证据并 complete；若尚未完成，在同一任务内"
+                "推进下一个具体步骤。中间 NO_CLAIM、局部产物或普通阻塞不等于"
+                "完成，除非任务合同明确将其定义为终态。若未达成北极星且不满足"
+                "升级条件，不得向用户列出普通技术选项；选择第一个未满足的承重 gate "
+                "并立即执行。"
+            )
+        elif task.assignee == "reviewer":
+            marker = "REVIEW_LIFECYCLE"
+            text = (
+                f"[{marker}] Reviewer task {task_id} is still running. "
+                "If the evidence is not decisive, continue the review. If it is "
+                "decisive, first write the deterministic verdict and handback "
+                "to the durable Kanban comment, then explicitly complete the task."
+            )
+        else:
+            self._reset_idle_followup()
+            return False
+
+        now = time.time()
+        if self._idle_followup_task_id != task_id:
+            self._idle_followup_task_id = task_id
+            self._idle_followup_since = now
+            self._idle_followup_sent = False
+            return True
+        if self._idle_followup_since is None:
+            self._idle_followup_since = now
+            return True
+        if self._idle_followup_sent:
+            return True
+        if now - self._idle_followup_since < self.IDLE_FOLLOWUP_GRACE_S:
+            return True
+
+        session = getattr(args, "zellij_session", "")
+        pane_id = str(getattr(args, "zellij_pane_id", ""))
+        if not session or not pane_id:
+            return False
+        log_line(log_path, f"idle followup for {task_id}: {marker}")
+        zellij_inject(session=session, pane_id=pane_id, text=text, log_path=log_path)
+        time.sleep(0.5)
+        zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
+        self._idle_followup_sent = True
+        return True
 
     def _remember_active_claim(self, task: kb.Task) -> None:
         self._active_task_id = task.id
@@ -771,6 +884,7 @@ class BaseInteractiveListener:
         self._active_run_id = None
         self._active_generation = None
         self._active_claim_lock = None
+        self._reset_idle_followup()
 
     # ── API failure retry on idle ──
     # When agent goes idle mid-task due to API error, inject "继续"
@@ -1085,6 +1199,25 @@ class BaseInteractiveListener:
             self._remember_active_claim(claimed)
         except Exception as exc:
             log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
+            return None, None
+
+        # ── Role-content mismatch guard ──────────────────────────────
+        # After claim, check if task content keywords suggest a different role.
+        # If mismatch detected and not authorized via assist-role, add comment
+        # and reclaim the task back to ready.
+        authorized_assignees = set(claim_assignees(args))
+        task_assignee = getattr(claimed, "assignee", None) or pane_profile
+        if task_assignee != pane_profile and task_assignee not in authorized_assignees:
+            # Not our task and not an authorized assist — task stealing guard
+            # (hermes_listener has its own; this covers codex/codewhale/claude)
+            log_line(log_path, f"role guard: reclaiming {claimed.id}: assignee={task_assignee} not in claim_assignees={sorted(authorized_assignees)} (task stealing guard)")
+            _reclaim_task_without_signaling_worker(
+                conn, claimed.id,
+                reason=f"{self.agent_slug} task stealing guard: assignee={task_assignee} profile={pane_profile}",
+                expected_run_id=claim_run_id,
+                expected_generation=claim_generation,
+                expected_claim_lock=claim_lock,
+            )
             return None, None
 
         claim_fence = {

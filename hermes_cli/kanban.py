@@ -2296,7 +2296,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 if judge_available:
-                    from hermes_cli.goals import judge_goal
+                    from hermes_cli.goals import judge_goal, kanban_goal_text
                     verdict = "done"
                     reason = ""
                     try:
@@ -2306,7 +2306,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         # ValueError into the fail-open handler below,
                         # silently disabling the gate.
                         verdict, reason, _, _, _ = judge_goal(
-                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                            goal=kanban_goal_text(task.title, task.body or ""),
                             last_response=(summary or args.result or "").strip(),
                         )
                     except Exception as judge_exc:

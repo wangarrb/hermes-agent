@@ -47,7 +47,7 @@ class CodexInteractiveListener(BaseInteractiveListener):
     # ── Idle/busy markers ──
     # Codex CLI uses › (U+203A) as its prompt symbol since v0.9+
     idle_markers: tuple[str, ...] = ("› ",)
-    busy_markers: tuple[str, ...] = ("thinking", "running", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    busy_markers: tuple[str, ...] = ("thinking", "working", "running", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     queued_input_markers: tuple[str, ...] = ()
 
     # ── Abstract method implementations ──
@@ -164,11 +164,24 @@ class CodexInteractiveListener(BaseInteractiveListener):
             tail_lines = _tail_nonempty_lines(screen, limit=5)
             if not tail_lines:
                 return False
-            tail = "\n".join(tail_lines).lower()
-            has_idle = any(m.lower() in tail for m in self.idle_markers)
-            has_busy = any(m.lower() in tail for m in self.busy_markers)
-            if not has_idle or has_busy:
-                last_line = tail_lines[-1].lower() if tail_lines else ""
+            # Codex TUI layout: idle prompt "›" sits ABOVE the status bar.
+            # The status bar (last line) shows model/context info.
+            # When Codex is working, "›" may still be visible in scrollback
+            # but the status bar is the actual last line.
+            # Rule: "›" must be in the LAST non-empty line to be idle,
+            # OR the last line is a status bar AND the line above it is "›".
+            last_line = tail_lines[-1].lower() if tail_lines else ""
+            is_status_bar = "context" in last_line and "%" in last_line
+            if is_status_bar and len(tail_lines) >= 2:
+                check_line = tail_lines[-2].lower()
+            else:
+                check_line = last_line
+            has_idle = any(m.lower() in check_line for m in self.idle_markers)
+            has_busy = any(m.lower() in last_line for m in self.busy_markers)
+            # Also treat status bar presence without idle prompt as busy
+            if is_status_bar and not has_idle:
+                has_busy = True
+            if not has_idle:
                 log_line(log_path, (
                     f"on_claim_pre_check attempt {attempt+1}/2: "
                     f"not ready (idle={has_idle} busy={has_busy} "
@@ -179,6 +192,68 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 import time as _t
                 _t.sleep(2.0)
         return True
+
+    # ── Post-inject: retry Enter if prompt stays in composer ──
+    _POST_INJECT_CONFIRM_S = 1.5
+    _POST_INJECT_MAX_RETRIES = 3
+
+    def on_post_inject(
+        self, args: argparse.Namespace, *,
+        zellij_session: str, zellij_pane_id: str, log_path: Path,
+    ) -> None:
+        """Submit a Codex prompt that remained queued after the first Enter.
+
+        Codex TUI sometimes does not submit on the first CR (raw byte 13).
+        Retry up to _POST_INJECT_MAX_RETRIES times, checking the screen each
+        time for the queued prompt.  Stop as soon as the prompt is gone (sent)
+        or a busy marker appears (agent started processing).
+        """
+        import time as _t
+        import subprocess as _sp
+        cmd_base = (
+            ["zellij", "--session", zellij_session, "action"]
+            if zellij_session
+            else ["zellij", "action"]
+        )
+        for attempt in range(1, self._POST_INJECT_MAX_RETRIES + 1):
+            _t.sleep(self._POST_INJECT_CONFIRM_S)
+            screen = zellij_dump_screen(
+                session=zellij_session,
+                pane_id=zellij_pane_id,
+                log_path=log_path,
+            )
+            if not screen:
+                return
+            tail = _tail_nonempty_lines(screen, limit=20)
+            tail_lower = "\n".join(tail).lower()
+            # Check if any busy marker appeared (agent started)
+            if any(m.lower() in tail_lower for m in self.busy_markers):
+                return
+            # Check if the injected prompt is still visible (unsent)
+            has_queued = any(
+                "请读取" in line and "kanban" in line.lower()
+                for line in tail
+            )
+            if not has_queued:
+                if attempt > 1:
+                    log_line(
+                        log_path,
+                        f"codex post-inject: queued prompt cleared after {attempt} Enter(s)",
+                    )
+                return
+            # Prompt still queued — send another Enter
+            _sp.run(
+                cmd_base + ["write", "-p", zellij_pane_id, "13"],
+                check=False,
+                stdout=_sp.DEVNULL,
+                stderr=_sp.PIPE,
+                text=True,
+                timeout=5,
+            )
+            log_line(
+                log_path,
+                f"codex post-inject: queued Kanban prompt remained; sent raw Enter (attempt {attempt}/{self._POST_INJECT_MAX_RETRIES})",
+            )
 
 
 # ── Entry point ──

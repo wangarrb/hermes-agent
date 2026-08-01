@@ -311,7 +311,8 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
+             verdict="done", reason="", complete_ok=True, summary="done",
+             captured_goals=None):
         import argparse
         import types
         from unittest.mock import MagicMock
@@ -348,10 +349,12 @@ class TestCLIJudgeGate:
         )
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
-        monkeypatch.setattr(
-            "hermes_cli.goals.judge_goal",
-            lambda **kw: (verdict, reason, False, None, False),
-        )
+        def fake_judge(**kw):
+            if captured_goals is not None:
+                captured_goals.append(kw["goal"])
+            return verdict, reason, False, None, False
+
+        monkeypatch.setattr("hermes_cli.goals.judge_goal", fake_judge)
 
         args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=None)
         return _cmd_complete(args), complete_calls
@@ -369,6 +372,18 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, verdict="done")
         assert rc == 0
         assert complete_calls == ["t1"]
+
+    def test_judge_receives_strict_kanban_completion_rubric(self, monkeypatch):
+        captured: list[str] = []
+        rc, complete_calls = self._run(
+            monkeypatch, verdict="done", captured_goals=captured,
+        )
+        assert rc == 0
+        assert complete_calls == ["t1"]
+        assert len(captured) == 1
+        assert "NORTH-STAR" in captured[0]
+        assert "intermediate NO_CLAIM" in captured[0]
+        assert "reviewer or user terminal authorization" in captured[0]
 
     def test_judge_unavailable_fails_open(self, monkeypatch):
         """No auxiliary client configured → gate skipped, task completes."""
