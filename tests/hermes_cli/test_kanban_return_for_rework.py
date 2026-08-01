@@ -21,7 +21,9 @@ def kanban_home(tmp_path, monkeypatch):
 
 def test_return_for_rework_delivers_control_and_releases_root_after_ack(kanban_home):
     with kb.connect() as conn:
-        root = kb.create_task(conn, title="implementation", assignee="implementer")
+        # This test exercises return-for-rework control delivery, not the
+        # independent-review completion gate for implementer-owned work.
+        root = kb.create_task(conn, title="implementation", assignee="planner")
         child = kb.create_task(
             conn, title="review", assignee="reviewer", parents=[root]
         )
@@ -150,7 +152,9 @@ def test_rework_hold_drains_only_after_every_control_ack(kanban_home):
 
 def test_old_generation_cannot_complete_or_block_current_generation(kanban_home):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="implementation", assignee="implementer")
+        # Keep the fixture focused on stale generation fences; implementer
+        # completion independently requires review artifact metadata.
+        task_id = kb.create_task(conn, title="implementation", assignee="planner")
         first = kb.claim_task(conn, task_id, claimer="old-pane")
         assert first is not None
 

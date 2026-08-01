@@ -24,9 +24,9 @@ def kanban_home(tmp_path, monkeypatch):
 
 def test_return_for_rework_and_control_ack_round_trip(kanban_home):
     with kb.connect() as conn:
-        parent = kb.create_task(
-            conn, title="implementation", assignee="implementer"
-        )
+        # The test targets CLI rework/control behavior, not the independent
+        # review gate on implementer completion.
+        parent = kb.create_task(conn, title="implementation", assignee="planner")
         child = kb.create_task(
             conn, title="review", assignee="reviewer", parents=[parent]
         )
@@ -54,9 +54,9 @@ def test_return_for_rework_and_control_ack_round_trip(kanban_home):
 
 def test_cli_uses_env_generation_fence(kanban_home, monkeypatch):
     with kb.connect() as conn:
-        task_id = kb.create_task(
-            conn, title="implementation", assignee="implementer"
-        )
+        # Keep the generation-fence fixture independent of the implementer
+        # review-artifact completion contract.
+        task_id = kb.create_task(conn, title="implementation", assignee="planner")
         first = kb.claim_task(conn, task_id, claimer="old-pane")
         old_run = first.current_run_id
         old_generation = first.generation
@@ -100,7 +100,7 @@ def test_explicit_fence_flags_work_without_worker_env(kanban_home):
     assert "Completed" in accepted
 
 
-def test_update_reopen_returns_to_todo_and_invalidates_done_descendant(
+def test_return_reopens_done_parent_and_invalidates_done_descendant(
     kanban_home,
 ):
     with kb.connect() as conn:
@@ -109,15 +109,17 @@ def test_update_reopen_returns_to_todo_and_invalidates_done_descendant(
         assert kb.complete_task(conn, parent, summary="v1")
         assert kb.complete_task(conn, child, summary="accepted v1")
 
-    out = kc.run_slash(f"update {parent} --reopen --body 'fix contract'"
+    out = kc.run_slash(
+        f"return-for-rework {parent} --reason 'fix contract'"
     )
-    assert "reopened" in out
+    assert "Returned" in out
     with kb.connect() as conn:
         parent_after = kb.get_task(conn, parent)
         child_after = kb.get_task(conn, child)
+        comments = kb.list_comments(conn, parent)
 
-    assert parent_after.status == "todo"
+    assert parent_after.status == "ready"
     assert parent_after.generation == 2
-    assert parent_after.body == "fix contract"
+    assert "fix contract" in comments[-1].body
     assert child_after.status == "stale"
     assert child_after.generation == 2
