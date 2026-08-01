@@ -1679,6 +1679,64 @@ def test_build_worker_context_includes_prior_attempts(kanban_home):
         conn.close()
 
 
+def test_goal_context_frontloads_current_handback_and_hides_stale_history(
+    kanban_home,
+):
+    """A reworked goal must not be steered by superseded attempts or
+    unrelated cross-task role history before its current corrective handback.
+    """
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="old role work", assignee="planner")
+        kb.claim_task(conn, other)
+        kb.complete_task(conn, other, summary="UNRELATED_ROLE_SUMMARY")
+
+        tid = kb.create_task(
+            conn,
+            title="continuous reconstruction goal",
+            assignee="planner",
+            goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+        kb.block_task(conn, tid, reason="STALE_GENERATION_SUMMARY")
+        kb.return_task_for_rework(
+            conn,
+            tid,
+            actor="reviewer",
+            reason="discard the stale conclusion",
+        )
+
+        kb.claim_task(conn, tid)
+        kb.reclaim_task(conn, tid, reason="CURRENT_GENERATION_EVIDENCE")
+        conn.execute(
+            "UPDATE task_runs SET summary = ? "
+            "WHERE task_id = ? AND generation = 2",
+            ("CURRENT_GENERATION_EVIDENCE", tid),
+        )
+        conn.commit()
+        kb.claim_task(conn, tid)
+        kb.add_comment(
+            conn,
+            tid,
+            "reviewer",
+            "REVIEWER_RESULT: CURRENT_AUTHORITATIVE_HANDBACK",
+        )
+
+        ctx = kb.build_worker_context(conn, tid)
+
+        assert "## Current authoritative handback" in ctx
+        assert ctx.index("CURRENT_AUTHORITATIVE_HANDBACK") < ctx.index(
+            "## Prior attempts on this task"
+        )
+        assert "CURRENT_GENERATION_EVIDENCE" in ctx
+        assert "STALE_GENERATION_SUMMARY" not in ctx
+        assert "1 prior attempt from an older generation omitted" in ctx
+        assert "UNRELATED_ROLE_SUMMARY" not in ctx
+        assert "## Recent work by @planner" not in ctx
+    finally:
+        conn.close()
+
+
 def test_build_worker_context_uses_parent_run_summary(kanban_home):
     """Downstream children read the parent's run.summary + metadata, not
     just task.result."""

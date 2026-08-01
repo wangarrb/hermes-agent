@@ -291,6 +291,16 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_GOAL_HANDOFF_PREFIXES = (
+    "CURRENT_EXECUTION_STATE",
+    "GOAL_STATE",
+    "REVIEWER_RESULT",
+    "REVIEWER_DECISION",
+    "REVIEWER_ROOT_CAUSE_RESET",
+    "RETURN FOR REWORK",
+    "INVALID_EARLY_STOP",
+    "SUPERSEDED",
+)
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -2392,7 +2402,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
-                "       max_runtime_seconds, last_heartbeat_at, started_at "
+                "       max_runtime_seconds, last_heartbeat_at, started_at, "
+                "       generation "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
             ).fetchall()
@@ -2404,14 +2415,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                         task_id, profile, status,
                         claim_lock, claim_expires, worker_pid,
                         max_runtime_seconds, last_heartbeat_at,
-                        started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                        started_at, generation
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
-                        started,
+                        started, int(row["generation"] or 1),
                     ),
                 )
                 # CAS: only install the pointer if nothing else claimed
@@ -4269,7 +4280,7 @@ def _synthesize_ended_run(
     """
     now = int(time.time())
     trow = conn.execute(
-        "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+        "SELECT assignee, current_step_key, generation FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
@@ -4280,15 +4291,15 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             status, outcome,
             summary, error, metadata,
-            started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            started_at, ended_at, generation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
-            now, now,
+            now, now, int(trow["generation"] or 1) if trow else 1,
         ),
     )
     return int(cur.lastrowid or 0)
@@ -4851,7 +4862,7 @@ def claim_task(
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, generation "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4860,8 +4871,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, generation
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4871,6 +4882,7 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                int(trow["generation"] or 1) if trow else 1,
             ),
         )
         run_id = run_cur.lastrowid
@@ -4968,7 +4980,7 @@ def claim_review_task(
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, generation "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -4977,8 +4989,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, generation
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4988,6 +5000,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                int(trow["generation"] or 1) if trow else 1,
             ),
         )
         run_id = run_cur.lastrowid
@@ -10470,17 +10483,18 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     Order:
       1. Task title (mandatory).
       2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
+      3. Current authoritative handback for goal tasks, when present.
+      4. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
+      5. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
-         completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+      6. Cross-task role history for ordinary tasks (most recent 5 completed
+         runs on other tasks). Goal tasks omit this unrelated history.
+      7. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
     All caps exist so worker prompts stay bounded even on pathological
@@ -10555,12 +10569,34 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
         lines.append("")
 
+    all_comments = list_comments(conn, task_id)
+    current_handback = None
+    if task.goal_mode:
+        for comment in reversed(all_comments):
+            body = (comment.body or "").strip().upper()
+            if body.startswith(_GOAL_HANDOFF_PREFIXES):
+                current_handback = comment
+                break
+        if current_handback is not None:
+            lines.append("## Current authoritative handback")
+            lines.append(_cap(current_handback.body, _CTX_MAX_COMMENT_BYTES))
+            lines.append("")
+
     # Prior attempts — show closed runs so a retrying worker sees the
     # history. Skip the currently-active run (that's this worker).
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    older_generation_count = 0
+    if task.goal_mode:
+        older_generation_count = sum(
+            1 for run in all_prior if int(run.generation) != int(task.generation)
+        )
+        all_prior = [
+            run for run in all_prior
+            if int(run.generation) == int(task.generation)
+        ]
     # list_runs returns ascending by started_at; "most recent" = last N
     if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
         omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
@@ -10572,6 +10608,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         first_shown_idx = 1
     if shown:
         lines.append("## Prior attempts on this task")
+        if older_generation_count:
+            suffix = "" if older_generation_count == 1 else "s"
+            lines.append(
+                f"_({older_generation_count} prior attempt{suffix} from an "
+                "older generation omitted; inspect durable history on demand)_"
+            )
         if omitted:
             lines.append(
                 f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
@@ -10596,6 +10638,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 except Exception:
                     pass
             lines.append("")
+    elif older_generation_count:
+        lines.append("## Prior attempts on this task")
+        suffix = "" if older_generation_count == 1 else "s"
+        lines.append(
+            f"_({older_generation_count} prior attempt{suffix} from an older "
+            "generation omitted; inspect durable history on demand)_"
+        )
+        lines.append("")
 
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
@@ -10660,7 +10710,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
+    if task.assignee and not task.goal_mode:
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
@@ -10685,7 +10735,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
     # comment-storm tasks don't blow out the worker's prompt. Older
     # comments summarised in a one-line marker like prior attempts.
-    all_comments = list_comments(conn, task_id)
+    if current_handback is not None:
+        all_comments = [c for c in all_comments if c.id != current_handback.id]
     if len(all_comments) > _CTX_MAX_COMMENTS:
         omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
         shown_c = all_comments[-_CTX_MAX_COMMENTS:]
