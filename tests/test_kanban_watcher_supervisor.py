@@ -45,6 +45,34 @@ def test_different_pane_is_not_a_replacement():
     assert not supervisor._has_live_replacement(current, 101, _cmd(pane="4"))
 
 
+def test_shell_command_mentioning_watcher_is_not_a_watcher():
+    supervisor = _load_supervisor()
+    cmdline = [
+        "/bin/bash",
+        "-c",
+        "python3 /tmp/deepseek_kanban_interactive.py --watch-child --profile planner",
+    ]
+
+    assert not supervisor._is_watcher(cmdline)
+
+
+def test_conda_wrapper_with_listener_argument_is_a_watcher():
+    supervisor = _load_supervisor()
+    cmdline = [
+        "/home/wyr/miniconda/bin/conda",
+        "run",
+        "-n",
+        "egomotion4d",
+        "python3",
+        "/tmp/hermes-kanban-role-context-listener.py",
+        "--watch-child",
+        "--profile",
+        "planner",
+    ]
+
+    assert supervisor._is_watcher(cmdline)
+
+
 def test_cleanup_prefers_launcher_and_only_targets_supervisor_children():
     supervisor = _load_supervisor()
     current = {101: _cmd(), 102: _cmd(), 201: _cmd()}

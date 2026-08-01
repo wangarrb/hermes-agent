@@ -48,10 +48,10 @@ def _read_cmdline(pid: int) -> list[str] | None:
 
 def _is_watcher(cmdline: list[str]) -> bool:
     """Check if a cmdline is a kanban watcher child process."""
-    joined = " ".join(cmdline)
-    if WATCH_CHILD_FLAG not in joined:
+    if WATCH_CHILD_FLAG not in cmdline:
         return False
-    return any(p in joined for p in WATCHER_PATTERNS)
+    argument_basenames = {Path(arg).name for arg in cmdline}
+    return any(pattern in argument_basenames for pattern in WATCHER_PATTERNS)
 
 
 def _is_conda_run_wrapper(cmdline: list[str]) -> bool:
