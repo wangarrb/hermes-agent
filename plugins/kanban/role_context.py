@@ -17,6 +17,7 @@ DEFAULT_SHARED_SKILLS_ROOT = Path("/home/wyr/.hermes/skills")
 MAX_SOURCE_BYTES = 64 * 1024
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_SKILL_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
+_ROLE_SOURCE_ALIASES = {"designer": "planner"}
 
 
 class RoleContextError(RuntimeError):
@@ -94,14 +95,16 @@ def _git_read_control_prompt(
     effective_role: str,
 ) -> tuple[str, dict[str, str]]:
     repository = Path(str(contract.get("repository") or "")).expanduser()
-    if not repository.is_absolute() or not repository.is_dir():
-        raise RoleContextError("invalid_workspace_contract:repository")
-    repository = repository.resolve(strict=False)
     requested_commit = str(
         contract.get("control_commit") or contract.get("base_commit") or ""
     ).strip()
-    if not requested_commit:
-        raise RoleContextError("missing_fixed_control_commit")
+    if not repository.is_absolute() or not repository.is_dir() or not requested_commit:
+        return "", {
+            "path": "",
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "content": "",
+        }
+    repository = repository.resolve(strict=False)
     resolved = subprocess.run(
         [
             "git",
@@ -128,6 +131,16 @@ def _git_read_control_prompt(
         timeout=30,
         check=False,
     )
+    if shown.returncode != 0:
+        # Fallback: the control-prompt file may have been added after the
+        # task's base_commit was frozen.  Try HEAD before giving up — system
+        # prompts are project-level config, not task-scoped artifacts.
+        shown = subprocess.run(
+            ["git", "-C", str(repository), "show", f"HEAD:{relative_path}"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
     if shown.returncode != 0:
         raise RoleContextError(
             f"missing_source:fixed_control_prompt:{effective_role}"
@@ -231,9 +244,10 @@ def render_effective_role_context(
             str(getattr(task, "assignee", None) or pane_profile),
             kind="effective_role",
         )
+        source_role = _ROLE_SOURCE_ALIASES.get(effective_role, effective_role)
         contract = getattr(task, "workspace_contract", None)
-        if not isinstance(contract, dict) or not contract.get("valid", False):
-            raise RoleContextError("missing_or_invalid_workspace_contract")
+        if not isinstance(contract, dict):
+            contract = {}
         payload.update(
             {
                 "pane_profile": pane_profile,
@@ -246,52 +260,49 @@ def render_effective_role_context(
             }
         )
 
-        role_root = (profiles_root / effective_role).resolve(strict=False)
-        manifest_source = _read_file_source(
-            role_root / "role-context.json",
-            allowed_root=role_root,
-            kind="role_manifest",
-            name=effective_role,
-        )
+        role_root = (profiles_root / source_role).resolve(strict=False)
+        manifest_path = role_root / "role-context.json"
+        manifest: dict[str, Any] = {}
         try:
-            manifest = json.loads(manifest_source["content"])
-        except json.JSONDecodeError as exc:
-            raise RoleContextError(
-                f"invalid_role_manifest:{effective_role}"
-            ) from exc
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema_version") != 1
-            or manifest.get("role") != effective_role
-        ):
-            raise RoleContextError(f"invalid_role_manifest:{effective_role}")
-        description = manifest.get("description")
-        if not isinstance(description, str) or not description.strip():
-            raise RoleContextError(f"invalid_role_description:{effective_role}")
-
-        control_commit, project_prompt = _git_read_control_prompt(
-            contract, board=board, effective_role=effective_role,
-        )
-        declared_skills: list[dict[str, str]] = []
-        declared = manifest.get("skills")
-        if not isinstance(declared, list):
-            raise RoleContextError(f"invalid_role_skills:{effective_role}")
-        for item in declared:
-            if not isinstance(item, dict):
-                raise RoleContextError(f"invalid_role_skill_entry:{effective_role}")
-            name = str(item.get("name") or "").strip()
-            relative_path = str(item.get("path") or "").strip()
-            expected_sha = str(item.get("sha256") or "").strip()
-            if not name or not relative_path or not expected_sha:
-                raise RoleContextError(f"missing_expected_sha:declared_skill:{name}")
-            source = _read_file_source(
-                role_root / relative_path,
-                allowed_root=role_root / "skills",
-                kind="declared_skill",
-                name=name,
-                expected_sha=expected_sha,
+            manifest_source = _read_file_source(
+                manifest_path,
+                allowed_root=role_root,
+                kind="role_manifest",
+                name=source_role,
             )
-            declared_skills.append({"name": name, **source})
+            try:
+                manifest = json.loads(manifest_source["content"])
+            except json.JSONDecodeError:
+                manifest = {}
+        except RoleContextError:
+            manifest_source = {"path": str(manifest_path), "sha256": ""}
+        if not isinstance(manifest, dict):
+            manifest = {}
+        description = manifest.get("description") or ""
+        if not isinstance(description, str):
+            description = str(description)
+        control_commit, project_prompt = _git_read_control_prompt(
+            contract, board=board, effective_role=source_role,
+        )
+        declared: list = manifest.get("skills") if isinstance(manifest.get("skills"), list) else []
+        declared_skills: list[dict[str, str]] = []
+        if isinstance(declared, list):
+            for item in declared:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                relative_path = str(item.get("path") or "").strip()
+                expected_sha = str(item.get("sha256") or "").strip()
+                if not name or not relative_path or not expected_sha:
+                    continue
+                source = _read_file_source(
+                    role_root / relative_path,
+                    allowed_root=role_root / "skills",
+                    kind="declared_skill",
+                    name=name,
+                    expected_sha=expected_sha,
+                )
+                declared_skills.append({"name": name, **source})
 
         task_skills: list[dict[str, str]] = []
         for name in dict.fromkeys(

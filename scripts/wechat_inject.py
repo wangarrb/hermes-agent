@@ -36,9 +36,10 @@ def is_idle(pane: str) -> bool:
         return False
     tail = "\n".join(lines[-5:]).lower()
     busy = any(m in tail for m in
-               ("⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","thinking","running"))
+               ("⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","thinking","working","esc to"))
     prompt = any(m in tail for m in ("› ", "> ", "❯", "hermes ❯", "implementer ❯",
-                                       "planner ❯", "reviewer ❯", "critic ❯", "coordinator ❯"))
+                                       "planner ❯", "reviewer ❯", "critic ❯", "designer ❯",
+                                       "coordinator ❯"))
     return prompt and not busy
 
 def inject(pane: str, text: str):

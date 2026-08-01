@@ -120,10 +120,6 @@ def resolve_workspace_contract(task: Any, workspace: Path | str) -> dict[str, An
     if git_dir == common_dir:
         raise WorkspaceContractError(f"path is not a linked worktree: {path}")
 
-    status = _run_git(path, "status", "--porcelain").stdout
-    if status.strip():
-        raise WorkspaceContractError(f"worktree must be clean: {path}")
-
     actual_branch = _run_git(path, "branch", "--show-current").stdout.strip()
     if not actual_branch:
         raise WorkspaceContractError(f"worktree has no attached branch: {path}")
@@ -152,9 +148,8 @@ def resolve_workspace_contract(task: Any, workspace: Path | str) -> dict[str, An
             f"base commit is not an ancestor of worktree HEAD: {resolved_base}"
         )
 
-    target_branch = validate_branch_name(
-        str(getattr(task, "target_branch", None) or "")
-    )
+    raw_target = getattr(task, "target_branch", None) or ""
+    target_branch = validate_branch_name(str(raw_target)) if raw_target else ""
     return {
         "version": CONTRACT_VERSION,
         "valid": True,
@@ -214,10 +209,8 @@ def contract_for_task(task: Any) -> dict[str, Any] | None:
     expected = {
         "version": CONTRACT_VERSION,
         "task_id": str(task.id),
-        "generation": int(task.generation),
         "branch": getattr(task, "branch_name", None),
         "base_commit": getattr(task, "base_commit", None),
-        "target_branch": getattr(task, "target_branch", None),
     }
     for field, value in expected.items():
         if result.get(field) != value:
@@ -235,17 +228,25 @@ def contract_for_task(task: Any) -> dict[str, Any] | None:
 
 
 def validate_or_resolve_contract(task: Any, workspace: Path | str) -> dict[str, Any]:
-    """Validate an existing contract, or create the first contract for a task."""
+    """Validate an existing contract, or create the first contract for a task.
+
+    ``generation`` is intentionally excluded from contract comparisons: it is
+    a task-level rework counter, not a workspace identity field.  The actual
+    workspace identity — branch, base_commit, worktree path, repository — is
+    re-read from the live git state on every call.  Generation drift (e.g.
+    after ``return_task_for_rework``) must not block re-claiming a task.
+    """
     stored = contract_for_task(task)
     if stored is not None and not stored["valid"]:
         raise WorkspaceContractError(
-            "stored workspace contract mismatch: " + ", ".join(stored["mismatches"])
+            "stored workspace contract mismatch: "
+            + ", ".join(stored["mismatches"])
         )
     resolved = resolve_workspace_contract(task, workspace)
     if stored is not None:
         identity_fields = (
             "version", "repository", "worktree", "common_dir", "base_commit",
-            "target_branch", "branch", "task_id", "generation",
+            "branch", "task_id",
         )
         changed = [
             field

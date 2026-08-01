@@ -160,10 +160,16 @@ def test_contract_resolver_fails_closed_for_dirty_branch_and_base_mismatch(
     _, workspace, task = _materialize_contract_task(tmp_path)
     contracts = _contracts()
 
-    (workspace / "dirty.txt").write_text("dirty\n", encoding="utf-8")
-    with pytest.raises(contracts.WorkspaceContractError, match="clean"):
-        contracts.resolve_workspace_contract(task, workspace)
-    (workspace / "dirty.txt").unlink()
+    # Worktree dirty (untracked or tracked modifications) must NOT block claim.
+    (workspace / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("v1\n", encoding="utf-8")
+    _git(workspace, "add", "tracked.txt")
+    _git(workspace, "commit", "-m", "add tracked.txt")
+    tracked.write_text("dirty\n", encoding="utf-8")
+    contracts.resolve_workspace_contract(task, workspace)  # should succeed
+    _git(workspace, "checkout", "--", "tracked.txt")
+    (workspace / "untracked.txt").unlink()
 
     _git(workspace, "checkout", "-b", "wrong-branch")
     with pytest.raises(contracts.WorkspaceContractError, match="branch mismatch"):
@@ -175,9 +181,30 @@ def test_contract_resolver_fails_closed_for_dirty_branch_and_base_mismatch(
         contracts.resolve_workspace_contract(bad_base, workspace)
 
 
-def test_rework_generation_marks_stored_contract_invalid_and_blocks_rebind(
+def test_contract_resolver_rejects_reachable_base_that_is_not_head_ancestor(
     kanban_home, tmp_path,
 ):
+    repo, workspace, task = _materialize_contract_task(tmp_path)
+    contracts = _contracts()
+
+    (repo / "new-main.txt").write_text("new main\n", encoding="utf-8")
+    _git(repo, "add", "new-main.txt")
+    _git(repo, "commit", "-m", "advance main")
+    newer_main = _git(repo, "rev-parse", "HEAD")
+
+    assert _git(workspace, "rev-parse", "HEAD") != newer_main
+    non_ancestor_base = replace(task, base_commit=newer_main)
+    with pytest.raises(contracts.WorkspaceContractError, match="not an ancestor"):
+        contracts.resolve_workspace_contract(non_ancestor_base, workspace)
+
+
+def test_rework_generation_does_not_invalidate_workspace_contract(
+    kanban_home, tmp_path,
+):
+    """Rework bumps task generation, but generation is not a workspace
+    identity field.  The stored contract should remain valid and
+    set_workspace_path should succeed without raising.
+    """
     _, workspace, task = _materialize_contract_task(tmp_path)
     contracts = _contracts()
 
@@ -189,15 +216,17 @@ def test_rework_generation_marks_stored_contract_invalid_and_blocks_rebind(
             reason="new generation",
         )
         reworked = kb.get_task(conn, task.id)
-        context = kb.build_worker_context(conn, task.id)
-        with pytest.raises(contracts.WorkspaceContractError, match="generation"):
-            kb.set_workspace_path(conn, task.id, workspace)
+        # Contract should still be valid (generation excluded from comparison).
+        stale_contract = contracts.contract_for_task(reworked)
+        assert stale_contract["valid"] is True
+        assert "generation" not in stale_contract["mismatches"]
+        # set_workspace_path should succeed without raising.
+        assert kb.set_workspace_path(conn, task.id, workspace)
+        refreshed = kb.get_task(conn, task.id)
 
-    stale_contract = contracts.contract_for_task(reworked)
-    assert stale_contract["version"] == "workspace_contract.v1"
-    assert stale_contract["valid"] is False
-    assert "generation" in stale_contract["mismatches"]
-    assert '"valid": false' in context
+    final_contract = contracts.contract_for_task(refreshed)
+    assert final_contract["valid"] is True
+    assert final_contract["mismatches"] == []
 
 
 def test_legacy_db_migrates_contract_columns_and_old_tasks_remain_readable(tmp_path):

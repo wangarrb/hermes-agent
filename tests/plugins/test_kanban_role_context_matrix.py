@@ -65,6 +65,15 @@ def _fixture(tmp_path: Path):
     )
     prompt.parent.mkdir(parents=True)
     prompt.write_text("TRUSTED PROJECT PROMPT\n", encoding="utf-8")
+    planner_prompt = (
+        repo
+        / ".hermes-kanban"
+        / "board"
+        / "planner"
+        / "kanban-system-prompt.md"
+    )
+    planner_prompt.parent.mkdir(parents=True)
+    planner_prompt.write_text("TRUSTED PLANNER PROMPT\n", encoding="utf-8")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "control prompt")
     control_commit = _git(repo, "rev-parse", "HEAD")
@@ -179,6 +188,31 @@ def test_task_assignee_is_effective_role_for_primary_claim(tmp_path):
 
     assert payload["effective_role"] == "implementer"
     assert payload["assist"] is False
+
+
+def test_designer_reuses_planner_profile_prompt(tmp_path):
+    repo, profiles, shared, task, _, _ = _fixture(tmp_path)
+    task.assignee = "designer"
+    task.skills = []
+    listener = HermesInteractiveListener()
+    output = tmp_path / "designer" / "role-context.json"
+
+    listener.render_effective_role_context(
+        board="board",
+        workspace=repo,
+        pane_profile="designer",
+        task=task,
+        output_path=output,
+        profiles_root=profiles,
+        shared_skills_root=shared,
+        backend="hermes",
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["effective_role"] == "designer"
+    assert payload["assist"] is False
+    assert payload["project_prompt"]["content"] == "TRUSTED PLANNER PROMPT\n"
+    assert "/planner/kanban-system-prompt.md" in payload["project_prompt"]["path"]
 
 
 @pytest.mark.parametrize("pane_profile", ["implementer", "coordinator"])
