@@ -620,6 +620,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--run-id", type=int, default=None,
+        help="Expected active run id (single-task fenced completion)",
+    )
+    p_complete.add_argument(
+        "--generation", type=int, default=None,
+        help="Expected task generation (single-task fenced completion)",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -656,6 +664,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
         ),
+    )
+    p_block.add_argument(
+        "--run-id", type=int, default=None,
+        help="Expected active run id (single-task fenced block)",
+    )
+    p_block.add_argument(
+        "--generation", type=int, default=None,
+        help="Expected task generation (single-task fenced block)",
     )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
@@ -2250,6 +2266,18 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_generation_for(task_id: str) -> Optional[int]:
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_GENERATION")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2261,7 +2289,12 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    explicit_run_id = getattr(args, "run_id", None)
+    explicit_generation = getattr(args, "generation", None)
+    if len(ids) > 1 and (
+        summary or raw_meta or explicit_run_id is not None
+        or explicit_generation is not None
+    ):
         print(
             "kanban: --summary / --metadata are per-task and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
@@ -2331,7 +2364,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     result=args.result,
                     summary=summary,
                     metadata=metadata,
-                    expected_run_id=_worker_run_id_for(tid),
+                    expected_run_id=(
+                        explicit_run_id
+                        if explicit_run_id is not None
+                        else _worker_run_id_for(tid)
+                    ),
+                    expected_generation=(
+                        explicit_generation
+                        if explicit_generation is not None
+                        else _worker_generation_for(tid)
+                    ),
                 )
             except independent_review.IndependentReviewError as exc:
                 failed.append(tid)
@@ -2381,17 +2423,45 @@ def _cmd_block(args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    explicit_run_id = getattr(args, "run_id", None)
+    explicit_generation = getattr(args, "generation", None)
+    if len(ids) > 1 and (
+        explicit_run_id is not None or explicit_generation is not None
+    ):
+        print(
+            "kanban: --run-id/--generation can only fence one task",
+            file=sys.stderr,
+        )
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            expected_run_id = (
+                explicit_run_id
+                if explicit_run_id is not None
+                else _worker_run_id_for(tid)
+            )
+            expected_generation = (
+                explicit_generation
+                if explicit_generation is not None
+                else _worker_generation_for(tid)
+            )
             if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+                kb.add_comment(
+                    conn,
+                    tid,
+                    author,
+                    f"BLOCKED: {reason}",
+                    expected_run_id=expected_run_id,
+                    expected_generation=expected_generation,
+                )
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=expected_run_id,
+                expected_generation=expected_generation,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
