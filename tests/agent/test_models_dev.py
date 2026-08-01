@@ -182,6 +182,8 @@ class TestFetchModelsDev:
 
         assert "anthropic" in result
         assert len(result) == len(SAMPLE_REGISTRY)
+        mock_get.assert_called_once_with(md.MODELS_DEV_URL, timeout=5)
+        assert md._MODELS_DEV_CACHE_TTL == 86400
 
     @patch("agent.models_dev.requests.get")
     def test_fetch_failure_returns_stale_cache(self, mock_get):
