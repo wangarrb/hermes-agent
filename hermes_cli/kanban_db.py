@@ -10736,7 +10736,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # comment-storm tasks don't blow out the worker's prompt. Older
     # comments summarised in a one-line marker like prior attempts.
     if current_handback is not None:
-        all_comments = [c for c in all_comments if c.id != current_handback.id]
+        # The highlighted handback supersedes earlier discussion for the
+        # active goal prompt.  Keep later progress comments only; the complete
+        # thread remains durable in SQLite and ``kanban show``.
+        handback_order = (current_handback.created_at, current_handback.id)
+        all_comments = [
+            c for c in all_comments
+            if (c.created_at, c.id) > handback_order
+        ]
     if len(all_comments) > _CTX_MAX_COMMENTS:
         omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
         shown_c = all_comments[-_CTX_MAX_COMMENTS:]

@@ -1718,6 +1718,12 @@ def test_goal_context_frontloads_current_handback_and_hides_stale_history(
         kb.add_comment(
             conn,
             tid,
+            "planner",
+            "STALE_COMMENT_BEFORE_HANDBACK",
+        )
+        kb.add_comment(
+            conn,
+            tid,
             "reviewer",
             "REVIEWER_RESULT: CURRENT_AUTHORITATIVE_HANDBACK",
         )
@@ -1730,6 +1736,7 @@ def test_goal_context_frontloads_current_handback_and_hides_stale_history(
         )
         assert "CURRENT_GENERATION_EVIDENCE" in ctx
         assert "STALE_GENERATION_SUMMARY" not in ctx
+        assert "STALE_COMMENT_BEFORE_HANDBACK" not in ctx
         assert "1 prior attempt from an older generation omitted" in ctx
         assert "UNRELATED_ROLE_SUMMARY" not in ctx
         assert "## Recent work by @planner" not in ctx
