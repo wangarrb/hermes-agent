@@ -140,6 +140,25 @@ class CodexInteractiveListener(BaseInteractiveListener):
             return f"codex-kanban [{task_id}]"
         return "codex-kanban"
 
+    def pane_is_idle(self, screen: str) -> bool:
+        """Require an idle composer with no busy marker in the live viewport."""
+        tail_lines = _tail_nonempty_lines(screen, limit=5)
+        if not tail_lines:
+            return False
+
+        viewport = "\n".join(tail_lines).lower()
+        if any(marker.lower() in viewport for marker in self.busy_markers):
+            return False
+
+        last_line = tail_lines[-1].lower()
+        is_status_bar = "context" in last_line and "%" in last_line
+        check_line = (
+            tail_lines[-2].lower()
+            if is_status_bar and len(tail_lines) >= 2
+            else last_line
+        )
+        return any(marker.lower() in check_line for marker in self.idle_markers)
+
     # ── Override on_claim_pre_check: check last 5 lines, not just last line ──
     # Codex TUI layout puts the "›" prompt 2-3 lines above the bottom status
     # bar (model name, workspace path).  The base class only checks the very
@@ -164,27 +183,11 @@ class CodexInteractiveListener(BaseInteractiveListener):
             tail_lines = _tail_nonempty_lines(screen, limit=5)
             if not tail_lines:
                 return False
-            # Codex TUI layout: idle prompt "›" sits ABOVE the status bar.
-            # The status bar (last line) shows model/context info.
-            # When Codex is working, "›" may still be visible in scrollback
-            # but the status bar is the actual last line.
-            # Rule: "›" must be in the LAST non-empty line to be idle,
-            # OR the last line is a status bar AND the line above it is "›".
-            last_line = tail_lines[-1].lower() if tail_lines else ""
-            is_status_bar = "context" in last_line and "%" in last_line
-            if is_status_bar and len(tail_lines) >= 2:
-                check_line = tail_lines[-2].lower()
-            else:
-                check_line = last_line
-            has_idle = any(m.lower() in check_line for m in self.idle_markers)
-            has_busy = any(m.lower() in last_line for m in self.busy_markers)
-            # Also treat status bar presence without idle prompt as busy
-            if is_status_bar and not has_idle:
-                has_busy = True
-            if not has_idle:
+            if not self.pane_is_idle(screen):
+                last_line = tail_lines[-1].lower()
                 log_line(log_path, (
                     f"on_claim_pre_check attempt {attempt+1}/2: "
-                    f"not ready (idle={has_idle} busy={has_busy} "
+                    f"not ready (live viewport is not idle; "
                     f"last={last_line[:60]})"
                 ))
                 return False

@@ -13,6 +13,9 @@ from plugins.kanban import base_listener as bl
 from plugins.kanban.hermes_listener.hermes_kanban_interactive import (
     HermesInteractiveListener,
 )
+from plugins.kanban.codex_listener.codex_kanban_interactive import (
+    CodexInteractiveListener,
+)
 
 
 @pytest.fixture
@@ -130,6 +133,36 @@ def test_busy_activity_resets_goal_idle_episode(
         listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
 
     assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 2
+
+
+def test_codex_working_view_never_gets_reviewer_lifecycle_followup(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="reviewer", goal_mode=False)
+    listener = CodexInteractiveListener()
+    codex_base = sys.modules[listener.on_task_running_monitor.__module__]
+    now = [100.0]
+    injected: list[str] = []
+    working_screen = """\
+• Working (18s • esc to interrupt) · 1 background terminal running
+
+› Run /review on my current changes
+
+  gpt-5.6-sol high · master · Context 64% used
+"""
+    monkeypatch.setattr(codex_base.time, "time", lambda: now[0])
+    monkeypatch.setattr(codex_base.time, "sleep", lambda _: None)
+    monkeypatch.setattr(codex_base, "zellij_dump_screen", lambda **_: working_screen)
+    monkeypatch.setattr(
+        codex_base, "zellij_inject", lambda **kw: injected.append(kw["text"])
+    )
+
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    assert not [text for text in injected if "REVIEW_LIFECYCLE" in text]
 
 
 def test_goal_completion_check_is_suppressed_while_reviewer_checkpoint_is_open(

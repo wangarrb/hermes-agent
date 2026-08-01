@@ -691,6 +691,14 @@ class BaseInteractiveListener:
             screen, self.idle_markers, self.busy_markers, self.queued_input_markers,
         )
 
+    def pane_is_idle(self, screen: str) -> bool:
+        """Return whether the current pane viewport is a safe idle boundary."""
+        return _looks_like_idle_pane(
+            screen,
+            idle_markers=self.idle_markers,
+            busy_markers=self.busy_markers,
+        )
+
     def on_claim_post_confirm(self, args: argparse.Namespace, log_path: Path) -> bool:
         """After claim, confirm the pane is still idle before injecting.
 
@@ -729,7 +737,7 @@ class BaseInteractiveListener:
             return
 
         # Check if pane is idle (not busy)
-        if not _looks_like_idle_pane(screen, idle_markers=self.idle_markers, busy_markers=self.busy_markers):
+        if not self.pane_is_idle(screen):
             # Pane is busy (agent recovered) — reset retry state so next error
             # cycle starts fresh
             self._api_retry_count = 0
