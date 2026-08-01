@@ -239,6 +239,17 @@ def test_hermes_strict_idle_path_also_checks_goal_completion(
     assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 1
 
 
+def test_hermes_active_interrupt_status_is_not_a_safe_idle_boundary() -> None:
+    listener = HermesInteractiveListener()
+
+    assert listener._is_truly_idle_line(
+        "⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
+    )
+    assert not listener._is_truly_idle_line(
+        "⚕ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
+    )
+
+
 @pytest.mark.parametrize(
     "activity_line",
     [
