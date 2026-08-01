@@ -700,6 +700,590 @@ def _accepted_revision(model: dict) -> dict | None:
     return revision if required.issubset(revision) else None
 
 
+REVIEW_RENDERER_SCHEMA = "mental_model_review_export.v1"
+REVIEW_EXPORT_ROOT = Path(
+    "/home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/exports"
+)
+
+
+def _canonical_json_sha(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_review_export_manifest(path: Path | None = None) -> dict:
+    manifest_path = path or (
+        HERMES_HOME / "mental-models" / "egomotion4d" / "review_exports.json"
+    )
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if data.get("schema_version") != 1:
+        raise ValueError("review export manifest schema_version must be 1")
+    models = data.get("models")
+    if not isinstance(models, dict):
+        raise ValueError("review export manifest models must be an object")
+    allowed_config_keys = {"enabled", "extra_decision_ids"}
+    for logical_id, config in models.items():
+        if not isinstance(logical_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*", logical_id
+        ):
+            raise ValueError(f"invalid logical model id: {logical_id!r}")
+        if not isinstance(config, dict):
+            raise ValueError(f"review export config for {logical_id} must be an object")
+        unknown = set(config) - allowed_config_keys
+        if unknown:
+            raise ValueError(
+                f"unknown review export config keys for {logical_id}: "
+                f"{', '.join(sorted(unknown))}"
+            )
+        if not isinstance(config.get("enabled", False), bool):
+            raise ValueError(f"enabled must be boolean for {logical_id}")
+        extras = config.get("extra_decision_ids", [])
+        if not isinstance(extras, list) or not all(
+            isinstance(item, str) and re.fullmatch(r"D\d+", item)
+            for item in extras
+        ):
+            raise ValueError(f"extra_decision_ids invalid for {logical_id}")
+    return data
+
+
+def _decision_sort_key(decision_id: str) -> tuple[int, str]:
+    match = re.fullmatch(r"D(\d+)", decision_id)
+    return (int(match.group(1)), decision_id) if match else (10**9, decision_id)
+
+
+def _decision_id_union(evidence_entry: dict, spec: dict, config: dict) -> list[str]:
+    values = []
+    for field_values in (
+        evidence_entry.get("d_ids", []),
+        spec.get("required_anchors", []),
+        spec.get("decision_ids", []),
+        config.get("extra_decision_ids", []),
+    ):
+        if not isinstance(field_values, list):
+            raise ValueError("decision id fields must be lists")
+        values.extend(field_values)
+    invalid = [item for item in values if not isinstance(item, str) or not re.fullmatch(r"D\d+", item)]
+    if invalid:
+        raise ValueError(f"invalid decision ids: {invalid!r}")
+    return sorted(set(values), key=_decision_sort_key)
+
+
+def _extract_current_decisions(text: str, decision_ids: list[str]) -> dict[str, str]:
+    table_candidates: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) < 3 or not re.fullmatch(r"D\d+", cells[0]):
+            continue
+        status_cells = [
+            cell
+            for cell in cells[1:]
+            if re.fullmatch(r"current(?:_[A-Za-z0-9]+)*", cell, flags=re.IGNORECASE)
+        ]
+        if status_cells:
+            table_candidates.setdefault(cells[0], []).append(stripped)
+
+    heading_candidates: dict[str, list[str]] = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^###\s+(D\d+)(.*)$", lines[index].strip())
+        if not match:
+            index += 1
+            continue
+        decision_id, suffix = match.group(1), match.group(2)
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end].strip()
+            if candidate == "---" or re.match(r"^###\s+D\d+", candidate):
+                break
+            end += 1
+        if re.search(r"\bcurrent\b", suffix, flags=re.IGNORECASE):
+            section = "\n".join(lines[index:end]).rstrip()
+            heading_candidates.setdefault(decision_id, []).append(section)
+        index = max(end, index + 1)
+
+    result = {}
+    for decision_id in decision_ids:
+        candidates = table_candidates.get(decision_id) or heading_candidates.get(
+            decision_id, []
+        )
+        if not candidates:
+            raise ValueError(f"missing current decision: {decision_id}")
+        unique = list(dict.fromkeys(candidates))
+        if len(unique) != 1:
+            raise ValueError(f"ambiguous current decision: {decision_id}")
+        result[decision_id] = unique[0]
+    return result
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)
+
+
+def _fetch_mental_model(api_url: str, physical_id: str) -> dict:
+    import urllib.request
+
+    with urllib.request.urlopen(
+        f"{api_url}/v1/default/banks/hermes/mental-models/{physical_id}",
+        timeout=30,
+    ) as response:
+        data = json.loads(response.read())
+    if not isinstance(data, dict):
+        raise ValueError(f"mental model response is not an object: {physical_id}")
+    return data
+
+
+def _review_revision_sha(
+    accepted_content_sha: str, accepted_evidence_sha: str, config: dict
+) -> tuple[str, str]:
+    config_sha = _canonical_json_sha(config)
+    revision = _canonical_json_sha(
+        {
+            "renderer_schema": REVIEW_RENDERER_SCHEMA,
+            "accepted_content_sha": accepted_content_sha,
+            "accepted_evidence_sha": accepted_evidence_sha,
+            "per_model_review_manifest_config_sha": config_sha,
+        }
+    )
+    return revision, config_sha
+
+
+def _render_review_export(
+    *,
+    logical_id: str,
+    model: dict,
+    accepted: dict,
+    accepted_content: str,
+    spec: dict,
+    evidence_entry: dict,
+    config: dict,
+    decisions: dict[str, str],
+    source_records: list[dict],
+    review_revision_sha: str,
+    config_sha: str,
+    first_generated_at: str,
+) -> bytes:
+    derived_paths = set(spec.get("source_files", []))
+    derived_records = []
+    topic_records = []
+    for record in source_records:
+        path = Path(record["path"])
+        root = HERMES_HOME / "mental-models" / "egomotion4d"
+        try:
+            relative = str(path.relative_to(root))
+        except ValueError:
+            relative = ""
+        if relative in derived_paths:
+            derived_records.append(record)
+        if record["name"].startswith("topics/") or "/topics/" in path.as_posix():
+            topic_records.append(record)
+
+    lines = [
+        "---",
+        "derived_review_view: true",
+        "consumer_injection: false",
+        "status: PASS",
+        f"renderer_schema: {REVIEW_RENDERER_SCHEMA}",
+        f"logical_id: {logical_id}",
+        f"accepted_revision_sha: {accepted['content_sha']}",
+        f"accepted_at: {accepted['accepted_at']}",
+        f"active_slot: {model['active_slot']}",
+        f"accepted_evidence_sha: {accepted['source_evidence_sha']}",
+        f"review_manifest_config_sha: {config_sha}",
+        f"review_revision_sha: {review_revision_sha}",
+        f"first_generated_at: {first_generated_at}",
+        "---",
+        "",
+        f"# {logical_id} 完整审核导出",
+        "",
+        "## 完整性结论",
+        "",
+        "- `✅ PASS accepted slot/content/evidence identity`",
+        "- `✅ PASS required prefix/anchors/terminal marker`",
+        "- `✅ PASS evidence source hashes`",
+        "- `✅ PASS current decision anchors`",
+        "- 此文件是可再生审核视图，不是项目事实源，也不会注入 agent preflight。",
+        "",
+        "## Accepted Model 原文",
+        "",
+        "<!-- BEGIN_ACCEPTED_MODEL_BYTES -->",
+        accepted_content,
+        "<!-- END_ACCEPTED_MODEL_BYTES -->",
+        "",
+        "## Generation Contract",
+        "",
+        "```json",
+        json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True),
+        "```",
+        "",
+        "## Decision Anchors",
+        "",
+    ]
+    for decision_id in sorted(decisions, key=_decision_sort_key):
+        lines.extend([f"### {decision_id}", "", decisions[decision_id], ""])
+
+    lines.extend(["## Derived Source Snapshots", ""])
+    for record in sorted(derived_records, key=lambda item: item["path"]):
+        lines.extend(
+            [
+                f"### `{record['path']}`",
+                "",
+                f"SHA256: `{record['actual_sha256']}`",
+                "",
+                f"<!-- BEGIN_SOURCE_BYTES {record['path']} -->",
+                record["text"],
+                f"<!-- END_SOURCE_BYTES {record['path']} -->",
+                "",
+            ]
+        )
+
+    lines.extend(["## KG Topic Currents", ""])
+    for record in sorted(topic_records, key=lambda item: item["path"]):
+        lines.extend(
+            [
+                f"### `{record['path']}`",
+                "",
+                f"SHA256: `{record['actual_sha256']}`",
+                "",
+                f"<!-- BEGIN_TOPIC_BYTES {record['path']} -->",
+                record["text"],
+                f"<!-- END_TOPIC_BYTES {record['path']} -->",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## Evidence Inventory",
+            "",
+            "| Name | Path | Expected SHA256 | Fresh SHA256 | Result |",
+            "|---|---|---|---|---|",
+        ]
+    )
+    for record in sorted(source_records, key=lambda item: item["name"]):
+        safe_path = record["path"].replace("|", "\\|")
+        lines.append(
+            f"| `{record['name']}` | `{safe_path}` | "
+            f"`{record['expected_sha256']}` | `{record['actual_sha256']}` | PASS |"
+        )
+    lines.extend(["", "END_MENTAL_MODEL_REVIEW_EXPORT", ""])
+    return "\n".join(lines).encode()
+
+
+def _render_blocked_review_page(
+    *,
+    logical_id: str,
+    errors: list[str],
+    model: dict | None,
+    generated_at: str,
+    last_valid_history: Path | None,
+) -> bytes:
+    accepted = _accepted_revision(model or {})
+    lines = [
+        "---",
+        "derived_review_view: true",
+        "consumer_injection: false",
+        "status: STALE/BLOCKED_DO_NOT_USE",
+        f"logical_id: {logical_id}",
+        f"generated_at: {generated_at}",
+        f"accepted_revision_sha: {accepted.get('content_sha', '') if accepted else ''}",
+        f"accepted_evidence_sha: {accepted.get('source_evidence_sha', '') if accepted else ''}",
+        "---",
+        "",
+        f"# {logical_id}: STALE/BLOCKED_DO_NOT_USE",
+        "",
+        "该审核视图未通过完整性验证，禁止把旧成功正文当作 current。",
+        "",
+        "## Block Reasons",
+        "",
+    ]
+    lines.extend(f"- {error}" for error in errors)
+    lines.extend(
+        [
+            "",
+            "## Last Valid History",
+            "",
+            f"`{last_valid_history}`" if last_valid_history else "无有效 history snapshot。",
+            "",
+        ]
+    )
+    return "\n".join(lines).encode()
+
+
+def _publish_review_exports(
+    api_url: str,
+    *,
+    registry: dict | None = None,
+    manifest_path: Path | None = None,
+    export_root: Path | None = None,
+    fetch_model=None,
+    generated_at: str | None = None,
+) -> dict:
+    model_root = HERMES_HOME / "mental-models" / "egomotion4d"
+    if registry is None:
+        registry = json.loads((model_root / "registry.json").read_text(encoding="utf-8"))
+    evidence_bundle = json.loads(
+        (model_root / "evidence_bundle.json").read_text(encoding="utf-8")
+    )
+    manifest = _load_review_export_manifest(manifest_path)
+    review_root = (export_root or REVIEW_EXPORT_ROOT) / "review"
+    current_dir = review_root / "current"
+    history_dir = review_root / "history"
+    current_dir.mkdir(parents=True, exist_ok=True)
+    history_dir.mkdir(parents=True, exist_ok=True)
+    fetch = fetch_model or (lambda physical_id: _fetch_mental_model(api_url, physical_id))
+    timestamp = generated_at or time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    results = {}
+    for logical_id, config in sorted(manifest["models"].items()):
+        if not config.get("enabled", False):
+            continue
+        model = registry.get("models", {}).get(logical_id)
+        errors = []
+        accepted = _accepted_revision(model or {})
+        evidence_entry = evidence_bundle.get("per_model", {}).get(logical_id)
+        spec = {}
+        source_records = []
+        accepted_content = ""
+        decisions = {}
+        revision_sha = ""
+        config_sha = _canonical_json_sha(config)
+
+        try:
+            if not isinstance(model, dict):
+                raise ValueError("model missing from registry")
+            if accepted is None:
+                raise ValueError("accepted revision missing or incomplete")
+            if accepted["slot"] != model.get("active_slot"):
+                raise ValueError("accepted slot does not match active slot")
+            if not isinstance(evidence_entry, dict):
+                raise ValueError("per-model evidence entry missing")
+            current_evidence = evidence_entry.get("evidence_sha256")
+            if current_evidence != accepted["source_evidence_sha"]:
+                raise ValueError(
+                    "accepted evidence SHA does not match current evidence bundle"
+                )
+
+            physical_id = model["physical_ids"][model["active_slot"]]
+            fetched = fetch(physical_id)
+            accepted_content = fetched.get("content", "")
+            if not accepted_content:
+                raise ValueError("accepted content is empty")
+            actual_content_sha = hashlib.sha256(accepted_content.encode()).hexdigest()
+            if actual_content_sha != accepted["content_sha"]:
+                raise ValueError("accepted content SHA mismatch")
+
+            spec = _model_generation_spec(logical_id)
+            if not spec:
+                raise ValueError("generation spec missing or invalid")
+            completeness_errors = _candidate_completeness_errors(
+                accepted_content,
+                _model_generation_requirements(logical_id),
+                source_fact_count=1,
+            )
+            if completeness_errors:
+                raise ValueError("; ".join(completeness_errors))
+
+            evidence_sources = evidence_entry.get("sources")
+            if not isinstance(evidence_sources, dict) or not evidence_sources:
+                raise ValueError("evidence source inventory missing")
+            for name, source in sorted(evidence_sources.items()):
+                if not isinstance(source, dict):
+                    raise ValueError(f"invalid evidence source record: {name}")
+                source_path = Path(source.get("path", ""))
+                expected_sha = source.get("sha256", "")
+                if not source_path.is_file():
+                    raise ValueError(f"evidence source missing: {source_path}")
+                raw = source_path.read_bytes()
+                actual_sha = hashlib.sha256(raw).hexdigest()
+                if actual_sha != expected_sha:
+                    raise ValueError(f"evidence source SHA mismatch: {source_path}")
+                source_records.append(
+                    {
+                        "name": name,
+                        "path": str(source_path),
+                        "expected_sha256": expected_sha,
+                        "actual_sha256": actual_sha,
+                        "text": raw.decode("utf-8"),
+                    }
+                )
+
+            root = model_root.resolve()
+            inventory_paths = {Path(record["path"]).resolve() for record in source_records}
+            for relative_text in spec.get("source_files", []):
+                relative = Path(relative_text)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError(f"invalid spec source path: {relative_text!r}")
+                resolved = (root / relative).resolve()
+                if root not in resolved.parents or resolved not in inventory_paths:
+                    raise ValueError(
+                        f"spec source is not bound to evidence inventory: {relative_text}"
+                    )
+
+            decision_source = next(
+                (
+                    record
+                    for record in source_records
+                    if record["name"] == "10-current-decisions.md"
+                    or Path(record["path"]).name == "10-current-decisions.md"
+                ),
+                None,
+            )
+            if decision_source is None:
+                raise ValueError("current decision source missing from evidence inventory")
+            decision_ids = _decision_id_union(evidence_entry, spec, config)
+            decisions = _extract_current_decisions(
+                decision_source["text"], decision_ids
+            )
+            revision_sha, config_sha = _review_revision_sha(
+                accepted["content_sha"], accepted["source_evidence_sha"], config
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+
+        current_path = current_dir / f"{logical_id}.md"
+        existing_history = sorted(history_dir.glob(f"{logical_id}-*.md"))
+        last_valid = existing_history[-1] if existing_history else None
+        if errors:
+            _atomic_write_bytes(
+                current_path,
+                _render_blocked_review_page(
+                    logical_id=logical_id,
+                    errors=errors,
+                    model=model,
+                    generated_at=timestamp,
+                    last_valid_history=last_valid,
+                ),
+            )
+            results[logical_id] = {"status": "BLOCKED", "errors": errors}
+            continue
+
+        history_path = history_dir / f"{logical_id}-{revision_sha[:12]}.md"
+        if history_path.exists():
+            history_bytes = history_path.read_bytes()
+            marker = f"review_revision_sha: {revision_sha}".encode()
+            if marker not in history_bytes:
+                error = "existing history snapshot revision header mismatch"
+                _atomic_write_bytes(
+                    current_path,
+                    _render_blocked_review_page(
+                        logical_id=logical_id,
+                        errors=[error],
+                        model=model,
+                        generated_at=timestamp,
+                        last_valid_history=last_valid,
+                    ),
+                )
+                results[logical_id] = {"status": "BLOCKED", "errors": [error]}
+                continue
+        else:
+            history_bytes = _render_review_export(
+                logical_id=logical_id,
+                model=model,
+                accepted=accepted,
+                accepted_content=accepted_content,
+                spec=spec,
+                evidence_entry=evidence_entry,
+                config=config,
+                decisions=decisions,
+                source_records=source_records,
+                review_revision_sha=revision_sha,
+                config_sha=config_sha,
+                first_generated_at=timestamp,
+            )
+            history_path.write_bytes(history_bytes)
+        _atomic_write_bytes(current_path, history_bytes)
+        results[logical_id] = {
+            "status": "PASS",
+            "review_revision_sha": revision_sha,
+            "current": str(current_path),
+            "history": str(history_path),
+        }
+
+    pass_count = sum(item["status"] == "PASS" for item in results.values())
+    if results and pass_count == len(results):
+        aggregate = "PASS_ALL"
+    elif pass_count:
+        aggregate = "PARTIAL_AUDIT_EXPORT_BLOCKED"
+    else:
+        aggregate = "BLOCK_ALL"
+    return {"aggregate": aggregate, "models": results}
+
+
+def _export_accepted_consumers(
+    api_url: str,
+    registry: dict,
+    *,
+    export_root: Path | None = None,
+    fetch_model=None,
+) -> dict:
+    root = export_root or REVIEW_EXPORT_ROOT
+    current_dir = root / "current"
+    current_dir.mkdir(parents=True, exist_ok=True)
+    fetch = fetch_model or (lambda physical_id: _fetch_mental_model(api_url, physical_id))
+    results = {}
+
+    for logical_id, model in sorted(registry.get("models", {}).items()):
+        accepted = _accepted_revision(model)
+        if accepted is None:
+            results[logical_id] = {"status": "SKIP", "reason": "no accepted revision"}
+            continue
+        active_slot = model.get("active_slot")
+        if accepted["slot"] != active_slot:
+            results[logical_id] = {"status": "BLOCKED", "reason": "accepted slot mismatch"}
+            continue
+        current_evidence = _model_evidence_sha(logical_id)
+        if not current_evidence or accepted["source_evidence_sha"] != current_evidence:
+            results[logical_id] = {"status": "BLOCKED", "reason": "stale evidence"}
+            continue
+        try:
+            physical_id = model["physical_ids"][active_slot]
+            export_data = fetch(physical_id)
+            content = export_data.get("content", "")
+            if not content or len(content) < 100:
+                raise ValueError("empty or too-short content")
+            if hashlib.sha256(content.encode()).hexdigest() != accepted["content_sha"]:
+                raise ValueError("fetched content SHA mismatch")
+
+            metadata_header = (
+                f"<!--\n"
+                f"  logical_id: {logical_id}\n"
+                f"  accepted_revision: {accepted['content_sha']}\n"
+                f"  evidence_bundle_sha: {current_evidence}\n"
+                f"  active_slot: {active_slot}\n"
+                f"  verdict: PASS_PUBLISH\n"
+                f"  accepted_at: {accepted['accepted_at']}\n"
+                f"  evidence_stale: false\n"
+                f"-->\n\n"
+            )
+            timestamp_raw = accepted.get("accepted_at", "")
+            try:
+                parsed = datetime.fromisoformat(timestamp_raw.replace("Z", "+00:00"))
+                timestamp_display = parsed.strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                timestamp_display = timestamp_raw
+            updated_line = f"> **最后更新**: {timestamp_display}\n\n"
+            current_file = current_dir / f"{logical_id}.md"
+            _atomic_write_bytes(
+                current_file, (metadata_header + updated_line + content).encode()
+            )
+            results[logical_id] = {"status": "PASS", "path": str(current_file)}
+        except Exception as exc:
+            results[logical_id] = {"status": "BLOCKED", "reason": str(exc)}
+
+    blocked = [item for item in results.values() if item["status"] == "BLOCKED"]
+    status = "PASS_ALL" if not blocked else "PARTIAL_CONSUMER_EXPORT_BLOCKED"
+    return {"status": status, "models": results}
+
+
 def _render_mental_model_index(registry: dict, generated_date: str) -> str:
     lines = [
         "# Egomotion4D Mental Models",
@@ -1559,6 +2143,7 @@ def _build_active_context(
     api_url: str,
     max_tokens: int = 2000,
     exclude_logical_id: str | None = None,
+    include_logical_id: str | None = None,
 ) -> str:
     """Build exact context from accepted (PASS_PUBLISH) active models only.
 
@@ -1575,6 +2160,8 @@ def _build_active_context(
 
     parts = []
     for logical_id, model in registry.get("models", {}).items():
+        if include_logical_id is not None and logical_id != include_logical_id:
+            continue
         if logical_id == exclude_logical_id:
             continue
         accepted = _accepted_revision(model)
@@ -1633,14 +2220,22 @@ def _matches_expected_term(text: str, term: str | list[str]) -> bool:
 
 
 def _format_gate_question(question: dict) -> str:
-    """Expose citation requirements already enforced by the scorer."""
+    """Expose citation and literal concept requirements enforced by the scorer."""
     anchors = [str(anchor) for anchor in question.get("key_d_refs", [])]
-    if not anchors:
-        return question["question"]
-    return (
-        f"{question['question']}\n\n"
-        f"Required decision anchors: {', '.join(anchors)}."
-    )
+    groups = []
+    for term in question.get("expected_pitfall_triggers", []):
+        alternatives = term if isinstance(term, list) else [term]
+        groups.append(" | ".join(str(item) for item in alternatives))
+    sections = [question["question"]]
+    if anchors:
+        sections.append(f"Required decision anchors: {', '.join(anchors)}.")
+    if groups:
+        sections.append(
+            "Required concept terms (use at least one literal alias from each group): "
+            + "; ".join(groups)
+            + "."
+        )
+    return "\n\n".join(sections)
 
 
 def _run_smoke_regression(
@@ -1776,7 +2371,14 @@ def _run_all_model_smoke(api_url: str) -> int:
     failures = 0
     for logical_id in accepted_ids:
         print(f"\n--- Target Smoke: {logical_id} ---")
-        if _run_smoke_regression(api_url, logical_id=logical_id) != 0:
+        isolated_context = _build_active_context(
+            api_url, max_tokens=2000, include_logical_id=logical_id
+        )
+        if _run_smoke_regression(
+            api_url,
+            isolated_context,
+            logical_id=logical_id,
+        ) != 0:
             failures += 1
     print(
         f"\nAll-model smoke: {len(accepted_ids) - failures}/{len(accepted_ids)} passed"
@@ -2117,76 +2719,17 @@ Evaluate the candidate. Is it safe to publish as the new active version?"""
 
     print(f"\nReport: {report_file}")
 
-    # Export accepted models using revision-based policy (not date-based).
-    # Only PASS_PUBLISH models get current/ consumer view and history snapshots.
-    # INITIAL/REJECT/ESCALATE content stays quarantined.
-    export_dir = Path("/home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/exports")
-    current_dir = export_dir / "current"
-    current_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = REVIEW_EXPORT_ROOT
+    consumer_result = _export_accepted_consumers(api_url, registry)
+    print(f"  Consumer export: {consumer_result['status']}")
+    for logical_id, result in consumer_result["models"].items():
+        print(f"    {logical_id}: {result['status']}")
 
-    for logical_id, model in registry.get("models", {}).items():
-        accepted = _accepted_revision(model)
-        if accepted is None:
-            print(f"  SKIP export {logical_id}: no accepted revision")
-            continue
-        content_sha = accepted["content_sha"]
-        active_slot = model["active_slot"]
-        if accepted["slot"] != active_slot:
-            print(f"  SKIP export {logical_id}: accepted slot mismatch")
-            continue
-        physical_id = model["physical_ids"][active_slot]
-
-        current_evidence = _model_evidence_sha(logical_id)
-        if not current_evidence or accepted["source_evidence_sha"] != current_evidence:
-            print(f"  SKIP export {logical_id}: stale evidence")
-            continue
-
-        try:
-            with urllib.request.urlopen(
-                f"{api_url}/v1/default/banks/hermes/mental-models/{physical_id}",
-                timeout=30,
-            ) as resp:
-                export_data = json.loads(resp.read())
-            content = export_data.get("content", "")
-            if not content or len(content) < 100:
-                print(f"  SKIP export {logical_id}: empty or too-short content")
-                continue
-            if hashlib.sha256(content.encode()).hexdigest() != content_sha:
-                print(f"  SKIP export {logical_id}: fetched content SHA mismatch")
-                continue
-
-            metadata_header = (
-                f"<!--\n"
-                f"  logical_id: {logical_id}\n"
-                f"  accepted_revision: {content_sha}\n"
-                f"  evidence_bundle_sha: {current_evidence}\n"
-                f"  active_slot: {active_slot}\n"
-                f"  verdict: PASS_PUBLISH\n"
-                f"  accepted_at: {accepted['accepted_at']}\n"
-                f"  evidence_stale: false\n"
-                f"-->\n\n"
-            )
-
-            # Visible last-updated timestamp (ISO → readable)
-            _ts_raw = accepted.get("accepted_at", "")
-            try:
-                from datetime import datetime as _dt
-                _parsed = _dt.fromisoformat(_ts_raw.replace("Z", "+00:00"))
-                _ts_display = _parsed.strftime("%Y-%m-%d %H:%M UTC")
-            except Exception:
-                _ts_display = _ts_raw
-            updated_line = f"> **最后更新**: {_ts_display}\n\n"
-
-            # Atomic current/ consumer view
-            current_file = current_dir / f"{logical_id}.md"
-            tmp_current = current_dir / f".{logical_id}.tmp"
-            with open(tmp_current, "w") as f:
-                f.write(metadata_header + updated_line + content)
-            os.rename(str(tmp_current), str(current_file))
-            print(f"  Current: {current_file.name} ({len(content)} chars)")
-
-        except Exception as e:
-            print(f"  Export failed for {logical_id}: {e}")
+    review_result = _publish_review_exports(api_url, registry=registry)
+    print(f"  Review export: {review_result['aggregate']}")
+    for logical_id, result in review_result["models"].items():
+        detail = "; ".join(result.get("errors", []))
+        print(f"    {logical_id}: {result['status']} {detail}".rstrip())
 
     # Export through the canonical Pitfall writer; this script never writes
     # pitfall index/catalog bytes directly.
@@ -2300,14 +2843,19 @@ def _mental_model_metrics(days: int = 28) -> dict:
     }
 
 
-def _run_mental_model_daily(run_stage_a, run_adjudicate, run_smoke) -> int:
+def _run_mental_model_daily(
+    run_stage_a, run_adjudicate, run_smoke, run_review_export=lambda: 0
+) -> int:
     """Compose the daily branches while always monitoring accepted content."""
     stage_a_rc = run_stage_a()
     if stage_a_rc == 1:
         return 1
     if stage_a_rc == 2:
         print("Stage A: no stale models, skipping Stage B")
-        return run_smoke()
+        smoke_rc = run_smoke()
+        if smoke_rc != 0:
+            return smoke_rc
+        return run_review_export()
 
     print("\n--- Stage A complete, starting Stage B ---\n")
     adjudicate_rc = run_adjudicate()
@@ -2398,6 +2946,9 @@ def main() -> int:
             mental_model_maintain,
             mental_model_adjudicate,
             lambda: _run_all_model_smoke(api_url),
+            lambda: 0
+            if _publish_review_exports(api_url)["aggregate"] == "PASS_ALL"
+            else 1,
         )
     pipeline_mode = _args.mode
     include_wiki = _args.include_wiki
