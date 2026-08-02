@@ -311,6 +311,50 @@ def test_hermes_role_prompt_above_decorative_border_checks_goal_completion(
     assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 1
 
 
+def test_hermes_stale_busy_marker_outside_recent_tail_does_not_block_goal_followup(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Old tool activity may stay visible after Hermes has returned idle."""
+    task_id = _running_task(assignee="planner", goal_mode=True)
+    listener = HermesInteractiveListener()
+    hermes_base = sys.modules[HermesInteractiveListener.__mro__[1].__module__]
+    now = [100.0]
+    injected: list[str] = []
+    screen = (
+        "┊ 💻 preparing terminal…\n"
+        "tool output line 1\n"
+        "tool output line 2\n"
+        "tool output line 3\n"
+        "tool output line 4\n"
+        "tool output line 5\n"
+        "planner ❯\n"
+        "────────────────\n"
+    )
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(hermes_base.time, "time", lambda: now[0])
+    monkeypatch.setattr(hermes_base.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        "plugins.kanban.hermes_listener.hermes_kanban_interactive.time.time",
+        lambda: now[0],
+    )
+    monkeypatch.setattr(
+        "plugins.kanban.hermes_listener.hermes_kanban_interactive.zellij_dump_screen",
+        lambda **_: screen,
+    )
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]))
+    monkeypatch.setattr(
+        hermes_base, "zellij_inject", lambda **kw: injected.append(kw["text"]),
+    )
+
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 1
+
+
 def test_hermes_active_interrupt_status_is_not_a_safe_idle_boundary() -> None:
     listener = HermesInteractiveListener()
 

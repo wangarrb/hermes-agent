@@ -204,7 +204,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
         # Transient activity above that bar still wins through busy_markers.
         last_line = self._last_non_decorative_line(screen)
         has_idle = self._is_truly_idle_line(last_line)
-        has_busy = any(m.lower() in tail for m in self.busy_markers)
+        has_busy = self._has_recent_busy_marker(screen)
         if not has_idle or has_busy:
             # Pane is busy or not showing idle prompt — reset retry state
             self._api_retry_count = 0
@@ -289,6 +289,11 @@ class HermesInteractiveListener(BaseInteractiveListener):
                 return stripped
         return ""
 
+    def _has_recent_busy_marker(self, screen: str) -> bool:
+        """Return whether current activity is visible near the pane bottom."""
+        recent_tail = "\n".join(_tail_nonempty_lines(screen, limit=5)).lower()
+        return any(marker.lower() in recent_tail for marker in self.busy_markers)
+
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
         if not self.idle_markers:
             return True
@@ -311,8 +316,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
             # Only check the LAST 5 non-empty lines (viewport scope) to avoid
             # false positives from scrollback: Hermes tool output boxes (┊ 💻 …)
             # linger in scrollback long after the tool finishes.
-            tail = "\n".join(_tail_nonempty_lines(screen, limit=5)).lower()
-            has_busy = any(m.lower() in tail for m in self.busy_markers)
+            has_busy = self._has_recent_busy_marker(screen)
             if has_busy:
                 log_line(log_path, f"on_claim_pre_check attempt {attempt+1}/2: busy marker detected, NOT idle")
                 return False
