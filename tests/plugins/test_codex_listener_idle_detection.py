@@ -100,3 +100,22 @@ def test_codex_claim_precheck_accepts_idle_composer(
     monkeypatch.setattr(time, "sleep", lambda _: None)
 
     assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+
+
+def test_codex_claim_precheck_ignores_stale_busy_words_in_completed_output(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Transcript prose must not override the live idle composer state."""
+    listener = codex.CodexInteractiveListener()
+    idle_screen = """\
+• The previous goal remains running in its working directory.
+─ Worked for 6m 35s ─
+
+› Run /review on my current changes
+
+  gpt-5.6-sol high · master · Context 22% used
+"""
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: idle_screen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")

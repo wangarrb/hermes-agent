@@ -47,7 +47,9 @@ class CodexInteractiveListener(BaseInteractiveListener):
     # ── Idle/busy markers ──
     # Codex CLI uses › (U+203A) as its prompt symbol since v0.9+
     idle_markers: tuple[str, ...] = ("› ",)
-    busy_markers: tuple[str, ...] = ("thinking", "working", "running", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    # Text busy states are live Codex status rows, not arbitrary transcript
+    # prose (for example, a completed answer may say a goal remains running).
+    busy_markers: tuple[str, ...] = ("• thinking", "• working", "• running", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     queued_input_markers: tuple[str, ...] = ()
 
     # ── Abstract method implementations ──
