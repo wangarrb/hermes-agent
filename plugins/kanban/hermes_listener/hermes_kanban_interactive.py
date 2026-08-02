@@ -196,12 +196,13 @@ class HermesInteractiveListener(BaseInteractiveListener):
         tail_lines = _tail_nonempty_lines(screen, limit=20)
         tail = "\n".join(tail_lines).lower()
 
-        # Idle marker must be in the LAST line (prompt/status bar at bottom),
-        # not just anywhere in tail — › can appear in tool output and scrollback.
+        # Idle marker must be the last meaningful line (prompt/status bar at
+        # bottom), not just anywhere in tail — › can appear in tool output and
+        # scrollback. Hermes may render a decorative border below the prompt.
         # Hermes has two valid idle renderings: the legacy bare role prompt and
         # the current static "⚕ ❯ msg=interrupt · ..." command-hint bar.
         # Transient activity above that bar still wins through busy_markers.
-        last_line = tail_lines[-1] if tail_lines else ""
+        last_line = self._last_non_decorative_line(screen)
         has_idle = self._is_truly_idle_line(last_line)
         has_busy = any(m.lower() in tail for m in self.busy_markers)
         if not has_idle or has_busy:
@@ -280,6 +281,14 @@ class HermesInteractiveListener(BaseInteractiveListener):
         """Return True only for a known idle prompt/status rendering."""
         return bool(self._IDLE_ONLY_RE.match(line.strip()))
 
+    def _last_non_decorative_line(self, screen: str) -> str:
+        """Return the final meaningful pane line, ignoring Hermes borders."""
+        for line in reversed(screen.splitlines()):
+            stripped = line.strip()
+            if stripped and not self._DECORATIVE_LINE_RE.match(stripped):
+                return stripped
+        return ""
+
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
         if not self.idle_markers:
             return True
@@ -291,13 +300,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
             screen = zellij_dump_screen(session=session, pane_id=str(pane_id), log_path=log_path)
             if not screen:
                 return False
-            # Find last non-empty, non-decorative line
-            last_line = ""
-            for line in reversed(screen.splitlines()):
-                line = line.strip()
-                if line and not self._DECORATIVE_LINE_RE.match(line):
-                    last_line = line
-                    break
+            last_line = self._last_non_decorative_line(screen)
             # Strict idle check: prompt marker with NO user input after it
             if not self._is_truly_idle_line(last_line):
                 log_line(log_path, f"on_claim_pre_check attempt {attempt+1}/2: last line NOT truly idle ({last_line[:80]})")
