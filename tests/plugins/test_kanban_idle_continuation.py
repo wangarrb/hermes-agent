@@ -255,8 +255,8 @@ def test_hermes_strict_idle_path_also_checks_goal_completion(
             "Task status: running\n"
             "└ 💻 $ hermes kanban --board egomotion4d show t_example  0.1s\n"
             "⚕ xopglm52 │ 49% │ 1.1d\n"
+            "planner ❯\n"
             "────────────────\n"
-            "⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel\n"
         ),
     )
     monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]))
@@ -358,7 +358,7 @@ def test_hermes_stale_busy_marker_outside_recent_tail_does_not_block_goal_follow
 def test_hermes_active_interrupt_status_is_not_a_safe_idle_boundary() -> None:
     listener = HermesInteractiveListener()
 
-    assert listener._is_truly_idle_line(
+    assert not listener._is_truly_idle_line(
         "⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
     )
     assert not listener._is_truly_idle_line(
@@ -370,6 +370,7 @@ def test_hermes_active_interrupt_status_is_not_a_safe_idle_boundary() -> None:
     "activity_line",
     [
         "(´･_･`) ruminating...",
+        "(｡•︿•｡) processing...",
         "└ ⚙ preparing process…",
         "⚙ wait proc_c915e817910 180s  (02m08s)",
         "└ 💻 preparing terminal…",

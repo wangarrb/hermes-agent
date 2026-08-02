@@ -199,9 +199,9 @@ class HermesInteractiveListener(BaseInteractiveListener):
         # Idle marker must be the last meaningful line (prompt/status bar at
         # bottom), not just anywhere in tail — › can appear in tool output and
         # scrollback. Hermes may render a decorative border below the prompt.
-        # Hermes has two valid idle renderings: the legacy bare role prompt and
-        # the current static "⚕ ❯ msg=interrupt · ..." command-hint bar.
-        # Transient activity above that bar still wins through busy_markers.
+        # A bare role prompt is the only idle rendering. The
+        # "⚕ ❯ msg=interrupt · ..." placeholder is emitted while
+        # ``cli._agent_running`` is true and is therefore explicitly busy.
         last_line = self._last_non_decorative_line(screen)
         has_idle = self._is_truly_idle_line(last_line)
         has_busy = self._has_recent_busy_marker(screen)
@@ -263,18 +263,15 @@ class HermesInteractiveListener(BaseInteractiveListener):
     # inject into a pane where the user is composing input.
     _DECORATIVE_LINE_RE = re.compile(r'^[─═│┃┤├┬┴┼┌┐└┘╭╰╮╯╚╝─┄┈╶╨╺╻╼╽╾╿┣┡┢┥┙┛┝┟┠┞]+$')
 
-    # Pattern: either a legacy bare role prompt or the exact current Hermes
-    # command-hint status bar.  Arbitrary text after the prompt remains busy.
-    # Matches: "❯ ", "planner ❯ ",
-    #          "⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
-    # Does NOT match: "❯ some text", "❯/steer 记住…"
+    # Only a bare prompt is idle. The command-hint placeholder contains a
+    # prompt symbol too, but cli.py renders it only while ``_agent_running`` is
+    # true. Arbitrary text after the prompt likewise remains busy.
+    # Matches: "❯ ", "planner ❯ "
+    # Does NOT match: "❯ some text", "❯/steer 记住…",
+    #                 "⚕ ❯ msg=interrupt · ..."
     _IDLE_ONLY_RE = re.compile(
-        r'^(?:'
-        r'(?:(?:coordinator|planner|implementer|critic|reviewer|designer)\s*)?[›❯]\s*'
-        r'|'
-        r'⚕\s*[›❯]\s+msg=interrupt\s*·\s*/queue\s*·\s*/bg\s*'
-        r'·\s*/steer\s*·\s*Ctrl\+C\s+cancel\s*'
-        r')$'
+        r'^(?:(?:coordinator|planner|implementer|critic|reviewer|designer)\s*)?'
+        r'[›❯]\s*$'
     )
 
     def _is_truly_idle_line(self, line: str) -> bool:
