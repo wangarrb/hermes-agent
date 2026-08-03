@@ -1,7 +1,7 @@
 # Kanban Publisher Result Notifications Design
 
 **Date:** 2026-08-03  
-**Status:** proposed  
+**Status:** accepted  
 **Scope:** custom Kanban plugin/listener and Kanban DB only
 
 ## 1. Goal
