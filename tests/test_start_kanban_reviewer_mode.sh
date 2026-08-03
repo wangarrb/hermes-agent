@@ -16,7 +16,7 @@ assert_mode() {
 }
 
 assert_mode economy $'economy\tgpt-5.6-luna\tmax'
-assert_mode balanced $'balanced\tgpt-5.6-terra\tmax'
+assert_mode balanced $'balanced\tgpt-5.6-sol\thigh'
 assert_mode performance $'performance\tgpt-5.6-sol\tmax'
 
 if bash -c 'source "$1"; resolve_reviewer_mode "$2"' reviewer-mode-test "$HELPER" fastest >/dev/null 2>&1; then

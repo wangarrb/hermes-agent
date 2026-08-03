@@ -46,6 +46,7 @@ codex-custom   （interactive Codex + Kanban watcher，强制用 xunfei-relay pr
 
 Agent 参数:
   --reviewer-mode <mode>           reviewer 资源模式：economy/balanced/performance，默认 balanced
+  --switch-reviewer-mode <mode>    安全边界热切换 reviewer pane 并 resume 原 Codex 会话
   --codex-model <model>            可选 Codex model override
   --codex-sandbox <mode>           Codex sandbox，默认 danger-full-access
   --deepseek-provider <provider>   CodeWhale/DeepSeek provider，默认 openrouter；可用 opencode-go
@@ -168,6 +169,7 @@ REVIEWER_MODE_REQUESTED="${KANBAN_REVIEWER_MODE:-balanced}"
 REVIEWER_MODE=""
 REVIEWER_MODEL=""
 REVIEWER_REASONING_EFFORT=""
+SWITCH_REVIEWER_MODE=""
 SESSION_NAME=""
 DRY_RUN=0
 CLEAN=1
@@ -366,6 +368,8 @@ while [[ $# -gt 0 ]]; do
             need_value "$1" "${2:-}"; REVIEWER_AGENT="$2"; shift 2 ;;
         --reviewer-mode)
             need_value "$1" "${2:-}"; REVIEWER_MODE_REQUESTED="$2"; shift 2 ;;
+        --switch-reviewer-mode)
+            need_value "$1" "${2:-}"; SWITCH_REVIEWER_MODE="$2"; REVIEWER_MODE_REQUESTED="$2"; shift 2 ;;
         --deepseek-provider)
             need_value "$1" "${2:-}"; DEEPSEEK_PROVIDER="$2"; shift 2 ;;
         --deepseek-model)
@@ -508,6 +512,20 @@ CLAUDE_INTERACTIVE="${REAL_HOME}/.local/bin/claude-kanban-interactive"
 if agent_is_used codex && [ ! -x "$CODEX_INTERACTIVE" ]; then
     echo "错误: 找不到可执行 Codex kanban interactive: $CODEX_INTERACTIVE" >&2
     exit 1
+fi
+
+if [ -n "$SWITCH_REVIEWER_MODE" ]; then
+    switch_args=(
+        --board "$BOARD"
+        --mode "$REVIEWER_MODE"
+        --session "$SESSION_NAME"
+        --workspace "$WORKSPACE"
+        --sandbox "$CODEX_SANDBOX"
+    )
+    if [ "$DRY_RUN" = "1" ]; then
+        switch_args+=(--dry-run)
+    fi
+    exec "$SCRIPT_DIR/hermes-kanban-switch-reviewer-mode" "${switch_args[@]}"
 fi
 if agent_is_used codewhale && [ ! -x "$CODEWHALE_INTERACTIVE" ]; then
     echo "错误: 找不到可执行 CodeWhale kanban interactive: $CODEWHALE_INTERACTIVE" >&2

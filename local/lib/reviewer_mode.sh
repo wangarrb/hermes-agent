@@ -7,7 +7,7 @@ resolve_reviewer_mode() {
             printf 'economy\tgpt-5.6-luna\tmax\n'
             ;;
         balanced|efficiency)
-            printf 'balanced\tgpt-5.6-terra\tmax\n'
+            printf 'balanced\tgpt-5.6-sol\thigh\n'
             ;;
         performance|high_precision)
             printf 'performance\tgpt-5.6-sol\tmax\n'

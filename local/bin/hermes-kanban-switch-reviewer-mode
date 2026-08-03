@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+source "$SCRIPT_DIR/../lib/reviewer_mode.sh"
+source "$SCRIPT_DIR/../lib/reviewer_mode_switch.sh"
+
+BOARD=""
+MODE="balanced"
+SESSION=""
+WORKSPACE="/home/wyr/code/Egomotion4D"
+SANDBOX="danger-full-access"
+TIMEOUT_S=600
+INTERVAL_S=10
+CHECKS=3
+WORKER=0
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --board) BOARD="${2:?--board requires a value}"; shift 2 ;;
+        --mode) MODE="${2:?--mode requires a value}"; shift 2 ;;
+        --session) SESSION="${2:?--session requires a value}"; shift 2 ;;
+        --workspace) WORKSPACE="${2:?--workspace requires a value}"; shift 2 ;;
+        --sandbox) SANDBOX="${2:?--sandbox requires a value}"; shift 2 ;;
+        --timeout-s) TIMEOUT_S="${2:?--timeout-s requires a value}"; shift 2 ;;
+        --interval-s) INTERVAL_S="${2:?--interval-s requires a value}"; shift 2 ;;
+        --checks) CHECKS="${2:?--checks requires a value}"; shift 2 ;;
+        --worker) WORKER=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+[[ -n "$BOARD" ]] || { echo "--board is required" >&2; exit 2; }
+[[ -d "$WORKSPACE" ]] || { echo "workspace does not exist: $WORKSPACE" >&2; exit 2; }
+SESSION="${SESSION:-kanban-${BOARD}}"
+IFS=$'\t' read -r MODE MODEL EFFORT < <(resolve_reviewer_mode "$MODE")
+
+shell_quote() { printf '%q' "$1"; }
+
+CODEX_HOME="/home/wyr/.codex-kanban/reviewer"
+INTERACTIVE="/home/wyr/.local/bin/codex-kanban-interactive"
+REASONING_ARG="model_reasoning_effort=\"${EFFORT}\""
+LAUNCH_CMD="cd $(shell_quote "$WORKSPACE") && CODEX_HOME=$(shell_quote "$CODEX_HOME") HERMES_KANBAN_BOARD=$(shell_quote "$BOARD") HERMES_REVIEWER_MODE=$(shell_quote "$MODE") CODEX_KANBAN_WORKSPACE=$(shell_quote "$WORKSPACE") $(shell_quote "$INTERACTIVE") --profile reviewer --claim-assignees reviewer --board $(shell_quote "$BOARD") --workspace $(shell_quote "$WORKSPACE") --previous-worker-delay-s 180 --model $(shell_quote "$MODEL") --codex-arg=-c --codex-arg=$(shell_quote "$REASONING_ARG") --sandbox $(shell_quote "$SANDBOX") --auto-start"
+
+if (( DRY_RUN )); then
+    echo "mode=${MODE} model=${MODEL} effort=${EFFORT}"
+    echo "$LAUNCH_CMD"
+    exit 0
+fi
+
+if (( ! WORKER )); then
+    PANE_ID="$(find_reviewer_pane_id "$SESSION")"
+    LOG="/home/wyr/.hermes/logs/reviewer-mode-switch-${BOARD}.log"
+    setsid "$SELF" --board "$BOARD" --mode "$MODE" --session "$SESSION" \
+        --workspace "$WORKSPACE" --sandbox "$SANDBOX" --timeout-s "$TIMEOUT_S" \
+        --interval-s "$INTERVAL_S" --checks "$CHECKS" --worker \
+        </dev/null >>"$LOG" 2>&1 &
+    echo "reviewer mode switch scheduled: pane=${PANE_ID} mode=${MODE} model=${MODEL}@${EFFORT} log=${LOG}"
+    exit 0
+fi
+
+PANE_ID="$(find_reviewer_pane_id "$SESSION")"
+echo "waiting for reviewer pane ${PANE_ID} safe boundary (${CHECKS} checks, ${INTERVAL_S}s interval)"
+wait_for_reviewer_switch_boundary "$SESSION" "$PANE_ID" "$TIMEOUT_S" "$INTERVAL_S" "$CHECKS"
+
+mapfile -t OLD_WATCHERS < <(
+    ps -eo pid=,args= | while read -r pid args; do
+        if [[ "$args" == *"--watch-child"* && "$args" == *"--profile reviewer"* && "$args" == *"--board $BOARD"* && "$args" == *"--zellij-pane-id $PANE_ID"* ]]; then
+            echo "$pid"
+        fi
+    done
+)
+
+ORIGINAL_FOCUS="$(zellij --session "$SESSION" action list-panes --all --json | jq -r '.[] | select(.is_plugin == false and .is_focused == true) | .id' | head -n 1)"
+zellij --session "$SESSION" action focus-pane --pane-id "$PANE_ID"
+NEW_PANE="$(zellij --session "$SESSION" action new-pane --in-place --close-replaced-pane \
+    --name codex-kanban --cwd "$WORKSPACE" -- bash -lc "$LAUNCH_CMD")"
+
+for pid in "${OLD_WATCHERS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+done
+
+if [[ -n "$ORIGINAL_FOCUS" && "$ORIGINAL_FOCUS" != "$PANE_ID" ]]; then
+    zellij --session "$SESSION" action focus-pane --pane-id "$ORIGINAL_FOCUS" 2>/dev/null || true
+fi
+echo "reviewer mode switched: old_pane=${PANE_ID} new_pane=${NEW_PANE} mode=${MODE} model=${MODEL}@${EFFORT}"
