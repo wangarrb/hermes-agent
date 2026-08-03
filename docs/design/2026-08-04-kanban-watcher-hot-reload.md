@@ -27,6 +27,12 @@ token 或 task body。锁 FD 在 watcher 整个生命周期及 self-exec 期间�
 同 key 的第二个 watcher 只记录 owner 后退出。锁文件残留不等于锁残留，正确性
 只依赖内核锁。
 
+Python 默认把新 FD 标为 close-on-exec，因此 watcher 必须在 exec 前把 lock FD
+显式设为 inheritable，并通过 `HERMES_KANBAN_WATCHER_LOCK_FD` 传给新进程；新
+进程优先接管该 FD，不能重新 open 同一文件并与自己竞争。正常冷启动不得信任
+外部伪造的 FD：只有 reload nonce、lock metadata、`fstat` 与当前 identity 全部
+匹配才允许接管。
+
 supervisor 自身也按 `(board, zellij_session)` 获取单例锁。它只发现并管理完全
 匹配当前 board/session 的内部 Python watcher；`conda run` wrapper 只作为启动
 诊断，不计作 claim loop。restart counter 按完整 watcher identity 统计。
@@ -40,8 +46,10 @@ hermes-kanban-reload-watchers --board <board> --session <session> [--profile <ro
 ```
 
 命令只向匹配的内部 Python watcher 发送 `SIGUSR1`，不 kill wrapper、agent 或
-pane。默认按 profile 稳定排序滚动处理；一个 watcher ACK 后才处理下一个，任一
-失败即停止剩余 reload 并返回非零。
+pane。它根据 lock metadata 只选择真正持锁的 PID；重复但未持锁进程只报告，
+不得发送 reload。默认按 profile 稳定排序滚动处理；一个 watcher ACK 后才处理
+下一个，任一失败即停止剩余 reload 并返回非零。同一 watcher 的并发 reload
+请求按 nonce 去重，运行中请求只保留最新一个 pending 请求。
 
 signal handler 只设置 reload flag，不做 I/O、DB 或 exec。watcher 在下一次安全
 循环边界执行 reload：当前没有打开的 DB transaction，也不在 inject/composer
@@ -50,14 +58,22 @@ signal handler 只设置 reload flag，不做 I/O、DB 或 exec。watcher 在下
 热重载步骤：
 
 1. 将 `active_task/current_run_id/generation/claim_lock`、watcher identity、原 PID
-   和 reload nonce 写入小型 handoff state；不保存 prompt 或凭证。
-2. 关闭 DB connection 和普通日志句柄；保留并显式继承 watcher lock FD。
-3. 使用当前 interpreter、原 argv 和过滤后的原 env 执行 `os.execve`；PID 不变。
-4. 新进程先接管继承的 lock FD，再用 task DB 验证 handoff：task 仍为 running，
+   和 reload nonce 写入 runtime 目录下 mode `0600` 的 handoff JSON；不保存
+   prompt 或凭证。写入前后都用当前 DB row 验证一次 active identity。
+2. 用当前 interpreter 对 watcher entry point 执行无副作用 reload preflight
+   （至少覆盖语法、import 和参数构造）；preflight 失败只写 FAILED ACK，旧 watcher
+   继续运行。
+3. 关闭 DB connection 和普通日志句柄；保留并显式继承 watcher lock FD。
+4. 使用当前 interpreter、原 argv 和过滤后的原 env 执行 `os.execve`；PID 不变。
+   `execve` 返回异常时必须在旧进程内重新打开 DB/日志、继续原 heartbeat，并写
+   FAILED ACK；不得经过会清理 active claim 的 `finally` 路径。
+5. 新进程先接管继承的 lock FD，再用 task DB 验证 handoff：task 仍为 running，
    run/generation/claim_lock/worker_pid 均匹配。验证成功才恢复 heartbeat；不得重新
    claim 或重新注入原 prompt。
-5. 原子写入 ACK，包含 nonce、PID、proc start-time、code revision 和恢复的
-   task/run。reload 命令验证 PID 未变化及 nonce 匹配后继续下一 role。
+6. 成功发送一次恢复后的 heartbeat，再原子写入 ACK。ACK 位于 mode `0600` 的
+   runtime reload 目录，包含 nonce、PID、proc start-time、code revision 和恢复的
+   task/run。reload 命令验证 PID 未变化、nonce 匹配和 heartbeat 成功后继续下一
+   role；完成后清理对应 handoff/ACK，保留限量摘要日志。
 
 handoff 缺失或不一致时 fail closed：不 claim、不 inject，记录精确原因并退出，
 让 scoped supervisor 按同一 identity 恢复；不得猜测或清除原 task。
@@ -78,7 +94,9 @@ handoff 缺失或不一致时 fail closed：不 claim、不 inject，记录精�
   表示未全部成功。
 - ACK 默认超时 15 秒，可显式覆盖；超时不强杀仍存活的 watcher，只报告其 PID、
   identity 和最后状态。
-- 如果 watcher self-exec 失败并退出，supervisor走现有受限重启；如果旧 watcher
+- `execve` 调用失败时旧 watcher必须原地恢复；只有新代码在 exec 后启动崩溃时
+  才交给 supervisor 受限重启。该异常路径不能承诺无缝 handoff，必须显式告警并
+  保留原 task 供现有 orphan recovery，而不能伪报 reload 成功。如果旧 watcher
   卡死且持锁，supervisor必须做 PID/start-time 与 pane ownership 校验后才能终止，
   禁止删除锁文件冒充释放锁。
 - 热重载不发送任何 Zellij prompt，也不改变 Kanban task 状态。
@@ -97,7 +115,9 @@ handoff 缺失或不一致时 fail closed：不 claim、不 inject，记录精�
    停止。
 6. 双 supervisor 同 identity 只有一个运行；不同 board/session 可并行。
 7. restart delay 内出现 launcher replacement 时不再 spawn。
-8. 现有 watcher supervisor、listener、result notification 与 composer-safe tests
+8. preflight/`execve` 失败时旧进程继续 heartbeat且不触发 active-claim cleanup；
+   exec 后启动崩溃必须可观察且不得产生成功 ACK。
+9. 现有 watcher supervisor、listener、result notification 与 composer-safe tests
    全部保持通过。
 
 人工 smoke 使用测试 board/session：保持一个 running task，执行 reload 命令，
