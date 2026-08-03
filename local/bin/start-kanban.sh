@@ -949,7 +949,7 @@ build_role_command() {
             for f in config.toml auth.json hooks.json installation_id .personality_migration version.json AGENTS.md RTK.md models_cache.json; do
                 [ -e "${REAL_HOME}/.codex/$f" ] && [ ! -e "$codex_home/$f" ] && ln -sf "${REAL_HOME}/.codex/$f" "$codex_home/$f"
             done
-            for d in claude-skills superpowers skills plugins; do
+            for d in claude-skills superpowers skills plugins agents; do
                 [ -d "${REAL_HOME}/.codex/$d" ] && [ ! -e "$codex_home/$d" ] && ln -sf "${REAL_HOME}/.codex/$d" "$codex_home/$d"
             done
             local codex_home_q
