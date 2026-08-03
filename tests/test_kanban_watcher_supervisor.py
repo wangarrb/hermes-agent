@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "local" / "bin" / "kanban-watcher-supervisor.py"
@@ -43,6 +45,56 @@ def test_different_pane_is_not_a_replacement():
     current = {101: _cmd(pane="4"), 202: _cmd(pane="5")}
 
     assert not supervisor._has_live_replacement(current, 101, _cmd(pane="4"))
+
+
+def test_restart_target_requires_same_live_zellij_pane_identity():
+    supervisor = _load_supervisor()
+
+    def run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": 4,
+                        "is_plugin": False,
+                        "terminal_command": (
+                            "bash -lc HERMES_KANBAN_BOARD=egomotion4d "
+                            "hermes-kanban-continue -p coordinator"
+                        ),
+                    }
+                ]
+            ),
+        )
+
+    assert supervisor._watcher_target_pane_is_current(_cmd(), run=run)
+
+
+def test_restart_target_rejects_removed_or_reused_pane():
+    supervisor = _load_supervisor()
+
+    def removed(*_args, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="[]")
+
+    def reused(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": 4,
+                        "is_plugin": False,
+                        "terminal_command": (
+                            "bash -lc HERMES_KANBAN_BOARD=egomotion4d "
+                            "hermes-kanban-continue -p designer"
+                        ),
+                    }
+                ]
+            ),
+        )
+
+    assert not supervisor._watcher_target_pane_is_current(_cmd(), run=removed)
+    assert not supervisor._watcher_target_pane_is_current(_cmd(), run=reused)
 
 
 def test_shell_command_mentioning_watcher_is_not_a_watcher():

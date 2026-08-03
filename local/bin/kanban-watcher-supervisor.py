@@ -17,6 +17,7 @@ reasonix_kanban_interactive.py / claude_kanban_interactive.py).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -109,6 +110,53 @@ def _has_live_replacement(
         pid != dead_pid and _watcher_key(cmdline) == key
         for pid, cmdline in current.items()
     )
+
+
+def _watcher_target_pane_is_current(
+    cmdline: list[str],
+    *,
+    run=subprocess.run,
+) -> bool:
+    """Return whether the original Zellij pane still owns this watcher role."""
+    key = _watcher_key(cmdline)
+    if key is None:
+        return False
+    board, profile, session, pane_id = key
+    try:
+        result = run(
+            [
+                "zellij",
+                "--session",
+                session,
+                "action",
+                "list-panes",
+                "--all",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        panes = json.loads(result.stdout)
+        expected_id = int(pane_id)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+    for pane in panes:
+        if pane.get("is_plugin") or pane.get("id") != expected_id:
+            continue
+        command = str(pane.get("terminal_command") or "")
+        owns_profile = (
+            f"--profile {profile}" in command or f"-p {profile}" in command
+        )
+        owns_board = (
+            f"--board {board}" in command
+            or f"HERMES_KANBAN_BOARD={board}" in command
+        )
+        return owns_profile and owns_board
+    return False
 
 
 def _read_process_identity(pid: int) -> tuple[int, int] | None:
@@ -269,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
                     log(
                         f"  skipping restart: profile={profile} already has "
                         "a live watcher for the same board/session/pane"
+                    )
+                    continue
+
+                if not _watcher_target_pane_is_current(cmdline):
+                    log(
+                        f"  skipping restart: profile={profile} target pane "
+                        "was removed or reassigned"
                     )
                     continue
 
