@@ -865,7 +865,6 @@ def _decision_id_union(evidence_entry: dict, spec: dict, config: dict) -> list[s
     values = []
     for field_values in (
         evidence_entry.get("d_ids", []),
-        spec.get("required_anchors", []),
         spec.get("decision_ids", []),
         config.get("extra_decision_ids", []),
     ):
@@ -875,6 +874,14 @@ def _decision_id_union(evidence_entry: dict, spec: dict, config: dict) -> list[s
     invalid = [item for item in values if not isinstance(item, str) or not re.fullmatch(r"D\d+", item)]
     if invalid:
         raise ValueError(f"invalid decision ids: {invalid!r}")
+    required_anchors = spec.get("required_anchors", [])
+    if not isinstance(required_anchors, list):
+        raise ValueError("required_anchors must be a list")
+    values.extend(
+        item
+        for item in required_anchors
+        if isinstance(item, str) and re.fullmatch(r"D\d+", item)
+    )
     return sorted(set(values), key=_decision_sort_key)
 
 
@@ -1236,21 +1243,24 @@ def _publish_review_exports(
                         f"spec source is not bound to evidence inventory: {relative_text}"
                     )
 
-            decision_source = next(
-                (
-                    record
-                    for record in source_records
-                    if record["name"] == "10-current-decisions.md"
-                    or Path(record["path"]).name == "10-current-decisions.md"
-                ),
-                None,
-            )
-            if decision_source is None:
-                raise ValueError("current decision source missing from evidence inventory")
             decision_ids = _decision_id_union(evidence_entry, spec, config)
-            decisions = _extract_current_decisions(
-                decision_source["text"], decision_ids
-            )
+            if decision_ids:
+                decision_source = next(
+                    (
+                        record
+                        for record in source_records
+                        if record["name"] == "10-current-decisions.md"
+                        or Path(record["path"]).name == "10-current-decisions.md"
+                    ),
+                    None,
+                )
+                if decision_source is None:
+                    raise ValueError(
+                        "current decision source missing from evidence inventory"
+                    )
+                decisions = _extract_current_decisions(
+                    decision_source["text"], decision_ids
+                )
             revision_sha, config_sha = _review_revision_sha(
                 accepted["content_sha"], accepted["source_evidence_sha"], config
             )

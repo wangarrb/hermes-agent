@@ -158,6 +158,42 @@ def test_review_export_blocks_when_evidence_source_hash_changes(
     assert not list((tmp_path / "exports" / "review" / "history").glob("*.md"))
 
 
+def test_review_export_allows_evidence_only_model_without_decision_source(
+    tmp_path, monkeypatch,
+):
+    module, registry, manifest, content, _ = _review_fixture(tmp_path, monkeypatch)
+    model_root = module.HERMES_HOME / "mental-models" / "egomotion4d"
+    evidence_bundle_path = model_root / "evidence_bundle.json"
+    evidence_bundle = json.loads(evidence_bundle_path.read_text(encoding="utf-8"))
+    evidence_entry = evidence_bundle["per_model"]["model-a"]
+    evidence_entry["d_ids"] = []
+    evidence_entry["sources"].pop("10-current-decisions.md")
+    evidence_bundle_path.write_text(
+        json.dumps(evidence_bundle, sort_keys=True), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module,
+        "_model_generation_spec",
+        lambda logical_id: {
+            "source_files": ["derived.md"],
+            "required_anchors": ["evidence-only section"],
+            "decision_ids": [],
+        },
+    )
+
+    result = module._publish_review_exports(
+        "http://unused",
+        registry=registry,
+        manifest_path=manifest,
+        export_root=tmp_path / "exports",
+        fetch_model=lambda _: {"content": content},
+        generated_at="2026-08-01T01:00:00Z",
+    )
+
+    assert result["aggregate"] == "PASS_ALL"
+    assert result["models"]["model-a"]["status"] == "PASS"
+
+
 def test_daily_no_refresh_still_runs_smoke_then_review_export(
     tmp_path, monkeypatch,
 ):
