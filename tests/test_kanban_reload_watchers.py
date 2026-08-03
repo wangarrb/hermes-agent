@@ -135,3 +135,110 @@ class TestAtomicRequestBeforeSignal:
         assert path.exists()
         mode = path.stat().st_mode & 0o777
         assert mode == 0o600
+
+
+class TestAckStrictValidation:
+    """_wait_for_ack 只接受 nonce/PID/start-time/identity/revision 全匹配且 ok=True 的 ACK。"""
+
+    def _make_ack(self, tmp_path, *, nonce="n1", pid=101, proc_start_time=55,
+                  identity_digest="", revision="rev1", ok=True, error=""):
+        sys.path.insert(0, str(REPO / "plugins" / "kanban"))
+        from watcher_runtime import (
+            WatcherIdentity, write_reload_ack,
+        )
+        ident = WatcherIdentity.from_values("egomotion4d", "coordinator", "kanban-egomotion4d", "4")
+        # The ACK file lives under the real identity digest; identity_digest
+        # only controls the ACK *content* so tests can forge mismatches.
+        digest = ident.digest
+        root = rw._get_runtime_root(str(tmp_path))
+        write_reload_ack(
+            root, digest,
+            rw.ReloadACK(
+                nonce=nonce, pid=pid, proc_start_time=proc_start_time,
+                code_revision=revision, ok=ok, error=error,
+                identity_digest=identity_digest or digest,
+            ),
+        )
+        return digest
+
+    def test_failed_ack_returned_immediately(self, tmp_path, monkeypatch):
+        """ok=False ACK 立即返回（不等待超时），供 CLI 停止 rolling。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        digest = self._make_ack(tmp_path, nonce="n1", ok=False, error="preflight")
+        root = rw._get_runtime_root(str(tmp_path))
+        start = time.monotonic()
+        ack = rw._wait_for_ack(
+            root, digest, "n1", timeout_s=5, pid=101,
+            proc_start_time=55, expected_revision="rev1",
+        )
+        elapsed = time.monotonic() - start
+        assert ack is not None
+        assert ack.ok is False
+        assert ack.error == "preflight"
+        assert elapsed < 3.0, "FAILED ACK must return immediately, not after timeout"
+
+    def test_ack_rejected_on_proc_start_time_mismatch(self, tmp_path, monkeypatch):
+        """proc_start_time 不匹配（PID 复用防护）→ 不接受，超时返回 None。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        digest = self._make_ack(tmp_path, nonce="n1", pid=101, proc_start_time=55)
+        root = rw._get_runtime_root(str(tmp_path))
+        ack = rw._wait_for_ack(
+            root, digest, "n1", timeout_s=1.0, pid=101,
+            proc_start_time=999,  # mismatch
+            expected_revision="rev1",
+        )
+        assert ack is None
+
+    def test_ack_rejected_on_identity_mismatch(self, tmp_path, monkeypatch):
+        """identity digest 不匹配 → 不接受。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        digest = self._make_ack(
+            tmp_path, nonce="n1", identity_digest="deadbeef", revision="rev1",
+        )
+        root = rw._get_runtime_root(str(tmp_path))
+        ack = rw._wait_for_ack(
+            root, digest, "n1", timeout_s=1.0, pid=101,
+            proc_start_time=55, expected_revision="rev1",
+        )
+        assert ack is None
+
+    def test_ack_rejected_on_revision_mismatch(self, tmp_path, monkeypatch):
+        """code revision 不匹配 → 不接受。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        digest = self._make_ack(tmp_path, nonce="n1", revision="old-rev")
+        root = rw._get_runtime_root(str(tmp_path))
+        ack = rw._wait_for_ack(
+            root, digest, "n1", timeout_s=1.0, pid=101,
+            proc_start_time=55, expected_revision="new-rev",
+        )
+        assert ack is None
+
+    def test_ack_accepted_when_all_fields_match(self, tmp_path, monkeypatch):
+        """全字段匹配且 ok=True → 接受。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        digest = self._make_ack(tmp_path, nonce="n1", pid=101, proc_start_time=55)
+        root = rw._get_runtime_root(str(tmp_path))
+        ack = rw._wait_for_ack(
+            root, digest, "n1", timeout_s=1.0, pid=101,
+            proc_start_time=55, expected_revision="rev1",
+        )
+        assert ack is not None
+        assert ack.ok is True
+
+    def test_lock_owner_requires_start_time(self, tmp_path, monkeypatch):
+        """_is_lock_owner 在提供 proc_start_time 时必须同时匹配 PID 和 start-time。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        sys.path.insert(0, str(REPO / "plugins" / "kanban"))
+        from watcher_runtime import (
+            WatcherIdentity, runtime_root, _atomic_write_json,
+        )
+        ident = WatcherIdentity.from_values("egomotion4d", "coordinator", "kanban-egomotion4d", "4")
+        root = runtime_root()
+        meta_path = root / ident.digest / "metadata.json"
+        _atomic_write_json(meta_path, {
+            "pid": 101, "proc_start_time": 55,
+            "identity": ident.digest, "code_revision": "rev1",
+        })
+        assert rw._is_lock_owner(101, ident.digest, root, proc_start_time=55)
+        assert not rw._is_lock_owner(101, ident.digest, root, proc_start_time=999)
+        assert not rw._is_lock_owner(102, ident.digest, root, proc_start_time=55)

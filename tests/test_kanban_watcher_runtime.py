@@ -415,6 +415,55 @@ class TestReloadACK:
         mode = reload_ack_path(root, ident.digest).stat().st_mode & 0o777
         assert mode == 0o600
 
+    def test_ack_has_ok_error_identity_fields(self, tmp_path, monkeypatch):
+        """FAILED ACKs carry ok=False + a machine-readable error; identity is pinned."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        ok_ack = ReloadACK(
+            nonce="n1", pid=123, proc_start_time=456,
+            code_revision="sha", ok=True,
+            identity_digest=ident.digest,
+            task_id="t_abc", run_id=7,
+        )
+        write_reload_ack(root, ident.digest, ok_ack)
+        loaded = read_reload_ack(root, ident.digest)
+        assert loaded is not None
+        assert loaded.ok is True
+        assert loaded.error == ""
+        assert loaded.identity_digest == ident.digest
+        assert loaded.task_id == "t_abc"
+        assert loaded.run_id == 7
+
+        failed_ack = ReloadACK(
+            nonce="n2", pid=123, proc_start_time=456,
+            code_revision="sha", ok=False, error="owner_mismatch",
+            identity_digest=ident.digest,
+        )
+        write_reload_ack(root, ident.digest, failed_ack)
+        loaded_failed = read_reload_ack(root, ident.digest)
+        assert loaded_failed is not None
+        assert loaded_failed.ok is False
+        assert loaded_failed.error == "owner_mismatch"
+        assert loaded_failed.identity_digest == ident.digest
+
+    def test_ack_backward_compatible_missing_optional_fields(self, tmp_path, monkeypatch):
+        """Old ACK JSON without ok/error/identity still parses (ok defaults True)."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        path = reload_ack_path(root, ident.digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "nonce": "n", "pid": 1, "proc_start_time": 1,
+            "code_revision": "", "task_id": "", "run_id": 0,
+        }))
+        loaded = read_reload_ack(root, ident.digest)
+        assert loaded is not None
+        assert loaded.ok is True
+        assert loaded.error == ""
+        assert loaded.identity_digest == ""
+
 
 class TestCleanupReloadState:
     def test_cleanup_removes_all_files(self, tmp_path, monkeypatch):
@@ -460,106 +509,326 @@ class TestLockInheritance:
         lock2.make_non_inheritable()
         lock2.release()
 
+    def test_adopt_rejects_invalid_fd(self, tmp_path, monkeypatch):
+        """Adoption of a closed/invalid FD raises RuntimeError (fail closed)."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        WatcherLock.acquire(ident).release()  # metadata exists but no lock held
+        with pytest.raises(RuntimeError):
+            WatcherLock.adopt_inherited(ident, 99999)
+
+    def test_adopt_rejects_wrong_dev_ino(self, tmp_path, monkeypatch):
+        """Adoption of an FD pointing at a DIFFERENT file must fail (dev/ino)."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        with WatcherLock.acquire(ident):
+            other = tmp_path / "other.lock"
+            other_fd = os.open(str(other), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                with pytest.raises(RuntimeError):
+                    WatcherLock.adopt_inherited(ident, other_fd)
+            finally:
+                os.close(other_fd)
+
+    def test_adopt_rejects_metadata_identity_mismatch(self, tmp_path, monkeypatch):
+        """Adoption fails when lock metadata identity does not match."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        lock = WatcherLock.acquire(ident)
+        fd = lock.make_inheritable()
+        try:
+            # Tamper with the metadata identity field
+            root = runtime_root()
+            meta_path = root / ident.digest / "metadata.json"
+            data = json.loads(meta_path.read_text())
+            data["identity"] = "tampered"
+            meta_path.write_text(json.dumps(data))
+            with pytest.raises(RuntimeError):
+                WatcherLock.adopt_inherited(ident, fd)
+        finally:
+            lock.make_non_inheritable()
+            lock.release()
+
+    def test_adopt_fail_closed_does_not_acquire(self, tmp_path, monkeypatch):
+        """A process that cannot adopt must exit; it must NOT fall back to acquire.
+
+        Simulates the watcher_main fail-closed contract: when the inherited
+        FD is invalid the process returns non-zero without ever holding a
+        fresh lock (i.e. a second process would still be able to acquire).
+        """
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        root = runtime_root()
+        meta_path = root / ident.digest / "metadata.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps({
+            "pid": os.getpid(), "proc_start_time": 0,
+            "identity": ident.digest, "code_revision": "test",
+        }))
+        # Invalid inherited FD + matching identity env → fail closed
+        code = f'''
+import sys, os
+sys.path.insert(0, "{REPO}/plugins/kanban")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+os.environ["HERMES_KANBAN_WATCHER_LOCK_FD"] = "424242"
+os.environ["HERMES_KANBAN_RELOAD_IDENTITY"] = "{ident.digest}"
+from watcher_runtime import WatcherIdentity, WatcherLock
+try:
+    WatcherLock.adopt_inherited(
+        WatcherIdentity.from_values("b", "p", "s", "1"), 424242,
+    )
+    print("SHOULD_NOT_ADOPT", flush=True)
+except RuntimeError:
+    print("ADOPT_REJECTED", flush=True)
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert "ADOPT_REJECTED" in result.stdout
+        # A fresh lock must still be acquirable afterwards (no leak)
+        with WatcherLock.acquire(ident):
+            pass
+
 
 # ── SIGUSR1 self-exec integration ────────────────────────────────────────────
 
 class TestSigusr1SelfExec:
-    """Verify SIGUSR1 triggers safe-boundary self-exec with PID preservation."""
+    """真实 os.execve 集成：同 PID、继承 FD、EXEC_GENERATION 变化、单次 claim/inject、ACK 恰好一次。
 
-    def test_sigusr1_self_exec_preserves_pid_and_emits_ack(self, tmp_path, monkeypatch):
-        """Fake watcher holds lock, receives SIGUSR1, self-execs, emits ACK."""
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-        # This test uses the fake_reload_watcher which handles SIGUSR1 by
-        # writing an ACK file (simulating the reload protocol).
-        code = f'''
-import sys, os, time, signal, json
-sys.path.insert(0, "{REPO}/tests/fixtures")
-os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
-import fake_reload_watcher
-sys.argv = ["fake_reload_watcher.py",
-    "--board", "testboard",
-    "--profile", "coordinator",
-    "--session", "test-session",
-    "--pane", "1",
-    "--handoff-dir", "{tmp_path}/handoff",
-]
-rc = fake_reload_watcher.main()
-sys.exit(rc if rc else 0)
-'''
-        # Start watcher
-        p = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    The fixture genuinely calls ``os.execve`` (same PID, same inherited lock
+    FD) and mirrors the production adopt-first entry point, so these tests
+    cover the real reload path rather than an ACK-only simulation.
+    """
+
+    FIXTURE = REPO / "tests" / "fixtures" / "fake_reload_watcher.py"
+
+    @staticmethod
+    def _ident() -> WatcherIdentity:
+        return WatcherIdentity.from_values(
+            "testboard", "coordinator", "test-session", "1",
         )
-        time.sleep(0.5)
 
-        # Write a reload request
+    def _launch(
+        self, tmp_path, *,
+        claim: bool = True,
+        extra_args: tuple[str, ...] = (),
+        extra_env: dict[str, str] | None = None,
+    ):
+        env = dict(os.environ)
+        env["XDG_RUNTIME_DIR"] = str(tmp_path)
+        if extra_env:
+            env.update(extra_env)
+        argv = [
+            sys.executable, str(self.FIXTURE),
+            "--board", "testboard",
+            "--profile", "coordinator",
+            "--session", "test-session",
+            "--pane", "1",
+            "--tick-s", "0.1",
+        ]
+        if claim:
+            argv += [
+                "--claim-file", str(tmp_path / "claim.json"),
+                "--inject-file", str(tmp_path / "inject.log"),
+            ]
+        argv += list(extra_args)
+        return subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+
+    def _wait_for_ack(self, tmp_path, nonce: str, timeout: float = 15.0):
         root = runtime_root()
-        ident = WatcherIdentity.from_values("testboard", "coordinator", "test-session", "1")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ack = read_reload_ack(root, self._ident().digest)
+            if ack is not None and ack.nonce == nonce:
+                return ack
+            time.sleep(0.2)
+        return None
+
+    def test_real_self_exec_preserves_pid_generation_and_claim(self, tmp_path, monkeypatch):
+        """真实 exec：PID 不变、EXEC_GENERATION 1→2、首次标记只一次、无第二 claim/inject、claim/heartbeat 保持。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        p = self._launch(tmp_path)
+        time.sleep(0.8)  # acquire lock + claim/inject + first heartbeats
+
+        root = runtime_root()
+        ident = self._ident()
+        meta_path = root / ident.digest / "metadata.json"
+        assert meta_path.exists(), "watcher metadata not found"
+        meta = json.loads(meta_path.read_text())
+        assert meta["pid"] == p.pid
+        original_pid = p.pid
+
+        # 写 reload request（用真实 owner_start_time）
         req = ReloadRequest(
-            nonce="test-nonce-123",
+            nonce="exec-nonce-1",
+            identity_digest=ident.digest,
+            owner_pid=original_pid,
+            owner_start_time=meta["proc_start_time"],
+            request_time=int(time.time()),
+        )
+        write_reload_request(root, req)
+        os.kill(original_pid, signal.SIGUSR1)
+
+        ack = self._wait_for_ack(tmp_path, "exec-nonce-1")
+        assert ack is not None, "ACK not written after real self-exec"
+        assert ack.ok is True, f"ACK should be ok, got error={ack.error!r}"
+        assert ack.pid == original_pid, "PID must be preserved across os.execve"
+        assert ack.identity_digest == ident.digest
+        assert ack.task_id == "t_fake"
+        assert ack.run_id == 1
+
+        # 给心跳一点时间，然后终止并收集输出
+        time.sleep(0.5)
+        assert p.poll() is None, "watcher died after self-exec"
+        p.terminate()
+        out, err = p.communicate(timeout=5)
+
+        # 真实 exec 发生：EXECVE 标记 + generation 变化
+        assert "EXECVE gen=2" in out, f"expected real execve marker, got:\n{out}\n{err}"
+        assert out.count("EXEC_GENERATION 1") == 1, "first-process marker must appear exactly once"
+        assert "EXEC_GENERATION 2" in out
+        # 无第二 claim/inject
+        assert out.count("CLAIM_INJECT 1") == 1
+        assert "CLAIM_INJECT_RESTORED 1" in out
+        assert "LOCK_ADOPTED" in out, "new process must adopt the inherited FD"
+        # claim 文件不变（active claim/heartbeat 保持）
+        claim = json.loads((tmp_path / "claim.json").read_text())
+        assert claim["task_id"] == "t_fake"
+        assert claim["run_id"] == 1
+        assert claim["generation"] == 1
+        assert claim["claim_lock"] == f"host:{original_pid}:fake-interactive"
+        # heartbeat 继续
+        assert out.count("HEARTBEAT") >= 3
+
+    def test_idle_watcher_acks_after_healthy_tick(self, tmp_path, monkeypatch):
+        """Idle watcher（无 claim）：adoption 后一个健康 tick 即 ACK。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        p = self._launch(tmp_path, claim=False)
+        time.sleep(0.8)
+
+        root = runtime_root()
+        ident = self._ident()
+        meta = json.loads((root / ident.digest / "metadata.json").read_text())
+        req = ReloadRequest(
+            nonce="idle-nonce-1",
             identity_digest=ident.digest,
             owner_pid=p.pid,
+            owner_start_time=meta["proc_start_time"],
+            request_time=int(time.time()),
+        )
+        write_reload_request(root, req)
+        os.kill(p.pid, signal.SIGUSR1)
+
+        ack = self._wait_for_ack(tmp_path, "idle-nonce-1")
+        assert ack is not None, "idle watcher should ACK after a healthy tick"
+        assert ack.ok is True
+        assert ack.pid == p.pid
+        assert ack.task_id == "", "idle ACK must not carry a task"
+
+        p.terminate()
+        out, err = p.communicate(timeout=5)
+        assert "EXEC_GENERATION 2" in out, f"expected exec, got:\n{out}\n{err}"
+        assert out.count("ACK_WRITTEN") == 1, "exactly one ACK per reload"
+
+    def test_failed_preflight_writes_failed_ack_and_keeps_old_loop(self, tmp_path, monkeypatch):
+        """Preflight 失败：写 FAILED ACK (ok=False, error=preflight)，不 exec，旧循环继续 heartbeat。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        p = self._launch(tmp_path, extra_args=("--fail-preflight",))
+        time.sleep(0.8)
+
+        root = runtime_root()
+        ident = self._ident()
+        meta = json.loads((root / ident.digest / "metadata.json").read_text())
+        req = ReloadRequest(
+            nonce="fail-nonce-1",
+            identity_digest=ident.digest,
+            owner_pid=p.pid,
+            owner_start_time=meta["proc_start_time"],
+            request_time=int(time.time()),
+        )
+        write_reload_request(root, req)
+        os.kill(p.pid, signal.SIGUSR1)
+
+        ack = self._wait_for_ack(tmp_path, "fail-nonce-1")
+        assert ack is not None, "FAILED ACK must be written"
+        assert ack.ok is False
+        assert ack.error == "preflight"
+        assert ack.pid == p.pid
+
+        time.sleep(0.5)
+        assert p.poll() is None, "watcher must continue after failed preflight"
+        p.terminate()
+        out, err = p.communicate(timeout=5)
+        # 没有 exec
+        assert "EXECVE" not in out, f"no exec on preflight failure:\n{out}\n{err}"
+        assert out.count("EXEC_GENERATION 1") == 1
+        assert out.count("HEARTBEAT") >= 3
+
+    def test_owner_mismatch_request_writes_failed_ack(self, tmp_path, monkeypatch):
+        """Request owner PID/start-time 不匹配：FAILED ACK (error=owner_mismatch)，不 exec。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        p = self._launch(tmp_path)
+        time.sleep(0.8)
+
+        root = runtime_root()
+        ident = self._ident()
+        req = ReloadRequest(
+            nonce="owner-nonce-1",
+            identity_digest=ident.digest,
+            owner_pid=999999,  # wrong owner
             owner_start_time=0,
             request_time=int(time.time()),
         )
         write_reload_request(root, req)
-
-        # Send SIGUSR1
         os.kill(p.pid, signal.SIGUSR1)
 
-        # Wait for ACK
-        ack_path = Path(tmp_path) / "handoff" / f"ack.{ident.digest}.json"
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if ack_path.exists():
-                break
-            time.sleep(0.2)
+        ack = self._wait_for_ack(tmp_path, "owner-nonce-1")
+        assert ack is not None, "owner-mismatch must produce a distinguishable FAILED ACK"
+        assert ack.ok is False
+        assert ack.error == "owner_mismatch"
 
         p.terminate()
-        p.wait(timeout=5)
-
-        assert ack_path.exists(), "ACK file not written after SIGUSR1"
-        ack_data = json.loads(ack_path.read_text())
-        assert ack_data["nonce"] == "test-nonce-123"
-        assert ack_data["status"] == "ACK"
+        out, _ = p.communicate(timeout=5)
+        assert "EXECVE" not in out, f"no exec on owner mismatch:\n{out}"
 
     def test_bare_sigusr1_without_request_does_not_reload(self, tmp_path, monkeypatch):
-        """SIGUSR1 without a valid reload request must not trigger reload."""
+        """SIGUSR1 无有效 request：忽略，不 ACK、不 exec。"""
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-        code = f'''
-import sys, os, time, signal
-sys.path.insert(0, "{REPO}/tests/fixtures")
-os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
-import fake_reload_watcher
-sys.argv = ["fake_reload_watcher.py",
-    "--board", "testboard",
-    "--profile", "coordinator",
-    "--session", "test-session",
-    "--pane", "1",
-    "--handoff-dir", "{tmp_path}/handoff",
-]
-rc = fake_reload_watcher.main()
-sys.exit(rc if rc else 0)
-'''
-        p = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        time.sleep(0.5)
+        p = self._launch(tmp_path)
+        time.sleep(0.8)
 
-        # Send SIGUSR1 without writing a reload request
         os.kill(p.pid, signal.SIGUSR1)
         time.sleep(1.0)
 
-        # Check no ACK was written
         root = runtime_root()
-        ident = WatcherIdentity.from_values("testboard", "coordinator", "test-session", "1")
-        ack_path = Path(tmp_path) / "handoff" / f"ack.{ident.digest}.json"
-        assert not ack_path.exists(), "ACK should not exist without valid request"
+        ack = read_reload_ack(root, self._ident().digest)
+        assert ack is None, "no ACK should be written without a valid request"
 
         p.terminate()
-        p.wait(timeout=5)
+        out, _ = p.communicate(timeout=5)
+        assert "EXECVE" not in out
+        assert "SIGUSR1_IGNORED no_valid_request" in out
+
+    def test_adopt_fail_closed_at_entry(self, tmp_path, monkeypatch):
+        """继承 FD 无效 + identity env 匹配：fake 入口 fail closed，退出非零，不 acquire。"""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        ident = self._ident()
+        p = self._launch(
+            tmp_path,
+            claim=False,
+            extra_env={
+                "HERMES_KANBAN_WATCHER_LOCK_FD": "424242",
+                "HERMES_KANBAN_RELOAD_IDENTITY": ident.digest,
+            },
+        )
+        out, err = p.communicate(timeout=10)
+        assert p.returncode != 0, "fail-closed adopt must exit non-zero"
+        assert "ADOPT_FAILED" in out, f"expected ADOPT_FAILED, got:\n{out}\n{err}"
+        assert "LOCK_ACQUIRED" not in out, "must NOT fall back to acquire()"
 
 
 # ── Isolated fake-board smoke test ────────────────────────────────────────────
@@ -567,40 +836,38 @@ sys.exit(rc if rc else 0)
 class TestIsolatedFakeBoardSmoke:
     """Smoke test: fake watcher holds lock, reload CLI triggers ACK, claim stays."""
 
+    FIXTURE = REPO / "tests" / "fixtures" / "fake_reload_watcher.py"
+
+    def _launch(self, tmp_path, *, board="fakeboard", session="fake-session"):
+        env = dict(os.environ)
+        env["XDG_RUNTIME_DIR"] = str(tmp_path)
+        return subprocess.Popen(
+            [
+                sys.executable, str(self.FIXTURE),
+                "--board", board,
+                "--profile", "coordinator",
+                "--session", session,
+                "--pane", "1",
+                "--claim-file", str(tmp_path / "claim.json"),
+                "--inject-file", str(tmp_path / "inject.log"),
+                "--tick-s", "0.1",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
+        )
+
     def test_reload_preserves_pid_and_claim_state(self, tmp_path, monkeypatch):
         """
-        1. Start a fake watcher with a fixed identity.
-        2. Write a reload request.
-        3. Send SIGUSR1.
-        4. Verify ACK is written with matching nonce and unchanged PID.
-        5. Verify the watcher continues running (heartbeat continues).
+        1. Start a fake watcher with a fixed identity (active claim).
+        2. Write a reload request with the real owner start-time.
+        3. Send SIGUSR1 → real self-exec.
+        4. Verify ACK is written with matching nonce, ok=True and unchanged PID.
+        5. Verify the claim fixture is unchanged and the watcher keeps running.
         """
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        p = self._launch(tmp_path)
+        time.sleep(0.8)
 
-        # Start fake watcher
-        code = f'''
-import sys, os, time
-sys.path.insert(0, "{REPO}/tests/fixtures")
-os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
-import fake_reload_watcher
-sys.argv = ["fake_reload_watcher.py",
-    "--board", "fakeboard",
-    "--profile", "coordinator",
-    "--session", "fake-session",
-    "--pane", "1",
-    "--handoff-dir", "{tmp_path}/handoff",
-    "--claim-file", "{tmp_path}/claim.json",
-]
-rc = fake_reload_watcher.main()
-sys.exit(rc if rc else 0)
-'''
-        p = subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        time.sleep(0.5)
-
-        # Verify watcher holds lock (metadata exists)
         root = runtime_root()
         ident = WatcherIdentity.from_values("fakeboard", "coordinator", "fake-session", "1")
         meta_path = root / ident.digest / "metadata.json"
@@ -608,25 +875,18 @@ sys.exit(rc if rc else 0)
         meta = json.loads(meta_path.read_text())
         assert meta["pid"] == p.pid, f"metadata PID {meta['pid']} != watcher PID {p.pid}"
 
-        # Write claim fixture
-        claim_path = Path(tmp_path) / "claim.json"
-        claim_data = {
-            "task_id": "t_smoke",
-            "run_id": 1,
-            "generation": 1,
-            "claim_lock": f"host:{p.pid}:fake-interactive",
-            "worker_pid": p.pid,
-        }
-        claim_path.parent.mkdir(parents=True, exist_ok=True)
-        claim_path.write_text(json.dumps(claim_data))
+        # The fake watcher wrote its own claim fixture on cold start
+        claim_path = tmp_path / "claim.json"
+        original_claim = json.loads(claim_path.read_text())
+        assert original_claim["task_id"] == "t_fake"
 
-        # Write reload request
+        # Write reload request with the REAL owner start-time
         nonce = "smoke-nonce-12345"
         req = ReloadRequest(
             nonce=nonce,
             identity_digest=ident.digest,
             owner_pid=p.pid,
-            owner_start_time=0,
+            owner_start_time=meta["proc_start_time"],
             request_time=int(time.time()),
         )
         write_reload_request(root, req)
@@ -634,31 +894,32 @@ sys.exit(rc if rc else 0)
         # Send SIGUSR1
         os.kill(p.pid, signal.SIGUSR1)
 
-        # Wait for ACK
-        ack_path = Path(tmp_path) / "handoff" / f"ack.{ident.digest}.json"
-        deadline = time.time() + 10
+        # Wait for ACK via the standard runtime-root path
+        ack = None
+        deadline = time.time() + 15
         while time.time() < deadline:
-            if ack_path.exists():
+            ack = read_reload_ack(root, ident.digest)
+            if ack is not None and ack.nonce == nonce:
                 break
             time.sleep(0.2)
+        assert ack is not None, "ACK not written"
+        assert ack.nonce == nonce, "nonce mismatch"
+        assert ack.ok is True, f"ACK should be ok, got error={ack.error!r}"
+        assert ack.pid == p.pid, "PID changed during reload"
+        assert ack.task_id == "t_fake"
 
-        assert ack_path.exists(), "ACK not written"
-        ack_data = json.loads(ack_path.read_text())
-        assert ack_data["nonce"] == nonce, "nonce mismatch"
-        assert ack_data["pid"] == p.pid, "PID changed during reload"
-
-        # Verify claim fixture unchanged
+        # Verify claim fixture unchanged (active claim preserved across exec)
         loaded_claim = json.loads(claim_path.read_text())
-        assert loaded_claim["task_id"] == "t_smoke"
-        assert loaded_claim["run_id"] == 1
-        assert loaded_claim["generation"] == 1
-        assert loaded_claim["claim_lock"] == f"host:{p.pid}:fake-interactive"
+        assert loaded_claim == original_claim, "claim changed during reload"
 
         # Verify watcher still alive (heartbeat continues)
         assert p.poll() is None, "watcher process died after reload"
 
         p.terminate()
-        p.wait(timeout=5)
+        out, _ = p.communicate(timeout=5)
+        assert out.count("EXEC_GENERATION 1") == 1
+        assert "EXEC_GENERATION 2" in out
+        assert out.count("ACK_WRITTEN") == 1, "exactly one ACK per reload"
 
     def test_two_same_key_spawn_attempts_yield_one_lock_owner(self, tmp_path, monkeypatch):
         """Two simultaneous same-key spawn attempts yield one lock owner."""
