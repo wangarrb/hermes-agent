@@ -1750,6 +1750,37 @@ class BaseInteractiveListener:
             log_line(log_path, f"missing zellij session/pane id; cannot inject into {self.agent_name} TUI")
             return 2
 
+        # ── Acquire watcher identity lock before any DB access ──
+        # Ensures exactly one functional claim loop per (board, profile,
+        # session, pane).  A second watcher with the same identity exits
+        # non-zero after logging the owner PID/start-time.
+        try:
+            from watcher_runtime import WatcherIdentity, WatcherLock
+        except ImportError:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "watcher_runtime",
+                Path(__file__).parent / "watcher_runtime.py",
+            )
+            assert _spec is not None and _spec.loader is not None
+            _wr = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_wr)
+            WatcherIdentity = _wr.WatcherIdentity
+            WatcherLock = _wr.WatcherLock
+
+        _watcher_identity = WatcherIdentity.from_values(
+            board=board,
+            profile=args.profile,
+            session=zellij_session,
+            pane=str(zellij_pane_id),
+        )
+        try:
+            _watcher_lock = WatcherLock.acquire(_watcher_identity)
+        except SystemExit:
+            log_line(log_path, f"watcher lock contended for {_watcher_identity.digest}; exiting")
+            return 1
+        log_line(log_path, f"watcher lock acquired: identity={_watcher_identity.digest}")
+
         poll_s = float(args.poll if args.poll is not None else listener_policy.poll_seconds())
         log_line(
             log_path,
@@ -1975,6 +2006,10 @@ class BaseInteractiveListener:
                 log_path=log_path,
             )
             self._clear_active_claim_identity()
+            try:
+                _watcher_lock.release()
+            except Exception:
+                pass
         log_line(log_path, "interactive watcher stopped")
         return 0
 

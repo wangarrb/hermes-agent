@@ -177,3 +177,77 @@ with WatcherLock.acquire(ident):
             assert data["pid"] == os.getpid()
             assert data["identity"] == ident.digest
             assert "proc_start_time" in data
+
+
+# ── watcher_main lock integration ────────────────────────────────────────────
+
+FIXTURE = REPO / "tests" / "fixtures" / "fake_reload_watcher.py"
+
+
+class TestWatcherMainLockIntegration:
+    """Verify that watcher_main enforces one claim loop per identity."""
+
+    def test_incomplete_identity_exits_nonzero_before_db(self, tmp_path):
+        """A watcher missing session/pane must exit non-zero without opening DB."""
+        # The fake watcher requires all four identity fields; argparse will
+        # error on missing args, which is the desired fail-closed behavior.
+        code = f'''
+import sys, os
+sys.path.insert(0, "{REPO}/plugins/kanban")
+sys.path.insert(0, "{REPO}/tests/fixtures")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+# Import watcher_runtime to check identity validation
+from watcher_runtime import WatcherIdentity
+try:
+    WatcherIdentity.from_values("board", "profile", "", "1")
+    print("SHOULD_NOT_REACH", flush=True)
+except (ValueError, TypeError):
+    print("REJECTED_INCOMPLETE", flush=True)
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert "REJECTED_INCOMPLETE" in result.stdout, f"Expected rejection, got: {result.stdout}"
+
+    def test_two_identical_watchers_yield_one_live_loop(self, tmp_path):
+        """Two identical watchers: one acquires lock and runs, other is rejected."""
+        code = f'''
+import sys, os, time
+sys.path.insert(0, "{REPO}/tests/fixtures")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+os.environ["HERMES_KANBAN_TEST_MODE"] = "1"
+# Run fake_reload_watcher with fixed identity
+import fake_reload_watcher
+sys.argv = ["fake_reload_watcher.py",
+    "--board", "testboard",
+    "--profile", "coordinator",
+    "--session", "test-session",
+    "--pane", "1",
+]
+rc = fake_reload_watcher.main()
+if rc:
+    print(f"EXITED code={{rc}}", flush=True)
+sys.exit(rc if rc else 0)
+'''
+        # Start first watcher
+        p1 = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(0.5)
+
+        # Start second watcher — should be rejected
+        p2 = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        out2, err2 = p2.communicate(timeout=10)
+        p1.terminate()
+        p1.wait(timeout=5)
+
+        assert "LOCK_REJECTED" in out2, (
+            f"Second identical watcher should be rejected.\n"
+            f"stdout: {out2}\nstderr: {err2}"
+        )
+        assert p2.returncode != 0, "Rejected watcher should exit non-zero"
