@@ -123,7 +123,9 @@ trap cleanup EXIT INT TERM
 # Auto-detect: add --continue only if the profile has a session to resume
 CONTINUE_ARG=""
 SESSION_DB="/home/wyr/.hermes/profiles/${PROFILE:-implementer}/state.db"
-if [ -f "$SESSION_DB" ]; then
+if [ "${HERMES_KANBAN_FRESH:-0}" = "1" ]; then
+    echo "$log_prefix Fresh session requested, skipping resume" >&2
+elif [ -f "$SESSION_DB" ]; then
     HAS_SESSION=$(python3 -c "
 import sqlite3
 try:

@@ -48,6 +48,11 @@ codex-custom   （interactive Codex + Kanban watcher，强制用 xunfei-relay pr
 Agent 参数:
   --reviewer-mode <mode>           reviewer 资源模式：economy/balanced/performance，默认 balanced
   --switch-reviewer-mode <mode>    安全边界热切换 reviewer pane 并 resume 原 Codex 会话
+  --switch-owner-project <role>    安全边界把 planner/designer/coordinator 切到显式目标项目
+  --target-project <slug>          owner 切换目标（Hermes project slug）
+  --target-board <board>           未登记项目时显式目标 board，或用于核对 project binding
+  --target-workspace <path>        未登记项目时显式主目录，或用于核对 project binding
+  --confirm-background-work-clear  确认待切换 owner 没有仍在运行的后台工作
   --codex-model <model>            可选 Codex model override
   --codex-sandbox <mode>           Codex sandbox，默认 danger-full-access
   --deepseek-provider <provider>   CodeWhale/DeepSeek provider，默认 openrouter；可用 opencode-go
@@ -172,6 +177,11 @@ REVIEWER_MODE=""
 REVIEWER_MODEL=""
 REVIEWER_REASONING_EFFORT=""
 SWITCH_REVIEWER_MODE=""
+SWITCH_OWNER_PROJECT=""
+TARGET_PROJECT=""
+TARGET_BOARD=""
+TARGET_WORKSPACE=""
+CONFIRM_BACKGROUND_WORK_CLEAR=0
 SESSION_NAME=""
 DRY_RUN=0
 CLEAN=1
@@ -374,6 +384,16 @@ while [[ $# -gt 0 ]]; do
             need_value "$1" "${2:-}"; REVIEWER_MODE_REQUESTED="$2"; shift 2 ;;
         --switch-reviewer-mode)
             need_value "$1" "${2:-}"; SWITCH_REVIEWER_MODE="$2"; REVIEWER_MODE_REQUESTED="$2"; shift 2 ;;
+        --switch-owner-project)
+            need_value "$1" "${2:-}"; SWITCH_OWNER_PROJECT="$2"; shift 2 ;;
+        --target-project)
+            need_value "$1" "${2:-}"; TARGET_PROJECT="$2"; shift 2 ;;
+        --target-board)
+            need_value "$1" "${2:-}"; TARGET_BOARD="$2"; shift 2 ;;
+        --target-workspace)
+            need_value "$1" "${2:-}"; TARGET_WORKSPACE="$2"; shift 2 ;;
+        --confirm-background-work-clear)
+            CONFIRM_BACKGROUND_WORK_CLEAR=1; shift ;;
         --deepseek-provider)
             need_value "$1" "${2:-}"; DEEPSEEK_PROVIDER="$2"; shift 2 ;;
         --deepseek-model)
@@ -497,18 +517,6 @@ WORKSPACE="$(readlink -f "$WORKSPACE")"
 DESIGNER_WORKSPACE="$(readlink -m "${DESIGNER_WORKSPACE:-${WORKSPACE}-designer}")"
 COORDINATOR_WORKSPACE="$(readlink -m "${COORDINATOR_WORKSPACE:-${WORKSPACE}-coordinator}")"
 
-OWNER_WORKSPACE_HELPER="$SCRIPT_DIR/hermes-kanban-owner-workspace"
-if [ "$DRY_RUN" != "1" ]; then
-    [ -x "$OWNER_WORKSPACE_HELPER" ] || {
-        echo "错误: 找不到 owner workspace helper: $OWNER_WORKSPACE_HELPER" >&2
-        exit 1
-    }
-    if [ "$DESIGNER_AGENT" != "none" ]; then
-        "$OWNER_WORKSPACE_HELPER" prepare --role designer --workspace "$WORKSPACE" --target "$DESIGNER_WORKSPACE"
-    fi
-    "$OWNER_WORKSPACE_HELPER" prepare --role coordinator --workspace "$WORKSPACE" --target "$COORDINATOR_WORKSPACE"
-fi
-
 if ! command -v zellij >/dev/null 2>&1; then
     echo "错误: 找不到 zellij" >&2
     exit 1
@@ -540,6 +548,24 @@ if [ -n "$SWITCH_REVIEWER_MODE" ]; then
     fi
     exec "$SCRIPT_DIR/hermes-kanban-switch-reviewer-mode" "${switch_args[@]}"
 fi
+if [ -n "$SWITCH_OWNER_PROJECT" ]; then
+    validate_role_name "owner project switch role" "$SWITCH_OWNER_PROJECT"
+    case "$SWITCH_OWNER_PROJECT" in
+        planner|designer|coordinator) ;;
+        *) echo "错误: 只允许切换 planner/designer/coordinator" >&2; exit 2 ;;
+    esac
+    switch_owner_args=(
+        --role "$SWITCH_OWNER_PROJECT"
+        --source-board "$BOARD"
+        --session "$SESSION_NAME"
+    )
+    [ -z "$TARGET_PROJECT" ] || switch_owner_args+=(--project "$TARGET_PROJECT")
+    [ -z "$TARGET_BOARD" ] || switch_owner_args+=(--target-board "$TARGET_BOARD")
+    [ -z "$TARGET_WORKSPACE" ] || switch_owner_args+=(--target-workspace "$TARGET_WORKSPACE")
+    [ "$CONFIRM_BACKGROUND_WORK_CLEAR" = "0" ] || switch_owner_args+=(--confirm-background-work-clear)
+    [ "$DRY_RUN" = "0" ] || switch_owner_args+=(--dry-run)
+    exec "$SCRIPT_DIR/hermes-kanban-switch-owner-project" "${switch_owner_args[@]}"
+fi
 if agent_is_used codewhale && [ ! -x "$CODEWHALE_INTERACTIVE" ]; then
     echo "错误: 找不到可执行 CodeWhale kanban interactive: $CODEWHALE_INTERACTIVE" >&2
     exit 1
@@ -551,6 +577,18 @@ fi
 if agent_is_used claude && [ ! -x "$CLAUDE_INTERACTIVE" ]; then
     echo "错误: 找不到可执行 Claude kanban interactive: $CLAUDE_INTERACTIVE" >&2
     exit 1
+fi
+
+OWNER_WORKSPACE_HELPER="$SCRIPT_DIR/hermes-kanban-owner-workspace"
+if [ "$DRY_RUN" != "1" ]; then
+    [ -x "$OWNER_WORKSPACE_HELPER" ] || {
+        echo "错误: 找不到 owner workspace helper: $OWNER_WORKSPACE_HELPER" >&2
+        exit 1
+    }
+    if [ "$DESIGNER_AGENT" != "none" ]; then
+        "$OWNER_WORKSPACE_HELPER" prepare --role designer --workspace "$WORKSPACE" --target "$DESIGNER_WORKSPACE"
+    fi
+    "$OWNER_WORKSPACE_HELPER" prepare --role coordinator --workspace "$WORKSPACE" --target "$COORDINATOR_WORKSPACE"
 fi
 
 deepseek_pane_count() {

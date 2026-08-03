@@ -303,6 +303,8 @@ def test_help_documents_project_neutral_owner_workspaces(tmp_path: Path) -> None
     assert "reviewer:implementer" in result.stdout
     assert "designer:implementer" not in result.stdout
     assert "coordinator:implementer" not in result.stdout
+    assert "--switch-owner-project" in result.stdout
+    assert "--target-project" in result.stdout
 
 
 def test_cli_overrides_both_owner_workspaces(tmp_path: Path) -> None:

@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+# shellcheck source=../lib/reviewer_mode_switch.sh
+source "$SCRIPT_DIR/../lib/reviewer_mode_switch.sh"
+# shellcheck source=../lib/owner_project_switch.sh
+source "$SCRIPT_DIR/../lib/owner_project_switch.sh"
+
+ROLE=""
+PROJECT=""
+SOURCE_BOARD="${HERMES_KANBAN_BOARD:-}"
+TARGET_BOARD=""
+TARGET_WORKSPACE=""
+SESSION=""
+CONFIRM_BACKGROUND=0
+TIMEOUT_S=600
+INTERVAL_S=10
+CHECKS=3
+WORKER=0
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --role) ROLE="${2:?--role requires a value}"; shift 2 ;;
+        --project) PROJECT="${2:?--project requires a value}"; shift 2 ;;
+        --source-board) SOURCE_BOARD="${2:?--source-board requires a value}"; shift 2 ;;
+        --target-board) TARGET_BOARD="${2:?--target-board requires a value}"; shift 2 ;;
+        --target-workspace) TARGET_WORKSPACE="${2:?--target-workspace requires a value}"; shift 2 ;;
+        --session) SESSION="${2:?--session requires a value}"; shift 2 ;;
+        --confirm-background-work-clear) CONFIRM_BACKGROUND=1; shift ;;
+        --timeout-s) TIMEOUT_S="${2:?--timeout-s requires a value}"; shift 2 ;;
+        --interval-s) INTERVAL_S="${2:?--interval-s requires a value}"; shift 2 ;;
+        --checks) CHECKS="${2:?--checks requires a value}"; shift 2 ;;
+        --worker) WORKER=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+owner_switch_validate_role "$ROLE"
+[[ -n "$SOURCE_BOARD" ]] || { echo "--source-board is required" >&2; exit 2; }
+SESSION="${SESSION:-kanban-${SOURCE_BOARD}}"
+
+BINDING="UNBOUND_EXPLICIT"
+if [[ -n "$PROJECT" ]]; then
+    IFS=$'\t' read -r TARGET_BOARD TARGET_WORKSPACE BINDING \
+        < <(owner_switch_resolve_project "$PROJECT" "$TARGET_BOARD" "$TARGET_WORKSPACE")
+else
+    [[ -n "$TARGET_BOARD" && -n "$TARGET_WORKSPACE" ]] || {
+        echo "use --project, or provide both --target-board and --target-workspace" >&2
+        exit 2
+    }
+    TARGET_WORKSPACE="$(readlink -m "$TARGET_WORKSPACE")"
+fi
+[[ -d "$TARGET_WORKSPACE" ]] || { echo "target workspace does not exist: $TARGET_WORKSPACE" >&2; exit 2; }
+
+case "$ROLE" in
+    planner) ROLE_WORKSPACE="$TARGET_WORKSPACE" ;;
+    *) ROLE_WORKSPACE="${TARGET_WORKSPACE}-${ROLE}" ;;
+esac
+
+shell_quote() { printf '%q' "$1"; }
+CONTINUE="$SCRIPT_DIR/hermes-kanban-continue"
+WATCHER="$SCRIPT_DIR/hermes-kanban-role-context-listener.py"
+LAUNCH_CMD="cd $(shell_quote "$ROLE_WORKSPACE") && HERMES_KANBAN_FRESH=1 HERMES_KANBAN_BOARD=$(shell_quote "$TARGET_BOARD") HERMES_KANBAN_CLAIM_ASSIGNEES=$(shell_quote "$ROLE") HERMES_KANBAN_WATCHER_SCRIPT=$(shell_quote "$WATCHER") $(shell_quote "$CONTINUE") -p $(shell_quote "$ROLE")"
+
+if (( DRY_RUN )); then
+    printf 'role=%s\ntarget_board=%s\ntarget_workspace=%s\nbinding=%s\n%s\n' \
+        "$ROLE" "$TARGET_BOARD" "$ROLE_WORKSPACE" "$BINDING" "$LAUNCH_CMD"
+    exit 0
+fi
+
+(( CONFIRM_BACKGROUND )) || {
+    echo "--confirm-background-work-clear is required after confirming no active owner background job/subagent" >&2
+    exit 2
+}
+
+if (( ! WORKER )); then
+    LOG="/home/wyr/.hermes/logs/owner-project-switch-${ROLE}-${SOURCE_BOARD}.log"
+    mkdir -p "$(dirname "$LOG")"
+    args=(--role "$ROLE" --source-board "$SOURCE_BOARD" --target-board "$TARGET_BOARD" --target-workspace "$TARGET_WORKSPACE" --session "$SESSION" --confirm-background-work-clear --timeout-s "$TIMEOUT_S" --interval-s "$INTERVAL_S" --checks "$CHECKS" --worker)
+    setsid "$SELF" "${args[@]}" </dev/null >>"$LOG" 2>&1 &
+    echo "owner project switch scheduled: role=$ROLE target=$TARGET_BOARD workspace=$ROLE_WORKSPACE log=$LOG"
+    exit 0
+fi
+
+owner_switch_has_live_reviewer "$TARGET_BOARD" || {
+    echo "target board has no live reviewer lane: $TARGET_BOARD" >&2
+    exit 3
+}
+if owner_switch_has_running_task "$SOURCE_BOARD" "$ROLE"; then
+    echo "owner has a running Kanban task on source board: $ROLE/$SOURCE_BOARD" >&2
+    exit 3
+fi
+
+PANE_ID="$(owner_switch_find_pane_id "$SESSION" "$ROLE")"
+wait_for_reviewer_switch_boundary "$SESSION" "$PANE_ID" "$TIMEOUT_S" "$INTERVAL_S" "$CHECKS"
+BEFORE_FINGERPRINT="$(owner_switch_pane_fingerprint "$SESSION" "$PANE_ID")"
+BEFORE_SCREEN="$(zellij --session "$SESSION" action dump-screen --pane-id "$PANE_ID")"
+BEFORE_SIGNATURE="$(reviewer_screen_signature "$BEFORE_SCREEN")"
+PANE_NAME="$(zellij --session "$SESSION" action list-panes --all --json | jq -r --argjson pane "$PANE_ID" '.[] | select(.id == $pane) | .name')"
+[[ "$PANE_NAME" == "$ROLE-hermes" ]] || {
+    echo "safe project switch currently requires a Hermes owner pane, found: $PANE_NAME" >&2
+    exit 3
+}
+
+BEFORE_SHA="$(git -C "$ROLE_WORKSPACE" rev-parse HEAD 2>/dev/null || printf missing)"
+if [[ "$ROLE" == "planner" ]]; then
+    "$SCRIPT_DIR/hermes-kanban-owner-workspace" prepare --role planner --workspace "$TARGET_WORKSPACE" >/dev/null
+else
+    "$SCRIPT_DIR/hermes-kanban-owner-workspace" prepare --role "$ROLE" --workspace "$TARGET_WORKSPACE" --target "$ROLE_WORKSPACE" >/dev/null
+fi
+AFTER_SHA="$(git -C "$ROLE_WORKSPACE" rev-parse HEAD)"
+
+CURRENT_PANE="$(owner_switch_find_pane_id "$SESSION" "$ROLE" 2>/dev/null || true)"
+CURRENT_FINGERPRINT="$(owner_switch_pane_fingerprint "$SESSION" "$PANE_ID" 2>/dev/null || true)"
+CURRENT_SCREEN="$(zellij --session "$SESSION" action dump-screen --pane-id "$PANE_ID" 2>/dev/null || true)"
+if [[ "$CURRENT_PANE" != "$PANE_ID" || "$CURRENT_FINGERPRINT" != "$BEFORE_FINGERPRINT" ]] || \
+   ! reviewer_screen_is_idle "$CURRENT_SCREEN" || \
+   [[ "$(reviewer_screen_signature "$CURRENT_SCREEN")" != "$BEFORE_SIGNATURE" ]]; then
+    echo "PREPARED_NOT_SWITCHED role=$ROLE target=$TARGET_BOARD before_sha=$BEFORE_SHA after_sha=$AFTER_SHA" >&2
+    exit 4
+fi
+
+ORIGINAL_FOCUS="$(zellij --session "$SESSION" action list-panes --all --json | jq -r '.[] | select(.is_plugin == false and .is_focused == true) | .id' | head -n 1)"
+zellij --session "$SESSION" action focus-pane --pane-id "$PANE_ID"
+NEW_PANE="$(zellij --session "$SESSION" action new-pane --in-place --close-replaced-pane --name "$ROLE-hermes" --cwd "$ROLE_WORKSPACE" -- bash -lc "$LAUNCH_CMD")"
+if [[ -n "$ORIGINAL_FOCUS" && "$ORIGINAL_FOCUS" != "$PANE_ID" ]]; then
+    zellij --session "$SESSION" action focus-pane --pane-id "$ORIGINAL_FOCUS" 2>/dev/null || true
+fi
+echo "owner project switched: role=$ROLE old_pane=$PANE_ID new_pane=$NEW_PANE target=$TARGET_BOARD workspace=$ROLE_WORKSPACE"
