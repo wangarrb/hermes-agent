@@ -10,7 +10,7 @@ Never sends Zellij input or changes Kanban task state.
 
 Usage:
     hermes-kanban-reload-watchers --board <board> --session <session> \
-        [--profile <role>] [--ack-timeout-s 15]
+        [--profile <role>] [--ack-timeout-s 75]
 """
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ __all__ = [
 # Watcher script patterns (same as supervisor)
 WATCHER_PATTERNS = [
     "hermes-kanban-role-context-listener.py",
+    "hermes_kanban_interactive.py",
     "deepseek_kanban_interactive.py",
     "codex_kanban_interactive.py",
     "reasonix_kanban_interactive.py",
@@ -67,6 +68,9 @@ WATCHER_PATTERNS = [
 ]
 WATCH_CHILD_FLAG = "--watch-child"
 WATCHER_KEY_FLAGS = ("--board", "--profile", "--zellij-session", "--zellij-pane-id")
+# Production Hermes watchers may sleep for up to 60 seconds between safe
+# checkpoints.  Leave enough slack for scheduling and post-exec health ACK.
+DEFAULT_ACK_TIMEOUT_S = 75.0
 
 
 def _read_cmdline(pid: int) -> list[str] | None:
@@ -251,7 +255,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--board", required=True)
     parser.add_argument("--session", required=True)
     parser.add_argument("--profile", action="append", default=None, help="Profile to reload (repeatable)")
-    parser.add_argument("--ack-timeout-s", type=float, default=15.0, help="ACK timeout per watcher")
+    parser.add_argument(
+        "--ack-timeout-s", type=float, default=DEFAULT_ACK_TIMEOUT_S,
+        help="ACK timeout per watcher (default: 75s; covers 60s watcher poll)",
+    )
     parser.add_argument("--runtime-root-path", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--proc-tree", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)

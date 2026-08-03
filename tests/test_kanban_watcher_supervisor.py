@@ -125,6 +125,14 @@ def test_conda_wrapper_with_listener_argument_is_a_watcher():
     assert supervisor._is_watcher(cmdline)
 
 
+def test_real_post_exec_hermes_listener_is_a_watcher():
+    supervisor = _load_supervisor()
+    cmdline = _cmd()
+    cmdline[1] = "/repo/plugins/kanban/hermes_listener/hermes_kanban_interactive.py"
+
+    assert supervisor._is_watcher(cmdline)
+
+
 def test_cleanup_prefers_launcher_and_only_targets_supervisor_children():
     supervisor = _load_supervisor()
     current = {101: _cmd(), 102: _cmd(), 201: _cmd()}

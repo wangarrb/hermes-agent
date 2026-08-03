@@ -96,7 +96,7 @@ handoff 缺失或不一致时 fail closed：不 claim、不 inject，记录精�
 
 - reload 命令输出每个 role 的 `REQUESTED / ACK / FAILED / SKIPPED`，并以非零退出
   表示未全部成功。
-- ACK 默认超时 15 秒，可显式覆盖；超时不强杀仍存活的 watcher，只报告其 PID、
+- ACK 默认超时 75 秒（覆盖当前最长 60 秒 watcher poll），可显式覆盖；超时不强杀仍存活的 watcher，只报告其 PID、
   identity 和最后状态。
 - `execve` 调用失败时旧 watcher必须原地恢复；只有新代码在 exec 后启动崩溃时
   才交给 supervisor 受限重启。该异常路径不能承诺无缝 handoff，必须显式告警并

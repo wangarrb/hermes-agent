@@ -27,6 +27,7 @@ from pathlib import Path
 
 WATCHER_PATTERNS = [
     "hermes-kanban-role-context-listener.py",
+    "hermes_kanban_interactive.py",
     "deepseek_kanban_interactive.py",
     "codex_kanban_interactive.py",
     "reasonix_kanban_interactive.py",

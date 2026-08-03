@@ -46,6 +46,30 @@ def _cmdline(*, board="egomotion4d", profile="coordinator", session="kanban-egom
 # ── Filtering tests ──────────────────────────────────────────────────────────
 
 class TestFiltering:
+    def test_selects_real_post_exec_hermes_listener(self, tmp_path, monkeypatch):
+        """A Hermes watcher remains discoverable after self-exec changes argv[0]."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        from watcher_runtime import WatcherIdentity, runtime_root, _atomic_write_json
+
+        ident = WatcherIdentity.from_values(
+            "egomotion4d", "coordinator", "kanban-egomotion4d", "4",
+        )
+        root = runtime_root()
+        _atomic_write_json(root / ident.digest / "metadata.json", {
+            "pid": 101, "proc_start_time": 55,
+            "identity": ident.digest, "code_revision": "rev",
+        })
+        cmdline = _cmdline()
+        cmdline[1] = "/repo/plugins/kanban/hermes_listener/hermes_kanban_interactive.py"
+
+        targets = rw._filter_reload_targets(
+            {101: cmdline}, board="egomotion4d",
+            session="kanban-egomotion4d", profiles=None,
+            runtime_root_path=str(tmp_path),
+        )
+
+        assert [target["pid"] for target in targets] == [101]
+
     def test_filters_exact_board_session(self, tmp_path, monkeypatch):
         """Only processes matching exact board/session are selected."""
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
@@ -109,6 +133,11 @@ class TestProfileOrdering:
         profiles = ["coordinator", "planner", "implementer", "reviewer"]
         result = rw._sort_profiles(profiles)
         assert result == ["coordinator", "implementer", "planner", "reviewer"]
+
+
+def test_default_ack_timeout_covers_slowest_watcher_poll():
+    """Default rolling wait must exceed the production 60-second poll."""
+    assert rw.DEFAULT_ACK_TIMEOUT_S >= 75.0
 
 
 class TestAtomicRequestBeforeSignal:
