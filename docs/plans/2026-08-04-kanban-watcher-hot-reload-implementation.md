@@ -66,8 +66,9 @@
 - Modify: `tests/test_kanban_watcher_runtime.py`
 
 - [ ] Write RED tests for mode-`0600` atomic handoff/ACK writes, nonce matching, PID/start-time checks and cleanup.
+- [ ] Write RED tests for a mode-`0600` atomic reload request containing nonce, identity and expected lock owner; a bare signal without a valid request must not reload.
 - [ ] Write RED tests that changing any of task ID, run ID, generation, claim lock, worker PID or watcher identity rejects restoration.
-- [ ] Implement `ReloadHandoff`, `write_handoff_atomic`, `read_verified_handoff`, `write_ack_atomic` and bounded cleanup. Handoff contains no prompt, token or credentials.
+- [ ] Implement `ReloadRequest`, `ReloadHandoff`, atomic request/handoff/ACK helpers and bounded cleanup. These records contain no prompt, token or credentials.
 - [ ] Add inherited-lock adoption: mark the held FD inheritable immediately before exec, pass FD + nonce in env, verify `fstat`/metadata/identity after exec, then return it to non-inheritable mode.
 - [ ] Run `scripts/run_tests.sh tests/test_kanban_watcher_runtime.py -q`.
 - [ ] Commit: `feat(kanban): add watcher reload handoff state`.
@@ -81,7 +82,7 @@
 
 - [ ] Write a RED subprocess integration test: fake watcher holds a lock and active claim fixture, receives `SIGUSR1`, self-execs with unchanged PID, restores state, emits one ACK and never emits a second claim/inject marker.
 - [ ] Write RED cases for a failed preflight and injected `execve` exception; the old process must continue heartbeat and must not enter active-claim cleanup.
-- [ ] Install a watcher-only SIGUSR1 handler that sets a reload flag. Do not perform I/O or exec in the handler.
+- [ ] Install a watcher-only SIGUSR1 handler that sets a reload flag. Do not perform I/O or exec in the handler; at the safe checkpoint, require and verify the request JSON before starting reload.
 - [ ] At loop-safe checkpoints, snapshot and revalidate active task/run/generation/claim-lock/worker-PID, run the same entry point with hidden `--reload-preflight`, then call `os.execve` using the same interpreter and argv.
 - [ ] Add startup adoption before normal claim discovery. Restore heartbeat only after DB row equality; do not claim or inject during restoration. Write success ACK only after one successful heartbeat.
 - [ ] Catch pre-exec and `execve` errors inside the active loop, reopen resources and continue old heartbeat. Ensure the outer `finally` does not clear the active claim on a failed reload attempt.
@@ -100,9 +101,9 @@
 - Create: `tests/test_kanban_reload_watchers.py`
 
 - [ ] Write RED tests using a fake proc tree/runtime root: filter exact board/session/profile; identify only inner Python watchers; ignore `conda run` wrappers and unrelated shell text; select the lock owner PID.
-- [ ] Write RED tests for stable profile order, ACK validation, 15-second configurable timeout, nonzero exit and stop-on-first-failure behavior.
+- [ ] Write RED tests for stable profile order, atomic request-before-signal ordering, nonce-matched ACK validation, 15-second configurable timeout, nonzero exit and stop-on-first-failure behavior.
 - [ ] Implement CLI arguments `--board`, `--session`, repeatable `--profile`, `--ack-timeout-s` and optional test-only injected proc/runtime roots.
-- [ ] Send SIGUSR1 only after PID/start-time/key/lock-owner revalidation. Report `REQUESTED`, `ACK`, `FAILED`, `SKIPPED`; never send Zellij input or change Kanban task state.
+- [ ] Generate a nonce and atomically write the request JSON, then send SIGUSR1 only after PID/start-time/key/lock-owner revalidation. Report `REQUESTED`, `ACK`, `FAILED`, `SKIPPED`; never send Zellij input or change Kanban task state.
 - [ ] Make the script executable and link it into `~/.local/bin` only after tests pass and only if the destination is absent or already points to this source.
 - [ ] Run `scripts/run_tests.sh tests/test_kanban_reload_watchers.py -q`.
 - [ ] Commit: `feat(kanban): add rolling watcher reload command`.

@@ -45,15 +45,19 @@ supervisor 自身也按 `(board, zellij_session)` 获取单例锁。它只发现
 hermes-kanban-reload-watchers --board <board> --session <session> [--profile <role>]
 ```
 
-命令只向匹配的内部 Python watcher 发送 `SIGUSR1`，不 kill wrapper、agent 或
-pane。它根据 lock metadata 只选择真正持锁的 PID；重复但未持锁进程只报告，
+命令为每个 watcher 生成 nonce，先在 mode `0600` 的 runtime reload 目录原子
+写入 request JSON，再向匹配的内部 Python watcher 发送 `SIGUSR1`，不 kill
+wrapper、agent 或 pane。request 只含 nonce、identity、owner PID/start-time、
+request time 和期望 code revision，不含 task/prompt/凭证。命令根据 lock metadata
+只选择真正持锁的 PID；重复但未持锁进程只报告，
 不得发送 reload。默认按 profile 稳定排序滚动处理；一个 watcher ACK 后才处理
 下一个，任一失败即停止剩余 reload 并返回非零。同一 watcher 的并发 reload
 请求按 nonce 去重，运行中请求只保留最新一个 pending 请求。
 
 signal handler 只设置 reload flag，不做 I/O、DB 或 exec。watcher 在下一次安全
-循环边界执行 reload：当前没有打开的 DB transaction，也不在 inject/composer
-操作中。即使存在 running task，也无需等待任务结束。
+循环边界读取并验证 request JSON 后执行 reload：当前没有打开的 DB transaction，
+也不在 inject/composer 操作中。即使存在 running task，也无需等待任务结束。
+没有合法 request 的裸 SIGUSR1 只记录并忽略，不能自行生成 reload。
 
 热重载步骤：
 
