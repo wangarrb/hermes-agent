@@ -79,7 +79,7 @@ state="${FAKE_ZELLIJ_STATE:?}"
 if [[ "$*" == *"list-panes"* ]]; then
   n=0; [[ ! -f "$state" ]] || n="$(<"$state")"; n=$((n + 1)); printf '%s' "$n" >"$state"
   if (( n >= 4 )); then id=8; else id=7; fi
-  printf '[{"id":%s,"name":"designer-hermes","terminal_command":"bash --profile designer","is_plugin":false,"is_focused":true,"pane_x":0,"pane_y":0,"pane_rows":20,"pane_columns":80}]\n' "$id"
+  printf '[{"id":%s,"name":"","terminal_command":"bash -lc hermes-kanban-continue -p designer","is_plugin":false,"is_focused":true,"pane_x":0,"pane_y":0,"pane_rows":20,"pane_columns":80}]\n' "$id"
   exit 0
 fi
 if [[ "$*" == *"dump-screen"* ]]; then

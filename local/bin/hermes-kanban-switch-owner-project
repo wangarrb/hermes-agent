@@ -100,9 +100,11 @@ wait_for_reviewer_switch_boundary "$SESSION" "$PANE_ID" "$TIMEOUT_S" "$INTERVAL_
 BEFORE_FINGERPRINT="$(owner_switch_pane_fingerprint "$SESSION" "$PANE_ID")"
 BEFORE_SCREEN="$(zellij --session "$SESSION" action dump-screen --pane-id "$PANE_ID")"
 BEFORE_SIGNATURE="$(reviewer_screen_signature "$BEFORE_SCREEN")"
-PANE_NAME="$(zellij --session "$SESSION" action list-panes --all --json | jq -r --argjson pane "$PANE_ID" '.[] | select(.id == $pane) | .name')"
-[[ "$PANE_NAME" == "$ROLE-hermes" ]] || {
-    echo "safe project switch currently requires a Hermes owner pane, found: $PANE_NAME" >&2
+PANE_RECORD="$(zellij --session "$SESSION" action list-panes --all --json | jq -c --argjson pane "$PANE_ID" '.[] | select(.id == $pane)')"
+PANE_NAME="$(printf '%s' "$PANE_RECORD" | jq -r '.name // ""')"
+PANE_COMMAND="$(printf '%s' "$PANE_RECORD" | jq -r '.terminal_command // ""')"
+[[ "$PANE_NAME" == "$ROLE-hermes" || "$PANE_COMMAND" == *"hermes-kanban-continue -p $ROLE"* ]] || {
+    echo "safe project switch currently requires a Hermes owner pane, found: ${PANE_NAME:-$PANE_COMMAND}" >&2
     exit 3
 }
 

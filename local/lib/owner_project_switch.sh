@@ -32,12 +32,12 @@ owner_switch_resolve_project() {
 owner_switch_find_pane_id() {
     local session="$1" role="$2" panes count
     panes="$(zellij --session "$session" action list-panes --all --json)" || return 1
-    count="$(printf '%s' "$panes" | jq --arg role "$role" '[.[] | select(.is_plugin == false) | select(((.name // "") | startswith($role + "-")) or ((.terminal_command // "") | contains("--profile " + $role)))] | length')"
+    count="$(printf '%s' "$panes" | jq --arg role "$role" '[.[] | select(.is_plugin == false) | select(((.name // "") | startswith($role + "-")) or ((.terminal_command // "") | contains("--profile " + $role)) or ((.terminal_command // "") | contains("-p " + $role)))] | length')"
     [[ "$count" == "1" ]] || {
         echo "expected exactly one $role pane in $session, found $count" >&2
         return 1
     }
-    printf '%s' "$panes" | jq -r --arg role "$role" '.[] | select(.is_plugin == false) | select(((.name // "") | startswith($role + "-")) or ((.terminal_command // "") | contains("--profile " + $role))) | .id'
+    printf '%s' "$panes" | jq -r --arg role "$role" '.[] | select(.is_plugin == false) | select(((.name // "") | startswith($role + "-")) or ((.terminal_command // "") | contains("--profile " + $role)) or ((.terminal_command // "") | contains("-p " + $role))) | .id'
 }
 
 owner_switch_pane_fingerprint() {
