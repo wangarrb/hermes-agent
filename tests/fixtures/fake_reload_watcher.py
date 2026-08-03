@@ -2,8 +2,9 @@
 
 This fixture is used by test_kanban_watcher_runtime.py to simulate a real
 watcher process that holds a lock, has an active claim, and responds to
-SIGUSR1 by self-executing.  It imports the real watcher_runtime module
-and uses the same lock/identity/handoff primitives.
+SIGUSR1 by checking a reload request file and writing an ACK.  It imports
+the real watcher_runtime module and uses the same lock/identity/handoff
+primitives.
 """
 from __future__ import annotations
 
@@ -22,6 +23,10 @@ sys.path.insert(0, str(KANBAN))
 from watcher_runtime import (  # type: ignore[import-not-found]
     WatcherIdentity,
     WatcherLock,
+    runtime_root,
+    read_reload_request,
+    write_reload_ack,
+    delete_reload_request,
 )
 
 
@@ -63,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             "worker_pid": os.getpid(),
         }))
 
-    # Set up SIGUSR1 handler (just sets a flag)
+    # Reload flag — set by SIGUSR1 handler, checked at safe boundary
     reload_requested = False
 
     def _handle_usr1(signum, frame):
@@ -72,25 +77,36 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGUSR1, _handle_usr1)
 
-    # Main loop — heartbeat and check for reload
+    # Main loop — heartbeat and check for reload at safe boundary
     heartbeat_count = 0
+    inject_count = 0  # Should never exceed 1
+
     while True:
         heartbeat_count += 1
         print(f"HEARTBEAT {heartbeat_count}", flush=True)
 
+        # Safe boundary: check reload request
         if reload_requested:
-            print("RELOAD_REQUESTED", flush=True)
-            # In a real watcher we'd do preflight + execve here.
-            # For testing, just write an ACK and continue.
-            if args.handoff_dir:
-                ack_path = Path(args.handoff_dir) / f"ack.{identity.digest}.json"
-                ack_path.write_text(json.dumps({
-                    "nonce": "test-nonce",
-                    "pid": os.getpid(),
-                    "proc_start_time": 0,
-                    "status": "ACK",
-                }))
             reload_requested = False
+            root = runtime_root()
+            req = read_reload_request(root, identity.digest)
+            if req is not None:
+                print(f"RELOAD_REQUESTED nonce={req.nonce}", flush=True)
+                # Simulate reload: write ACK (in real watcher, this would
+                # be after os.execve + heartbeat recovery)
+                if args.handoff_dir:
+                    ack_dir = Path(args.handoff_dir)
+                    ack_dir.mkdir(parents=True, exist_ok=True)
+                    ack_path = ack_dir / f"ack.{identity.digest}.json"
+                    ack_path.write_text(json.dumps({
+                        "nonce": req.nonce,
+                        "pid": os.getpid(),
+                        "proc_start_time": 0,
+                        "status": "ACK",
+                    }))
+                delete_reload_request(root, identity.digest)
+            else:
+                print("SIGUSR1_IGNORED no_valid_request", flush=True)
 
         time.sleep(0.2)
 

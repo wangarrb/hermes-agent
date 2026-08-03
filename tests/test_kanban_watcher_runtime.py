@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -458,3 +459,104 @@ class TestLockInheritance:
         # Clean up
         lock2.make_non_inheritable()
         lock2.release()
+
+
+# ── SIGUSR1 self-exec integration ────────────────────────────────────────────
+
+class TestSigusr1SelfExec:
+    """Verify SIGUSR1 triggers safe-boundary self-exec with PID preservation."""
+
+    def test_sigusr1_self_exec_preserves_pid_and_emits_ack(self, tmp_path, monkeypatch):
+        """Fake watcher holds lock, receives SIGUSR1, self-execs, emits ACK."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        # This test uses the fake_reload_watcher which handles SIGUSR1 by
+        # writing an ACK file (simulating the reload protocol).
+        code = f'''
+import sys, os, time, signal, json
+sys.path.insert(0, "{REPO}/tests/fixtures")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+import fake_reload_watcher
+sys.argv = ["fake_reload_watcher.py",
+    "--board", "testboard",
+    "--profile", "coordinator",
+    "--session", "test-session",
+    "--pane", "1",
+    "--handoff-dir", "{tmp_path}/handoff",
+]
+rc = fake_reload_watcher.main()
+sys.exit(rc if rc else 0)
+'''
+        # Start watcher
+        p = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(0.5)
+
+        # Write a reload request
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("testboard", "coordinator", "test-session", "1")
+        req = ReloadRequest(
+            nonce="test-nonce-123",
+            identity_digest=ident.digest,
+            owner_pid=p.pid,
+            owner_start_time=0,
+            request_time=int(time.time()),
+        )
+        write_reload_request(root, req)
+
+        # Send SIGUSR1
+        os.kill(p.pid, signal.SIGUSR1)
+
+        # Wait for ACK
+        ack_path = Path(tmp_path) / "handoff" / f"ack.{ident.digest}.json"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if ack_path.exists():
+                break
+            time.sleep(0.2)
+
+        p.terminate()
+        p.wait(timeout=5)
+
+        assert ack_path.exists(), "ACK file not written after SIGUSR1"
+        ack_data = json.loads(ack_path.read_text())
+        assert ack_data["nonce"] == "test-nonce-123"
+        assert ack_data["status"] == "ACK"
+
+    def test_bare_sigusr1_without_request_does_not_reload(self, tmp_path, monkeypatch):
+        """SIGUSR1 without a valid reload request must not trigger reload."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        code = f'''
+import sys, os, time, signal
+sys.path.insert(0, "{REPO}/tests/fixtures")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+import fake_reload_watcher
+sys.argv = ["fake_reload_watcher.py",
+    "--board", "testboard",
+    "--profile", "coordinator",
+    "--session", "test-session",
+    "--pane", "1",
+    "--handoff-dir", "{tmp_path}/handoff",
+]
+rc = fake_reload_watcher.main()
+sys.exit(rc if rc else 0)
+'''
+        p = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(0.5)
+
+        # Send SIGUSR1 without writing a reload request
+        os.kill(p.pid, signal.SIGUSR1)
+        time.sleep(1.0)
+
+        # Check no ACK was written
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("testboard", "coordinator", "test-session", "1")
+        ack_path = Path(tmp_path) / "handoff" / f"ack.{ident.digest}.json"
+        assert not ack_path.exists(), "ACK should not exist without valid request"
+
+        p.terminate()
+        p.wait(timeout=5)

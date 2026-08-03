@@ -1781,6 +1781,196 @@ class BaseInteractiveListener:
             return 1
         log_line(log_path, f"watcher lock acquired: identity={_watcher_identity.digest}")
 
+        # Active claim state — declared early so post-exec adoption can restore it
+        active_task: str | None = None
+        active_run_id: int | None = None
+        active_generation: int | None = None
+        active_claim_lock: str | None = None
+
+        # ── SIGUSR1 reload handler (flag-only, no I/O in handler) ──
+        _reload_flag = False
+
+        # ── Resolve watcher_runtime module for reload helpers ──
+        _wr_module = sys.modules.get("watcher_runtime")
+        if _wr_module is None:
+            _wr_module = _wr  # type: ignore[name-defined]
+
+        # ── Post-exec lock adoption ──
+        # If this process was started via os.execve for a reload, the lock FD
+        # was made inheritable and passed via env.  Adopt it instead of acquiring
+        # a new lock.
+        _inherited_lock_fd_str = os.environ.get("HERMES_KANBAN_WATCHER_LOCK_FD", "")
+        _reload_nonce_env = os.environ.get("HERMES_KANBAN_RELOAD_NONCE", "")
+        _reload_identity_env = os.environ.get("HERMES_KANBAN_RELOAD_IDENTITY", "")
+
+        if _inherited_lock_fd_str and _reload_identity_env == _watcher_identity.digest:
+            try:
+                _inherited_fd = int(_inherited_lock_fd_str)
+                _watcher_lock = WatcherLock.adopt_inherited(_watcher_identity, _inherited_fd)
+                log_line(log_path, f"adopted inherited lock FD={_inherited_fd} for reload")
+            except (ValueError, RuntimeError) as exc:
+                log_line(log_path, f"failed to adopt inherited lock: {exc}; acquiring new")
+                try:
+                    _watcher_lock = WatcherLock.acquire(_watcher_identity)
+                except SystemExit:
+                    log_line(log_path, f"watcher lock contended for {_watcher_identity.digest}; exiting")
+                    return 1
+
+            # Verify handoff against DB if nonce is present
+            if _reload_nonce_env:
+                root = _wr_module.runtime_root()
+                handoff = _wr_module.read_reload_handoff(root, _watcher_identity.digest)
+                if handoff and handoff.nonce == _reload_nonce_env:
+                    try:
+                        conn_check = kb.connect(board=board)
+                        (
+                            status,
+                            current_run_id,
+                            current_generation,
+                            current_claim_lock,
+                        ) = _task_claim_state(conn_check, handoff.task_id)
+                        conn_check.close()
+                        if (
+                            status == "running"
+                            and current_run_id == handoff.run_id
+                            and current_generation == handoff.generation
+                            and current_claim_lock == handoff.claim_lock
+                        ):
+                            log_line(log_path, f"reload handoff verified: task={handoff.task_id} run={handoff.run_id}")
+                            # Restore active claim state without claiming/injecting again
+                            active_task = handoff.task_id
+                            active_run_id = handoff.run_id
+                            active_generation = handoff.generation
+                            active_claim_lock = handoff.claim_lock
+                            # Write success ACK after heartbeat will be sent below
+                        else:
+                            log_line(log_path, f"reload handoff mismatch: status={status} run={current_run_id} vs handoff run={handoff.run_id}")
+                    except Exception as exc:
+                        log_line(log_path, f"reload handoff DB verification failed: {exc}")
+                # Clean up reload state
+                _wr_module.cleanup_reload_state(root, _watcher_identity.digest)
+        elif _inherited_lock_fd_str:
+            # Stale env from unrelated exec — ignore and acquire normally
+            log_line(log_path, "stale HERMES_KANBAN_WATCHER_LOCK_FD env; acquiring new lock")
+            try:
+                _watcher_lock = WatcherLock.acquire(_watcher_identity)
+            except SystemExit:
+                log_line(log_path, f"watcher lock contended for {_watcher_identity.digest}; exiting")
+                return 1
+
+        def _handle_sigusr1(signum: int, frame: Any) -> None:  # noqa: ARG001
+            nonlocal _reload_flag
+            _reload_flag = True
+
+        signal.signal(signal.SIGUSR1, _handle_sigusr1)
+
+        def _try_reload_at_safe_boundary() -> bool:
+            """Check for a valid reload request and self-exec if present.
+
+            Returns True if reload was initiated (process will be replaced).
+            Returns False if no reload needed, or if reload failed and old
+            loop should continue.
+            """
+            nonlocal _reload_flag
+            if not _reload_flag:
+                return False
+            _reload_flag = False
+
+            root = _wr_module.runtime_root()
+            req = _wr_module.read_reload_request(root, _watcher_identity.digest)
+            if req is None:
+                log_line(log_path, "SIGUSR1 received but no valid reload request; ignoring")
+                return False
+
+            log_line(log_path, f"reload requested: nonce={req.nonce}")
+
+            # Verify the requesting owner still matches our lock metadata
+            meta_path = _watcher_lock.lock_path.parent / "metadata.json"
+            try:
+                meta = json.loads(meta_path.read_text())
+                if meta.get("pid") != req.owner_pid:
+                    log_line(log_path, f"reload owner PID mismatch: {meta.get('pid')} != {req.owner_pid}; ignoring")
+                    return False
+            except (OSError, json.JSONDecodeError):
+                log_line(log_path, "could not read lock metadata for reload verification; ignoring")
+                return False
+
+            # Write handoff snapshot of active claim state
+            if active_task is not None:
+                handoff = _wr_module.ReloadHandoff(
+                    nonce=req.nonce,
+                    identity_digest=_watcher_identity.digest,
+                    task_id=active_task,
+                    run_id=active_run_id or 0,
+                    generation=active_generation or 1,
+                    claim_lock=active_claim_lock or "",
+                    worker_pid=os.getpid(),
+                    original_pid=os.getpid(),
+                )
+                _wr_module.write_reload_handoff(root, handoff)
+                log_line(log_path, f"reload handoff written: task={active_task} run={active_run_id}")
+
+            # Preflight: verify the entry point is importable and parseable
+            try:
+                subclass_file = Path(sys.modules[type(self).__module__].__file__ or __file__).resolve()
+                import py_compile
+                py_compile.compile(str(subclass_file), doraise=True)
+            except Exception as exc:
+                log_line(log_path, f"reload preflight failed: {exc}; continuing old loop")
+                _wr_module.delete_reload_request(root, _watcher_identity.digest)
+                _wr_module.delete_reload_handoff(root, _watcher_identity.digest)
+                # Write FAILED ACK
+                ack = _wr_module.ReloadACK(
+                    nonce=req.nonce, pid=os.getpid(),
+                    proc_start_time=_wr_module._proc_start_time(os.getpid()),
+                    code_revision=_wr_module._code_revision(),
+                )
+                _wr_module.write_reload_ack(root, _watcher_identity.digest, ack)
+                return False
+
+            # Close DB connection and prepare for exec
+            nonlocal _conn
+            if _conn is not None:
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+
+            # Make lock FD inheritable
+            lock_fd = _watcher_lock.make_inheritable()
+
+            # Set env for post-exec adoption
+            env = dict(os.environ)
+            env["HERMES_KANBAN_WATCHER_LOCK_FD"] = str(lock_fd)
+            env["HERMES_KANBAN_RELOAD_NONCE"] = req.nonce
+            env["HERMES_KANBAN_RELOAD_IDENTITY"] = _watcher_identity.digest
+
+            # Build argv (same entry point, same args)
+            subclass_file = Path(sys.modules[type(self).__module__].__file__ or __file__).resolve()
+            argv = [sys.executable, str(subclass_file)] + sys.argv[1:]
+
+            try:
+                log_line(log_path, f"execve for reload: {argv[0]}")
+                os.execve(argv[0], argv, env)
+            except OSError as exc:
+                # execve failed — reopen resources and continue old loop
+                log_line(log_path, f"execve failed: {exc}; reopening resources and continuing")
+                _watcher_lock.make_non_inheritable()
+                # Write FAILED ACK
+                ack = _wr_module.ReloadACK(
+                    nonce=req.nonce, pid=os.getpid(),
+                    proc_start_time=_wr_module._proc_start_time(os.getpid()),
+                    code_revision=_wr_module._code_revision(),
+                )
+                _wr_module.write_reload_ack(root, _watcher_identity.digest, ack)
+                _wr_module.delete_reload_request(root, _watcher_identity.digest)
+                _wr_module.delete_reload_handoff(root, _watcher_identity.digest)
+                return False
+
+            # Unreachable — execve replaces the process
+            return True
+
         poll_s = float(args.poll if args.poll is not None else listener_policy.poll_seconds())
         log_line(
             log_path,
@@ -1853,14 +2043,17 @@ class BaseInteractiveListener:
                     time.sleep(4.0)
             return None
 
-        active_task: str | None = None
-        active_run_id: int | None = None
-        active_generation: int | None = None
-        active_claim_lock: str | None = None
         last_hb = 0.0
 
         try:
             while not _STOP:
+                # ── Safe-boundary reload checkpoint ──
+                if _reload_flag:
+                    if _try_reload_at_safe_boundary():
+                        pass  # execve succeeded — unreachable
+                    # If reload failed, _try_reload already cleaned up;
+                    # continue old loop normally
+
                 now = time.time()
                 conn = _ensure_conn()
                 if conn is None:
@@ -1947,6 +2140,20 @@ class BaseInteractiveListener:
                                     )
                                     continue
                                 last_hb = now
+                                # If this is the first heartbeat after a reload adoption, write ACK
+                                if _reload_nonce_env and active_task:
+                                    root_ack = _wr_module.runtime_root()
+                                    ack = _wr_module.ReloadACK(
+                                        nonce=_reload_nonce_env,
+                                        pid=os.getpid(),
+                                        proc_start_time=_wr_module._proc_start_time(os.getpid()),
+                                        code_revision=_wr_module._code_revision(),
+                                        task_id=active_task,
+                                        run_id=active_run_id or 0,
+                                    )
+                                    _wr_module.write_reload_ack(root_ack, _watcher_identity.digest, ack)
+                                    log_line(log_path, f"reload ACK written: nonce={_reload_nonce_env}")
+                                    _reload_nonce_env = ""  # Only write once
                         time.sleep(min(poll_s, 5.0))
                         continue
 
