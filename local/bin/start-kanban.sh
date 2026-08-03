@@ -9,6 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 
 set -euo pipefail
 
+# Reviewer resource-mode mapping is kept separate from the layout code so the
+# model/reasoning contract has a tiny executable test.
+source "$SCRIPT_DIR/../lib/reviewer_mode.sh"
+
 # 坑63: Hermes profile 下 HOME 指向虚拟目录
 export REAL_HOME="/home/wyr"
 # 不要 export HOME=/home/wyr — zellij pane 启动的 hermes -p 需要 profile 的虚拟 HOME
@@ -41,6 +45,7 @@ codex-custom   （interactive Codex + Kanban watcher，强制用 xunfei-relay pr
   deepseek-reasonix （interactive Reasonix + Kanban watcher）
 
 Agent 参数:
+  --reviewer-mode <mode>           reviewer 资源模式：economy/balanced/performance，默认 balanced
   --codex-model <model>            可选 Codex model override
   --codex-sandbox <mode>           Codex sandbox，默认 danger-full-access
   --deepseek-provider <provider>   CodeWhale/DeepSeek provider，默认 openrouter；可用 opencode-go
@@ -159,6 +164,10 @@ TASK_DELIVERY="${KANBAN_TASK_DELIVERY:-inject}"
 ASSIST_CLAIM_DELAY="${KANBAN_ASSIST_CLAIM_DELAY_S:-${HERMES_KANBAN_ASSIST_CLAIM_DELAY_S:-}}"
 CODEX_MODEL="${CODEX_KANBAN_MODEL:-}"
 CODEX_SANDBOX="${CODEX_KANBAN_SANDBOX:-danger-full-access}"
+REVIEWER_MODE_REQUESTED="${KANBAN_REVIEWER_MODE:-balanced}"
+REVIEWER_MODE=""
+REVIEWER_MODEL=""
+REVIEWER_REASONING_EFFORT=""
 SESSION_NAME=""
 DRY_RUN=0
 CLEAN=1
@@ -355,6 +364,8 @@ while [[ $# -gt 0 ]]; do
             exit 2 ;;
         -r|--reviewer-agent)
             need_value "$1" "${2:-}"; REVIEWER_AGENT="$2"; shift 2 ;;
+        --reviewer-mode)
+            need_value "$1" "${2:-}"; REVIEWER_MODE_REQUESTED="$2"; shift 2 ;;
         --deepseek-provider)
             need_value "$1" "${2:-}"; DEEPSEEK_PROVIDER="$2"; shift 2 ;;
         --deepseek-model)
@@ -403,6 +414,9 @@ while [[ $# -gt 0 ]]; do
             usage ;;
     esac
 done
+
+IFS=$'\t' read -r REVIEWER_MODE REVIEWER_MODEL REVIEWER_REASONING_EFFORT \
+    < <(resolve_reviewer_mode "$REVIEWER_MODE_REQUESTED")
 
 if [ -z "$BOARD" ]; then
     echo "错误: 必须指定 board 名称 (-b)" >&2
@@ -785,7 +799,7 @@ workspace_for_role() {
 build_role_command() {
     local role="$1"
     local agent="$2"
-    local board_q role_q role_workspace workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q
+    local board_q role_q role_workspace workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q role_model role_reasoning reviewer_mode_env reasoning_arg_q
     board_q="$(shell_quote "$BOARD")"
     role_q="$(shell_quote "$role")"
     role_workspace="$(workspace_for_role "$role")"
@@ -870,11 +884,23 @@ build_role_command() {
             done
             local codex_home_q
             codex_home_q="$(shell_quote "$codex_home")"
-            cmd="cd ${workspace_q} && CODEX_HOME=${codex_home_q} HERMES_KANBAN_BOARD=${board_q} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            role_model="$CODEX_MODEL"
+            role_reasoning=""
+            reviewer_mode_env=""
+            if [ "$role" = "reviewer" ]; then
+                role_model="$REVIEWER_MODEL"
+                role_reasoning="$REVIEWER_REASONING_EFFORT"
+                reviewer_mode_env=" HERMES_REVIEWER_MODE=$(shell_quote "$REVIEWER_MODE")"
+            fi
+            cmd="cd ${workspace_q} && CODEX_HOME=${codex_home_q} HERMES_KANBAN_BOARD=${board_q}${reviewer_mode_env} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
-            if [ -n "$CODEX_MODEL" ]; then
-                model_q="$(shell_quote "$CODEX_MODEL")"
+            if [ -n "$role_model" ]; then
+                model_q="$(shell_quote "$role_model")"
                 cmd+=" --model ${model_q}"
+            fi
+            if [ -n "$role_reasoning" ]; then
+                reasoning_arg_q="$(shell_quote "model_reasoning_effort=\"${role_reasoning}\"")"
+                cmd+=" --codex-arg=-c --codex-arg=${reasoning_arg_q}"
             fi
             if [ -n "$CODEX_SANDBOX" ]; then
                 sandbox_q="$(shell_quote "$CODEX_SANDBOX")"
@@ -992,6 +1018,9 @@ echo "  designer workspace: ${DESIGNER_WORKSPACE}"
 echo "  Task delivery: ${TASK_DELIVERY}"
 if agent_is_used codex; then
     echo "  Codex model/sandbox: ${CODEX_MODEL:-auto}/${CODEX_SANDBOX:-auto}"
+fi
+if [ "$REVIEWER_AGENT" = "codex" ] || [ "$REVIEWER_AGENT" = "codex-custom" ]; then
+    echo "  Reviewer mode: ${REVIEWER_MODE} (${REVIEWER_MODEL}@${REVIEWER_REASONING_EFFORT})"
 fi
 if agent_is_used codewhale; then
     echo "  CodeWhale provider/model: ${DEEPSEEK_PROVIDER}/${DEEPSEEK_MODEL:-auto}"
