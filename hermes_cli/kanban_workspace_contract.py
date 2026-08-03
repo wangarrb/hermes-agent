@@ -140,13 +140,9 @@ def resolve_workspace_contract(task: Any, workspace: Path | str) -> dict[str, An
             f"base commit is not reachable in repository: {declared_base}"
         )
     resolved_base = resolved_base_result.stdout.strip()
-    ancestor = _run_git(
-        path, "merge-base", "--is-ancestor", resolved_base, "HEAD", check=False,
-    )
-    if ancestor.returncode != 0:
-        raise WorkspaceContractError(
-            f"base commit is not an ancestor of worktree HEAD: {resolved_base}"
-        )
+    # NOTE: base commit ancestor check removed — designer/planner worktrees
+    # may legitimately lag behind the main repository (they sync before
+    # starting work); lag must not block claiming a ready task.
 
     raw_target = getattr(task, "target_branch", None) or ""
     target_branch = validate_branch_name(str(raw_target)) if raw_target else ""

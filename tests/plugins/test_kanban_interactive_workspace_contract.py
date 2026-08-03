@@ -155,7 +155,11 @@ def test_claim_persists_resolved_worktree_and_actual_branch_in_prompt(
     assert claimed.branch_name == expected_branch
 
     assert len(injected) == 1
-    prompt_path = Path(injected[0])
+    # [by watcher] provenance marker is appended to distinguish watcher
+    # injections from user input — assert it is present, then strip it to
+    # resolve the underlying prompt path.
+    assert injected[0].endswith(" [by watcher]")
+    prompt_path = Path(injected[0].removesuffix(" [by watcher]"))
     assert prompt_path.is_relative_to(resolved_workspace)
     assert not prompt_path.is_relative_to(pane_workspace)
     prompt = prompt_path.read_text(encoding="utf-8")
