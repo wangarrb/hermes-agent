@@ -65,8 +65,10 @@ Each entry uses one of `whole_file`, `markdown_heading`, `python_symbol` or
 - `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/continuous-execution-mode-protocol.md`
   (`whole_file`).
 
-The source manifest stores absolute path, semantic section selector and SHA256.
-A deterministic builder emits
+The source manifest stores stable absolute paths and semantic section
+selectors; it deliberately does not pin a source SHA, because a legitimate
+canonical-rule edit must trigger refresh rather than invalidate the manifest.
+A deterministic builder computes the current whole-file SHA256 and emits
 `sources/kanban_collaboration_current_evidence.md` containing only bounded
 extracts plus the complete source/hash inventory. It never invents policy and
 never reads generated mental-model exports as input.
