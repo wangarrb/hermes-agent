@@ -12,6 +12,7 @@ set -euo pipefail
 # Reviewer resource-mode mapping is kept separate from the layout code so the
 # model/reasoning contract has a tiny executable test.
 source "$SCRIPT_DIR/../lib/reviewer_mode.sh"
+source "$SCRIPT_DIR/../lib/codex_role_home.sh"
 
 # 坑63: Hermes profile 下 HOME 指向虚拟目录
 export REAL_HOME="/home/wyr"
@@ -945,13 +946,7 @@ build_role_command() {
             # session for THAT role, not the global most-recent one.
             # Shared files (config, auth, skills) are symlinked from ~/.codex.
             local codex_home="${REAL_HOME}/.codex-kanban/${role}"
-            mkdir -p "$codex_home/sessions"
-            for f in config.toml auth.json hooks.json installation_id .personality_migration version.json AGENTS.md RTK.md models_cache.json; do
-                [ -e "${REAL_HOME}/.codex/$f" ] && [ ! -e "$codex_home/$f" ] && ln -sf "${REAL_HOME}/.codex/$f" "$codex_home/$f"
-            done
-            for d in claude-skills superpowers skills plugins agents; do
-                [ -d "${REAL_HOME}/.codex/$d" ] && [ ! -e "$codex_home/$d" ] && ln -sf "${REAL_HOME}/.codex/$d" "$codex_home/$d"
-            done
+            ensure_codex_role_home "$REAL_HOME" "$codex_home"
             local codex_home_q
             codex_home_q="$(shell_quote "$codex_home")"
             role_model="$CODEX_MODEL"
