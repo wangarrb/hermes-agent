@@ -39,7 +39,7 @@
       "ground_truth": "planner 用项目主目录；designer/coordinator 用登记的长期 workspace；implementer 默认继承任务发布者 workspace。",
       "key_d_refs": [],
       "expected_pitfall_triggers": [["planner", "主目录"], ["designer", "长期 workspace"], ["coordinator", "长期 workspace"], ["implementer", "继承发布者"]],
-      "forbidden_assertions": ["planner 默认新建 worktree", "implementer 总是在固定共享目录"],
+      "forbidden_assertions": ["planner 默认新建 worktree", "implementer 总是在固定共享目录", "implementer 可写卡必须总是显式 workspace", "designer create 必须由数据库机械强制 worktree/base"],
       "pass_condition": "必须给出四角色的默认 workspace 所有权。"
     },
     {
