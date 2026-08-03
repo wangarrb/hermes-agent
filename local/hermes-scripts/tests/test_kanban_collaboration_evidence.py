@@ -187,6 +187,71 @@ def test_shell_function_rejects_unsupported_backticks(tmp_path: Path) -> None:
         module.build_snapshot(manifest, tmp_path / "evidence.md")
 
 
+def test_shell_function_ignores_fake_declarations_inside_heredocs(tmp_path: Path) -> None:
+    module = _load_module()
+    shell = tmp_path / "fake-only.sh"
+    shell.write_text(
+        "cat <<'EOF'\n"
+        "usage() {\n"
+        "  fake body\n"
+        "}\n"
+        "EOF\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+    manifest = _manifest(tmp_path, [_source(shell, [{"kind": "shell_function", "value": "usage"}])])
+
+    with pytest.raises(ValueError, match="resolved 0 times"):
+        module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+
+def test_shell_function_finds_only_real_declaration_after_a_heredoc(tmp_path: Path) -> None:
+    module = _load_module()
+    shell = tmp_path / "fake-before-real.sh"
+    shell.write_text(
+        "cat <<'EOF'\n"
+        "usage() { fake }\n"
+        "EOF\n"
+        "usage() { :; }\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+    manifest = _manifest(tmp_path, [_source(shell, [{"kind": "shell_function", "value": "usage"}])])
+
+    snapshot = module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+    assert snapshot["evidence"][0]["bounded_bytes"] == "usage() { :; }\n"
+
+
+def test_shell_function_does_not_treat_a_here_string_as_a_heredoc(tmp_path: Path) -> None:
+    module = _load_module()
+    shell = tmp_path / "here-string.sh"
+    shell.write_text("usage() { read value <<< \"}\"; }\n", encoding="utf-8")
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+    manifest = _manifest(tmp_path, [_source(shell, [{"kind": "shell_function", "value": "usage"}])])
+
+    snapshot = module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+    assert snapshot["evidence"][0]["bounded_bytes"] == "usage() { read value <<< \"}\"; }\n"
+
+
+def test_shell_function_ignores_fake_declarations_in_quotes_and_comments(tmp_path: Path) -> None:
+    module = _load_module()
+    shell = tmp_path / "quoted-fakes.sh"
+    shell.write_text(
+        "# usage() { fake comment }\n"
+        "fake='usage() { fake quote }'\n"
+        "usage() { :; }\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+    manifest = _manifest(tmp_path, [_source(shell, [{"kind": "shell_function", "value": "usage"}])])
+
+    snapshot = module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+    assert snapshot["evidence"][0]["bounded_bytes"] == "usage() { :; }\n"
+
+
 @pytest.mark.parametrize(
     ("sources", "error"),
     [

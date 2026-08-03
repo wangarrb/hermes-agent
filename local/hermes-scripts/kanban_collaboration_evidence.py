@@ -148,7 +148,12 @@ def _shell_closing_brace(text: str, opening: int) -> int:
                 raise ValueError("unsupported shell escape")
             index += 2
             continue
-        if char == "<" and text[index + 1 : index + 2] == "<":
+        if (
+            char == "<"
+            and text[index - 1 : index] != "<"
+            and text[index + 1 : index + 2] == "<"
+            and text[index + 2 : index + 3] != "<"
+        ):
             index = _skip_heredoc(text, index)
             continue
         if char in ("'", '"'):
@@ -168,12 +173,77 @@ def _shell_closing_brace(text: str, opening: int) -> int:
     raise ValueError("unclosed shell function body")
 
 
+def _shell_function_starts(text: str, name: str) -> list[int]:
+    starts: list[int] = []
+    escaped = False
+    comment = False
+    contexts: list[dict[str, str | None]] = [{"quote": None, "command": None}]
+    index = 0
+    while index < len(text):
+        char = text[index]
+        context = contexts[-1]
+        quote = context["quote"]
+        if comment:
+            if char == "\n":
+                comment = False
+            index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote == '"':
+                escaped = True
+            elif char == "`" and quote == '"':
+                raise ValueError("unsupported shell construct: backticks")
+            elif char == quote:
+                context["quote"] = None
+            elif char == "$" and quote == '"' and text[index + 1 : index + 2] == "(":
+                contexts.append({"quote": None, "command": "$("})
+                index += 2
+                continue
+            index += 1
+            continue
+        if index == 0 or text[index - 1] == "\n":
+            match = _SHELL_FUNCTION_RE.match(text, index)
+            if match is not None:
+                if match.group("name") == name:
+                    starts.append(match.start())
+                index = match.end()
+                continue
+        if char == "$" and text[index + 1 : index + 2] == "(":
+            contexts.append({"quote": None, "command": "$("})
+            index += 2
+            continue
+        if char == "`":
+            raise ValueError("unsupported shell construct: backticks")
+        if char == "\\":
+            if index + 1 >= len(text):
+                raise ValueError("unsupported shell escape")
+            index += 2
+            continue
+        if (
+            char == "<"
+            and text[index - 1 : index] != "<"
+            and text[index + 1 : index + 2] == "<"
+            and text[index + 2 : index + 3] != "<"
+        ):
+            index = _skip_heredoc(text, index)
+            continue
+        if char in ("'", '"'):
+            context["quote"] = char
+        elif char == "#" and (index == 0 or text[index - 1].isspace()):
+            comment = True
+        elif char == ")" and context["command"] == "$(":
+            contexts.pop()
+        index += 1
+    return starts
+
+
 def _shell_function(text: str, name: str) -> list[str]:
-    extracted = []
-    for match in _SHELL_FUNCTION_RE.finditer(text):
-        if match.group("name") == name:
-            extracted.append(text[match.start() : _shell_closing_brace(text, match.end() - 1)])
-    return extracted
+    return [
+        text[start : _shell_closing_brace(text, text.find("{", start))]
+        for start in _shell_function_starts(text, name)
+    ]
 
 
 def _resolve_selector(text: str, selector: dict[str, Any]) -> str:
