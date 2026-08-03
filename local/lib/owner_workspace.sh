@@ -117,6 +117,10 @@ owner_workspace_prepare() {
         return 3
     fi
     if [[ -n "$(git -C "$target" status --porcelain)" ]]; then
+        if [[ "$action" == "prepare" && "$created_worktree" == "0" ]]; then
+            echo "status=DIRTY_NOT_SYNCED"
+            return 0
+        fi
         echo "owner worktree is dirty: $target" >&2
         return 3
     fi

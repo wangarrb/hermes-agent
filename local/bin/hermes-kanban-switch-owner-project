@@ -108,9 +108,10 @@ PANE_NAME="$(zellij --session "$SESSION" action list-panes --all --json | jq -r 
 
 BEFORE_SHA="$(git -C "$ROLE_WORKSPACE" rev-parse HEAD 2>/dev/null || printf missing)"
 if [[ "$ROLE" == "planner" ]]; then
-    "$SCRIPT_DIR/hermes-kanban-owner-workspace" prepare --role planner --workspace "$TARGET_WORKSPACE" >/dev/null
+    "$SCRIPT_DIR/hermes-kanban-owner-workspace" sync --role planner --workspace "$TARGET_WORKSPACE" >/dev/null
 else
     "$SCRIPT_DIR/hermes-kanban-owner-workspace" prepare --role "$ROLE" --workspace "$TARGET_WORKSPACE" --target "$ROLE_WORKSPACE" >/dev/null
+    "$SCRIPT_DIR/hermes-kanban-owner-workspace" sync --role "$ROLE" --workspace "$TARGET_WORKSPACE" --target "$ROLE_WORKSPACE" >/dev/null
 fi
 AFTER_SHA="$(git -C "$ROLE_WORKSPACE" rev-parse HEAD)"
 

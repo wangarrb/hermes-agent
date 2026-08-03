@@ -52,6 +52,8 @@ $HELPER prepare --role coordinator --workspace "$PRIMARY" >/dev/null
 assert_eq "$(git -C "$TMP/AnyRepo-coordinator" branch --show-current)" "coordinator/mainline"
 
 printf 'dirty\n' >>"$TMP/AnyRepo-coordinator/base.txt"
+prepare_dirty="$($HELPER prepare --role coordinator --workspace "$PRIMARY")"
+assert_contains "$prepare_dirty" "status=DIRTY_NOT_SYNCED"
 if $HELPER sync --role coordinator --workspace "$PRIMARY" >/dev/null 2>&1; then
     fail "dirty worktree was accepted"
 fi
