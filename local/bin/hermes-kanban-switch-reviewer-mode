@@ -75,7 +75,7 @@ mapfile -t OLD_WATCHERS < <(
 )
 
 ORIGINAL_FOCUS="$(zellij --session "$SESSION" action list-panes --all --json | jq -r '.[] | select(.is_plugin == false and .is_focused == true) | .id' | head -n 1)"
-zellij --session "$SESSION" action focus-pane --pane-id "$PANE_ID"
+zellij --session "$SESSION" action focus-pane-id "$PANE_ID"
 NEW_PANE="$(zellij --session "$SESSION" action new-pane --in-place --close-replaced-pane \
     --name codex-kanban --cwd "$WORKSPACE" -- bash -lc "$LAUNCH_CMD")"
 
@@ -84,6 +84,6 @@ for pid in "${OLD_WATCHERS[@]}"; do
 done
 
 if [[ -n "$ORIGINAL_FOCUS" && "$ORIGINAL_FOCUS" != "$PANE_ID" ]]; then
-    zellij --session "$SESSION" action focus-pane --pane-id "$ORIGINAL_FOCUS" 2>/dev/null || true
+    zellij --session "$SESSION" action focus-pane-id "$ORIGINAL_FOCUS" 2>/dev/null || true
 fi
 echo "reviewer mode switched: old_pane=${PANE_ID} new_pane=${NEW_PANE} mode=${MODE} model=${MODEL}@${EFFORT}"

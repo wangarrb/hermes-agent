@@ -115,5 +115,9 @@ assert_contains "$source_text" "owner_switch_has_running_task"
 assert_contains "$source_text" "wait_for_reviewer_switch_boundary"
 assert_contains "$source_text" "owner_switch_pane_fingerprint"
 assert_contains "$source_text" "--close-replaced-pane"
+assert_contains "$source_text" "action focus-pane-id"
+if [[ "$source_text" == *"action focus-pane --pane-id"* ]]; then
+    fail "unsupported zellij focus-pane subcommand remains"
+fi
 
 echo "PASS: owner project switch contract"

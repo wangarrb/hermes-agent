@@ -128,9 +128,9 @@ if [[ "$CURRENT_PANE" != "$PANE_ID" || "$CURRENT_FINGERPRINT" != "$BEFORE_FINGER
 fi
 
 ORIGINAL_FOCUS="$(zellij --session "$SESSION" action list-panes --all --json | jq -r '.[] | select(.is_plugin == false and .is_focused == true) | .id' | head -n 1)"
-zellij --session "$SESSION" action focus-pane --pane-id "$PANE_ID"
+zellij --session "$SESSION" action focus-pane-id "$PANE_ID"
 NEW_PANE="$(zellij --session "$SESSION" action new-pane --in-place --close-replaced-pane --name "$ROLE-hermes" --cwd "$ROLE_WORKSPACE" -- bash -lc "$LAUNCH_CMD")"
 if [[ -n "$ORIGINAL_FOCUS" && "$ORIGINAL_FOCUS" != "$PANE_ID" ]]; then
-    zellij --session "$SESSION" action focus-pane --pane-id "$ORIGINAL_FOCUS" 2>/dev/null || true
+    zellij --session "$SESSION" action focus-pane-id "$ORIGINAL_FOCUS" 2>/dev/null || true
 fi
 echo "owner project switched: role=$ROLE old_pane=$PANE_ID new_pane=$NEW_PANE target=$TARGET_BOARD workspace=$ROLE_WORKSPACE"

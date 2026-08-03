@@ -39,5 +39,8 @@ dry_run="$(bash "$SWITCH" --board egomotion4d --mode balanced --dry-run)"
 [[ "$dry_run" == *"HERMES_REVIEWER_MODE=balanced"* ]]
 [[ "$dry_run" == *"--model gpt-5.6-sol"* ]]
 [[ "$dry_run" == *"model_reasoning_effort="* ]]
+switch_source="$(<"$SWITCH")"
+[[ "$switch_source" == *"action focus-pane-id"* ]]
+[[ "$switch_source" != *"action focus-pane --pane-id"* ]]
 
 echo "reviewer mode switch safety: PASS"
