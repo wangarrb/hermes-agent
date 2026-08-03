@@ -43,14 +43,15 @@ algorithm rules into Hermes.
 
 ### Implementer responsibility
 
-The implementer is no longer a worker pool for planner, designer, or
-coordinator.  An owner keeps bounded work in its own goal and uses a background
-subagent for long-running or parallel implementation, experiment, or inventory
-work.  The owner remains responsible for integration, evidence, and goal
-completion; it does not create an implementer Kanban card merely to wait for
-that work.
+The implementer is no longer the default worker pool for planner, designer, or
+coordinator.  An owner keeps bounded work in its own goal and preferentially
+uses a background subagent for long-running or parallel implementation,
+experiment, or inventory work.  The owner remains responsible for integration,
+evidence, and goal completion.  It may still create an implementer Kanban card
+when a background subagent is unsuitable, the contract is frozen, and durable
+cross-session Kanban ownership is worth the communication cost.
 
-Implementer capacity is reserved for reviewer assistance.  A reviewer may
+Implementer capacity is primarily reserved for reviewer assistance.  A reviewer may
 delegate deterministic diff inspection, focused tests, artifact and metric
 inventory, reproduction, bounded tool-heavy investigation, or a small repair
 whose acceptance contract is already frozen.  Implementer cost is treated as

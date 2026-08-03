@@ -27,8 +27,8 @@
 - [ ] Add failing guidance assertions proving planner/designer/coordinator share
   the owner capability boundary and implementer is a bounded reviewer assistant.
 - [ ] Assert generic owner guidance sends long work to background subagents,
-  calls the detached helper for an explicit project switch, and never recommends
-  an owner-to-implementer delegation.
+  calls the detached helper for an explicit project switch, and makes
+  owner-to-implementer delegation an explicit non-default exception.
 - [ ] Run the two focused test files and confirm the new assertions fail.
 - [ ] Extend `_ROLE_SOURCE_ALIASES` to map coordinator to planner and replace the
   stale per-role listener strings with a shared owner string plus the new
@@ -48,8 +48,8 @@
 - Modify: `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/continuous-execution-mode-protocol.md`
 - Create: `/home/wyr/code/Egomotion4D/tests/test_role_guidance_contract.py`
 
-- [ ] Add a static guidance test reading the project files and rejecting the old
-  owner-to-implementer delegation language.
+- [ ] Add a static guidance test reading the project files and rejecting language
+  that makes owner-to-implementer delegation the default long-work path.
 - [ ] Verify RED against current project guidance.
 - [ ] Update the smallest guaranteed sections: owners use background subagents
   for long work; implementer assists reviewer; reviewer retains probability,
