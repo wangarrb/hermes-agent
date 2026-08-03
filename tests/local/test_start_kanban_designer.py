@@ -39,12 +39,28 @@ def _sandboxed_launcher(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     source = START_SCRIPT.read_text(encoding="utf-8")
     original = 'export REAL_HOME="/home/wyr"'
     assert original in source
-    launcher = tmp_path / "start-kanban.sh"
+    launcher = tmp_path / "local/bin/start-kanban.sh"
+    launcher.parent.mkdir(parents=True)
     launcher.write_text(
         source.replace(original, f'export REAL_HOME="{fake_home}"', 1),
         encoding="utf-8",
     )
     launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
+    test_lib = tmp_path / "local/lib"
+    test_lib.mkdir(parents=True)
+    for name in ("reviewer_mode.sh", "owner_workspace.sh"):
+        (test_lib / name).write_text(
+            (REPO_ROOT / "local/lib" / name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    helper = tmp_path / "local/bin/hermes-kanban-owner-workspace"
+    helper.write_text(
+        (REPO_ROOT / "local/bin/hermes-kanban-owner-workspace").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
 
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
@@ -61,10 +77,7 @@ def _run_launcher(
 ) -> tuple[subprocess.CompletedProcess[str], str, Path, Path]:
     launcher, fake_home, env = _sandboxed_launcher(tmp_path)
     workspace = tmp_path / "workspace"
-    designer_workspace = tmp_path / "designer-workspace"
     workspace.mkdir()
-    designer_workspace.mkdir()
-    env["KANBAN_DESIGNER_WORKSPACE"] = str(designer_workspace)
     if env_updates:
         env.update(env_updates)
 
@@ -85,7 +98,8 @@ def _run_launcher(
     )
     layout_path = fake_home / ".config/zellij/layouts/kanban-launcher.kdl"
     layout = layout_path.read_text(encoding="utf-8") if layout_path.exists() else ""
-    return result, layout, workspace.resolve(), designer_workspace.resolve()
+    designer_workspace = Path(f"{workspace.resolve()}-designer")
+    return result, layout, workspace.resolve(), designer_workspace
 
 
 def _pane(layout: str, role: str) -> str:
@@ -116,9 +130,11 @@ def test_default_layout_has_designer_and_no_critic(tmp_path: Path) -> None:
     ]
     assert "critic" not in layout.lower()
     assert f'cwd="{designer_workspace}"' in _pane(layout, "designer")
-    for role in ("planner", "reviewer", "implementer", "coordinator"):
+    assert f'cwd="{workspace}-coordinator"' in _pane(layout, "coordinator")
+    for role in ("planner", "reviewer", "implementer"):
         assert f'cwd="{workspace}"' in _pane(layout, role)
     assert f"designer workspace: {designer_workspace}" in result.stdout
+    assert f"coordinator workspace: {workspace}-coordinator" in result.stdout
 
 
 def test_designer_cli_env_and_profile_keep_workspace_isolated(tmp_path: Path) -> None:
@@ -150,18 +166,22 @@ def test_designer_cli_env_and_profile_keep_workspace_isolated(tmp_path: Path) ->
 
 
 def test_designer_environment_mapping_is_used_without_cli_override(tmp_path: Path) -> None:
+    override = tmp_path / "explicit-designer"
     result, layout, _, designer_workspace = _run_launcher(
         tmp_path,
         "--reviewer-agent",
         "hermes",
-        env_updates={"KANBAN_DESIGNER_AGENT": "claude"},
+        env_updates={
+            "KANBAN_DESIGNER_AGENT": "claude",
+            "KANBAN_DESIGNER_WORKSPACE": str(override),
+        },
     )
 
     assert result.returncode == 0, result.stderr
     designer = _pane(layout, "designer")
     assert "designer-claude" in designer
-    assert f"CLAUDE_KANBAN_WORKSPACE={designer_workspace}" in designer
-    assert f"--workspace {designer_workspace}" in designer
+    assert f"CLAUDE_KANBAN_WORKSPACE={override}" in designer
+    assert f"--workspace {override}" in designer
 
 
 @pytest.mark.parametrize("option", ["-c", "--critic-agent"])
@@ -183,7 +203,7 @@ def test_removed_critic_option_exits_two_with_migration_hint(
     assert "已移除" in result.stderr or "迁移" in result.stderr
 
 
-def test_designer_supports_assist_delays_and_previous_worker_delay(
+def test_reviewer_supports_implementer_assist_delays_and_previous_worker_delay(
     tmp_path: Path,
 ) -> None:
     result, layout, _, _ = _run_launcher(
@@ -193,21 +213,21 @@ def test_designer_supports_assist_delays_and_previous_worker_delay(
         "--reviewer-agent",
         "hermes",
         "--assist-role",
-        "designer:implementer",
+        "reviewer:implementer",
         "--assist-role",
         "planner:designer",
         "--assist-role-delay",
-        "designer:implementer:12",
+        "reviewer:implementer:12",
         "--previous-worker-delay-s",
         "77",
     )
 
     assert result.returncode == 0, result.stderr
-    designer = _pane(layout, "designer")
+    reviewer = _pane(layout, "reviewer")
     planner = _pane(layout, "planner")
-    assert "--claim-assignees designer,implementer" in designer
-    assert "--assist-claim-delay-for implementer=12" in designer
-    assert "--previous-worker-delay-s 77" in designer
+    assert "HERMES_KANBAN_CLAIM_ASSIGNEES=reviewer,implementer" in reviewer
+    assert "HERMES_KANBAN_ASSIST_CLAIM_DELAYS=implementer=12" in reviewer
+    assert "HERMES_KANBAN_PREVIOUS_WORKER_DELAY_S=77" in reviewer
     assert "HERMES_KANBAN_CLAIM_ASSIGNEES=planner,designer" in planner
 
 
@@ -263,7 +283,7 @@ def test_planner_and_designer_hermes_start_with_equal_toolsets(
     assert f"cd {designer_workspace}" in designer
 
 
-def test_help_documents_designer_default_workspace(tmp_path: Path) -> None:
+def test_help_documents_project_neutral_owner_workspaces(tmp_path: Path) -> None:
     launcher, _, env = _sandboxed_launcher(tmp_path)
     result = subprocess.run(
         [str(launcher), "--help"],
@@ -276,7 +296,40 @@ def test_help_documents_designer_default_workspace(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "-d, --designer-agent" in result.stdout
     assert "--designer-workspace" in result.stdout
-    assert "/home/wyr/code/Egomotion4D-designer" in result.stdout
+    assert "--coordinator-workspace" in result.stdout
+    assert "<primary>-designer" in result.stdout
+    assert "<primary>-coordinator" in result.stdout
+    assert "/home/wyr/code/Egomotion4D-designer" not in result.stdout
+    assert "reviewer:implementer" in result.stdout
+    assert "designer:implementer" not in result.stdout
+    assert "coordinator:implementer" not in result.stdout
+
+
+def test_cli_overrides_both_owner_workspaces(tmp_path: Path) -> None:
+    designer = tmp_path / "designer-explicit"
+    coordinator = tmp_path / "coordinator-explicit"
+    result, layout, _, _ = _run_launcher(
+        tmp_path,
+        "--designer-workspace",
+        str(designer),
+        "--coordinator-workspace",
+        str(coordinator),
+        "--reviewer-agent",
+        "hermes",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f'cwd="{designer}"' in _pane(layout, "designer")
+    assert f'cwd="{coordinator}"' in _pane(layout, "coordinator")
+
+
+def test_launcher_delegates_real_owner_preparation_to_helper() -> None:
+    source = START_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'OWNER_WORKSPACE_HELPER="$SCRIPT_DIR/hermes-kanban-owner-workspace"' in source
+    assert '"$OWNER_WORKSPACE_HELPER" prepare --role designer' in source
+    assert '"$OWNER_WORKSPACE_HELPER" prepare --role coordinator' in source
+    assert 'if [ "$DRY_RUN" != "1" ]; then' in source
 
 
 def test_stop_script_only_matches_active_roles() -> None:

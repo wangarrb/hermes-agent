@@ -52,7 +52,7 @@ owner_workspace_print_contract() {
 }
 
 owner_workspace_prepare() {
-    local action="$1" role="$2" workspace="$3" dry_run="${4:-0}"
+    local action="$1" role="$2" workspace="$3" dry_run="${4:-0}" target_override="${5:-}"
     local primary target branch base integration_branch created_worktree=0 created_branch=0
 
     owner_workspace_validate_role "$role" || return
@@ -66,7 +66,11 @@ owner_workspace_prepare() {
         return 2
     }
     base="$(git -C "$primary" rev-parse HEAD)" || return
-    target="$(owner_workspace_path "$primary" "$role")" || return
+    if [[ -n "$target_override" ]]; then
+        target="$(readlink -m "$target_override")"
+    else
+        target="$(owner_workspace_path "$primary" "$role")" || return
+    fi
     branch="$(owner_workspace_branch "$primary" "$role")" || return
 
     owner_workspace_print_contract "$primary" "$role" "$target" "$branch" "$base" "$integration_branch"

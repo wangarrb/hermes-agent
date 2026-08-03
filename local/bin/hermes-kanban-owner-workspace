@@ -7,7 +7,7 @@ source "$ROOT/local/lib/owner_workspace.sh"
 
 usage() {
     cat <<'EOF'
-Usage: hermes-kanban-owner-workspace <prepare|sync> --role <planner|designer|coordinator> --workspace <primary> [--dry-run]
+Usage: hermes-kanban-owner-workspace <prepare|sync> --role <planner|designer|coordinator> --workspace <primary> [--target <path>] [--dry-run]
 EOF
 }
 
@@ -18,11 +18,13 @@ case "$action" in prepare|sync) ;; *) usage >&2; exit 2 ;; esac
 
 role=""
 workspace=""
+target=""
 dry_run=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --role) role="${2:-}"; shift 2 ;;
         --workspace) workspace="${2:-}"; shift 2 ;;
+        --target) target="${2:-}"; shift 2 ;;
         --dry-run) dry_run=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -30,4 +32,4 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$role" && -n "$workspace" ]] || { usage >&2; exit 2; }
-owner_workspace_prepare "$action" "$role" "$workspace" "$dry_run"
+owner_workspace_prepare "$action" "$role" "$workspace" "$dry_run" "$target"

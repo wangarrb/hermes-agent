@@ -2,7 +2,7 @@
 # 启动 kanban 5分窗口。角色固定，底层 agent 可切换。
 # 默认布局：左上planner=hermes,右上reviewer=codex,左下implementer=hermes,中下designer=hermes,右下coordinator=hermes
 # 默认任务交付：inject（通过 Zellij 注入）；self-poll 已移除
-# 双角色用法：--assist-role coordinator:implementer --assist-role designer:implementer
+# reviewer 确定性协助：--assist-role reviewer:implementer
 
 SOURCE_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
@@ -25,8 +25,9 @@ usage() {
 
 核心参数:
   -b, --board <board>              Kanban board 名称，例如 egomotion4d
-  -w, --workspace <path>           工作目录，默认 $HOME/code/Egomotion4D
-  --designer-workspace <path>      designer 工作目录，默认 /home/wyr/code/Egomotion4D-designer
+  -w, --workspace <path>           项目主工作目录
+  --designer-workspace <path>      designer 工作目录，默认 <primary>-designer
+  --coordinator-workspace <path>   coordinator 工作目录，默认 <primary>-coordinator
   -n, --dry-run                    只生成并打印 zellij layout，不启动/不清理
 
 角色 -> agent 映射（默认就是当前常用配置）:
@@ -67,7 +68,7 @@ Agent 参数:
                                    profile:sec、:sec、sec。省略时默认 profile/assignee=implementer
   --assist-profile-delay <spec>    同上，但总是作为全局 profile 规则下发，适合 backup_immplementer
   --assist-role <role:assignee>    让某个 pane 空闲时辅助 claim 指定 assignee 的 ready 任务；
-                                   例如 planner:implementer。可重复。主角色优先。
+                                   例如 reviewer:implementer。可重复。主角色优先。
 
 Zellij:
   --session-name <name>            新 session 名，默认 kanban-<board>
@@ -147,7 +148,8 @@ clean_session_name() {
 
 BOARD=""
 WORKSPACE="${KANBAN_WORKSPACE:-${CODEWHALE_KANBAN_WORKSPACE:-${CODEX_KANBAN_WORKSPACE:-${DEEPSEEK_KANBAN_WORKSPACE:-${REAL_HOME}/code/Egomotion4D}}}}"
-DESIGNER_WORKSPACE="${KANBAN_DESIGNER_WORKSPACE:-${REAL_HOME}/code/Egomotion4D-designer}"
+DESIGNER_WORKSPACE="${KANBAN_DESIGNER_WORKSPACE:-}"
+COORDINATOR_WORKSPACE="${KANBAN_COORDINATOR_WORKSPACE:-}"
 COORDINATOR_AGENT="${KANBAN_COORDINATOR_AGENT:-hermes}"
 PLANNER_AGENT="${KANBAN_PLANNER_AGENT:-hermes}"
 IMPLEMENTER_AGENT="${KANBAN_IMPLEMENTER_AGENT:-hermes}"
@@ -353,6 +355,8 @@ while [[ $# -gt 0 ]]; do
             need_value "$1" "${2:-}"; WORKSPACE="$2"; shift 2 ;;
         --designer-workspace)
             need_value "$1" "${2:-}"; DESIGNER_WORKSPACE="$2"; shift 2 ;;
+        --coordinator-workspace)
+            need_value "$1" "${2:-}"; COORDINATOR_WORKSPACE="$2"; shift 2 ;;
         -o|--coordinator-agent)
             need_value "$1" "${2:-}"; COORDINATOR_AGENT="$2"; shift 2 ;;
         -p|--planner-agent)
@@ -490,11 +494,20 @@ if [ ! -d "$WORKSPACE" ]; then
     exit 1
 fi
 WORKSPACE="$(readlink -f "$WORKSPACE")"
-if [ ! -d "$DESIGNER_WORKSPACE" ]; then
-    echo "错误: designer workspace 不存在: $DESIGNER_WORKSPACE" >&2
-    exit 1
+DESIGNER_WORKSPACE="$(readlink -m "${DESIGNER_WORKSPACE:-${WORKSPACE}-designer}")"
+COORDINATOR_WORKSPACE="$(readlink -m "${COORDINATOR_WORKSPACE:-${WORKSPACE}-coordinator}")"
+
+OWNER_WORKSPACE_HELPER="$SCRIPT_DIR/hermes-kanban-owner-workspace"
+if [ "$DRY_RUN" != "1" ]; then
+    [ -x "$OWNER_WORKSPACE_HELPER" ] || {
+        echo "错误: 找不到 owner workspace helper: $OWNER_WORKSPACE_HELPER" >&2
+        exit 1
+    }
+    if [ "$DESIGNER_AGENT" != "none" ]; then
+        "$OWNER_WORKSPACE_HELPER" prepare --role designer --workspace "$WORKSPACE" --target "$DESIGNER_WORKSPACE"
+    fi
+    "$OWNER_WORKSPACE_HELPER" prepare --role coordinator --workspace "$WORKSPACE" --target "$COORDINATOR_WORKSPACE"
 fi
-DESIGNER_WORKSPACE="$(readlink -f "$DESIGNER_WORKSPACE")"
 
 if ! command -v zellij >/dev/null 2>&1; then
     echo "错误: 找不到 zellij" >&2
@@ -807,11 +820,11 @@ append_assist_delay_args() {
 
 workspace_for_role() {
     local role="$1"
-    if [ "$role" = "designer" ]; then
-        printf '%s' "$DESIGNER_WORKSPACE"
-    else
-        printf '%s' "$WORKSPACE"
-    fi
+    case "$role" in
+        designer) printf '%s' "$DESIGNER_WORKSPACE" ;;
+        coordinator) printf '%s' "$COORDINATOR_WORKSPACE" ;;
+        *) printf '%s' "$WORKSPACE" ;;
+    esac
 }
 
 build_role_command() {
@@ -1033,6 +1046,7 @@ else
 fi
 echo "  workspace: ${WORKSPACE}"
 echo "  designer workspace: ${DESIGNER_WORKSPACE}"
+echo "  coordinator workspace: ${COORDINATOR_WORKSPACE}"
 echo "  Task delivery: ${TASK_DELIVERY}"
 if agent_is_used codex; then
     echo "  Codex model/sandbox: ${CODEX_MODEL:-auto}/${CODEX_SANDBOX:-auto}"
