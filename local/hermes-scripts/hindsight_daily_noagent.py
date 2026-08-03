@@ -2343,7 +2343,26 @@ def _format_gate_question(question: dict) -> str:
             + "; ".join(groups)
             + "."
         )
+    forbidden = [str(item) for item in question.get("forbidden_assertions", [])]
+    if forbidden:
+        sections.append(
+            "Forbidden assertions (do not state or endorse these exact claims): "
+            + "; ".join(forbidden)
+            + "."
+        )
     return "\n\n".join(sections)
+
+
+def _smoke_answer_contract_passes(text: str, question: dict) -> bool:
+    """Apply required-term and explicit forbidden-claim smoke assertions."""
+    key_terms = list(question.get("key_d_refs", []))
+    key_terms += list(question.get("expected_pitfall_triggers", []))
+    matched = sum(1 for term in key_terms if _matches_expected_term(text, term))
+    d_refs = list(question.get("key_d_refs", []))
+    has_d_refs = all(_matches_expected_term(text, term) for term in d_refs)
+    forbidden = list(question.get("forbidden_assertions", []))
+    has_forbidden = any(_matches_expected_term(text, term) for term in forbidden)
+    return bool(key_terms) and has_d_refs and matched >= len(key_terms) * 0.5 and not has_forbidden
 
 
 def _run_smoke_regression(
@@ -2426,10 +2445,7 @@ def _run_smoke_regression(
             key_terms += list(q.get("expected_pitfall_triggers", []))
             matched = sum(1 for term in key_terms if _matches_expected_term(text, term))
             total = len(key_terms)
-
-            d_refs = list(q.get("key_d_refs", []))
-            has_d_refs = all(_matches_expected_term(text, term) for term in d_refs)
-            if total > 0 and has_d_refs and matched >= total * 0.5:
+            if _smoke_answer_contract_passes(text, q):
                 print(f"  {qid}: PASS ({matched}/{total} key terms)")
                 passed += 1
             else:

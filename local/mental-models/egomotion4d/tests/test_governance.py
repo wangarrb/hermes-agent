@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ SCRIPT = REPO_ROOT / "local" / "hermes-scripts" / "hindsight_daily_noagent.py"
 RUN_AB = MODEL_ROOT / "benchmark" / "run_ab.py"
 PITFALL_WRITER = MODEL_ROOT / "pitfall_writer.py"
 WRAPPER = REPO_ROOT / "local" / "hermes-scripts" / "daily_mental_model_wrapper.py"
+RECREATE_MODELS = MODEL_ROOT / "recreate_models.py"
 
 
 def _load_module(name: str, path: Path):
@@ -24,6 +26,100 @@ def _load_module(name: str, path: Path):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_kanban_collaboration_model_contract_is_complete():
+    spec = json.loads(
+        (MODEL_ROOT / "specs" / "kanban-collaboration.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    benchmark = json.loads(
+        (
+            MODEL_ROOT
+            / "benchmark"
+            / "questions-kanban-collaboration.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert spec["output_language"] == "zh-CN"
+    assert spec["max_tokens"] == 4096
+    assert spec["required_prefix"] == "# Egomotion4D Kanban"
+    assert spec["required_terminal_marker"] == "END_KANBAN_COLLABORATION"
+    assert spec["inline_source_files"] is True
+    assert spec["source_files"] == [
+        "sources/kanban_collaboration_current_evidence.md"
+    ]
+    assert spec["benchmark_file"] == "questions-kanban-collaboration.json"
+    question_ids = {item["id"] for item in benchmark["questions"]}
+    assert set(spec["smoke_ids"]) <= question_ids
+    assert len(benchmark["questions"]) >= 8
+    required_topics = {
+        "dispatch",
+        "notification",
+        "goal-completion",
+        "workspace",
+        "verdict-reset",
+        "safe-fifo",
+        "reassign",
+        "authority",
+    }
+    assert {item["topic"] for item in benchmark["questions"]} == required_topics
+    for question in benchmark["questions"]:
+        assert question["expected_pitfall_triggers"]
+        assert question["forbidden_assertions"]
+
+
+def test_recreate_models_selects_only_collaboration_pair_in_dry_run():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RECREATE_MODELS),
+            "--model-root",
+            str(MODEL_ROOT),
+            "--only",
+            "egomotion4d-kanban-collaboration",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count('"id": "egomotion4d-kanban-collaboration-') == 2
+    assert '"id": "egomotion4d-kanban-collaboration-a"' in result.stdout
+    assert '"id": "egomotion4d-kanban-collaboration-b"' in result.stdout
+    assert "research-guardrails-a" not in result.stdout
+
+
+def test_smoke_contract_rejects_forbidden_assertions(daily):
+    question = {
+        "key_d_refs": [],
+        "expected_pitfall_triggers": ["default subscribe", "same-profile default off"],
+        "forbidden_assertions": ["same-profile default subscribe"],
+    }
+
+    assert daily._smoke_answer_contract_passes(
+        "Cross-profile is default subscribe; same-profile default off.", question
+    )
+    assert not daily._smoke_answer_contract_passes(
+        "Cross-profile is default subscribe; same-profile default subscribe.", question
+    )
+
+
+def test_gate_question_exposes_forbidden_assertions(daily):
+    rendered = daily._format_gate_question(
+        {
+            "question": "How does notification work?",
+            "key_d_refs": [],
+            "expected_pitfall_triggers": ["default subscribe"],
+            "forbidden_assertions": ["same-profile default subscribe"],
+        }
+    )
+
+    assert "Forbidden assertions" in rendered
+    assert "same-profile default subscribe" in rendered
 
 
 @pytest.fixture

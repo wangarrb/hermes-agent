@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "logical_id": "egomotion4d-kanban-collaboration",
+  "questions": [
+    {
+      "id": "KB01",
+      "topic": "dispatch",
+      "question": "Egomotion4D Kanban 的唯一合法任务分发路径是什么？可以同时运行 headless dispatch/daemon 吗？",
+      "ground_truth": "只能使用 interactive watcher + Zellij inject；禁止 headless dispatch、daemon 和 dispatch_once/dispatch_loop。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["interactive watcher", "交互式 watcher"], ["Zellij inject", "zellij 注入"], ["禁止 headless", "不得 headless"]],
+      "forbidden_assertions": ["可以同时使用 headless dispatch", "daemon 是备用分发路径"],
+      "pass_condition": "必须说明唯一分发路径并拒绝 headless 竞争 claim。"
+    },
+    {
+      "id": "KB02",
+      "topic": "notification",
+      "question": "任务创建后的结果通知在跨 profile 与同 profile 场景分别默认如何处理？",
+      "ground_truth": "跨 profile create 默认订阅发布者；同 profile 默认关闭，除非显式请求。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["跨 profile", "cross-profile"], ["默认订阅", "default subscribe"], ["同 profile", "same-profile"], ["默认关闭", "default off"]],
+      "forbidden_assertions": ["同 profile 默认订阅", "所有 create 都不订阅"],
+      "pass_condition": "必须同时区分跨 profile 默认开与同 profile 默认关。"
+    },
+    {
+      "id": "KB03",
+      "topic": "goal-completion",
+      "question": "planner/designer 的大型 Kanban goal 在何时才算完成？送审或测试通过是否足够？",
+      "ground_truth": "必须达到 north-star 证据并获得最终 reviewer 的通过或带病通过；仅送审、局部 artifact 或测试通过都不等于完成。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["最终 reviewer", "final reviewer"], ["通过", "带病通过"], ["不等于完成", "不是完成"]],
+      "forbidden_assertions": ["提交审核即完成", "测试通过就可以 complete goal"],
+      "pass_condition": "必须把最终 reviewer acceptance 纳入完成条件。"
+    },
+    {
+      "id": "KB04",
+      "topic": "workspace",
+      "question": "planner、designer、coordinator、implementer 默认在哪个 workspace 工作？",
+      "ground_truth": "planner 用项目主目录；designer/coordinator 用登记的长期 workspace；implementer 默认继承任务发布者 workspace。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["planner", "主目录"], ["designer", "长期 workspace"], ["coordinator", "长期 workspace"], ["implementer", "继承发布者"]],
+      "forbidden_assertions": ["planner 默认新建 worktree", "implementer 总是在固定共享目录"],
+      "pass_condition": "必须给出四角色的默认 workspace 所有权。"
+    },
+    {
+      "id": "KB05",
+      "topic": "verdict-reset",
+      "question": "reviewer 的正式结论和算法路线重置权如何定义？",
+      "ground_truth": "正式审核只给通过、拒绝、大修后再审、带病通过之一；正式成功率由 reviewer 判定，低于30%或承重假设被证伪立即换路。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": ["通过", "拒绝", "大修后再审", "带病通过", ["低于30%", "<30%"], ["立即换路", "重置路线"]],
+      "forbidden_assertions": ["必须等三次失败才换路", "planner 自己决定正式成功率"],
+      "pass_condition": "必须包含四态 verdict、reviewer 概率所有权和即时承重纠偏。"
+    },
+    {
+      "id": "KB06",
+      "topic": "safe-fifo",
+      "question": "目标 pane 正忙或输入框不稳定时，结果通知如何处理？等待通知时 goal 检查间隔如何调整？",
+      "ground_truth": "事件立即进入 durable FIFO，但不得立即注入；watcher 在安全边界有序投递，等待通知时 insurance 间隔延长到120分钟。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["durable FIFO", "持久队列"], ["安全边界", "safe boundary"], ["120分钟", "120 minutes"]],
+      "forbidden_assertions": ["pane 忙时立即注入", "等待期间继续两分钟轮询"],
+      "pass_condition": "必须说明 durable queue、安全注入和120分钟保险间隔。"
+    },
+    {
+      "id": "KB07",
+      "topic": "reassign",
+      "question": "常任务在 owner 间流转时应优先 reassign 还是创建反向通知/continuation 卡？",
+      "ground_truth": "同一 objective 优先保留原卡并 reassign/写 durable handback；通知由通用结果机制承担，不创建 notification 或纯唤醒 continuation 卡。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["原卡", "same task"], ["reassign", "重新指派"], ["durable", "持久评论"], ["不创建 notification", "禁止通知卡"]],
+      "forbidden_assertions": ["每次交回都创建新 continuation", "用 reviewer 卡承载纯通知"],
+      "pass_condition": "必须优先原卡流转并拒绝通知型卡片。"
+    },
+    {
+      "id": "KB08",
+      "topic": "authority",
+      "question": "mental model 与当前代码、AGENTS.md、角色 prompt 或旧 Hindsight 记忆冲突时，以谁为准？",
+      "ground_truth": "当前运行代码和自动加载的 AGENTS.md/当前角色 prompt 优先；mental model 是审阅缓存，旧记忆或旧导出必须视为过时。",
+      "key_d_refs": [],
+      "expected_pitfall_triggers": [["当前代码", "current code"], ["AGENTS.md", "角色 prompt"], ["审阅缓存", "review cache"], ["过时", "stale"]],
+      "forbidden_assertions": ["mental model 覆盖当前代码", "旧 Hindsight 记忆优先"],
+      "pass_condition": "必须给出正确事实源优先级。"
+    }
+  ]
+}

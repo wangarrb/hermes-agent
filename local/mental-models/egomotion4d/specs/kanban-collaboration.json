@@ -1,0 +1,42 @@
+{
+  "output_language": "zh-CN",
+  "source_query": "根据唯一的权威证据快照，生成一份当前有效的 Egomotion4D Kanban 协作 mental model。它是审阅缓存，不是新的规则源。必须按顺序包含九个二级标题：系统拓扑与唯一分发路径；角色职责与决策权；任务、Goal 与审核生命周期；Workspace、分支与并发写集；Watcher 安全注入与结果通知；Reviewer 结论、成功率与路线重置；资源模式与委派边界；故障恢复与禁止事项；事实源与更新方式。必须明确：interactive watcher + Zellij inject 是唯一分发路径；planner 使用项目主目录，designer/coordinator 使用登记的长期 workspace，implementer 默认继承发布者 workspace；大型 owner 工作使用真实 Kanban goal，最终 reviewer 通过或带病通过属于完成条件；reviewer 给出四态确定结论并拥有正式成功率/路线重置；跨 profile create 默认订阅发布者，同 profile 默认不订阅除非显式请求；结果先进入 durable FIFO，只有安全输入边界才注入，等待通知时 goal completion insurance 间隔为 120 分钟；durable comment 是权威，不创建 notification/continuation 卡，不使用 headless dispatch；当前代码、AGENTS.md 和角色 prompt 优先于旧记忆及导出。不得编造规则，不得把 mental model 写成强制每轮注入。最后一行必须且只能是 END_KANBAN_COLLABORATION。",
+  "tags": [
+    "egomotion4d",
+    "hmm-kanban-collaboration-current"
+  ],
+  "max_tokens": 4096,
+  "required_anchors": [
+    "系统拓扑与唯一分发路径",
+    "角色职责与决策权",
+    "任务、Goal 与审核生命周期",
+    "Workspace、分支与并发写集",
+    "Watcher 安全注入与结果通知",
+    "Reviewer 结论、成功率与路线重置",
+    "资源模式与委派边界",
+    "故障恢复与禁止事项",
+    "事实源与更新方式"
+  ],
+  "decision_ids": [],
+  "required_terminal_marker": "END_KANBAN_COLLABORATION",
+  "require_source_facts": false,
+  "required_prefix": "# Egomotion4D Kanban",
+  "inline_source_files": true,
+  "source_fact_retry_contract_version": 1,
+  "adjudicator_contract_version": 4,
+  "benchmark_file": "questions-kanban-collaboration.json",
+  "smoke_ids": [
+    "KB01",
+    "KB02",
+    "KB03",
+    "KB04",
+    "KB05",
+    "KB06",
+    "KB07",
+    "KB08"
+  ],
+  "source_files": [
+    "sources/kanban_collaboration_current_evidence.md"
+  ],
+  "source_document_id": "egomotion4d-hmm-kanban-collaboration-current-v1"
+}

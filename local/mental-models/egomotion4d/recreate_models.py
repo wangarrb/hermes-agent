@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recreate all 4 mental models with optimized source_query.
+"""Recreate Egomotion4D mental models from their tracked generation specs.
 
 Key improvements over v1:
 - Explicit D-ref ranges to guide retrieval
@@ -7,10 +7,21 @@ Key improvements over v1:
 - Bilingual query
 - Tighter scope per model
 """
+import argparse
 import hashlib, json, os, requests, time, sys
 
 API = "http://127.0.0.1:8888"
 BANK = "hermes"
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--model-root",
+    default=os.path.expanduser("~/.hermes/mental-models/egomotion4d"),
+    help="Root containing specs/, sources/ and benchmark/",
+)
+parser.add_argument("--only", help="Create only one full logical model ID")
+parser.add_argument("--dry-run", action="store_true", help="Print payloads only")
+args = parser.parse_args()
 
 models = [
     {
@@ -104,12 +115,29 @@ Exclude:
 Cite D/task/report anchors. Mark unanchored as UNVERIFIED_LEAD.""",
         "max_tokens": 2048,
     },
+    {
+        "id_suffix": "kanban-collaboration",
+        "name_a": "Egomotion4D Kanban 协作机制 (active A)",
+        "name_b": "Egomotion4D Kanban 协作机制 (candidate B)",
+        "source_query": "Generate the current Egomotion4D Kanban collaboration model.",
+        "max_tokens": 4096,
+    },
 ]
 
-spec_root = os.path.expanduser("~/.hermes/mental-models/egomotion4d/specs")
+if args.only:
+    requested_suffix = args.only.removeprefix("egomotion4d-")
+    models = [model for model in models if model["id_suffix"] == requested_suffix]
+    if not models:
+        parser.error(f"unknown logical model: {args.only}")
+
+model_root = os.path.abspath(os.path.expanduser(args.model_root))
+spec_root = os.path.join(model_root, "specs")
+configured_models = []
 for model in models:
     spec_path = os.path.join(spec_root, f"{model['id_suffix']}.json")
     if not os.path.isfile(spec_path):
+        if args.only:
+            parser.error(f"generation spec not found: {spec_path}")
         continue
     with open(spec_path, encoding="utf-8") as spec_file:
         spec = json.load(spec_file)
@@ -130,6 +158,8 @@ for model in models:
     model["source_query"] = "\n\n".join(query_parts) + "\n"
     model["max_tokens"] = spec["max_tokens"]
     model["tags"] = spec["tags"]
+    configured_models.append(model)
+models = configured_models
 
 trigger = {
     "mode": "full",
@@ -152,6 +182,10 @@ for m in models:
             "max_tokens": m["max_tokens"],
             "trigger": trigger,
         }
+        if args.dry_run:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            created.append(payload["id"])
+            continue
         try:
             resp = requests.post(f"{API}/v1/default/banks/{BANK}/mental-models", json=payload, timeout=15)
             d = resp.json()
@@ -164,6 +198,9 @@ for m in models:
             print(f"ERROR: {payload['id']} - {e}")
 
 print(f"\nCreated {len(created)} models. Waiting for reflect operations to complete...")
+
+if args.dry_run:
+    sys.exit(0)
 
 
 # After creating models, update registry with per-model evidence SHAs from bundle.
