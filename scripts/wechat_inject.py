@@ -102,9 +102,7 @@ def main():
 
     before = dump(pane)
     inject(pane, message)
-    print(f"[{role}] 已注入，等待响应...", file=sys.stderr)
-    response = wait_response(pane, before, args.timeout)
-    print(response)
+    print(f"[{role}] 转发成功")
 
 if __name__ == "__main__":
     main()
