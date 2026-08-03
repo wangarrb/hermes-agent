@@ -408,6 +408,163 @@ def test_refresh_evidence_bundle_recomputes_changed_sources(tmp_path, monkeypatc
     assert refreshed["per_model"][logical_id]["evidence_sha256"] != "old"
 
 
+def test_refresh_evidence_bundle_builds_registered_kanban_snapshot_before_hashing(
+    tmp_path, monkeypatch, daily
+):
+    logical_id = "egomotion4d-kanban-collaboration"
+    source_dir = tmp_path / "mental-models" / "egomotion4d" / "sources"
+    source_dir.mkdir(parents=True)
+    canonical_source = tmp_path / "canonical.txt"
+    canonical_source.write_text("canonical evidence\n", encoding="utf-8")
+    snapshot = source_dir / "kanban_collaboration_current_evidence.md"
+    (source_dir / "kanban_collaboration_sources.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "logical_id": logical_id,
+                "sources": [
+                    {
+                        "name": "canonical",
+                        "path": str(canonical_source),
+                        "selectors": [{"kind": "whole_file"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source_dir / "derived-build-inputs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    snapshot.name: {
+                        "authority": "canonical-source-extract",
+                        "replaceable": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "mental-models" / "egomotion4d" / "evidence_bundle.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    logical_id: {
+                        "d_ids": [],
+                        "sources": {
+                            "snapshot": {"path": str(snapshot), "sha256": "stale"}
+                        },
+                        "evidence_sha256": "old",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    refreshed = daily._refresh_evidence_bundle()
+
+    assert snapshot.is_file()
+    assert refreshed["per_model"][logical_id]["sources"]["snapshot"]["sha256"] == (
+        hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    )
+
+
+def test_refresh_evidence_bundle_requires_manifest_for_registered_kanban_model(
+    tmp_path, monkeypatch, daily
+):
+    root = tmp_path / "mental-models" / "egomotion4d"
+    root.mkdir(parents=True)
+    (root / "evidence_bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    "egomotion4d-kanban-collaboration": {
+                        "d_ids": [],
+                        "sources": {},
+                        "evidence_sha256": "old",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    with pytest.raises(ValueError, match="kanban collaboration manifest"):
+        daily._refresh_evidence_bundle()
+
+
+def test_refresh_evidence_bundle_does_not_require_kanban_manifest_for_old_models(
+    tmp_path, monkeypatch, daily
+):
+    logical_id = "egomotion4d-dynamic-actor"
+    root = tmp_path / "mental-models" / "egomotion4d"
+    root.mkdir(parents=True)
+    (root / "evidence_bundle.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    logical_id: {"d_ids": [], "sources": {}, "evidence_sha256": "old"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    assert daily._refresh_evidence_bundle()["per_model"][logical_id]["evidence_sha256"]
+
+
+def test_validate_current_evidence_build_input_accepts_canonical_source_extract(
+    tmp_path, daily
+):
+    source = tmp_path / "kanban_collaboration_current_evidence.md"
+    source.write_text("derived snapshot", encoding="utf-8")
+    (tmp_path / "derived-build-inputs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    source.name: {
+                        "authority": "canonical-source-extract",
+                        "replaceable": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    daily._validate_current_evidence_build_input(source)
+
+
+def test_validate_current_evidence_build_input_rejects_unknown_authority(tmp_path, daily):
+    source = tmp_path / "kanban_collaboration_current_evidence.md"
+    source.write_text("derived snapshot", encoding="utf-8")
+    (tmp_path / "derived-build-inputs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    source.name: {"authority": "untrusted", "replaceable": True}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid derived build input contract"):
+        daily._validate_current_evidence_build_input(source)
+
+
 def test_refresh_evidence_bundle_rejects_unmarked_current_evidence(
     tmp_path, monkeypatch, daily
 ):
@@ -570,7 +727,7 @@ def test_all_model_smoke_checks_each_accepted_revision(tmp_path, monkeypatch, da
     monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
     calls = []
 
-    def fake_smoke(_api_url, *, logical_id, **_kwargs):
+    def fake_smoke(_api_url, _isolated_context, *, logical_id, **_kwargs):
         calls.append(logical_id)
         return 0
 

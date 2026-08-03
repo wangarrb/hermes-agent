@@ -8,6 +8,7 @@ After pipeline completes, triggers an agent analysis for daily research summary.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import pwd
@@ -628,6 +629,13 @@ def _canonical_evidence_sha(entry: dict) -> str:
 
 
 CURRENT_EVIDENCE_BUILD_INPUT_MANIFEST = "derived-build-inputs.json"
+KANBAN_COLLABORATION_LOGICAL_ID = "egomotion4d-kanban-collaboration"
+KANBAN_COLLABORATION_MANIFEST = "kanban_collaboration_sources.json"
+KANBAN_COLLABORATION_SNAPSHOT = "kanban_collaboration_current_evidence.md"
+CURRENT_EVIDENCE_BUILD_INPUT_AUTHORITIES = {
+    "kg-current-evidence",
+    "canonical-source-extract",
+}
 
 
 def _validate_current_evidence_build_input(path: Path) -> None:
@@ -644,16 +652,46 @@ def _validate_current_evidence_build_input(path: Path) -> None:
         ) from exc
     if (
         manifest.get("schema_version") != 1
-        or contract.get("authority") != "kg-current-evidence"
+        or contract.get("authority") not in CURRENT_EVIDENCE_BUILD_INPUT_AUTHORITIES
         or contract.get("replaceable") is not True
     ):
         raise ValueError(f"{path}: invalid derived build input contract")
+
+
+def _build_kanban_collaboration_snapshot(evidence_root: Path) -> None:
+    """Regenerate the registered Kanban evidence input through its maintained helper."""
+    sources_root = evidence_root / "sources"
+    manifest_path = sources_root / KANBAN_COLLABORATION_MANIFEST
+    if not manifest_path.is_file():
+        raise ValueError(f"kanban collaboration manifest missing: {manifest_path}")
+
+    helper_path = Path(__file__).with_name("kanban_collaboration_evidence.py")
+    if not helper_path.is_file():
+        raise ValueError(f"kanban collaboration evidence helper missing: {helper_path}")
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "hindsight_daily_kanban_collaboration_evidence", helper_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("unable to create helper import spec")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        build_snapshot = getattr(helper, "build_snapshot", None)
+        if not callable(build_snapshot):
+            raise TypeError("helper does not export callable build_snapshot")
+        build_snapshot(manifest_path, sources_root / KANBAN_COLLABORATION_SNAPSHOT)
+    except Exception as exc:
+        raise ValueError(
+            f"kanban collaboration evidence build failed: {helper_path}"
+        ) from exc
 
 
 def _refresh_evidence_bundle() -> dict:
     """Refresh source hashes and deterministic identities without changing acceptance."""
     path = HERMES_HOME / "mental-models" / "egomotion4d" / "evidence_bundle.json"
     bundle = json.loads(path.read_text(encoding="utf-8"))
+    if KANBAN_COLLABORATION_LOGICAL_ID in bundle.get("per_model", {}):
+        _build_kanban_collaboration_snapshot(path.parent)
     for logical_id, entry in bundle.get("per_model", {}).items():
         spec_name = logical_id.removeprefix("egomotion4d-") + ".json"
         spec_path = path.parent / "specs" / spec_name

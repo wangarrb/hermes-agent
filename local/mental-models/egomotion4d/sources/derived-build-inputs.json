@@ -2,6 +2,10 @@
   "schema_version": 1,
   "policy": "Derived, replaceable mental-model build inputs. KG/current evidence owns truth; conclusions must be written there first.",
   "sources": {
+    "kanban_collaboration_current_evidence.md": {
+      "authority": "canonical-source-extract",
+      "replaceable": true
+    },
     "dynamic_actor_current_evidence.md": {
       "authority": "kg-current-evidence",
       "replaceable": true,
