@@ -560,3 +560,135 @@ sys.exit(rc if rc else 0)
 
         p.terminate()
         p.wait(timeout=5)
+
+
+# ── Isolated fake-board smoke test ────────────────────────────────────────────
+
+class TestIsolatedFakeBoardSmoke:
+    """Smoke test: fake watcher holds lock, reload CLI triggers ACK, claim stays."""
+
+    def test_reload_preserves_pid_and_claim_state(self, tmp_path, monkeypatch):
+        """
+        1. Start a fake watcher with a fixed identity.
+        2. Write a reload request.
+        3. Send SIGUSR1.
+        4. Verify ACK is written with matching nonce and unchanged PID.
+        5. Verify the watcher continues running (heartbeat continues).
+        """
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+
+        # Start fake watcher
+        code = f'''
+import sys, os, time
+sys.path.insert(0, "{REPO}/tests/fixtures")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+import fake_reload_watcher
+sys.argv = ["fake_reload_watcher.py",
+    "--board", "fakeboard",
+    "--profile", "coordinator",
+    "--session", "fake-session",
+    "--pane", "1",
+    "--handoff-dir", "{tmp_path}/handoff",
+    "--claim-file", "{tmp_path}/claim.json",
+]
+rc = fake_reload_watcher.main()
+sys.exit(rc if rc else 0)
+'''
+        p = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(0.5)
+
+        # Verify watcher holds lock (metadata exists)
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("fakeboard", "coordinator", "fake-session", "1")
+        meta_path = root / ident.digest / "metadata.json"
+        assert meta_path.exists(), "watcher metadata not found"
+        meta = json.loads(meta_path.read_text())
+        assert meta["pid"] == p.pid, f"metadata PID {meta['pid']} != watcher PID {p.pid}"
+
+        # Write claim fixture
+        claim_path = Path(tmp_path) / "claim.json"
+        claim_data = {
+            "task_id": "t_smoke",
+            "run_id": 1,
+            "generation": 1,
+            "claim_lock": f"host:{p.pid}:fake-interactive",
+            "worker_pid": p.pid,
+        }
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        claim_path.write_text(json.dumps(claim_data))
+
+        # Write reload request
+        nonce = "smoke-nonce-12345"
+        req = ReloadRequest(
+            nonce=nonce,
+            identity_digest=ident.digest,
+            owner_pid=p.pid,
+            owner_start_time=0,
+            request_time=int(time.time()),
+        )
+        write_reload_request(root, req)
+
+        # Send SIGUSR1
+        os.kill(p.pid, signal.SIGUSR1)
+
+        # Wait for ACK
+        ack_path = Path(tmp_path) / "handoff" / f"ack.{ident.digest}.json"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if ack_path.exists():
+                break
+            time.sleep(0.2)
+
+        assert ack_path.exists(), "ACK not written"
+        ack_data = json.loads(ack_path.read_text())
+        assert ack_data["nonce"] == nonce, "nonce mismatch"
+        assert ack_data["pid"] == p.pid, "PID changed during reload"
+
+        # Verify claim fixture unchanged
+        loaded_claim = json.loads(claim_path.read_text())
+        assert loaded_claim["task_id"] == "t_smoke"
+        assert loaded_claim["run_id"] == 1
+        assert loaded_claim["generation"] == 1
+        assert loaded_claim["claim_lock"] == f"host:{p.pid}:fake-interactive"
+
+        # Verify watcher still alive (heartbeat continues)
+        assert p.poll() is None, "watcher process died after reload"
+
+        p.terminate()
+        p.wait(timeout=5)
+
+    def test_two_same_key_spawn_attempts_yield_one_lock_owner(self, tmp_path, monkeypatch):
+        """Two simultaneous same-key spawn attempts yield one lock owner."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        code = f'''
+import sys, os
+sys.path.insert(0, "{REPO}/tests/fixtures")
+os.environ["XDG_RUNTIME_DIR"] = "{tmp_path}"
+import fake_reload_watcher
+sys.argv = ["fake_reload_watcher.py",
+    "--board", "fakeboard2",
+    "--profile", "coordinator",
+    "--session", "fake-session2",
+    "--pane", "1",
+]
+rc = fake_reload_watcher.main()
+sys.exit(rc if rc else 0)
+'''
+        p1 = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(0.3)
+        p2 = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        out2, _ = p2.communicate(timeout=5)
+        p1.terminate()
+        p1.wait(timeout=5)
+
+        assert "LOCK_REJECTED" in out2, "Second same-key spawn should be rejected"
+        assert p2.returncode != 0, "Rejected spawn should exit non-zero"
