@@ -17,7 +17,7 @@ DEFAULT_SHARED_SKILLS_ROOT = Path("/home/wyr/.hermes/skills")
 MAX_SOURCE_BYTES = 64 * 1024
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _SAFE_SKILL_NAME = re.compile(r"^[A-Za-z0-9._/-]+$")
-_ROLE_SOURCE_ALIASES = {"designer": "planner"}
+_ROLE_SOURCE_ALIASES = {"designer": "planner", "coordinator": "planner"}
 
 
 class RoleContextError(RuntimeError):

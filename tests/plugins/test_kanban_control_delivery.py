@@ -299,5 +299,18 @@ def test_task_prompt_contains_role_guidance_and_generation_fences(tmp_path):
     )
 
     assert "--run-id 42 --generation 3" in prompt
-    assert "implementer：负责落地执行" in prompt
+    assert "implementer：主要协助 reviewer" in prompt
+    assert "owner 的例外委派" in prompt
+    assert "正式成功率、算法方向、路线重置、审核结论和最终 handback 只由 reviewer 决定" in prompt
     assert "HERMES_KANBAN_GENERATION=3" in prompt
+
+
+@pytest.mark.parametrize("owner_role", ["planner", "designer", "coordinator"])
+def test_owner_guidance_uses_background_subagents_and_explicit_project_switch(owner_role):
+    guidance = bl.role_guidance(owner_role)
+
+    assert "连续执行 owner" in guidance
+    assert "耗时或可并行工作优先使用自己的后台子 agent" in guidance
+    assert "hermes-kanban-switch-owner-project" in guidance
+    assert "implementer 卡不是默认选择" in guidance
+    assert "禁止发布 implementer" not in guidance

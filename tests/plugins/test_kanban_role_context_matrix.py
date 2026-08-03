@@ -190,17 +190,18 @@ def test_task_assignee_is_effective_role_for_primary_claim(tmp_path):
     assert payload["assist"] is False
 
 
-def test_designer_reuses_planner_profile_prompt(tmp_path):
+@pytest.mark.parametrize("owner_role", ["designer", "coordinator"])
+def test_secondary_owner_reuses_planner_profile_prompt(tmp_path, owner_role):
     repo, profiles, shared, task, _, _ = _fixture(tmp_path)
-    task.assignee = "designer"
+    task.assignee = owner_role
     task.skills = []
     listener = HermesInteractiveListener()
-    output = tmp_path / "designer" / "role-context.json"
+    output = tmp_path / owner_role / "role-context.json"
 
     listener.render_effective_role_context(
         board="board",
         workspace=repo,
-        pane_profile="designer",
+        pane_profile=owner_role,
         task=task,
         output_path=output,
         profiles_root=profiles,
@@ -209,7 +210,7 @@ def test_designer_reuses_planner_profile_prompt(tmp_path):
     )
     payload = json.loads(output.read_text(encoding="utf-8"))
 
-    assert payload["effective_role"] == "designer"
+    assert payload["effective_role"] == owner_role
     assert payload["assist"] is False
     assert payload["project_prompt"]["content"] == "TRUSTED PLANNER PROMPT\n"
     assert "/planner/kanban-system-prompt.md" in payload["project_prompt"]["path"]
