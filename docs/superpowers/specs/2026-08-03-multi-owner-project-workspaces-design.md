@@ -41,6 +41,37 @@ when a project does not provide an intentional role-specific override.  This
 keeps the behavior useful outside Egomotion4D without copying its paths or
 algorithm rules into Hermes.
 
+### Implementer responsibility
+
+The implementer is no longer a worker pool for planner, designer, or
+coordinator.  An owner keeps bounded work in its own goal and uses a background
+subagent for long-running or parallel implementation, experiment, or inventory
+work.  The owner remains responsible for integration, evidence, and goal
+completion; it does not create an implementer Kanban card merely to wait for
+that work.
+
+Implementer capacity is reserved for reviewer assistance.  A reviewer may
+delegate deterministic diff inspection, focused tests, artifact and metric
+inventory, reproduction, bounded tool-heavy investigation, or a small repair
+whose acceptance contract is already frozen.  Implementer cost is treated as
+negligible relative to reviewer tokens, so the reviewer should delegate when
+the saved reviewer work exceeds the communication cost.  Formal success
+probability, algorithm direction, route reset, review verdict, and final
+handback remain reviewer-only decisions.
+
+Every reviewer-to-implementer task records an absolute workspace, actual
+branch, base SHA, write set, and commit ownership when writes are allowed.  If
+those fields are absent, the task is read-only and the implementer may report
+evidence but must not repair code.  This is especially important when the
+reviewed delivery belongs to a designer or coordinator worktree rather than
+the primary repository.
+
+This responsibility change is guidance-only.  It is expressed in the
+guaranteed project instructions and role prompts; this design deliberately
+does not add task-creator validation, claim rejection, database policy, or a
+new notification protocol.  A mistaken owner-to-implementer assignment is
+corrected through role guidance rather than a mechanical gate.
+
 ## Workspace convention
 
 Given a primary repository `/parent/Repo`:
@@ -101,15 +132,24 @@ a detached switch worker so replacing its own pane cannot kill the operation.
 The worker:
 
 1. accepts only `planner`, `designer`, or `coordinator`;
-2. confirms the selected pane has no running Kanban task;
-3. confirms an idle prompt and unchanged composer three times at ten-second
+2. confirms the target board already has a live reviewer lane capable of
+   accepting its checkpoint and final-review tasks;
+3. confirms the selected pane has no running Kanban task, no active owner
+   subagent, and no background job still using the source workspace;
+4. confirms an idle prompt and unchanged composer three times at ten-second
    intervals;
-4. prepares and synchronizes the target owner workspace;
-5. immediately before replacement, re-resolves the same pane and confirms once
+5. prepares and synchronizes the target owner workspace;
+6. immediately before replacement, re-resolves the same pane and confirms once
    more that it has no running task and that its composer signature is still
    the accepted signature;
-6. starts the target board/profile in a fresh project conversation;
-7. replaces only the selected pane in place.
+7. starts the target board/profile in a fresh project conversation;
+8. replaces only the selected pane in place.
+
+The natural-language owner flow verifies and explicitly confirms that its
+subagent/background-work ledger is clear before invoking the switch helper.
+The helper requires that confirmation and refuses an unattended switch without
+it.  An owner goal cannot complete while an owned background subagent remains
+active or has not handed back its result.
 
 The role profile and durable memory are retained, but the previous project's
 conversation is not resumed.  Other panes remain on their current boards and
@@ -122,6 +162,8 @@ projects.  A switch back uses the same command with the original project.
 - Merge conflict: abort the merge, restore the pre-switch repository state,
   and keep the old pane running.
 - Running task, busy prompt, or changing composer: do not switch.
+- Missing target reviewer lane or active source-project subagent/background
+  work: do not switch.
 - Missing or ambiguous project registry binding: request the missing value;
   never guess a repository or board.
 - Any failure before pane replacement is a zero-pane-change failure and is
@@ -148,6 +190,10 @@ only after the new worktrees and ancestry have been verified.
 ## Verification
 
 - Generic role guidance gives all three owners the same capability boundary.
+- Focused guidance tests prove owner prompts use background subagents instead
+  of implementer cards, reviewer guidance permits only bounded implementer
+  delegation, and success probability, algorithm direction, verdict, and
+  handback remain reviewer-owned.
 - Project role-context tests prove designer and coordinator reuse the planner
   prompt while retaining their effective role names.
 - Launcher tests derive sibling paths from arbitrary temporary repository
@@ -167,3 +213,4 @@ only after the new worktrees and ancestry have been verified.
 - No automatic pushing of owner branches.
 - No deletion of legacy worktrees or branches.
 - No role-specific changes in the generic Hermes runtime or database schema.
+- No database or listener enforcement of who may create implementer tasks.
