@@ -86,6 +86,11 @@ def stop_requested() -> bool:
     return _STOP
 
 
+def _result_notifications_enabled() -> bool:
+    raw = os.environ.get("HERMES_KANBAN_RESULT_NOTIFICATIONS", "1")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _has_open_reviewer_checkpoint(conn: Any, origin_task_id: str) -> bool:
     """Return whether the origin goal explicitly waits on an open review card."""
     for comment in reversed(kb.list_comments(conn, origin_task_id)):
@@ -921,6 +926,8 @@ class BaseInteractiveListener:
         self._idle_followup_since: float | None = None
         self._idle_followup_sent: bool = False
         self._goal_completion_last_sent_at: dict[str, float] = {}
+        self._goal_result_wait_since: dict[str, float] = {}
+        self._goals_waiting_on_results: set[str] = set()
         self._stable_composer_cache: dict[tuple[str, str], tuple[str, float]] = {}
 
     # An idle prompt is a safe input boundary, but brief idle flashes occur
@@ -928,6 +935,7 @@ class BaseInteractiveListener:
     IDLE_FOLLOWUP_GRACE_S: float = 15.0
     DAYTIME_GOAL_COMPLETION_INTERVAL_S: float = 2 * 60.0
     OVERNIGHT_GOAL_COMPLETION_INTERVAL_S: float = 30 * 60.0
+    RESULT_WAIT_GOAL_INTERVAL_S: float = 120 * 60.0
     OVERNIGHT_GOAL_COMPLETION_START_HOUR: int = 1
     OVERNIGHT_GOAL_COMPLETION_END_HOUR: int = 9
 
@@ -971,20 +979,59 @@ class BaseInteractiveListener:
             self._reset_idle_followup()
             return False
 
+        now = time.time()
+        waiting_state: kb.ResultWaitState | None = None
         if task.goal_mode:
-            if _has_open_reviewer_checkpoint(conn, task_id):
-                self._reset_idle_followup()
-                return True
-            marker = "GOAL_COMPLETION_CHECK"
-            text = (
-                f"[{marker}] Kanban task {task_id}: 任务都完成了吗？"
-                "请依据任务的北极星目标、durable history 和实际证据检查。"
-                "若已全部完成，更新证据并 complete；若尚未完成，在同一任务内"
-                "推进下一个具体步骤。中间 NO_CLAIM、局部产物或普通阻塞不等于"
-                "完成，除非任务合同明确将其定义为终态。若未达成北极星且不满足"
-                "升级条件，不得向用户列出普通技术选项；选择第一个未满足的承重 gate "
-                "并立即执行。"
+            if _result_notifications_enabled():
+                waiting_state = kb.result_wait_state(
+                    conn,
+                    task.assignee or self._profile,
+                    exclude_task_id=task_id,
+                )
+            waiting_on_results = bool(
+                waiting_state
+                and (waiting_state.watched_tasks or waiting_state.queue_ids)
             )
+            if waiting_on_results:
+                if task_id not in self._goals_waiting_on_results:
+                    self._goals_waiting_on_results.add(task_id)
+                    self._goal_result_wait_since[task_id] = now
+                watched = ", ".join(
+                    f"{watched_id}({status})"
+                    for watched_id, status in waiting_state.watched_tasks[:8]
+                ) or "none"
+                queued = ",".join(
+                    str(queue_id) for queue_id in waiting_state.queue_ids[:8]
+                ) or "none"
+                marker = "WAITING_ON_TASK_RESULTS"
+                text = (
+                    f"[{marker}] Kanban goal {task_id} is waiting on subscribed "
+                    f"task results: tasks={watched}; queue={queued}. This is the "
+                    "120-minute insurance check. Do not poll or create a "
+                    "continuation/notification card; continue only work that is "
+                    "independent of those results and let the watcher deliver them."
+                )
+            else:
+                if task_id in self._goals_waiting_on_results:
+                    self._goals_waiting_on_results.discard(task_id)
+                    self._goal_result_wait_since.pop(task_id, None)
+                    self._goal_completion_last_sent_at.pop(task_id, None)
+                    self._idle_followup_task_id = task_id
+                    self._idle_followup_since = now
+                    self._idle_followup_sent = False
+                if _has_open_reviewer_checkpoint(conn, task_id):
+                    self._reset_idle_followup()
+                    return True
+                marker = "GOAL_COMPLETION_CHECK"
+                text = (
+                    f"[{marker}] Kanban task {task_id}: 任务都完成了吗？"
+                    "请依据任务的北极星目标、durable history 和实际证据检查。"
+                    "若已全部完成，更新证据并 complete；若尚未完成，在同一任务内"
+                    "推进下一个具体步骤。中间 NO_CLAIM、局部产物或普通阻塞不等于"
+                    "完成，除非任务合同明确将其定义为终态。若未达成北极星且不满足"
+                    "升级条件，不得向用户列出普通技术选项；选择第一个未满足的承重 gate "
+                    "并立即执行。"
+                )
         elif task.assignee == "reviewer":
             marker = "REVIEW_LIFECYCLE"
             text = (
@@ -997,7 +1044,6 @@ class BaseInteractiveListener:
             self._reset_idle_followup()
             return False
 
-        now = time.time()
         if self._idle_followup_task_id != task_id:
             self._idle_followup_task_id = task_id
             self._idle_followup_since = now
@@ -1011,10 +1057,15 @@ class BaseInteractiveListener:
         if now - self._idle_followup_since < self.IDLE_FOLLOWUP_GRACE_S:
             return True
         if task.goal_mode:
-            last_sent_at = self._goal_completion_last_sent_at.get(task_id)
-            interval_s = self._goal_completion_interval_s(now)
-            if last_sent_at is not None and now - last_sent_at < interval_s:
-                return True
+            if task_id in self._goals_waiting_on_results:
+                wait_since = self._goal_result_wait_since.get(task_id, now)
+                if now - wait_since < self.RESULT_WAIT_GOAL_INTERVAL_S:
+                    return True
+            else:
+                last_sent_at = self._goal_completion_last_sent_at.get(task_id)
+                interval_s = self._goal_completion_interval_s(now)
+                if last_sent_at is not None and now - last_sent_at < interval_s:
+                    return True
 
         session = getattr(args, "zellij_session", "")
         pane_id = str(getattr(args, "zellij_pane_id", ""))
@@ -1036,7 +1087,10 @@ class BaseInteractiveListener:
         time.sleep(0.5)
         zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
         if task.goal_mode:
-            self._goal_completion_last_sent_at[task_id] = now
+            if task_id in self._goals_waiting_on_results:
+                self._goal_result_wait_since[task_id] = now
+            else:
+                self._goal_completion_last_sent_at[task_id] = now
         self._idle_followup_sent = True
         return True
 
@@ -1338,6 +1392,94 @@ class BaseInteractiveListener:
             log_path,
             f"delivered control {leased.id} for {leased.task_id}; awaiting ACK",
         )
+        return True
+
+    def pump_result_notifications(
+        self, args: argparse.Namespace, conn: Any, log_path: Path,
+    ) -> bool:
+        """Deliver one durable FIFO batch, or hold normal injection while pending.
+
+        The task transition that created the queue item never waits for this
+        method. A busy or unavailable pane simply leaves the durable head in
+        place for a later watcher tick.
+        """
+        if not _result_notifications_enabled():
+            return False
+        profile = str(getattr(args, "profile", "") or "").strip()
+        if not profile:
+            return False
+        wait_state = kb.result_wait_state(
+            conn, profile, exclude_task_id=self._active_task_id,
+        )
+        if not wait_state.queue_ids:
+            return False
+
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if not session or not pane_id:
+            return True
+        if not self.wait_for_stable_composer_input(
+            session=session,
+            pane_id=pane_id,
+            log_path=log_path,
+        ):
+            return True
+
+        receiver = f"{self._control_receiver(args)}:results"
+        try:
+            items = kb.lease_result_notifications(
+                conn,
+                target_profile=profile,
+                lease_owner=receiver,
+                limit=8,
+                lease_seconds=90,
+            )
+        except (ValueError, sqlite3.DatabaseError) as exc:
+            log_line(log_path, f"result queue lease failed: {exc}")
+            return True
+        if not items:
+            return True
+
+        parts: list[str] = []
+        for item in items:
+            detail = ""
+            payload = item.payload or {}
+            summary = payload.get("summary") or payload.get("reason")
+            if summary:
+                compact = " ".join(str(summary).split())[:160]
+                detail = f" ({compact})"
+            parts.append(
+                f"q{item.id}/e{item.event_id}:{item.task_id}={item.event_kind}{detail}"
+            )
+        prompt = tag_injected_text(
+            "[TASK_RESULTS_READY] "
+            + "; ".join(parts)
+            + ". Read each task's durable summary/comments/events, then continue "
+              "the existing objective; repeated queue/event IDs are replays.",
+            source_profile="watcher",
+        )
+        queue_ids = [item.id for item in items]
+        ok = zellij_inject(
+            session=session,
+            pane_id=pane_id,
+            text=prompt,
+            log_path=log_path,
+        )
+        if not ok:
+            kb.release_result_notification_lease(
+                conn, queue_ids, lease_owner=receiver,
+            )
+            log_line(log_path, f"result injection failed; released {queue_ids}")
+            return True
+        if not kb.mark_result_notifications_delivered(
+            conn, queue_ids, lease_owner=receiver,
+        ):
+            log_line(
+                log_path,
+                f"result queue injected but delivery CAS failed for {queue_ids}",
+            )
+        else:
+            log_line(log_path, f"delivered result queue rows {queue_ids} to {profile}")
         return True
 
     # ── claim_and_inject_one ──
@@ -1718,8 +1860,20 @@ class BaseInteractiveListener:
                         and current_generation == active_generation
                         and current_claim_lock == active_claim_lock
                     ):
-                        # Hook: subclass may do progress watch / idle reclaim / etc
-                        self.on_task_running_monitor(args, conn, active_task, log_path)
+                        # Cooperative controls preempt ordinary callbacks; durable
+                        # result callbacks in turn preempt goal/lifecycle nudges.
+                        # Heartbeats still run below even while a pane is busy and
+                        # an injection remains queued.
+                        injection_preempted = self.pump_control_messages(
+                            args, conn, log_path,
+                        )
+                        if not injection_preempted:
+                            injection_preempted = self.pump_result_notifications(
+                                args, conn, log_path,
+                            )
+                        if not injection_preempted:
+                            # Hook: subclass may do progress watch / idle reclaim / etc
+                            self.on_task_running_monitor(args, conn, active_task, log_path)
 
                         if now - last_hb >= max(15.0, min(float(args.ttl) / 3.0, 120.0)):
                             try:
@@ -1776,6 +1930,15 @@ class BaseInteractiveListener:
                         session=zellij_session, pane_id=str(zellij_pane_id),
                         name=self.pane_label(), log_path=log_path,
                     )
+
+                # Control and result queues have priority over backend idle hooks
+                # and ready-task discovery. Enqueue never waits for this boundary.
+                if self.pump_control_messages(args, conn, log_path):
+                    time.sleep(poll_s)
+                    continue
+                if self.pump_result_notifications(args, conn, log_path):
+                    time.sleep(poll_s)
+                    continue
 
                 # Hook: subclass idle-loop actions (e.g. auto-dismiss steering)
                 self.on_watcher_loop_idle(args, conn, log_path)

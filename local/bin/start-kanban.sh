@@ -868,9 +868,10 @@ workspace_for_role() {
 build_role_command() {
     local role="$1"
     local agent="$2"
-    local board_q role_q role_workspace workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q role_model role_reasoning reviewer_mode_env reasoning_arg_q
+    local board_q role_q role_workspace workspace_q codex_q provider_q model_q sandbox_q cmd claim_assignees claim_q assist_delay_q assist_delay_env assist_delays profile_delays_q item hermes_toolsets_q hermes_toolsets_env watcher_script_q continue_script_q role_model role_reasoning reviewer_mode_env reasoning_arg_q origin_profile_env
     board_q="$(shell_quote "$BOARD")"
     role_q="$(shell_quote "$role")"
+    origin_profile_env="HERMES_KANBAN_ORIGIN_PROFILE=${role_q}"
     role_workspace="$(workspace_for_role "$role")"
     workspace_q="$(shell_quote "$role_workspace")"
     codex_q="$(shell_quote "$CODEX_INTERACTIVE")"
@@ -936,7 +937,7 @@ build_role_command() {
             # context after claim without modifying the Hermes Agent source tree.
             watcher_script_q="$(shell_quote "$SCRIPT_DIR/hermes-kanban-role-context-listener.py")"
             continue_script_q="$(shell_quote "$SCRIPT_DIR/hermes-kanban-continue")"
-            printf 'sleep %s && cd %s && HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s HERMES_KANBAN_WATCHER_SCRIPT=%s%s%s %s -p %s' "$stagger_s" "$workspace_q" "$board_q" "$claim_q" "$watcher_script_q" "$assist_delay_env" "$hermes_toolsets_env" "$continue_script_q" "$role_q"
+            printf 'sleep %s && cd %s && %s HERMES_KANBAN_BOARD=%s HERMES_KANBAN_CLAIM_ASSIGNEES=%s HERMES_KANBAN_WATCHER_SCRIPT=%s%s%s %s -p %s' "$stagger_s" "$workspace_q" "$origin_profile_env" "$board_q" "$claim_q" "$watcher_script_q" "$assist_delay_env" "$hermes_toolsets_env" "$continue_script_q" "$role_q"
             ;;
         codex|codex-custom)
             # Per-role CODEX_HOME: each codex pane gets its own
@@ -961,7 +962,7 @@ build_role_command() {
                 role_reasoning="$REVIEWER_REASONING_EFFORT"
                 reviewer_mode_env=" HERMES_REVIEWER_MODE=$(shell_quote "$REVIEWER_MODE")"
             fi
-            cmd="cd ${workspace_q} && CODEX_HOME=${codex_home_q} HERMES_KANBAN_BOARD=${board_q}${reviewer_mode_env} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && CODEX_HOME=${codex_home_q} ${origin_profile_env} HERMES_KANBAN_BOARD=${board_q}${reviewer_mode_env} CODEX_KANBAN_WORKSPACE=${workspace_q} ${codex_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$role_model" ]; then
                 model_q="$(shell_quote "$role_model")"
@@ -985,7 +986,7 @@ build_role_command() {
             # 用 codewhale-kanban-interactive
             local cw_q
             cw_q="$(shell_quote "$CODEWHALE_INTERACTIVE")"
-            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CODEWHALE_KANBAN_WORKSPACE=${workspace_q} DEEPSEEK_KANBAN_WORKSPACE=${workspace_q} ${cw_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && ${origin_profile_env} HERMES_KANBAN_BOARD=${board_q} CODEWHALE_KANBAN_WORKSPACE=${workspace_q} DEEPSEEK_KANBAN_WORKSPACE=${workspace_q} ${cw_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$DEEPSEEK_MODEL" ]; then
                 model_q="$(shell_quote "$DEEPSEEK_MODEL")"
@@ -1008,7 +1009,7 @@ build_role_command() {
             ;;
         deepseek-reasonix)
             reasonix_q="$(shell_quote "$REASONIX_INTERACTIVE")"
-            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} ${reasonix_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && ${origin_profile_env} HERMES_KANBAN_BOARD=${board_q} ${reasonix_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             if [ -n "$DEEPSEEK_MODEL" ]; then
                 model_q="$(shell_quote "$DEEPSEEK_MODEL")"
@@ -1024,7 +1025,7 @@ build_role_command() {
         claude)
             local claude_q
             claude_q="$(shell_quote "$CLAUDE_INTERACTIVE")"
-            cmd="cd ${workspace_q} && HERMES_KANBAN_BOARD=${board_q} CLAUDE_KANBAN_WORKSPACE=${workspace_q} ${claude_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
+            cmd="cd ${workspace_q} && ${origin_profile_env} HERMES_KANBAN_BOARD=${board_q} CLAUDE_KANBAN_WORKSPACE=${workspace_q} ${claude_q} --profile ${role_q} --claim-assignees ${claim_q} --board ${board_q} --workspace ${workspace_q}"
             cmd="$(append_assist_delay_args "$cmd" "$assist_delays")"
             cmd+=" --auto-start"
             if [ "$agent" = "codex-custom" ]; then

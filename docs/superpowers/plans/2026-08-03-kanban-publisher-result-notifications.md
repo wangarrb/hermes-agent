@@ -18,7 +18,7 @@
 - Modify: `hermes_cli/kanban_db.py` (schema, task creation, event append, queue API)
 - Create: `tests/hermes_cli/test_kanban_result_notifications.py`
 
-- [ ] **Step 1: Write schema and subscription policy tests**
+- [x] **Step 1: Write schema and subscription policy tests**
 
   Add isolated-board tests that assert fresh and reopened DBs contain
   `kanban_result_subscriptions` and `kanban_result_queue`; an explicitly passed
@@ -26,7 +26,7 @@
   requested subscription on the existing task; and `reassign_task` leaves the
   original subscriber unchanged.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
   Run:
 
@@ -36,7 +36,7 @@
 
   Expected: FAIL because the tables and `result_subscriber` API do not exist.
 
-- [ ] **Step 3: Add the minimal durable schema and subscription API**
+- [x] **Step 3: Add the minimal durable schema and subscription API**
 
   In `SCHEMA_SQL`, create:
 
@@ -72,11 +72,11 @@
   names with the existing canonicalizer. Do not infer origin or assignee policy
   in this DB function.
 
-- [ ] **Step 4: Run the schema/subscription tests and verify GREEN**
+- [x] **Step 4: Run the schema/subscription tests and verify GREEN**
 
   Run the focused file. Expected: subscription tests PASS.
 
-- [ ] **Step 5: Write event enqueue and queue lease tests**
+- [x] **Step 5: Write event enqueue and queue lease tests**
 
   Add tests proving:
 
@@ -94,11 +94,11 @@
     and nonterminal subscribed task IDs without counting a same-profile goal's
     own task.
 
-- [ ] **Step 6: Run the focused tests and verify RED**
+- [x] **Step 6: Run the focused tests and verify RED**
 
   Expected: FAIL because actionable enqueue and lease APIs are absent.
 
-- [ ] **Step 7: Implement event-coupled enqueue and strict FIFO leasing**
+- [x] **Step 7: Implement event-coupled enqueue and strict FIFO leasing**
 
   Make `_append_event` return its integer event ID and, for the fixed actionable
   event-kind set, call a private `_enqueue_result_notifications` before the
@@ -120,7 +120,7 @@
   contiguous eligible prefix, stopping before any unexpired foreign lease.
   State transitions do no pane or Zellij I/O.
 
-- [ ] **Step 8: Run DB notification tests and the nearby DB regression suite**
+- [x] **Step 8: Run DB notification tests and the nearby DB regression suite**
 
   Run:
 
@@ -136,7 +136,7 @@
 - Modify: `hermes_cli/kanban.py` (create flags and origin resolution)
 - Modify: `tests/hermes_cli/test_kanban_result_notifications.py`
 
-- [ ] **Step 1: Write CLI policy tests**
+- [x] **Step 1: Write CLI policy tests**
 
   Test `_cmd_create` with `HERMES_KANBAN_ORIGIN_PROFILE` and assert:
 
@@ -153,11 +153,11 @@
   - arbitrary profile names follow the same rules, with no reviewer/owner
     branches.
 
-- [ ] **Step 2: Run those tests and verify RED**
+- [x] **Step 2: Run those tests and verify RED**
 
   Expected: FAIL because the create flags and resolution helper are absent.
 
-- [ ] **Step 3: Implement the minimal create options**
+- [x] **Step 3: Implement the minimal create options**
 
   Add a mutually exclusive `--notify-origin` / `--no-notify-origin` pair with
   default `None`, plus `--notify-profile PROFILE` and
@@ -169,7 +169,7 @@
   origin exists and canonical origin differs from canonical assignee. Pass
   only the resolved value to `kb.create_task`.
 
-- [ ] **Step 4: Run CLI and DB tests and verify GREEN**
+- [x] **Step 4: Run CLI and DB tests and verify GREEN**
 
   Run:
 
@@ -185,13 +185,13 @@
 - Modify: `local/bin/start-kanban.sh` (`build_role_command`)
 - Modify: `tests/local/test_start_kanban_designer.py`
 
-- [ ] **Step 1: Add failing launcher assertions**
+- [x] **Step 1: Add failing launcher assertions**
 
   Extend the generated-command tests to require
   `HERMES_KANBAN_ORIGIN_PROFILE=<logical role>` for Hermes, Codex, CodeWhale,
   DeepSeek/Reasonix, and Claude panes, independent of the underlying agent.
 
-- [ ] **Step 2: Run the launcher test and verify RED**
+- [x] **Step 2: Run the launcher test and verify RED**
 
   Run:
 
@@ -201,13 +201,13 @@
 
   Expected: FAIL because the environment variable is absent.
 
-- [ ] **Step 3: Add one common origin environment prefix**
+- [x] **Step 3: Add one common origin environment prefix**
 
   Compute `origin_profile_env="HERMES_KANBAN_ORIGIN_PROFILE=${role_q}"` once in
   `build_role_command` and include it in every backend's launched environment.
   Do not alter claim assignees or infer origin from the underlying model.
 
-- [ ] **Step 4: Run launcher tests and verify GREEN**
+- [x] **Step 4: Run launcher tests and verify GREEN**
 
   Expected: PASS.
 
@@ -218,7 +218,7 @@
 - Create: `tests/plugins/test_kanban_result_delivery.py`
 - Modify: `tests/plugins/test_kanban_idle_continuation.py`
 
-- [ ] **Step 1: Write safe-delivery behavior tests**
+- [x] **Step 1: Write safe-delivery behavior tests**
 
   Test a minimal `BaseInteractiveListener` subclass and assert:
 
@@ -234,7 +234,7 @@
   - `HERMES_KANBAN_RESULT_NOTIFICATIONS=0` leaves the queue untouched and
     performs no result injection, while the default value enables delivery.
 
-- [ ] **Step 2: Run delivery tests and verify RED**
+- [x] **Step 2: Run delivery tests and verify RED**
 
   Run:
 
@@ -244,7 +244,7 @@
 
   Expected: FAIL because the drain method is absent.
 
-- [ ] **Step 3: Implement one central result-drain path**
+- [x] **Step 3: Implement one central result-drain path**
 
   Add `pump_result_notifications(args, conn, log_path) -> bool`. It targets
   `args.profile`, checks the existing backend-specific safe boundary before
@@ -259,7 +259,7 @@
   explicit subscription requests remain durable and queued until the feature
   is re-enabled, so rollback does not delete result ownership or queue data.
 
-- [ ] **Step 4: Write goal-wait throttling tests**
+- [x] **Step 4: Write goal-wait throttling tests**
 
   Extend idle continuation tests to prove a running goal with a nonterminal
   subscribed cross-profile task suppresses the normal two-minute reminder;
@@ -268,11 +268,11 @@
   excluded; and after the final result is delivered with no remaining watched
   tasks, the normal goal interval is restored from a reset timer.
 
-- [ ] **Step 5: Run goal tests and verify RED**
+- [x] **Step 5: Run goal tests and verify RED**
 
   Expected: FAIL because wait-state-aware throttling is absent.
 
-- [ ] **Step 6: Add the 120-minute waiting state to idle follow-up**
+- [x] **Step 6: Add the 120-minute waiting state to idle follow-up**
 
   Add `RESULT_WAIT_GOAL_INTERVAL_S = 120 * 60`. Query
   `kb.result_wait_state` before selecting a goal interval. Seed/reset a
@@ -282,7 +282,7 @@
   explicitly says to wait for watcher delivery rather than poll or create a
   continuation card.
 
-- [ ] **Step 7: Run watcher and idle regression tests and verify GREEN**
+- [x] **Step 7: Run watcher and idle regression tests and verify GREEN**
 
   Run:
 
@@ -301,7 +301,7 @@
 - Modify: `docs/superpowers/specs/2026-08-03-kanban-publisher-result-notifications-design.md` (accepted status only)
 - Track: `docs/superpowers/plans/2026-08-03-kanban-publisher-result-notifications.md`
 
-- [ ] **Step 1: Run all focused suites together**
+- [x] **Step 1: Run all focused suites together**
 
   ```bash
   python3 -m pytest \
@@ -316,12 +316,12 @@
 
   Expected: PASS with no warnings attributable to this change.
 
-- [ ] **Step 2: Inspect scope and unrelated dirt**
+- [x] **Step 2: Inspect scope and unrelated dirt**
 
   Run `git status --short`, `git diff --stat`, and focused diffs. Confirm
   `scripts/wechat_inject.py` remains untouched and unstaged.
 
-- [ ] **Step 3: Commit only the notification implementation**
+- [x] **Step 3: Commit only the notification implementation**
 
   Stage only the files listed in this plan and commit with:
 
@@ -329,7 +329,7 @@
   git commit -m "feat(kanban): notify publishers of task results"
   ```
 
-- [ ] **Step 4: Report rollout behavior**
+- [x] **Step 4: Report rollout behavior**
 
   Report the commit SHA, exact test counts, no-push status, and that existing
   panes need a watcher/launcher restart before new CLI creates inherit

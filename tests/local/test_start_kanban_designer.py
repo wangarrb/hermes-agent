@@ -137,6 +137,21 @@ def test_default_layout_has_designer_and_no_critic(tmp_path: Path) -> None:
     assert f"coordinator workspace: {workspace}-coordinator" in result.stdout
 
 
+def test_every_backend_exports_its_logical_origin_profile(tmp_path: Path) -> None:
+    result, layout, _, _ = _run_launcher(
+        tmp_path,
+        "--planner-agent", "hermes",
+        "--reviewer-agent", "codex",
+        "--implementer-agent", "codewhale",
+        "--designer-agent", "deepseek-reasonix",
+        "--coordinator-agent", "claude",
+    )
+
+    assert result.returncode == 0, result.stderr
+    for role in ("planner", "reviewer", "implementer", "designer", "coordinator"):
+        assert f"HERMES_KANBAN_ORIGIN_PROFILE={role}" in _pane(layout, role)
+
+
 def test_designer_cli_env_and_profile_keep_workspace_isolated(tmp_path: Path) -> None:
     result, layout, workspace, designer_workspace = _run_launcher(
         tmp_path,

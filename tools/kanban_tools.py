@@ -328,6 +328,42 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     return default, f"{name} must be a boolean or 'true'/'false'"
 
 
+def _result_notifications_enabled() -> bool:
+    raw = os.environ.get("HERMES_KANBAN_RESULT_NOTIFICATIONS", "1")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _result_subscriber_for_create(args: dict, assignee: Any) -> Optional[str]:
+    """Resolve generic cross-profile publisher notification policy."""
+    from hermes_cli.profiles import normalize_profile_name
+
+    explicit = str(args.get("notify_profile") or "").strip()
+    if explicit:
+        return normalize_profile_name(explicit)
+    origin = str(
+        args.get("origin_profile")
+        or os.environ.get("HERMES_KANBAN_ORIGIN_PROFILE")
+        or os.environ.get("HERMES_KANBAN_PROFILE")
+        or os.environ.get("HERMES_PROFILE")
+        or ""
+    ).strip()
+    raw_notify = args.get("notify_origin")
+    if raw_notify is not None:
+        notify, error = _parse_bool_arg(args, "notify_origin")
+        if error:
+            raise ValueError(error)
+        if not notify:
+            return None
+        if not origin:
+            raise ValueError("notify_origin requires an origin profile")
+        return normalize_profile_name(origin)
+    if not _result_notifications_enabled() or not origin:
+        return None
+    origin_profile = normalize_profile_name(origin)
+    assignee_profile = normalize_profile_name(str(assignee))
+    return origin_profile if origin_profile != assignee_profile else None
+
+
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     """Belt-and-suspenders runtime guard for orchestrator-only handlers.
 
@@ -1102,6 +1138,10 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    try:
+        result_subscriber = _result_subscriber_for_create(args, assignee)
+    except ValueError as exc:
+        return tool_error(str(exc))
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1189,6 +1229,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                result_subscriber=result_subscriber,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1196,6 +1237,7 @@ def _handle_create(args: dict, **kw) -> str:
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
+                result_subscriber=result_subscriber,
             )
         finally:
             conn.close()
@@ -1766,6 +1808,28 @@ KANBAN_CREATE_SCHEMA = {
                     "(e.g. 'researcher-a', 'reviewer', 'writer'). "
                     "Required — tasks without an assignee are never "
                     "dispatched."
+                ),
+            },
+            "origin_profile": {
+                "type": "string",
+                "description": (
+                    "Logical publishing profile. Defaults to the current pane "
+                    "profile; use only for a non-pane caller or explicit override."
+                ),
+            },
+            "notify_profile": {
+                "type": "string",
+                "description": (
+                    "Explicit profile to notify when the task produces an "
+                    "actionable result. Overrides origin-based defaults."
+                ),
+            },
+            "notify_origin": {
+                "type": "boolean",
+                "description": (
+                    "Explicitly enable or disable origin notification. By "
+                    "default cross-profile creates subscribe and same-profile "
+                    "creates do not."
                 ),
             },
             "body": {

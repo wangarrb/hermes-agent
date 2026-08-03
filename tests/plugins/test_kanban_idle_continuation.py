@@ -230,6 +230,83 @@ def test_goal_completion_check_is_suppressed_while_reviewer_checkpoint_is_open(
     assert not [text for text in injected if "GOAL_COMPLETION_CHECK" in text]
 
 
+def test_goal_waiting_on_subscribed_task_uses_120_minute_insurance_interval(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="planner", goal_mode=True)
+    with kb.connect() as conn:
+        watched = kb.create_task(
+            conn,
+            title="review checkpoint",
+            assignee="reviewer",
+            result_subscriber="planner",
+        )
+    listener = _Listener()
+    now = [100.0]
+    injected: list[str] = []
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "planner ❯\n")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]) or True)
+
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + listener.DAYTIME_GOAL_COMPLETION_INTERVAL_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        assert injected == []
+
+        now[0] = 100.0 + listener.RESULT_WAIT_GOAL_INTERVAL_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    assert len(injected) == 2  # prompt plus the existing CR compatibility write
+    assert "WAITING_ON_TASK_RESULTS" in injected[0]
+    assert watched in injected[0]
+    assert "120" in injected[0]
+    assert injected[0].endswith("[by watcher]")
+
+
+def test_goal_timer_resets_after_last_queued_result_is_delivered(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="planner", goal_mode=True)
+    with kb.connect() as conn:
+        watched = kb.create_task(
+            conn,
+            title="review checkpoint",
+            assignee="reviewer",
+            result_subscriber="planner",
+        )
+        assert kb.complete_task(conn, watched)
+    listener = _Listener()
+    now = [100.0]
+    injected: list[str] = []
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "planner ❯\n")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]) or True)
+
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        leased = kb.lease_result_notifications(
+            conn,
+            target_profile="planner",
+            lease_owner="test",
+            now=101,
+        )
+        assert kb.mark_result_notifications_delivered(
+            conn, [item.id for item in leased], lease_owner="test", now=102
+        )
+
+        now[0] += 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        assert injected == []
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    checks = [text for text in injected if "GOAL_COMPLETION_CHECK" in text]
+    assert len(checks) == 1
+
+
 def test_goal_completion_check_resumes_after_reviewer_checkpoint_closes(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

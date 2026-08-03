@@ -28,7 +28,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_independent_review as independent_review
 from hermes_cli import kanban_workspace_contract as workspace_contract
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.profiles import get_active_profile_name
+from hermes_cli.profiles import get_active_profile_name, normalize_profile_name
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +346,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
+    p_create.add_argument(
+        "--origin-profile",
+        default=None,
+        help="Logical publishing profile (overrides HERMES_KANBAN_ORIGIN_PROFILE)",
+    )
+    p_create.add_argument(
+        "--notify-profile",
+        default=None,
+        help="Explicit profile to notify when this task produces an actionable result",
+    )
+    notify_origin = p_create.add_mutually_exclusive_group()
+    notify_origin.add_argument(
+        "--notify-origin",
+        action="store_true",
+        dest="notify_origin",
+        default=None,
+        help="Notify the origin profile even for same-profile publication",
+    )
+    notify_origin.add_argument(
+        "--no-notify-origin",
+        action="store_false",
+        dest="notify_origin",
+        help="Do not implicitly notify the origin profile",
+    )
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -1135,6 +1159,41 @@ def _profile_author() -> str:
         return "user"
 
 
+def _result_notifications_enabled() -> bool:
+    raw = os.environ.get("HERMES_KANBAN_RESULT_NOTIFICATIONS", "1")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _resolve_result_subscriber(args: argparse.Namespace) -> Optional[str]:
+    explicit = str(getattr(args, "notify_profile", None) or "").strip()
+    if explicit:
+        return normalize_profile_name(explicit)
+
+    origin = str(
+        getattr(args, "origin_profile", None)
+        or os.environ.get("HERMES_KANBAN_ORIGIN_PROFILE")
+        or os.environ.get("HERMES_KANBAN_PROFILE")
+        or os.environ.get("HERMES_PROFILE")
+        or ""
+    ).strip()
+    notify_origin = getattr(args, "notify_origin", None)
+    if notify_origin is False:
+        return None
+    if notify_origin is True:
+        if not origin:
+            raise ValueError("--notify-origin requires an origin profile")
+        return normalize_profile_name(origin)
+    if not _result_notifications_enabled() or not origin:
+        return None
+
+    origin_profile = normalize_profile_name(origin)
+    assignee_raw = str(getattr(args, "assignee", None) or "").strip()
+    if not assignee_raw:
+        return None
+    assignee = normalize_profile_name(assignee_raw)
+    return origin_profile if origin_profile != assignee else None
+
+
 # ---------------------------------------------------------------------------
 # Boards management (hermes kanban boards …)
 # ---------------------------------------------------------------------------
@@ -1487,6 +1546,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     try:
+        result_subscriber = _resolve_result_subscriber(args)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    try:
         with kb.connect_closing() as conn:
             task_id = kb.create_task(
                 conn,
@@ -1511,6 +1575,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
+                result_subscriber=result_subscriber,
             )
             task = kb.get_task(conn, task_id)
     except ValueError as exc:

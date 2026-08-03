@@ -1008,6 +1008,38 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("assignee", "extra", "expected"),
+    [
+        ("reviewer", {}, ["planner"]),
+        ("planner", {}, []),
+        ("planner", {"notify_origin": True}, ["planner"]),
+        ("reviewer", {"notify_origin": False}, []),
+        ("reviewer", {"notify_profile": "coordinator"}, ["coordinator"]),
+    ],
+)
+def test_create_tool_applies_origin_result_notification_policy(
+    monkeypatch, worker_env, assignee, extra, expected,
+):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_ORIGIN_PROFILE", "planner")
+    out = json.loads(kt._handle_create({
+        "title": f"notify {assignee}",
+        "assignee": assignee,
+        **extra,
+    }))
+    assert out["ok"] is True
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT target_profile FROM kanban_result_subscriptions "
+            "WHERE task_id = ? ORDER BY target_profile",
+            (out["task_id"],),
+        ).fetchall()
+    assert [row["target_profile"] for row in rows] == expected
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen

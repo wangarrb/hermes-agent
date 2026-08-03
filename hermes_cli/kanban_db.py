@@ -1246,6 +1246,62 @@ class Event:
 
 
 @dataclass
+class ResultNotification:
+    """One leased publisher-pane result queue item."""
+
+    id: int
+    task_id: str
+    event_id: int
+    target_profile: str
+    event_kind: str
+    payload: Optional[dict]
+    status: str
+    lease_owner: Optional[str]
+    lease_expires: Optional[int]
+    created_at: int
+    delivered_at: Optional[int]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ResultNotification":
+        payload = json.loads(row["payload"]) if row["payload"] else None
+        if payload is not None and not isinstance(payload, dict):
+            raise ValueError(f"result notification {row['id']} payload must be an object")
+        return cls(
+            id=int(row["id"]),
+            task_id=str(row["task_id"]),
+            event_id=int(row["event_id"]),
+            target_profile=str(row["target_profile"]),
+            event_kind=str(row["event_kind"]),
+            payload=payload,
+            status=str(row["status"]),
+            lease_owner=row["lease_owner"],
+            lease_expires=(
+                int(row["lease_expires"])
+                if row["lease_expires"] is not None
+                else None
+            ),
+            created_at=int(row["created_at"]),
+            delivered_at=(
+                int(row["delivered_at"])
+                if row["delivered_at"] is not None
+                else None
+            ),
+        )
+
+
+@dataclass
+class ResultWaitState:
+    """Outstanding cross-pane work and queued results for one profile."""
+
+    watched_tasks: list[tuple[str, str]]
+    queue_ids: list[int]
+
+    @property
+    def watched_task_ids(self) -> list[str]:
+        return [task_id for task_id, _status in self.watched_tasks]
+
+
+@dataclass
 class ControlMessage:
     """Durable safe-boundary control delivered to an interactive listener."""
 
@@ -1515,6 +1571,32 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Local pane result subscriptions are intentionally separate from gateway
+-- chat subscriptions: they route by logical profile and are drained by the
+-- interactive watcher only at a safe composer boundary.
+CREATE TABLE IF NOT EXISTS kanban_result_subscriptions (
+    task_id        TEXT NOT NULL,
+    target_profile TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    active         INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (task_id, target_profile)
+);
+
+CREATE TABLE IF NOT EXISTS kanban_result_queue (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    event_id       INTEGER NOT NULL,
+    target_profile TEXT NOT NULL,
+    event_kind     TEXT NOT NULL,
+    payload        TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    lease_owner    TEXT,
+    lease_expires  INTEGER,
+    created_at     INTEGER NOT NULL,
+    delivered_at  INTEGER,
+    UNIQUE (event_id, target_profile)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1531,6 +1613,8 @@ CREATE INDEX IF NOT EXISTS idx_reservations_status   ON task_scope_reservations(
 CREATE INDEX IF NOT EXISTS idx_reservation_scopes    ON task_reservation_scopes(scope_kind, scope, reservation_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_result_sub_task       ON kanban_result_subscriptions(task_id, active);
+CREATE INDEX IF NOT EXISTS idx_result_queue_target   ON kanban_result_queue(target_profile, status, id);
 """
 
 
@@ -2771,6 +2855,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    result_subscriber: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2796,6 +2881,7 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    result_subscriber = _canonical_assignee(result_subscriber)
     assert_role_policy_operation(
         conn, "create", target_roles=(assignee,), actor_role=created_by,
     )
@@ -2944,6 +3030,14 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if result_subscriber:
+                with write_txn(conn):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kanban_result_subscriptions "
+                        "(task_id, target_profile, created_at, active) "
+                        "VALUES (?, ?, ?, 1)",
+                        (row["id"], result_subscriber, int(time.time())),
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -3074,6 +3168,13 @@ def create_task(
                         "(parent_id, child_id, parent_generation) "
                         "SELECT id, ?, generation FROM tasks WHERE id = ?",
                         (task_id, pid),
+                    )
+                if result_subscriber:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kanban_result_subscriptions "
+                        "(task_id, target_profile, created_at, active) "
+                        "VALUES (?, ?, ?, 1)",
+                        (task_id, result_subscriber, now),
                     )
                 _append_event(
                     conn,
@@ -4166,6 +4267,80 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+_ACTIONABLE_RESULT_EVENTS = {
+    "completed",
+    "blocked",
+    "block_loop_detected",
+    "gave_up",
+    "returned_for_rework",
+    "invalidated_for_rework",
+}
+
+
+def _compact_result_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict],
+) -> dict:
+    task_row = conn.execute(
+        "SELECT generation FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    compact: dict[str, Any] = {
+        "task_id": task_id,
+        "kind": kind,
+        "generation": int(task_row["generation"]) if task_row else None,
+    }
+    if payload:
+        for key in (
+            "summary",
+            "reason",
+            "return_task_id",
+            "control_ids",
+            "rework_hold",
+            "previous_status",
+        ):
+            if key in payload and payload[key] is not None:
+                compact[key] = payload[key]
+        if payload.get("kind") is not None:
+            compact["block_kind"] = payload["kind"]
+    return compact
+
+
+def _enqueue_result_notifications(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    kind: str,
+    payload: Optional[dict],
+    now: int,
+) -> None:
+    if kind not in _ACTIONABLE_RESULT_EVENTS:
+        return
+    # The root also emits returned_for_rework after its invalidation. Suppress
+    # only that redundant root invalidation; subscribed descendants still need
+    # their own actionable callback.
+    if (
+        kind == "invalidated_for_rework"
+        and payload
+        and payload.get("return_task_id") == task_id
+    ):
+        return
+    compact = json.dumps(
+        _compact_result_payload(conn, task_id, kind, payload),
+        ensure_ascii=False,
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO kanban_result_queue "
+        "(task_id, event_id, target_profile, event_kind, payload, created_at) "
+        "SELECT ?, ?, target_profile, ?, ?, ? "
+        "FROM kanban_result_subscriptions "
+        "WHERE task_id = ? AND active = 1",
+        (task_id, event_id, kind, compact, now, task_id),
+    )
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4173,7 +4348,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4183,10 +4358,163 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
+    )
+    event_id = int(cur.lastrowid)
+    _enqueue_result_notifications(
+        conn,
+        task_id=task_id,
+        event_id=event_id,
+        kind=kind,
+        payload=payload,
+        now=now,
+    )
+    return event_id
+
+
+def lease_result_notifications(
+    conn: sqlite3.Connection,
+    *,
+    target_profile: str,
+    lease_owner: str,
+    limit: int = 8,
+    lease_seconds: int = 60,
+    now: Optional[int] = None,
+) -> list[ResultNotification]:
+    """Lease a contiguous FIFO prefix without skipping a foreign head."""
+    profile = _canonical_assignee(target_profile)
+    owner = str(lease_owner or "").strip()
+    if not profile or not owner:
+        raise ValueError("target_profile and lease_owner are required")
+    limit = max(1, int(limit))
+    now_i = int(time.time()) if now is None else int(now)
+    expires = now_i + max(1, int(lease_seconds))
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT * FROM kanban_result_queue "
+            "WHERE target_profile = ? AND status != 'delivered' ORDER BY id",
+            (profile,),
+        ).fetchall()
+        eligible: list[int] = []
+        for row in rows:
+            foreign_live_lease = (
+                row["status"] == "leased"
+                and row["lease_owner"] != owner
+                and row["lease_expires"] is not None
+                and int(row["lease_expires"]) > now_i
+            )
+            if foreign_live_lease:
+                break
+            eligible.append(int(row["id"]))
+            if len(eligible) >= limit:
+                break
+        if not eligible:
+            return []
+        placeholders = ",".join("?" for _ in eligible)
+        conn.execute(
+            "UPDATE kanban_result_queue SET status = 'leased', lease_owner = ?, "
+            f"lease_expires = ? WHERE id IN ({placeholders})",
+            (owner, expires, *eligible),
+        )
+        leased_rows = conn.execute(
+            f"SELECT * FROM kanban_result_queue WHERE id IN ({placeholders}) "
+            "ORDER BY id",
+            tuple(eligible),
+        ).fetchall()
+        return [ResultNotification.from_row(row) for row in leased_rows]
+
+
+def mark_result_notifications_delivered(
+    conn: sqlite3.Connection,
+    ids: Iterable[int],
+    *,
+    lease_owner: str,
+    now: Optional[int] = None,
+) -> bool:
+    queue_ids = tuple(int(item) for item in ids)
+    if not queue_ids:
+        return True
+    placeholders = ",".join("?" for _ in queue_ids)
+    with write_txn(conn):
+        owned = conn.execute(
+            f"SELECT COUNT(*) AS n FROM kanban_result_queue "
+            f"WHERE id IN ({placeholders}) AND status = 'leased' "
+            "AND lease_owner = ?",
+            (*queue_ids, lease_owner),
+        ).fetchone()
+        if int(owned["n"]) != len(queue_ids):
+            return False
+        conn.execute(
+            "UPDATE kanban_result_queue SET status = 'delivered', "
+            "delivered_at = ?, lease_owner = NULL, lease_expires = NULL "
+            f"WHERE id IN ({placeholders})",
+            ((int(time.time()) if now is None else int(now)), *queue_ids),
+        )
+    return True
+
+
+def release_result_notification_lease(
+    conn: sqlite3.Connection,
+    ids: Iterable[int],
+    *,
+    lease_owner: str,
+) -> bool:
+    queue_ids = tuple(int(item) for item in ids)
+    if not queue_ids:
+        return True
+    placeholders = ",".join("?" for _ in queue_ids)
+    with write_txn(conn):
+        owned = conn.execute(
+            f"SELECT COUNT(*) AS n FROM kanban_result_queue "
+            f"WHERE id IN ({placeholders}) AND status = 'leased' "
+            "AND lease_owner = ?",
+            (*queue_ids, lease_owner),
+        ).fetchone()
+        if int(owned["n"]) != len(queue_ids):
+            return False
+        conn.execute(
+            "UPDATE kanban_result_queue SET status = 'pending', "
+            "lease_owner = NULL, lease_expires = NULL "
+            f"WHERE id IN ({placeholders})",
+            queue_ids,
+        )
+    return True
+
+
+def result_wait_state(
+    conn: sqlite3.Connection,
+    target_profile: str,
+    *,
+    exclude_task_id: Optional[str] = None,
+) -> ResultWaitState:
+    profile = _canonical_assignee(target_profile)
+    if not profile:
+        return ResultWaitState([], [])
+    params: list[Any] = [profile]
+    exclude_sql = ""
+    if exclude_task_id:
+        exclude_sql = " AND t.id != ?"
+        params.append(exclude_task_id)
+    watched = conn.execute(
+        "SELECT t.id, t.status FROM kanban_result_subscriptions s "
+        "JOIN tasks t ON t.id = s.task_id "
+        "WHERE s.target_profile = ? AND s.active = 1 "
+        "AND t.status IN ('todo', 'scheduled', 'ready', 'running', 'review')"
+        + exclude_sql
+        + " ORDER BY t.created_at, t.id",
+        tuple(params),
+    ).fetchall()
+    queued = conn.execute(
+        "SELECT id FROM kanban_result_queue WHERE target_profile = ? "
+        "AND status != 'delivered' ORDER BY id",
+        (profile,),
+    ).fetchall()
+    return ResultWaitState(
+        watched_tasks=[(str(row["id"]), str(row["status"])) for row in watched],
+        queue_ids=[int(row["id"]) for row in queued],
     )
 
 
@@ -6984,6 +7312,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_result_queue WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM kanban_result_subscriptions WHERE task_id = ?", (task_id,)
+        )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -7007,6 +7339,10 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_result_queue WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM kanban_result_subscriptions WHERE task_id = ?", (task_id,)
+        )
     recompute_ready(conn)
     return True
 
