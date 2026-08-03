@@ -2343,13 +2343,6 @@ def _format_gate_question(question: dict) -> str:
             + "; ".join(groups)
             + "."
         )
-    forbidden = [str(item) for item in question.get("forbidden_assertions", [])]
-    if forbidden:
-        sections.append(
-            "Forbidden assertions (do not state or endorse these exact claims): "
-            + "; ".join(forbidden)
-            + "."
-        )
     return "\n\n".join(sections)
 
 

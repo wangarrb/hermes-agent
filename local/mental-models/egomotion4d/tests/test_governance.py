@@ -121,7 +121,7 @@ def test_smoke_contract_rejects_forbidden_assertions(daily):
     )
 
 
-def test_gate_question_exposes_forbidden_assertions(daily):
+def test_gate_question_keeps_forbidden_assertions_private_to_scorer(daily):
     rendered = daily._format_gate_question(
         {
             "question": "How does notification work?",
@@ -131,8 +131,9 @@ def test_gate_question_exposes_forbidden_assertions(daily):
         }
     )
 
-    assert "Forbidden assertions" in rendered
-    assert "same-profile default subscribe" in rendered
+    assert "Required concept terms" in rendered
+    assert "Forbidden assertions" not in rendered
+    assert "same-profile default subscribe" not in rendered
 
 
 @pytest.fixture
