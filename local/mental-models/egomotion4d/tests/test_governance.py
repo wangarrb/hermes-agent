@@ -59,6 +59,9 @@ def test_kanban_collaboration_model_contract_is_complete():
     assert "designer create 当前由代码机械要求 worktree/path/base" in spec[
         "source_query"
     ]
+    assert "同一 objective 的普通交接优先保留原卡并 reassign" in spec[
+        "source_query"
+    ]
     question_ids = {item["id"] for item in benchmark["questions"]}
     assert set(spec["smoke_ids"]) <= question_ids
     assert len(benchmark["questions"]) >= 8
