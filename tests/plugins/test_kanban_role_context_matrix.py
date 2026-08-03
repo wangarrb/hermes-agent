@@ -282,7 +282,9 @@ def test_claim_path_emits_manifest_and_exposes_control_sha_in_prompt(
     manifest = rendered_calls[0]["output_path"]
     assert manifest.name == "role-context.json"
     assert manifest.is_file()
-    prompt = Path(injected[0]).read_text(encoding="utf-8")
+    assert injected[0].endswith("[by watcher]")
+    prompt_path = injected[0].removesuffix(" [by watcher]")
+    prompt = Path(prompt_path).read_text(encoding="utf-8")
     assert f"HERMES_KANBAN_CONTROL_PROMPT_SHA256={'a' * 64}" in prompt
 
 

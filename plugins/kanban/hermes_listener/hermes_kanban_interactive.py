@@ -47,6 +47,7 @@ from base_listener import (  # noqa: E402
     role_guidance,
     zellij_dump_screen,
     zellij_inject,
+    tag_injected_text,
     zellij_rename_pane,
 )
 
@@ -139,6 +140,13 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if task_id:
             return f"hermes-kanban [{task_id}]"
         return "hermes-kanban"
+
+    def read_pane_screen(
+        self, *, session: str, pane_id: str, log_path: Path,
+    ) -> str | None:
+        return zellij_dump_screen(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
 
     # ── Override on_task_running_monitor: stricter API error detection ──
     # Hermes pane shows ❯ prompt even while working (ghost state), so the
@@ -239,7 +247,12 @@ class HermesInteractiveListener(BaseInteractiveListener):
         self._api_retry_first_at = None
         log_line(log_path, f"api-error-retry {self._api_retry_count}/{self.API_RETRY_MAX} for task {task_id}: injecting 继续 after {elapsed:.0f}s")
 
-        zellij_inject(session=zellij_session, pane_id=zellij_pane_id, text="继续", log_path=log_path)
+        zellij_inject(
+            session=zellij_session,
+            pane_id=zellij_pane_id,
+            text=tag_injected_text("继续", source_profile="watcher"),
+            log_path=log_path,
+        )
         time.sleep(0.5)
         zellij_inject(session=zellij_session, pane_id=zellij_pane_id, text="\r", log_path=log_path)
 

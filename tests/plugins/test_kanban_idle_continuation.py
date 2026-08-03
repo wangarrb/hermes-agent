@@ -113,6 +113,7 @@ def test_goal_task_gets_one_completion_check_per_idle_episode(
     assert "不得向用户列出普通技术选项" in checks[0]
     assert "第一个未满足的承重 gate" in checks[0]
     assert "Continue the same goal" not in checks[0]
+    assert checks[0].endswith("[by watcher]")
 
 
 def test_goal_completion_check_is_throttled_to_2_minutes_outside_1_to_9(

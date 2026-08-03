@@ -218,6 +218,7 @@ def test_idle_pane_receives_control_once_and_blocks_claim_until_ack(
 
     assert len(injected) == 1
     assert "\n" not in injected[0]
+    assert injected[0].endswith("[by watcher]")
     assert f"control-ack {control_id}" in injected[0]
     assert task_id in injected[0]
     assert message.status == "delivered"

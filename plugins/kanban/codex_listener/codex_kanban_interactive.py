@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -161,14 +162,41 @@ class CodexInteractiveListener(BaseInteractiveListener):
         )
         return any(marker.lower() in check_line for marker in self.idle_markers)
 
+    _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s?(.*))?$")
+
+    def composer_input_text(self, screen: str) -> str | None:
+        """Extract the current Codex composer buffer, excluding its status bar."""
+        lines = screen.splitlines()
+        prompt_index = None
+        first_text = ""
+        for index in range(len(lines) - 1, -1, -1):
+            match = self._COMPOSER_PROMPT_RE.match(lines[index])
+            if match:
+                prompt_index = index
+                first_text = (match.group(1) or "").strip()
+                break
+        if prompt_index is None:
+            return None
+
+        parts = [first_text] if first_text else []
+        for line in lines[prompt_index + 1 :]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if "context" in lowered and ("%" in lowered or "used" in lowered):
+                break
+            parts.append(stripped)
+        payload = "\n".join(parts).strip()
+        return payload or None
+
     # ── Override on_claim_pre_check: check last 5 lines, not just last line ──
     # Codex TUI layout puts the "›" prompt 2-3 lines above the bottom status
     # bar (model name, workspace path).  The base class only checks the very
     # last non-empty line, which is the status bar and never contains "›",
-    # so the pane is never deemed ready.  We check the last 5 non-empty lines
-    # for an idle marker and ensure no busy marker is present in the same
-    # window.  Requires TWO consecutive checks, 2 s apart, for stability
-    # (same pattern as HermesInteractiveListener).
+    # so the pane is never deemed ready. We check the live viewport and, when
+    # the persistent composer contains text, require three unchanged 10-second
+    # intervals. Content changes reset the count.
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
         if not self.idle_markers:
             return True
@@ -176,27 +204,41 @@ class CodexInteractiveListener(BaseInteractiveListener):
         pane_id = getattr(args, "zellij_pane_id", "")
         if not session or not pane_id:
             return True
-        for attempt in range(2):
-            screen = zellij_dump_screen(
-                session=session, pane_id=str(pane_id), log_path=log_path,
-            )
-            if not screen:
-                return False
-            tail_lines = _tail_nonempty_lines(screen, limit=5)
-            if not tail_lines:
-                return False
-            if not self.pane_is_idle(screen):
-                last_line = tail_lines[-1].lower()
-                log_line(log_path, (
-                    f"on_claim_pre_check attempt {attempt+1}/2: "
-                    f"not ready (live viewport is not idle; "
-                    f"last={last_line[:60]})"
-                ))
-                return False
-            if attempt == 0:
-                import time as _t
-                _t.sleep(2.0)
-        return True
+        screen = zellij_dump_screen(
+            session=session, pane_id=str(pane_id), log_path=log_path,
+        )
+        if not screen:
+            return False
+        tail_lines = _tail_nonempty_lines(screen, limit=5)
+        if not tail_lines or not self.pane_is_idle(screen):
+            last_line = tail_lines[-1].lower() if tail_lines else ""
+            log_line(log_path, (
+                "on_claim_pre_check: not ready (live viewport is not idle; "
+                f"last={last_line[:60]})"
+            ))
+            return False
+        return self.wait_for_stable_composer_input(
+            session=session,
+            pane_id=str(pane_id),
+            log_path=log_path,
+            initial_screen=screen,
+            screen_reader=zellij_dump_screen,
+        )
+
+    def on_claim_post_confirm(
+        self, args: argparse.Namespace, log_path: Path,
+    ) -> bool:
+        """Close the race where typing starts after the pre-claim probe."""
+        session = getattr(args, "zellij_session", "")
+        pane_id = str(getattr(args, "zellij_pane_id", ""))
+        if not session or not pane_id:
+            return False
+        return self.wait_for_stable_composer_input(
+            session=session,
+            pane_id=pane_id,
+            log_path=log_path,
+            screen_reader=zellij_dump_screen,
+        )
 
     # ── Post-inject: retry Enter if prompt stays in composer ──
     _POST_INJECT_CONFIRM_S = 1.5

@@ -331,6 +331,26 @@ def write_task_prompt(
 # Shared zellij helpers
 # ──────────────────────────────────────────────
 
+_INJECTION_SOURCE_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def tag_injected_text(text: str, *, source_profile: str) -> str:
+    """Append a visible provenance marker to injected prompt text.
+
+    Raw terminal control bytes and TUI slash commands do not use this helper.
+    ``source_profile`` is deliberately generic so future role-authorized pane
+    injections can use ``[by planner]``, ``[by reviewer]``, and so on.
+    """
+    source = str(source_profile or "").strip().lower()
+    if not _INJECTION_SOURCE_PROFILE_RE.fullmatch(source):
+        raise ValueError("source_profile must contain only letters, digits, '.', '_' or '-'")
+    marker = f"[by {source}]"
+    payload = str(text).rstrip()
+    if payload.endswith(marker):
+        return payload
+    return f"{payload} {marker}" if payload else marker
+
+
 def zellij_inject(*, session: str, pane_id: str, text: str, log_path: Path) -> bool:
     """Inject text into a Zellij pane and press Enter.
 
@@ -699,6 +719,97 @@ class BaseInteractiveListener:
             busy_markers=self.busy_markers,
         )
 
+    def composer_input_text(self, screen: str) -> str | None:  # noqa: ARG002
+        """Return non-empty composer text, or ``None`` when empty/unsupported.
+
+        Backends with a persistent composer should override this. The shared
+        stability guard then protects every automatic injection path without
+        teaching the base listener each TUI's screen layout.
+        """
+        return None
+
+    def read_pane_screen(
+        self, *, session: str, pane_id: str, log_path: Path,
+    ) -> str | None:
+        """Read a pane through the backend's patchable screen-reader seam."""
+        return zellij_dump_screen(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
+
+    INPUT_STABILITY_INTERVAL_S: float = 10.0
+    INPUT_STABILITY_UNCHANGED_CONFIRMATIONS: int = 3
+    INPUT_STABILITY_CACHE_S: float = 5.0
+
+    def wait_for_stable_composer_input(
+        self,
+        *,
+        session: str,
+        pane_id: str,
+        log_path: Path,
+        initial_screen: str | None = None,
+        screen_reader: Any | None = None,
+    ) -> bool:
+        """Allow injection only after non-empty composer text stops changing.
+
+        A non-empty composer needs three unchanged *intervals* of ten seconds,
+        i.e. at least thirty seconds after the last observed edit. Any content
+        change resets the counter. Empty composers pass immediately; unknown,
+        missing, or newly-busy panes fail closed.
+        """
+        read_screen = screen_reader or self.read_pane_screen
+        screen = initial_screen
+        if screen is None:
+            screen = read_screen(
+                session=session, pane_id=pane_id, log_path=log_path,
+            )
+        if not screen or not screen.strip() or not self.pane_is_idle(screen):
+            return False
+
+        current = self.composer_input_text(screen)
+        cache_key = (str(session), str(pane_id))
+        if not current:
+            self._stable_composer_cache.pop(cache_key, None)
+            return True
+
+        cached = self._stable_composer_cache.get(cache_key)
+        now = time.time()
+        if (
+            cached is not None
+            and cached[0] == current
+            and now - cached[1] <= self.INPUT_STABILITY_CACHE_S
+        ):
+            return True
+
+        unchanged = 0
+        while unchanged < self.INPUT_STABILITY_UNCHANGED_CONFIRMATIONS:
+            time.sleep(self.INPUT_STABILITY_INTERVAL_S)
+            screen = read_screen(
+                session=session, pane_id=pane_id, log_path=log_path,
+            )
+            if not screen or not screen.strip() or not self.pane_is_idle(screen):
+                self._stable_composer_cache.pop(cache_key, None)
+                return False
+            observed = self.composer_input_text(screen)
+            if not observed:
+                self._stable_composer_cache.pop(cache_key, None)
+                return True
+            if observed == current:
+                unchanged += 1
+            else:
+                current = observed
+                unchanged = 0
+                log_line(
+                    log_path,
+                    "composer input changed; reset 10s stability confirmations",
+                )
+
+        self._stable_composer_cache[cache_key] = (current, time.time())
+        log_line(
+            log_path,
+            "composer input unchanged for 3x10s; automatic injection allowed",
+        )
+        return True
+
     def on_claim_post_confirm(self, args: argparse.Namespace, log_path: Path) -> bool:
         """After claim, confirm the pane is still idle before injecting.
 
@@ -796,6 +907,7 @@ class BaseInteractiveListener:
         self._idle_followup_since: float | None = None
         self._idle_followup_sent: bool = False
         self._goal_completion_last_sent_at: dict[str, float] = {}
+        self._stable_composer_cache: dict[tuple[str, str], tuple[str, float]] = {}
 
     # An idle prompt is a safe input boundary, but brief idle flashes occur
     # between tool calls.  Require a stable idle interval before injecting.
@@ -894,8 +1006,19 @@ class BaseInteractiveListener:
         pane_id = str(getattr(args, "zellij_pane_id", ""))
         if not session or not pane_id:
             return False
+        if not self.wait_for_stable_composer_input(
+            session=session,
+            pane_id=pane_id,
+            log_path=log_path,
+        ):
+            return True
         log_line(log_path, f"idle followup for {task_id}: {marker}")
-        zellij_inject(session=session, pane_id=pane_id, text=text, log_path=log_path)
+        zellij_inject(
+            session=session,
+            pane_id=pane_id,
+            text=tag_injected_text(text, source_profile="watcher"),
+            log_path=log_path,
+        )
         time.sleep(0.5)
         zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
         if task.goal_mode:
@@ -1021,11 +1144,23 @@ class BaseInteractiveListener:
             return True  # still waiting for backoff; skip reclaim this tick
 
         # Backoff elapsed — inject "继续"
+        if not self.wait_for_stable_composer_input(
+            session=session,
+            pane_id=pane_id,
+            log_path=log_path,
+            initial_screen=screen,
+        ):
+            return True
         self._api_retry_count += 1
         self._api_retry_first_at = None  # reset timer; next error detection starts fresh
         log_line(log_path, f"api-error-retry {self._api_retry_count}/{self.API_RETRY_MAX} for task {task_id}: injecting 继续 after {elapsed:.0f}s")
 
-        zellij_inject(session=session, pane_id=pane_id, text="继续", log_path=log_path)
+        zellij_inject(
+            session=session,
+            pane_id=pane_id,
+            text=tag_injected_text("继续", source_profile="watcher"),
+            log_path=log_path,
+        )
         time.sleep(0.5)
         zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
 
@@ -1162,7 +1297,9 @@ class BaseInteractiveListener:
             return True
 
         self._mark_prompt_superseded(leased)
-        prompt = self._control_prompt(leased)
+        prompt = tag_injected_text(
+            self._control_prompt(leased), source_profile="watcher",
+        )
         ok = zellij_inject(
             session=session,
             pane_id=pane_id,
@@ -1380,6 +1517,9 @@ class BaseInteractiveListener:
             task_id=claimed.id, title=claimed.title,
             assignee=task_assignee, profile=pane_profile,
             prompt_path=prompt_path, board=board,
+        )
+        inject_str = tag_injected_text(
+            inject_str, source_profile="watcher",
         )
 
         zellij_session = getattr(args, "zellij_session", "")

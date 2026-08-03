@@ -97,9 +97,59 @@ def test_codex_claim_precheck_accepts_idle_composer(
   gpt-5.6-sol high · master · Context 64% used
 """
     monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: idle_screen)
-    monkeypatch.setattr(time, "sleep", lambda _: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
 
     assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+    assert sleeps == [10.0, 10.0, 10.0]
+
+
+def test_codex_claim_precheck_resets_stability_when_composer_changes(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+
+    def screen(text: str) -> str:
+        return f"""\
+─ Worked for 1m ─
+
+› {text}
+
+  gpt-5.6-sol high · master · Context 64% used
+"""
+
+    screens = iter(
+        [
+            screen("draft A"),
+            screen("draft B"),
+            screen("draft B"),
+            screen("draft B"),
+            screen("draft B"),
+        ]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: next(screens))
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+    assert sleeps == [10.0, 10.0, 10.0, 10.0]
+
+
+def test_codex_claim_precheck_accepts_empty_composer_without_stability_delay(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    idle_screen = (
+        "─ Worked for 1m ─\n\n"
+        "› \n\n"
+        "  gpt-5.6-sol high · master · Context 64% used\n"
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: idle_screen)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+    assert sleeps == []
 
 
 def test_codex_claim_precheck_ignores_stale_busy_words_in_completed_output(
