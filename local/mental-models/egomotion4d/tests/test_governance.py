@@ -547,7 +547,9 @@ def test_validate_current_evidence_build_input_accepts_canonical_source_extract(
         encoding="utf-8",
     )
 
-    daily._validate_current_evidence_build_input(source)
+    daily._validate_current_evidence_build_input(
+        source, logical_id="egomotion4d-kanban-collaboration"
+    )
 
 
 def test_validate_current_evidence_build_input_rejects_unknown_authority(tmp_path, daily):
@@ -684,6 +686,22 @@ def test_refresh_evidence_bundle_rejects_registered_kanban_bundle_without_snapsh
     monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
 
     with pytest.raises(ValueError, match="expected snapshot"):
+        daily._refresh_evidence_bundle()
+
+
+def test_refresh_evidence_bundle_rejects_impostor_model_using_kanban_snapshot(
+    tmp_path, monkeypatch, daily
+):
+    _source_dir, _snapshot, bundle_path = _write_kanban_refresh_fixture(
+        tmp_path, snapshot_bytes=b"valid canonical snapshot\n"
+    )
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    entry = bundle["per_model"].pop("egomotion4d-kanban-collaboration")
+    bundle["per_model"]["egomotion4d-impostor"] = entry
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    with pytest.raises(ValueError, match="invalid derived build input contract"):
         daily._refresh_evidence_bundle()
 
 

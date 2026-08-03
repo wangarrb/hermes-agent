@@ -638,7 +638,9 @@ CURRENT_EVIDENCE_BUILD_INPUT_AUTHORITIES = {
 }
 
 
-def _validate_current_evidence_build_input(path: Path) -> None:
+def _validate_current_evidence_build_input(
+    path: Path, *, logical_id: str | None = None
+) -> None:
     """Reject curated current-evidence files that can masquerade as a truth store."""
     if not path.name.endswith("_current_evidence.md"):
         return
@@ -656,6 +658,7 @@ def _validate_current_evidence_build_input(path: Path) -> None:
     elif authority == "canonical-source-extract":
         authority_valid = (
             path.name == KANBAN_COLLABORATION_SNAPSHOT
+            and logical_id == KANBAN_COLLABORATION_LOGICAL_ID
             and contract.get("logical_id") == KANBAN_COLLABORATION_LOGICAL_ID
             and contract.get("manifest") == KANBAN_COLLABORATION_MANIFEST
         )
@@ -769,7 +772,9 @@ def _refresh_evidence_bundle() -> dict:
                 if not source_path.is_file():
                     raise FileNotFoundError(source_path)
                 source_bytes = source_path.read_bytes()
-                _validate_current_evidence_build_input(source_path)
+                _validate_current_evidence_build_input(
+                    source_path, logical_id=logical_id
+                )
                 source["sha256"] = hashlib.sha256(source_bytes).hexdigest()
             entry["evidence_sha256"] = _canonical_evidence_sha(entry)
         bundle["schema_version"] = 2
