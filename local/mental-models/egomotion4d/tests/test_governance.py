@@ -51,8 +51,13 @@ def test_kanban_collaboration_model_contract_is_complete():
         "sources/kanban_collaboration_current_evidence.md"
     ]
     assert spec["benchmark_file"] == "questions-kanban-collaboration.json"
-    assert "implementer 未显式 workspace 时默认继承发布者 workspace" in spec["source_query"]
-    assert "不得声称 designer create 由数据库机械强制 worktree/base" in spec["source_query"]
+    assert "owner 发布 implementer 卡未显式 workspace 时默认继承发布者 workspace" in spec[
+        "source_query"
+    ]
+    assert "reviewer 发布可写 implementer 卡必须显式" in spec["source_query"]
+    assert "designer create 当前由代码机械要求 worktree/path/base" in spec[
+        "source_query"
+    ]
     question_ids = {item["id"] for item in benchmark["questions"]}
     assert set(spec["smoke_ids"]) <= question_ids
     assert len(benchmark["questions"]) >= 8
@@ -73,10 +78,7 @@ def test_kanban_collaboration_model_contract_is_complete():
     workspace_question = next(
         item for item in benchmark["questions"] if item["topic"] == "workspace"
     )
-    assert "implementer 可写卡必须总是显式 workspace" in workspace_question[
-        "forbidden_assertions"
-    ]
-    assert "designer create 必须由数据库机械强制 worktree/base" in workspace_question[
+    assert "owner→implementer 可写卡必须总是显式 workspace" in workspace_question[
         "forbidden_assertions"
     ]
 
