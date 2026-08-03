@@ -27,21 +27,43 @@ algorithm-only and must not absorb operational process material.
 
 ## 3. Truth Ownership
 
-The model is derived from a small canonical source manifest.
+The model is derived from a small canonical source manifest at
+`~/.hermes/mental-models/egomotion4d/sources/kanban_collaboration_sources.json`.
+Each entry uses one of `whole_file`, `markdown_heading`, `python_symbol` or
+`shell_function`; selectors must resolve exactly once.
 
 ### Generic sources
 
-- Hermes custom Kanban notification and watcher design specs;
-- `local/bin/start-kanban.sh` launcher contract;
-- `plugins/kanban/base_listener.py` safe-boundary and delivery behavior;
-- `hermes_cli/kanban_db.py` task lifecycle, control and result outbox behavior.
+- `/home/wyr/.hermes/hermes-agent-repo/docs/superpowers/specs/2026-08-03-kanban-publisher-result-notifications-design.md`
+  (`whole_file`);
+- `/home/wyr/.hermes/hermes-agent-repo/docs/superpowers/specs/2026-08-03-multi-owner-project-workspaces-design.md`
+  (`whole_file`);
+- `/home/wyr/.hermes/hermes-agent-repo/local/bin/start-kanban.sh`
+  (`shell_function: workspace_for_role`, `shell_function: build_role_command`,
+  plus the usage block bounded by `usage()`);
+- `/home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py`
+  (`python_symbol: BaseInteractiveListener.wait_for_stable_composer_input`,
+  `_handle_idle_task_followup`, `pump_control_messages`,
+  `pump_result_notifications`);
+- `/home/wyr/.hermes/hermes-agent-repo/hermes_cli/kanban_db.py`
+  (`python_symbol: create_task`, `return_task_for_rework`,
+  `lease_result_notifications`, `result_wait_state`).
 
 ### Egomotion4D overlay sources
 
-- `/home/wyr/code/Egomotion4D/AGENTS.md`, especially §8.0–§8.4;
-- reviewer, planner, implementer and coordinator project prompts under
-  `.hermes-kanban/egomotion4d/`;
-- `continuous-execution-mode-protocol.md`.
+- `/home/wyr/code/Egomotion4D/AGENTS.md`
+  (`markdown_heading: ## 8. Kanban 任务系统`, through the next level-2
+  heading or EOF);
+- `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/reviewer/kanban-system-prompt.md`
+  (`whole_file`);
+- `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/planner/kanban-system-prompt.md`
+  (`whole_file`, also authoritative for designer behavior);
+- `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/implementer/kanban-system-prompt.md`
+  (`whole_file`);
+- `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/coordinator/kanban-system-prompt.md`
+  (`whole_file`);
+- `/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/continuous-execution-mode-protocol.md`
+  (`whole_file`).
 
 The source manifest stores absolute path, semantic section selector and SHA256.
 A deterministic builder emits
@@ -51,11 +73,22 @@ never reads generated mental-model exports as input.
 
 ## 4. Maintenance and Staleness
 
-Before the existing evidence-bundle refresh, daily maintenance regenerates the
-derived source snapshot atomically. Any canonical source hash or selected
-section change changes this model's evidence SHA and makes it stale. The normal
-inactive-slot refresh, adjudication, smoke and atomic PASS_PUBLISH switch then
-apply without a second maintenance system.
+The only scheduled entrypoint remains
+`local/hermes-scripts/daily_mental_model_wrapper.py`, deployed as the current
+Hermes cron wrapper. It invokes the deployed
+`~/.hermes/scripts/hindsight_daily_noagent.py --mental-model-daily`. At the
+start of `_refresh_evidence_bundle()`, that script calls the new deterministic
+builder `~/.hermes/scripts/kanban_collaboration_evidence.py`, whose maintained
+source lives at
+`local/hermes-scripts/kanban_collaboration_evidence.py`. The builder atomically
+regenerates
+`~/.hermes/mental-models/egomotion4d/sources/kanban_collaboration_current_evidence.md`
+from the manifest before source hashes are recomputed.
+
+Any canonical source hash or selected section change changes this model's
+evidence SHA and makes it stale. The normal inactive-slot refresh,
+adjudication, smoke and atomic PASS_PUBLISH switch then apply without a second
+maintenance system.
 
 Missing files, missing selected headings, duplicate selectors or an empty
 extract fail closed as `BLOCK_INVALID_EVIDENCE_BUNDLE`; the previous accepted
@@ -112,10 +145,38 @@ at least:
 - reassign versus reverse notification tasks;
 - authority when model content conflicts with current code/`AGENTS.md`.
 
+Each smoke item has an exact required assertion and forbidden assertion. For
+example: cross-profile create must say “default subscribe” while same-profile
+must say “default off unless explicit”; a busy/non-stable composer must say the
+queue remains durable and must not say it injects immediately; goal completion
+must include final reviewer `通过|带病通过` and must reject “submission means
+done”.
+
 Publication requires the existing candidate completeness check, adjudicator and
-target-isolated smoke gate. Review exports embed the exact generation spec,
-derived evidence and source hash inventory. The wiki registry index gains the
-model automatically after PASS_PUBLISH.
+target-isolated smoke gate. Runtime identity is exactly:
+
+- registry owner:
+  `~/.hermes/mental-models/egomotion4d/registry.json`;
+- logical ID: `egomotion4d-kanban-collaboration`;
+- physical IDs: `egomotion4d-kanban-collaboration-a` and
+  `egomotion4d-kanban-collaboration-b`;
+- generation spec:
+  `~/.hermes/mental-models/egomotion4d/specs/kanban-collaboration.json`;
+- benchmark:
+  `~/.hermes/mental-models/egomotion4d/benchmark/questions-kanban-collaboration.json`;
+- review manifest owner:
+  `~/.hermes/mental-models/egomotion4d/review_exports.json`.
+
+`mental_model_maintain()` may refresh only the inactive physical ID and records
+the candidate transaction. Only `mental_model_adjudicate()` may atomically flip
+`registry.models[logical_id].active_slot` after completeness, adjudication and
+`_run_smoke_regression()` pass. It then invokes
+`_export_accepted_consumers()` for accepted current/history exports and
+`_publish_review_exports()` for accepted review current/history exports; no
+builder or recreate script may write an accepted revision directly. Review
+exports embed the exact generation spec, derived evidence and source hash
+inventory. `_render_mental_model_index()` adds the model to the wiki registry
+index automatically after PASS_PUBLISH.
 
 ## 7. Consumer Boundary
 
@@ -137,6 +198,18 @@ Implementation changes only the custom mental-model/Kanban overlay:
 
 It does not change core Hindsight, generic Hermes Agent runtime, Egomotion4D
 algorithm code or old mental-model history.
+
+For the initial implementation commit, the wiki write allowlist is limited to:
+
+- `auto-maintenance/project/egomotion4d/mental-models/README.md`;
+- `.../exports/current/egomotion4d-kanban-collaboration.md`;
+- `.../exports/history/egomotion4d-kanban-collaboration-*.md`;
+- `.../exports/review/current/egomotion4d-kanban-collaboration.md`;
+- `.../exports/review/history/egomotion4d-kanban-collaboration-*.md`.
+
+Daily reports may be generated for operational evidence but are not staged by
+this change. No pre-existing wiki modification or deletion outside the
+allowlist is staged.
 
 ## 9. Verification
 
