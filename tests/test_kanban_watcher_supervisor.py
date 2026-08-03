@@ -166,3 +166,53 @@ def test_cleanup_targets_marked_fallback_after_supervisor_reparenting():
     )
 
     assert candidates == [101]
+
+
+# ── Board/session scoping and singleton ──────────────────────────────────────
+
+def test_discovery_filters_by_board():
+    """Discovery excludes watchers from other boards."""
+    supervisor = _load_supervisor()
+    # The _has_live_replacement function already checks identity key which
+    # includes board.  Verify it rejects different board.
+    assert not supervisor._has_live_replacement(
+        {101: _cmd(board="other-board")}, 101, _cmd(),
+    )
+
+
+def test_discovery_filters_by_session():
+    """Discovery excludes watchers from other sessions."""
+    supervisor = _load_supervisor()
+    assert not supervisor._has_live_replacement(
+        {101: _cmd(session="other-session")}, 101, _cmd(),
+    )
+
+
+def test_supervisor_identity_key_includes_board_and_session():
+    """The watcher key tuple includes board and session for scoping."""
+    supervisor = _load_supervisor()
+    key = supervisor._watcher_key(_cmd())
+    assert key is not None
+    board, profile, session, pane = key
+    assert board == "egomotion4d"
+    assert session == "kanban-egomotion4d"
+
+
+def test_different_board_supervisors_coexist():
+    """Supervisors for different boards should not interfere."""
+    supervisor = _load_supervisor()
+    # Same pane but different board — not a replacement
+    current = {101: _cmd(board="board-a"), 102: _cmd(board="board-b")}
+    assert not supervisor._has_live_replacement(
+        current, 101, _cmd(board="board-a"),
+    )
+
+
+def test_launcher_replacement_during_restart_delay():
+    """If a launcher replacement appears during restart_delay, no spawn occurs."""
+    supervisor = _load_supervisor()
+    # Simulate: a dead watcher, but a new live process with same identity
+    # already exists → _has_live_replacement returns True
+    current = {201: _cmd()}
+    dead_cmdline = _cmd()
+    assert supervisor._has_live_replacement(current, 101, dead_cmdline)

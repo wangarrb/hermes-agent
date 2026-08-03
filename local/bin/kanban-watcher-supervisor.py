@@ -263,9 +263,31 @@ def _exec_str(cmd: list[str]) -> str:
     return [c.decode("utf-8", errors="replace") if isinstance(c, bytes) else c for c in cmd]
 
 
+def _matches_board_session(cmdline: list[str], board: str, session: str) -> bool:
+    """Check if a watcher cmdline matches the given board and session."""
+    key = _watcher_key(cmdline)
+    if key is None:
+        return False
+    proc_board, _profile, proc_session, _pane = key
+    if board and proc_board != board:
+        return False
+    if session and proc_session != session:
+        return False
+    return True
+
+
+def _watcher_identity_key(cmdline: list[str]) -> str:
+    """Return a stable string key for restart counting (full identity)."""
+    key = _watcher_key(cmdline)
+    if key is None:
+        return "unknown"
+    return ":".join(key)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Kanban watcher supervisor")
     parser.add_argument("--session", default="", help="Zellij session name (for logging only)")
+    parser.add_argument("--board", default="", help="Board slug for scoping (filters discovery)")
     parser.add_argument("--poll-s", type=float, default=30.0, help="Poll interval in seconds")
     parser.add_argument("--max-restarts", type=int, default=5, help="Max restarts per process before giving up")
     parser.add_argument("--restart-delay-s", type=float, default=5.0, help="Delay before restarting a crashed watcher")
@@ -284,16 +306,43 @@ def main(argv: list[str] | None = None) -> int:
             f.write(line + "\n")
 
     session_label = args.session or "unknown"
-    log(f"supervisor started: session={session_label} poll={args.poll_s}s")
+    board_label = args.board or "all"
+    log(f"supervisor started: board={board_label} session={session_label} poll={args.poll_s}s")
+
+    # ── Supervisor singleton lock keyed by board/session ──
+    _supervisor_lock_fd = -1
+    if args.board and args.session:
+        import fcntl as _fcntl
+        _sup_lock_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/hermes-kanban-{os.getuid()}")) / "hermes-kanban" / "supervisors"
+        _sup_lock_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(str(_sup_lock_dir), 0o700)
+        except PermissionError:
+            pass
+        _sup_lock_key = f"{args.board}:{args.session}"
+        import hashlib as _hl
+        _sup_lock_file = _sup_lock_dir / f"sup-{_hl.sha256(_sup_lock_key.encode()).hexdigest()[:16]}.lock"
+        _supervisor_lock_fd = os.open(str(_sup_lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            _fcntl.flock(_supervisor_lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except BlockingIOError:
+            log(f"another supervisor for board={args.board} session={args.session} is already running; exiting")
+            os.close(_supervisor_lock_fd)
+            return 0
 
     # Track: {pid: {"cmdline": [...], "restarts": N, "env": {...}}}
     tracked: dict[int, dict] = {}
-    restart_counts: dict[str, int] = {}  # key=profile, value=restart count
+    restart_counts: dict[str, int] = {}  # key=full identity, value=restart count
 
     while True:
         try:
-            # Discover current watchers
+            # Discover current watchers, filtered by board/session if scoped
             current = discover_watchers()
+            if args.board:
+                current = {
+                    pid: cmdline for pid, cmdline in current.items()
+                    if _matches_board_session(cmdline, args.board, args.session)
+                }
 
             # Find dead ones
             dead_pids = [pid for pid in tracked if pid not in current and not _process_alive(pid)]
@@ -335,13 +384,24 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
                 # Restart
-                key = profile
+                key = _watcher_identity_key(cmdline)
                 restart_counts[key] = restart_counts.get(key, 0) + 1
                 if restart_counts[key] > args.max_restarts:
-                    log(f"  giving up on profile={profile}: exceeded max_restarts={args.max_restarts}")
+                    log(f"  giving up on profile={profile} identity={key}: exceeded max_restarts={args.max_restarts}")
                     continue
 
                 time.sleep(args.restart_delay_s)
+
+                # Re-discover and check for launcher replacement before spawning
+                rediscovered = discover_watchers()
+                if args.board:
+                    rediscovered = {
+                        pid: cmd for pid, cmd in rediscovered.items()
+                        if _matches_board_session(cmd, args.board, args.session)
+                    }
+                if _has_live_replacement(rediscovered, pid, cmdline):
+                    log(f"  skipping restart: launcher replacement appeared for profile={profile}")
+                    continue
                 try:
                     env = dict(info.get("env") or os.environ)
                     env[_SUPERVISOR_FALLBACK_ENV] = "1"
