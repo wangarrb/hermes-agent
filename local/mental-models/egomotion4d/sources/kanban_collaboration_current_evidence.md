@@ -729,7 +729,7 @@ END_EXACT_BOUNDED_BYTES
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
 whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener.wait_for_stable_composer_input"}
-bounded_byte_length: 2577
+bounded_byte_length: 2576
 BEGIN_EXACT_BOUNDED_BYTES
     def wait_for_stable_composer_input(
         self,
@@ -801,14 +801,13 @@ BEGIN_EXACT_BOUNDED_BYTES
         )
         return True
 
-
 END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
 whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener._handle_idle_task_followup"}
-bounded_byte_length: 6492
+bounded_byte_length: 6491
 BEGIN_EXACT_BOUNDED_BYTES
     def _handle_idle_task_followup(
         self,
@@ -950,14 +949,13 @@ BEGIN_EXACT_BOUNDED_BYTES
         self._idle_followup_sent = True
         return True
 
-
 END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
 whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener.pump_control_messages"}
-bounded_byte_length: 3075
+bounded_byte_length: 3074
 BEGIN_EXACT_BOUNDED_BYTES
     def pump_control_messages(
         self, args: argparse.Namespace, conn: Any, log_path: Path,
@@ -1047,14 +1045,13 @@ BEGIN_EXACT_BOUNDED_BYTES
         )
         return True
 
-
 END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
 whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener.pump_result_notifications"}
-bounded_byte_length: 3271
+bounded_byte_length: 3229
 BEGIN_EXACT_BOUNDED_BYTES
     def pump_result_notifications(
         self, args: argparse.Namespace, conn: Any, log_path: Path,
@@ -1144,15 +1141,13 @@ BEGIN_EXACT_BOUNDED_BYTES
             log_line(log_path, f"delivered result queue rows {queue_ids} to {profile}")
         return True
 
-    # ── claim_and_inject_one ──
-
 END_EXACT_BOUNDED_BYTES
 
 ## kanban-db
 path: /home/wyr/.hermes/hermes-agent-repo/hermes_cli/kanban_db.py
 whole_file_sha256: 01c0c66b4ef67823749143d2aab628ed65a464ed8c9a9a2789fb53d6b63ae9b2
 selector: {"kind": "python_symbol", "value": "create_task"}
-bounded_byte_length: 17261
+bounded_byte_length: 17259
 BEGIN_EXACT_BOUNDED_BYTES
 def create_task(
     conn: sqlite3.Connection,
@@ -1525,15 +1520,13 @@ def create_task(
             continue
     raise RuntimeError("unreachable")
 
-
-
 END_EXACT_BOUNDED_BYTES
 
 ## kanban-db
 path: /home/wyr/.hermes/hermes-agent-repo/hermes_cli/kanban_db.py
 whole_file_sha256: 01c0c66b4ef67823749143d2aab628ed65a464ed8c9a9a2789fb53d6b63ae9b2
 selector: {"kind": "python_symbol", "value": "return_task_for_rework"}
-bounded_byte_length: 8888
+bounded_byte_length: 8886
 BEGIN_EXACT_BOUNDED_BYTES
 def return_task_for_rework(
     conn: sqlite3.Connection,
@@ -1759,15 +1752,13 @@ def return_task_for_rework(
         control_ids=control_ids,
     )
 
-
-
 END_EXACT_BOUNDED_BYTES
 
 ## kanban-db
 path: /home/wyr/.hermes/hermes-agent-repo/hermes_cli/kanban_db.py
 whole_file_sha256: 01c0c66b4ef67823749143d2aab628ed65a464ed8c9a9a2789fb53d6b63ae9b2
 selector: {"kind": "python_symbol", "value": "lease_result_notifications"}
-bounded_byte_length: 1917
+bounded_byte_length: 1915
 BEGIN_EXACT_BOUNDED_BYTES
 def lease_result_notifications(
     conn: sqlite3.Connection,
@@ -1820,15 +1811,13 @@ def lease_result_notifications(
         ).fetchall()
         return [ResultNotification.from_row(row) for row in leased_rows]
 
-
-
 END_EXACT_BOUNDED_BYTES
 
 ## kanban-db
 path: /home/wyr/.hermes/hermes-agent-repo/hermes_cli/kanban_db.py
 whole_file_sha256: 01c0c66b4ef67823749143d2aab628ed65a464ed8c9a9a2789fb53d6b63ae9b2
 selector: {"kind": "python_symbol", "value": "result_wait_state"}
-bounded_byte_length: 1148
+bounded_byte_length: 1146
 BEGIN_EXACT_BOUNDED_BYTES
 def result_wait_state(
     conn: sqlite3.Connection,
@@ -1862,8 +1851,6 @@ def result_wait_state(
         watched_tasks=[(str(row["id"]), str(row["status"])) for row in watched],
         queue_ids=[int(row["id"]) for row in queued],
     )
-
-
 
 END_EXACT_BOUNDED_BYTES
 

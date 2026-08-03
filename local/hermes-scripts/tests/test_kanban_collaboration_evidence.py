@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -90,8 +91,8 @@ def test_build_snapshot_resolves_all_selector_kinds_and_normalizes_crlf(tmp_path
     bounded = [item["bounded_bytes"] for item in snapshot["evidence"]]
     assert bounded == [
         "## Target\nbody\n### Nested\nkeep\n",
-        "@decorator\ndef top():\n    return 1\n\n",
-        "    @classmethod\n    def run(cls):\n        return 2\n\n",
+        "@decorator\ndef top():\n    return 1\n",
+        "    @classmethod\n    def run(cls):\n        return 2\n",
         "usage() {\n  printf '%s' 'brace } stays quoted'\n  echo \"{ quoted too }\"\n}\n",
     ]
     assert snapshot["sources"][0]["sha256"] == hashlib.sha256(markdown.read_bytes()).hexdigest()
@@ -109,6 +110,127 @@ def test_shell_function_ignores_braces_and_quotes_in_comments(tmp_path: Path) ->
     snapshot = module.build_snapshot(manifest, tmp_path / "evidence.md")
 
     assert snapshot["evidence"][0]["bounded_bytes"].endswith("  :\n}\n")
+
+
+def test_python_symbol_ends_at_the_selected_ast_node(tmp_path: Path) -> None:
+    module = _load_module()
+    source = tmp_path / "symbols.py"
+    source.write_text(
+        "@decorator\n"
+        "def top():\n"
+        "    return 1\n"
+        "top_level_value = 2\n"
+        "# top-level tail\n\n"
+        "class Worker:\n"
+        "    @decorator\n"
+        "    def run(self):\n"
+        "        return 3\n"
+        "    class_value = 4\n"
+        "    # class tail\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest(
+        tmp_path,
+        [
+            _source(
+                source,
+                [
+                    {"kind": "python_symbol", "value": "top"},
+                    {"kind": "python_symbol", "value": "Worker.run"},
+                ],
+            )
+        ],
+    )
+
+    snapshot = module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+    assert [item["bounded_bytes"] for item in snapshot["evidence"]] == [
+        "@decorator\ndef top():\n    return 1\n",
+        "    @decorator\n    def run(self):\n        return 3\n",
+    ]
+
+
+def test_shell_function_handles_escaped_braces_heredocs_and_nested_subshells(tmp_path: Path) -> None:
+    module = _load_module()
+    shell = tmp_path / "complex.sh"
+    shell.write_text(
+        "usage() {\n"
+        "  printf '%s\\n' \\}\n"
+        "  cat <<'EOF'\n"
+        "} literal heredoc brace\n"
+        "EOF\n"
+        "  nested=$(printf '%s' \"$(printf '%s' '}')\")\n"
+        "  ( printf '%s' 'subshell }' )\n"
+        "}\n"
+        "after() { :; }\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+    manifest = _manifest(tmp_path, [_source(shell, [{"kind": "shell_function", "value": "usage"}])])
+
+    snapshot = module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+    extracted = snapshot["evidence"][0]["bounded_bytes"]
+    assert "} literal heredoc brace" in extracted
+    assert "nested=$(printf" in extracted
+    assert extracted.rstrip().endswith("}")
+
+
+def test_shell_function_rejects_unsupported_backticks(tmp_path: Path) -> None:
+    module = _load_module()
+    shell = tmp_path / "backticks.sh"
+    shell.write_text("usage() { value=`printf '%s' '}'`; }\n", encoding="utf-8")
+    subprocess.run(["bash", "-n", str(shell)], check=True)
+    manifest = _manifest(tmp_path, [_source(shell, [{"kind": "shell_function", "value": "usage"}])])
+
+    with pytest.raises(ValueError, match="unsupported shell construct"):
+        module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+
+@pytest.mark.parametrize(
+    ("sources", "error"),
+    [
+        ([], "sources must be non-empty"),
+        ([{"name": "source", "path": "PATH", "selectors": []}], "selectors must be non-empty"),
+        ([{"name": "", "path": "PATH", "selectors": [{"kind": "whole_file"}]}], "name must be non-empty"),
+        ([{"name": "source", "path": "", "selectors": [{"kind": "whole_file"}]}], "path must be non-empty"),
+        (
+            [
+                {"name": "duplicate", "path": "PATH", "selectors": [{"kind": "whole_file"}]},
+                {"name": "duplicate", "path": "PATH", "selectors": [{"kind": "whole_file"}]},
+            ],
+            "source names must be unique",
+        ),
+    ],
+)
+def test_build_snapshot_rejects_empty_or_ambiguous_source_declarations(
+    tmp_path: Path, sources: list[dict[str, object]], error: str
+) -> None:
+    module = _load_module()
+    source = tmp_path / "source.txt"
+    source.write_text("value\n", encoding="utf-8")
+    rendered_sources = [
+        {**item, "path": str(source.resolve()) if item.get("path") == "PATH" else item.get("path")}
+        for item in sources
+    ]
+    manifest = _manifest(tmp_path, rendered_sources)
+
+    with pytest.raises(ValueError, match=error):
+        module.build_snapshot(manifest, tmp_path / "evidence.md")
+
+
+def test_real_manifest_rebuild_matches_the_tracked_snapshot(tmp_path: Path) -> None:
+    module = _load_module()
+    repo = Path(__file__).parents[3]
+    manifest = repo / "local" / "mental-models" / "egomotion4d" / "sources" / "kanban_collaboration_sources.json"
+    tracked = repo / "local" / "mental-models" / "egomotion4d" / "sources" / "kanban_collaboration_current_evidence.md"
+    rebuilt = tmp_path / "evidence.md"
+
+    snapshot = module.build_snapshot(manifest, rebuilt)
+
+    assert len(snapshot["sources"]) == 11
+    assert len(snapshot["evidence"]) == 19
+    assert rebuilt.read_bytes() == tracked.read_bytes()
 
 
 def test_build_snapshot_extracts_real_start_kanban_usage(tmp_path: Path) -> None:

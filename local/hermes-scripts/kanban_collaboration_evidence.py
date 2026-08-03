@@ -17,6 +17,9 @@ from typing import Any
 TERMINAL_MARKER = "END_KANBAN_COLLABORATION_EVIDENCE"
 _HEADING_RE = re.compile(r"^(#{1,6})\s+.*$")
 _SHELL_FUNCTION_RE = re.compile(r"(?m)^[ \t]*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\(\)[ \t]*\{")
+_HEREDOC_RE = re.compile(
+    r"<<(?P<strip>-?)[ \t]*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
 
 
 def _normalized_text(path: Path) -> tuple[bytes, str]:
@@ -53,21 +56,21 @@ def _python_symbol(text: str, symbol: str) -> list[str]:
     except SyntaxError as exc:
         raise ValueError(f"invalid Python source for selector {symbol!r}: {exc.msg}") from exc
 
-    nodes: list[tuple[ast.AST, list[ast.stmt]]] = []
+    nodes: list[ast.AST] = []
     if "." in symbol:
         class_name, method_name = symbol.split(".", 1)
         if "." in method_name:
             raise ValueError(f"unsupported Python symbol {symbol!r}")
         for candidate in tree.body:
             if isinstance(candidate, ast.ClassDef) and candidate.name == class_name:
-                nodes.extend((method, candidate.body)
+                nodes.extend(method
                     for method in candidate.body
                     if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and method.name == method_name
                 )
     else:
         nodes = [
-            (candidate, tree.body)
+            candidate
             for candidate in tree.body
             if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef))
             and candidate.name == symbol
@@ -75,20 +78,33 @@ def _python_symbol(text: str, symbol: str) -> list[str]:
 
     lines = text.splitlines(keepends=True)
     extracted: list[str] = []
-    for node, scope in nodes:
+    for node in nodes:
         start = _symbol_start(node) - 1
-        indent = node.col_offset
-        end = len(lines)
-        for candidate in scope:
-            if (
-                candidate is not node
-                and isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                and candidate.col_offset <= indent
-                and candidate.lineno > node.lineno
-            ):
-                end = min(end, _symbol_start(candidate) - 1)
-        extracted.append("".join(lines[start:end]))
+        extracted.append("".join(lines[start : node.end_lineno]))
     return extracted
+
+
+def _skip_heredoc(text: str, opening: int) -> int:
+    match = _HEREDOC_RE.match(text, opening)
+    if match is None:
+        raise ValueError("unsupported shell heredoc")
+    header_end = text.find("\n", match.end())
+    if header_end == -1 or "<<" in text[match.end() : header_end]:
+        raise ValueError("unsupported shell heredoc")
+    delimiter = match.group("delimiter")
+    strip_tabs = bool(match.group("strip"))
+    position = header_end + 1
+    while position <= len(text):
+        line_end = text.find("\n", position)
+        if line_end == -1:
+            line_end = len(text)
+        line = text[position:line_end]
+        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+            return line_end if line_end == len(text) else line_end + 1
+        if line_end == len(text):
+            break
+        position = line_end + 1
+    raise ValueError("unterminated shell heredoc")
 
 
 def _shell_closing_brace(text: str, opening: int) -> int:
@@ -111,6 +127,8 @@ def _shell_closing_brace(text: str, opening: int) -> int:
                 escaped = False
             elif char == "\\" and quote == '"':
                 escaped = True
+            elif char == "`" and quote == '"':
+                raise ValueError("unsupported shell construct: backticks")
             elif char == quote:
                 context["quote"] = None
             elif char == "$" and quote == '"' and text[index + 1 : index + 2] == "(":
@@ -122,6 +140,16 @@ def _shell_closing_brace(text: str, opening: int) -> int:
         if char == "$" and text[index + 1 : index + 2] == "(":
             contexts.append({"quote": None, "command": "$("})
             index += 2
+            continue
+        if char == "`":
+            raise ValueError("unsupported shell construct: backticks")
+        if char == "\\":
+            if index + 1 >= len(text):
+                raise ValueError("unsupported shell escape")
+            index += 2
+            continue
+        if char == "<" and text[index + 1 : index + 2] == "<":
+            index = _skip_heredoc(text, index)
             continue
         if char in ("'", '"'):
             context["quote"] = char
@@ -227,15 +255,27 @@ def build_snapshot(manifest_path: Path, output_path: Path) -> dict[str, object]:
     sources = manifest.get("sources")
     if not isinstance(sources, list):
         raise ValueError("manifest sources must be a list")
+    if not sources:
+        raise ValueError("manifest sources must be non-empty")
 
     snapshot_sources: list[dict[str, str]] = []
     evidence: list[dict[str, object]] = []
+    source_names: set[str] = set()
     for source in sources:
         if not isinstance(source, dict):
             raise ValueError("each manifest source must be an object")
         name, path_text, selectors = source.get("name"), source.get("path"), source.get("selectors")
         if not isinstance(name, str) or not isinstance(path_text, str) or not isinstance(selectors, list):
             raise ValueError("each source requires name, path, and selectors")
+        if not name:
+            raise ValueError("source name must be non-empty")
+        if not path_text:
+            raise ValueError("source path must be non-empty")
+        if not selectors:
+            raise ValueError("source selectors must be non-empty")
+        if name in source_names:
+            raise ValueError("source names must be unique")
+        source_names.add(name)
         path = Path(path_text)
         if not path.is_absolute():
             raise ValueError(f"source path must be absolute: {path}")
