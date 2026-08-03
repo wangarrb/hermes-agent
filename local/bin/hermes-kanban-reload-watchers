@@ -121,14 +121,27 @@ def _get_runtime_root(rt_path: str | None = None) -> Path:
     return runtime_root()
 
 
-def _is_lock_owner(pid: int, identity_digest: str, rt_root: Path) -> bool:
-    """Check if a PID matches the lock metadata owner for the given identity."""
+def _is_lock_owner(
+    pid: int,
+    identity_digest: str,
+    rt_root: Path,
+    *,
+    proc_start_time: int | None = None,
+) -> bool:
+    """Check if a PID matches the lock metadata owner for the given identity.
+
+    When ``proc_start_time`` is provided it must match too (PID-reuse safe).
+    """
     meta_path = rt_root / identity_digest / "metadata.json"
     try:
         meta = json.loads(meta_path.read_text())
-        return meta.get("pid") == pid
     except (OSError, json.JSONDecodeError):
         return False
+    if meta.get("pid") != pid:
+        return False
+    if proc_start_time is not None:
+        return meta.get("proc_start_time") == proc_start_time
+    return True
 
 
 def _filter_reload_targets(
@@ -199,16 +212,35 @@ def _discover_watchers() -> dict[int, list[str]]:
 
 
 def _wait_for_ack(
-    rt_root: Path, identity_digest: str, nonce: str,
-    timeout_s: float, pid: int,
+    rt_root: Path,
+    identity_digest: str,
+    nonce: str,
+    timeout_s: float,
+    pid: int,
+    *,
+    proc_start_time: int,
+    expected_revision: str,
 ) -> ReloadACK | None:
-    """Poll for an ACK file matching the nonce. Returns None on timeout."""
+    """Poll for an ACK file matching the nonce. Returns None on timeout.
+
+    The ACK is accepted only when ALL of the following match: nonce, PID,
+    proc start-time (PID-reuse safety), identity digest and code revision,
+    and ``ok=True``.  A FAILED ACK (``ok=False``) is returned immediately so
+    the caller can stop rolling with a distinguishable error instead of
+    waiting out the timeout.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         ack = read_reload_ack(rt_root, identity_digest)
         if ack is not None and ack.nonce == nonce:
-            # Verify PID unchanged (self-exec keeps PID)
-            if ack.pid == pid:
+            if not ack.ok:
+                return ack  # FAILED ACK — caller reports the error
+            if (
+                ack.pid == pid
+                and ack.proc_start_time == proc_start_time
+                and ack.identity_digest == identity_digest
+                and ack.code_revision == expected_revision
+            ):
                 return ack
         time.sleep(0.3)
     return None
@@ -264,9 +296,11 @@ def main(argv: list[str] | None = None) -> int:
             all_ok = False
             break
 
-        # Revalidate lock owner PID immediately before sending signal
-        if not _is_lock_owner(pid, ident.digest, rt_root):
-            print(f"SKIPPED: {ident.profile} — PID {pid} no longer owns lock")
+        # Revalidate lock owner PID+start-time immediately before sending signal
+        if not _is_lock_owner(
+            pid, ident.digest, rt_root, proc_start_time=owner_start,
+        ):
+            print(f"SKIPPED: {ident.profile} — PID {pid} no longer owns lock (start-time mismatch)")
             continue
 
         # Verify the process is still alive
@@ -297,8 +331,20 @@ def main(argv: list[str] | None = None) -> int:
             all_ok = False
             break
 
-        # Wait for ACK
-        ack = _wait_for_ack(rt_root, ident.digest, nonce, args.ack_timeout_s, pid)
+        # Wait for ACK (validated: nonce, PID, proc start-time, identity,
+        # code revision, ok=True)
+        ack = _wait_for_ack(
+            rt_root, ident.digest, nonce, args.ack_timeout_s, pid,
+            proc_start_time=owner_start,
+            expected_revision=req.code_revision,
+        )
+        if ack is not None and not ack.ok:
+            print(f"FAILED: {ident.profile} — watcher reported error={ack.error!r} (pid={ack.pid})")
+            delete_reload_request(rt_root, ident.digest)
+            delete_reload_handoff(rt_root, ident.digest)
+            delete_reload_ack(rt_root, ident.digest)
+            all_ok = False
+            break
         if ack is None:
             print(f"FAILED: {ident.profile} — ACK timeout after {args.ack_timeout_s}s")
             delete_reload_request(rt_root, ident.digest)

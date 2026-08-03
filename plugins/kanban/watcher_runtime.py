@@ -237,21 +237,82 @@ class WatcherLock:
     ) -> "WatcherLock":
         """Adopt an inherited lock FD after ``os.execve``.
 
-        Verifies the FD still holds the kernel lock and that metadata/identity
-        match before returning a ``WatcherLock`` wrapping the inherited FD.
-        """
-        # Verify the FD is valid and still locked by us
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError):
-            raise RuntimeError("inherited lock FD is not held by this process")
-        # Re-set to non-inheritable
-        os.set_inheritable(fd, False)
+        Strictly verifies, before adoption (any mismatch raises
+        ``RuntimeError`` and the caller must fail closed — never fall back to
+        :meth:`acquire` while the inherited FD may still hold the kernel lock):
 
+        1. The FD is a valid open file descriptor.
+        2. ``fstat`` dev/ino of the FD matches the expected ``watcher.lock``.
+        3. ``/proc/self/fd/<fd>`` resolves to the same lock path.
+        4. The kernel lock is still held on the FD.
+        5. Lock metadata matches the identity digest, this PID and this
+           process's proc start-time.
+        """
+        if fd < 0:
+            raise RuntimeError(f"invalid inherited lock FD {fd}")
+
+        # Expected lock layout — same as acquire()
         root = runtime_root()
         lock_dir = root / identity.digest
         lock_path = lock_dir / "watcher.lock"
         meta_path = lock_dir / "metadata.json"
+
+        # 1) FD is a valid open file
+        try:
+            fd_stat = os.fstat(fd)
+        except OSError as exc:
+            raise RuntimeError(f"inherited lock FD {fd} is not open: {exc}") from exc
+
+        # 2) FD points at the expected lock file (dev/ino identity)
+        try:
+            expected_stat = lock_path.stat()
+        except OSError as exc:
+            raise RuntimeError(f"expected lock path missing: {lock_path}: {exc}") from exc
+        if (fd_stat.st_dev, fd_stat.st_ino) != (
+            expected_stat.st_dev, expected_stat.st_ino,
+        ):
+            raise RuntimeError(
+                f"inherited FD {fd} does not point at {lock_path} "
+                f"(dev/ino mismatch: fd={fd_stat.st_dev}:{fd_stat.st_ino} "
+                f"expected={expected_stat.st_dev}:{expected_stat.st_ino})"
+            )
+
+        # 3) /proc/self/fd/<fd> resolves to the same path
+        try:
+            resolved = Path(f"/proc/self/fd/{fd}").resolve()
+        except OSError as exc:
+            raise RuntimeError(f"cannot resolve /proc/self/fd/{fd}: {exc}") from exc
+        if resolved != lock_path.resolve():
+            raise RuntimeError(
+                f"/proc/self/fd/{fd} -> {resolved}, expected {lock_path.resolve()}"
+            )
+
+        # 4) The kernel lock is still held on this FD
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            raise RuntimeError(f"inherited lock FD {fd} is not held: {exc}") from exc
+
+        # 5) Metadata matches identity / PID / proc start-time
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read lock metadata {meta_path}: {exc}") from exc
+        if meta.get("identity") != identity.digest:
+            raise RuntimeError(
+                f"lock metadata identity mismatch: {meta.get('identity')} != {identity.digest}"
+            )
+        if meta.get("pid") != os.getpid():
+            raise RuntimeError(
+                f"lock metadata pid {meta.get('pid')} != current pid {os.getpid()}"
+            )
+        if meta.get("proc_start_time") != _proc_start_time(os.getpid()):
+            raise RuntimeError(
+                "lock metadata proc_start_time mismatch with current process"
+            )
+
+        # Re-set to non-inheritable
+        os.set_inheritable(fd, False)
 
         return cls(identity, fd, lock_path, meta_path)
 
@@ -400,11 +461,23 @@ def delete_reload_handoff(root: Path, identity_digest: str) -> None:
 
 @dataclass(frozen=True)
 class ReloadACK:
-    """Acknowledgement that a watcher successfully reloaded."""
+    """Acknowledgement that a watcher reloaded (or failed to reload).
+
+    ``ok=True`` means the watcher successfully adopted the inherited lock and
+    reached the post-reload health requirement (idle: one healthy DB tick;
+    active: DB claim equality + one heartbeat).  ``ok=False`` carries a
+    machine-readable ``error`` reason (e.g. ``preflight``, ``execve_failed``,
+    ``owner_mismatch``) so the CLI can stop rolling immediately instead of
+    timing out.  ``identity_digest`` pins the ACK to the exact watcher
+    identity that was asked to reload.
+    """
     nonce: str
     pid: int
     proc_start_time: int
     code_revision: str
+    ok: bool = True
+    error: str = ""
+    identity_digest: str = ""
     task_id: str = ""
     run_id: int = 0
 
@@ -414,6 +487,9 @@ class ReloadACK:
             "pid": self.pid,
             "proc_start_time": self.proc_start_time,
             "code_revision": self.code_revision,
+            "ok": self.ok,
+            "error": self.error,
+            "identity": self.identity_digest,
             "task_id": self.task_id,
             "run_id": self.run_id,
         }
@@ -425,6 +501,9 @@ class ReloadACK:
             pid=int(d["pid"]),
             proc_start_time=int(d["proc_start_time"]),
             code_revision=str(d.get("code_revision", "")),
+            ok=bool(d.get("ok", True)),
+            error=str(d.get("error", "")),
+            identity_digest=str(d.get("identity", "")),
             task_id=str(d.get("task_id", "")),
             run_id=int(d.get("run_id", 0)),
         )
