@@ -1147,15 +1147,16 @@ for proc_pattern in "hermes.*kanban.*dispatch" "hermes.*kanban.*daemon"; do
 done
 
 # ── Launch watcher supervisor (single process, monitors all watcher children) ──
-# Kill old supervisor if running
-if pgrep -f "kanban-watcher-supervisor" >/dev/null 2>&1; then
-    pkill -f "kanban-watcher-supervisor" 2>/dev/null || true
+# Scoped cleanup: only stop supervisors for the same board/session, never global pkill.
+# Match supervisor processes that carry --board "$BOARD" --session "$SESSION_NAME".
+if pgrep -f "kanban-watcher-supervisor.*--board.*${BOARD}.*--session.*${SESSION_NAME}" >/dev/null 2>&1; then
+    pkill -f "kanban-watcher-supervisor.*--board.*${BOARD}.*--session.*${SESSION_NAME}" 2>/dev/null || true
     sleep 0.5
 fi
 SUPERVISOR="$SCRIPT_DIR/kanban-watcher-supervisor.py"
 if [ -x "$SUPERVISOR" ]; then
     SUPERVISOR_LOG="$HOME/.hermes/hermes-agent/kanban_logs/$BOARD/watcher-supervisor-stderr.log"
-    nohup python3 "$SUPERVISOR" --session "$SESSION_NAME" --poll-s 30 \
+    nohup python3 "$SUPERVISOR" --board "$BOARD" --session "$SESSION_NAME" --poll-s 30 \
         > "$SUPERVISOR_LOG" 2>&1 &
     echo "  watcher supervisor started: pid=$! (stderr log: $SUPERVISOR_LOG)"
 else
