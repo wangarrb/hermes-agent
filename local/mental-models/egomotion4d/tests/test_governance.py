@@ -441,6 +441,8 @@ def test_refresh_evidence_bundle_builds_registered_kanban_snapshot_before_hashin
                     snapshot.name: {
                         "authority": "canonical-source-extract",
                         "replaceable": True,
+                        "logical_id": "egomotion4d-kanban-collaboration",
+                        "manifest": "kanban_collaboration_sources.json",
                     }
                 },
             }
@@ -536,6 +538,8 @@ def test_validate_current_evidence_build_input_accepts_canonical_source_extract(
                     source.name: {
                         "authority": "canonical-source-extract",
                         "replaceable": True,
+                        "logical_id": "egomotion4d-kanban-collaboration",
+                        "manifest": "kanban_collaboration_sources.json",
                     }
                 },
             }
@@ -563,6 +567,169 @@ def test_validate_current_evidence_build_input_rejects_unknown_authority(tmp_pat
 
     with pytest.raises(ValueError, match="invalid derived build input contract"):
         daily._validate_current_evidence_build_input(source)
+
+
+def _write_kanban_refresh_fixture(
+    tmp_path: Path,
+    *,
+    manifest_logical_id: str = "egomotion4d-kanban-collaboration",
+    bundle_sources: dict | None = None,
+    snapshot_bytes: bytes | None = None,
+) -> tuple[Path, Path, Path]:
+    logical_id = "egomotion4d-kanban-collaboration"
+    source_dir = tmp_path / "mental-models" / "egomotion4d" / "sources"
+    source_dir.mkdir(parents=True)
+    canonical_source = tmp_path / "canonical.txt"
+    canonical_source.write_text("canonical evidence\n", encoding="utf-8")
+    snapshot = source_dir / "kanban_collaboration_current_evidence.md"
+    if snapshot_bytes is not None:
+        snapshot.write_bytes(snapshot_bytes)
+    (source_dir / "kanban_collaboration_sources.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "logical_id": manifest_logical_id,
+                "sources": [
+                    {
+                        "name": "canonical",
+                        "path": str(canonical_source),
+                        "selectors": [{"kind": "whole_file"}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source_dir / "derived-build-inputs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    snapshot.name: {
+                        "authority": "canonical-source-extract",
+                        "replaceable": True,
+                        "logical_id": logical_id,
+                        "manifest": "kanban_collaboration_sources.json",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    if bundle_sources is None:
+        bundle_sources = {"snapshot": {"path": str(snapshot), "sha256": "stale"}}
+    bundle_path = tmp_path / "mental-models" / "egomotion4d" / "evidence_bundle.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "per_model": {
+                    logical_id: {
+                        "d_ids": [],
+                        "sources": bundle_sources,
+                        "evidence_sha256": "old",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return source_dir, snapshot, bundle_path
+
+
+def test_validate_current_evidence_build_input_rejects_canonical_authority_impostor(
+    tmp_path, daily
+):
+    source = tmp_path / "impostor_current_evidence.md"
+    source.write_text("derived snapshot", encoding="utf-8")
+    (tmp_path / "derived-build-inputs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sources": {
+                    source.name: {
+                        "authority": "canonical-source-extract",
+                        "replaceable": True,
+                        "logical_id": "egomotion4d-kanban-collaboration",
+                        "manifest": "kanban_collaboration_sources.json",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid derived build input contract"):
+        daily._validate_current_evidence_build_input(source)
+
+
+def test_refresh_evidence_bundle_rejects_wrong_kanban_manifest_logical_id(
+    tmp_path, monkeypatch, daily
+):
+    _source_dir, _snapshot, _bundle = _write_kanban_refresh_fixture(
+        tmp_path, manifest_logical_id="egomotion4d-impostor"
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    with pytest.raises(ValueError, match="manifest logical_id"):
+        daily._refresh_evidence_bundle()
+
+
+def test_refresh_evidence_bundle_rejects_registered_kanban_bundle_without_snapshot(
+    tmp_path, monkeypatch, daily
+):
+    _source_dir, _snapshot, _bundle = _write_kanban_refresh_fixture(
+        tmp_path, bundle_sources={}
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    with pytest.raises(ValueError, match="expected snapshot"):
+        daily._refresh_evidence_bundle()
+
+
+def test_refresh_evidence_bundle_rejects_helper_returning_wrong_logical_id(
+    tmp_path, monkeypatch, daily
+):
+    _source_dir, _snapshot, _bundle = _write_kanban_refresh_fixture(tmp_path)
+    fake_daily_script = tmp_path / "hindsight_daily_noagent.py"
+    fake_daily_script.write_text("# test helper anchor\n", encoding="utf-8")
+    fake_helper = fake_daily_script.with_name("kanban_collaboration_evidence.py")
+    fake_helper.write_text(
+        "def build_snapshot(_manifest, output):\n"
+        "    output.write_text('fake snapshot\\n', encoding='utf-8')\n"
+        "    return {'logical_id': 'egomotion4d-impostor'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+    monkeypatch.setattr(daily, "__file__", str(fake_daily_script))
+
+    with pytest.raises(ValueError, match="evidence build failed"):
+        daily._refresh_evidence_bundle()
+
+
+@pytest.mark.parametrize("old_snapshot", [b"old snapshot\n", None])
+def test_refresh_evidence_bundle_restores_snapshot_when_later_source_fails(
+    tmp_path, monkeypatch, daily, old_snapshot
+):
+    _source_dir, snapshot, bundle_path = _write_kanban_refresh_fixture(
+        tmp_path, snapshot_bytes=old_snapshot
+    )
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["per_model"]["egomotion4d-kanban-collaboration"]["sources"][
+        "missing"
+    ] = {"path": str(tmp_path / "missing.md"), "sha256": "stale"}
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+    original_bundle = bundle_path.read_bytes()
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        daily._refresh_evidence_bundle()
+
+    assert bundle_path.read_bytes() == original_bundle
+    if old_snapshot is None:
+        assert not snapshot.exists()
+    else:
+        assert snapshot.read_bytes() == old_snapshot
 
 
 def test_refresh_evidence_bundle_rejects_unmarked_current_evidence(

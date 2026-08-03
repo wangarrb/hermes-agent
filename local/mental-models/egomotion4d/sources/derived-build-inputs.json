@@ -4,7 +4,9 @@
   "sources": {
     "kanban_collaboration_current_evidence.md": {
       "authority": "canonical-source-extract",
-      "replaceable": true
+      "replaceable": true,
+      "logical_id": "egomotion4d-kanban-collaboration",
+      "manifest": "kanban_collaboration_sources.json"
     },
     "dynamic_actor_current_evidence.md": {
       "authority": "kg-current-evidence",

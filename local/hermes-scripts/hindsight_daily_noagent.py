@@ -650,20 +650,50 @@ def _validate_current_evidence_build_input(path: Path) -> None:
         raise ValueError(
             f"{path}: missing derived build input contract in {manifest_path}"
         ) from exc
+    authority = contract.get("authority")
+    if authority == "kg-current-evidence":
+        authority_valid = True
+    elif authority == "canonical-source-extract":
+        authority_valid = (
+            path.name == KANBAN_COLLABORATION_SNAPSHOT
+            and contract.get("logical_id") == KANBAN_COLLABORATION_LOGICAL_ID
+            and contract.get("manifest") == KANBAN_COLLABORATION_MANIFEST
+        )
+    else:
+        authority_valid = False
     if (
         manifest.get("schema_version") != 1
-        or contract.get("authority") not in CURRENT_EVIDENCE_BUILD_INPUT_AUTHORITIES
+        or authority not in CURRENT_EVIDENCE_BUILD_INPUT_AUTHORITIES
+        or not authority_valid
         or contract.get("replaceable") is not True
     ):
         raise ValueError(f"{path}: invalid derived build input contract")
 
 
-def _build_kanban_collaboration_snapshot(evidence_root: Path) -> None:
+def _build_kanban_collaboration_snapshot(evidence_root: Path, entry: dict) -> None:
     """Regenerate the registered Kanban evidence input through its maintained helper."""
     sources_root = evidence_root / "sources"
     manifest_path = sources_root / KANBAN_COLLABORATION_MANIFEST
     if not manifest_path.is_file():
         raise ValueError(f"kanban collaboration manifest missing: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"kanban collaboration manifest invalid: {manifest_path}") from exc
+    if manifest.get("logical_id") != KANBAN_COLLABORATION_LOGICAL_ID:
+        raise ValueError(f"kanban collaboration manifest logical_id mismatch: {manifest_path}")
+
+    snapshot_path = sources_root / KANBAN_COLLABORATION_SNAPSHOT
+    bundle_sources = entry.get("sources")
+    if not isinstance(bundle_sources, dict) or not any(
+        isinstance(source, dict)
+        and isinstance(source.get("path"), str)
+        and Path(source["path"]).resolve() == snapshot_path.resolve()
+        for source in bundle_sources.values()
+    ):
+        raise ValueError(
+            f"kanban collaboration bundle entry missing expected snapshot: {snapshot_path}"
+        )
 
     helper_path = Path(__file__).with_name("kanban_collaboration_evidence.py")
     if not helper_path.is_file():
@@ -679,55 +709,90 @@ def _build_kanban_collaboration_snapshot(evidence_root: Path) -> None:
         build_snapshot = getattr(helper, "build_snapshot", None)
         if not callable(build_snapshot):
             raise TypeError("helper does not export callable build_snapshot")
-        build_snapshot(manifest_path, sources_root / KANBAN_COLLABORATION_SNAPSHOT)
+        snapshot = build_snapshot(manifest_path, snapshot_path)
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("logical_id") != KANBAN_COLLABORATION_LOGICAL_ID
+        ):
+            raise ValueError("helper returned mismatched logical_id")
     except Exception as exc:
         raise ValueError(
             f"kanban collaboration evidence build failed: {helper_path}"
         ) from exc
 
 
+def _restore_kanban_collaboration_snapshot(
+    snapshot_path: Path, old_snapshot: bytes | None
+) -> None:
+    """Compensate a failed refresh without claiming multi-file atomicity."""
+    if old_snapshot is None:
+        snapshot_path.unlink(missing_ok=True)
+        return
+    temporary_path = snapshot_path.with_suffix(snapshot_path.suffix + ".restore.tmp")
+    try:
+        temporary_path.write_bytes(old_snapshot)
+        os.replace(temporary_path, snapshot_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _refresh_evidence_bundle() -> dict:
     """Refresh source hashes and deterministic identities without changing acceptance."""
     path = HERMES_HOME / "mental-models" / "egomotion4d" / "evidence_bundle.json"
     bundle = json.loads(path.read_text(encoding="utf-8"))
-    if KANBAN_COLLABORATION_LOGICAL_ID in bundle.get("per_model", {}):
-        _build_kanban_collaboration_snapshot(path.parent)
-    for logical_id, entry in bundle.get("per_model", {}).items():
-        spec_name = logical_id.removeprefix("egomotion4d-") + ".json"
-        spec_path = path.parent / "specs" / spec_name
-        if spec_path.is_file():
-            spec = json.loads(spec_path.read_text(encoding="utf-8"))
-            decision_ids = spec.get("decision_ids")
-            if decision_ids is not None:
-                if not isinstance(decision_ids, list) or not all(
-                    isinstance(item, str) and re.fullmatch(r"D\d+", item)
-                    for item in decision_ids
-                ):
-                    raise ValueError(
-                        f"{spec_path}: decision_ids must contain only D<number> strings"
-                    )
-                entry["d_ids"] = list(dict.fromkeys(decision_ids))
-        for source in entry.get("sources", {}).values():
-            source_path = Path(source["path"])
-            if not source_path.is_file():
-                raise FileNotFoundError(source_path)
-            source_bytes = source_path.read_bytes()
-            _validate_current_evidence_build_input(source_path)
-            source["sha256"] = hashlib.sha256(source_bytes).hexdigest()
-        entry["evidence_sha256"] = _canonical_evidence_sha(entry)
-    bundle["schema_version"] = 2
-    bundle["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    global_payload = {
-        key: value["evidence_sha256"]
-        for key, value in sorted(bundle.get("per_model", {}).items())
-    }
-    bundle["bundle_sha256"] = hashlib.sha256(
-        json.dumps(global_payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    return bundle
+    per_model = bundle.get("per_model", {})
+    collaboration_entry = per_model.get(KANBAN_COLLABORATION_LOGICAL_ID)
+    snapshot_path = path.parent / "sources" / KANBAN_COLLABORATION_SNAPSHOT
+    old_snapshot = snapshot_path.read_bytes() if snapshot_path.is_file() else None
+    try:
+        if collaboration_entry is not None:
+            _build_kanban_collaboration_snapshot(path.parent, collaboration_entry)
+        # A process crash can still fall between replacing snapshot and bundle. In that
+        # case source-hash mismatch fails closed and prevents publish on the next run.
+        for logical_id, entry in per_model.items():
+            spec_name = logical_id.removeprefix("egomotion4d-") + ".json"
+            spec_path = path.parent / "specs" / spec_name
+            if spec_path.is_file():
+                spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                decision_ids = spec.get("decision_ids")
+                if decision_ids is not None:
+                    if not isinstance(decision_ids, list) or not all(
+                        isinstance(item, str) and re.fullmatch(r"D\d+", item)
+                        for item in decision_ids
+                    ):
+                        raise ValueError(
+                            f"{spec_path}: decision_ids must contain only D<number> strings"
+                        )
+                    entry["d_ids"] = list(dict.fromkeys(decision_ids))
+            for source in entry.get("sources", {}).values():
+                source_path = Path(source["path"])
+                if not source_path.is_file():
+                    raise FileNotFoundError(source_path)
+                source_bytes = source_path.read_bytes()
+                _validate_current_evidence_build_input(source_path)
+                source["sha256"] = hashlib.sha256(source_bytes).hexdigest()
+            entry["evidence_sha256"] = _canonical_evidence_sha(entry)
+        bundle["schema_version"] = 2
+        bundle["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        global_payload = {
+            key: value["evidence_sha256"] for key, value in sorted(per_model.items())
+        }
+        bundle["bundle_sha256"] = hashlib.sha256(
+            json.dumps(global_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, path)
+        return bundle
+    except Exception:
+        if collaboration_entry is not None:
+            try:
+                _restore_kanban_collaboration_snapshot(snapshot_path, old_snapshot)
+            except OSError:
+                pass
+        raise
 
 
 def _accepted_revision(model: dict) -> dict | None:
