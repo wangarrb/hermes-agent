@@ -450,6 +450,49 @@ def read_reload_handoff(root: Path, identity_digest: str) -> ReloadHandoff | Non
     return ReloadHandoff.from_dict(data)
 
 
+def validate_reload_handoff(
+    handoff: ReloadHandoff | None,
+    *,
+    nonce: str,
+    identity_digest: str,
+    current_pid: int,
+    task_state: tuple[str | None, int | None, int | None, str | None] | None,
+) -> str | None:
+    """Return a machine-readable reload handoff error, or ``None``.
+
+    Every reload writes a handoff, including an explicit empty handoff for an
+    idle watcher.  This prevents a missing or invalid active handoff from
+    falling through to the idle success-ACK path.
+    """
+    if handoff is None:
+        return "missing_handoff"
+    if handoff.nonce != nonce:
+        return "nonce_mismatch"
+    if handoff.identity_digest != identity_digest:
+        return "identity_mismatch"
+    if handoff.original_pid != current_pid or handoff.worker_pid != current_pid:
+        return "pid_mismatch"
+    if not handoff.task_id:
+        if (
+            handoff.run_id != 0
+            or handoff.generation != 0
+            or bool(handoff.claim_lock)
+        ):
+            return "invalid_idle_handoff"
+        return None
+    if task_state is None:
+        return "claim_state_unavailable"
+    status, run_id, generation, claim_lock = task_state
+    if (
+        status != "running"
+        or run_id != handoff.run_id
+        or generation != handoff.generation
+        or claim_lock != handoff.claim_lock
+    ):
+        return "claim_state_mismatch"
+    return None
+
+
 def delete_reload_handoff(root: Path, identity_digest: str) -> None:
     try:
         reload_handoff_path(root, identity_digest).unlink()

@@ -61,6 +61,7 @@ from watcher_runtime import (  # type: ignore[import-not-found]
     delete_reload_request,
     delete_reload_handoff,
     cleanup_reload_state,
+    validate_reload_handoff,
 )
 
 
@@ -133,7 +134,37 @@ def main(argv: list[str] | None = None) -> int:
     if is_reload_exec and reload_nonce_env:
         root = runtime_root()
         handoff = read_reload_handoff(root, identity.digest)
-        if handoff and handoff.nonce == reload_nonce_env:
+        task_state = None
+        if handoff and handoff.task_id and args.claim_file:
+            claim_path = Path(args.claim_file)
+            if claim_path.exists():
+                claim = json.loads(claim_path.read_text())
+                task_state = (
+                    "running", claim.get("run_id"), claim.get("generation"),
+                    claim.get("claim_lock"),
+                )
+        handoff_error = validate_reload_handoff(
+            handoff,
+            nonce=reload_nonce_env,
+            identity_digest=identity.digest,
+            current_pid=os.getpid(),
+            task_state=task_state,
+        )
+        if handoff_error:
+            write_reload_ack(
+                root, identity.digest,
+                ReloadACK(
+                    nonce=reload_nonce_env, pid=os.getpid(),
+                    proc_start_time=_proc_start_time(os.getpid()),
+                    code_revision="unknown", ok=False, error=handoff_error,
+                    identity_digest=identity.digest,
+                ),
+            )
+            print(f"HANDOFF_REJECTED error={handoff_error}", flush=True)
+            delete_reload_request(root, identity.digest)
+            delete_reload_handoff(root, identity.digest)
+            return 1
+        if handoff and handoff.task_id:
             active_task = handoff.task_id
             active_run_id = handoff.run_id
             active_generation = handoff.generation
@@ -245,19 +276,19 @@ def main(argv: list[str] | None = None) -> int:
             delete_reload_handoff(root, identity.digest)
             return False
 
-        # Handoff snapshot of the active claim
+        # Explicit active or idle handoff; missing is always a reload failure.
+        handoff = ReloadHandoff(
+            nonce=req.nonce,
+            identity_digest=identity.digest,
+            task_id=active_task or "",
+            run_id=active_run_id or 0,
+            generation=active_generation or 0,
+            claim_lock=active_claim_lock or "",
+            worker_pid=os.getpid(),
+            original_pid=os.getpid(),
+        )
+        write_reload_handoff(root, handoff)
         if active_task is not None:
-            handoff = ReloadHandoff(
-                nonce=req.nonce,
-                identity_digest=identity.digest,
-                task_id=active_task,
-                run_id=active_run_id or 0,
-                generation=active_generation or 1,
-                claim_lock=active_claim_lock or "",
-                worker_pid=os.getpid(),
-                original_pid=os.getpid(),
-            )
-            write_reload_handoff(root, handoff)
             print(f"HANDOFF_WRITTEN task={active_task} run={active_run_id}", flush=True)
 
         if exec_count >= args.exec_limit:

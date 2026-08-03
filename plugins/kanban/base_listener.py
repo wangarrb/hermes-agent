@@ -1785,8 +1785,17 @@ class BaseInteractiveListener:
         _reload_identity_env = os.environ.get("HERMES_KANBAN_RELOAD_IDENTITY", "")
         _is_reload_exec = bool(
             _inherited_lock_fd_str
+            and _reload_nonce_env
             and _reload_identity_env == _watcher_identity.digest
         )
+
+        if _inherited_lock_fd_str and not _is_reload_exec:
+            log_line(
+                log_path,
+                "incomplete or identity-mismatched inherited reload state; "
+                "fail closed without acquiring another watcher lock",
+            )
+            return 1
 
         if _is_reload_exec:
             try:
@@ -1804,12 +1813,6 @@ class BaseInteractiveListener:
                 return 1
             log_line(log_path, f"adopted inherited lock FD={_inherited_fd} for reload")
         else:
-            if _inherited_lock_fd_str:
-                log_line(
-                    log_path,
-                    "stale HERMES_KANBAN_WATCHER_LOCK_FD env (identity "
-                    "mismatch); acquiring a fresh lock",
-                )
             try:
                 _watcher_lock = WatcherLock.acquire(_watcher_identity)
             except SystemExit:
@@ -1843,32 +1846,49 @@ class BaseInteractiveListener:
         if _is_reload_exec and _reload_nonce_env:
             root = _wr_module.runtime_root()
             handoff = _wr_module.read_reload_handoff(root, _watcher_identity.digest)
-            if handoff and handoff.nonce == _reload_nonce_env:
+            task_state = None
+            if handoff and handoff.task_id:
                 try:
                     conn_check = kb.connect(board=board)
-                    (
+                    task_state = (
                         status,
                         current_run_id,
                         current_generation,
                         current_claim_lock,
                     ) = _task_claim_state(conn_check, handoff.task_id)
                     conn_check.close()
-                    if (
-                        status == "running"
-                        and current_run_id == handoff.run_id
-                        and current_generation == handoff.generation
-                        and current_claim_lock == handoff.claim_lock
-                    ):
-                        log_line(log_path, f"reload handoff verified: task={handoff.task_id} run={handoff.run_id}")
-                        # Restore active claim state without claiming/injecting again
-                        active_task = handoff.task_id
-                        active_run_id = handoff.run_id
-                        active_generation = handoff.generation
-                        active_claim_lock = handoff.claim_lock
-                    else:
-                        log_line(log_path, f"reload handoff mismatch: status={status} run={current_run_id} vs handoff run={handoff.run_id}")
                 except Exception as exc:
                     log_line(log_path, f"reload handoff DB verification failed: {exc}")
+            handoff_error = _wr_module.validate_reload_handoff(
+                handoff,
+                nonce=_reload_nonce_env,
+                identity_digest=_watcher_identity.digest,
+                current_pid=os.getpid(),
+                task_state=task_state,
+            )
+            if handoff_error:
+                _wr_module.write_reload_ack(
+                    root, _watcher_identity.digest,
+                    _wr_module.ReloadACK(
+                        nonce=_reload_nonce_env,
+                        pid=os.getpid(),
+                        proc_start_time=_wr_module._proc_start_time(os.getpid()),
+                        code_revision=_wr_module._code_revision(),
+                        ok=False,
+                        error=handoff_error,
+                        identity_digest=_watcher_identity.digest,
+                    ),
+                )
+                _wr_module.delete_reload_request(root, _watcher_identity.digest)
+                _wr_module.delete_reload_handoff(root, _watcher_identity.digest)
+                log_line(log_path, f"reload handoff rejected: {handoff_error}")
+                return 1
+            if handoff and handoff.task_id:
+                log_line(log_path, f"reload handoff verified: task={handoff.task_id} run={handoff.run_id}")
+                active_task = handoff.task_id
+                active_run_id = handoff.run_id
+                active_generation = handoff.generation
+                active_claim_lock = handoff.claim_lock
             # Clean up reload state (request/handoff/ACK will be rewritten
             # by the new process as needed)
             _wr_module.cleanup_reload_state(root, _watcher_identity.digest)
@@ -1935,19 +1955,20 @@ class BaseInteractiveListener:
                 _wr_module.delete_reload_request(root, _watcher_identity.digest)
                 return False
 
-            # Write handoff snapshot of active claim state
+            # Always write a handoff.  An explicit empty handoff distinguishes
+            # a healthy idle watcher from a missing/corrupt active handoff.
+            handoff = _wr_module.ReloadHandoff(
+                nonce=req.nonce,
+                identity_digest=_watcher_identity.digest,
+                task_id=active_task or "",
+                run_id=active_run_id or 0,
+                generation=active_generation or 0,
+                claim_lock=active_claim_lock or "",
+                worker_pid=os.getpid(),
+                original_pid=os.getpid(),
+            )
+            _wr_module.write_reload_handoff(root, handoff)
             if active_task is not None:
-                handoff = _wr_module.ReloadHandoff(
-                    nonce=req.nonce,
-                    identity_digest=_watcher_identity.digest,
-                    task_id=active_task,
-                    run_id=active_run_id or 0,
-                    generation=active_generation or 1,
-                    claim_lock=active_claim_lock or "",
-                    worker_pid=os.getpid(),
-                    original_pid=os.getpid(),
-                )
-                _wr_module.write_reload_handoff(root, handoff)
                 log_line(log_path, f"reload handoff written: task={active_task} run={active_run_id}")
 
             # Preflight: verify the entry point is importable and parseable

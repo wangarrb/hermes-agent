@@ -590,6 +590,98 @@ except RuntimeError:
         with WatcherLock.acquire(ident):
             pass
 
+    def test_production_entry_identity_mismatch_fails_without_acquire(
+        self, tmp_path, monkeypatch,
+    ):
+        """An inherited FD with the wrong identity is never a cold start.
+
+        This exercises the real ``BaseInteractiveListener.watcher_main``
+        startup branch.  Falling back to ``acquire`` would leave the unrelated
+        inherited lock alive and create a second functional identity.
+        """
+        import argparse
+        import base_listener as bl
+
+        class Listener(bl.BaseInteractiveListener):
+            agent_name = "test"
+            agent_slug = "test"
+
+            def build_tui_cmd(self, workspace, **kwargs):
+                return []
+
+            def has_saved_sessions(self, workspace):
+                return True
+
+            def inject_text(self, *args, **kwargs):
+                return ""
+
+        called = []
+
+        def forbidden_acquire(cls, identity):
+            called.append(identity)
+            raise AssertionError("identity-mismatched inherited FD fell back to acquire")
+
+        monkeypatch.setattr(WatcherLock, "acquire", classmethod(forbidden_acquire))
+        monkeypatch.setenv("HERMES_KANBAN_WATCHER_LOCK_FD", "123")
+        monkeypatch.setenv("HERMES_KANBAN_RELOAD_IDENTITY", "wrong-identity")
+        args = argparse.Namespace(
+            profile="planner", board="testboard", workspace=str(tmp_path),
+            zellij_session="test-session", zellij_pane_id="1",
+        )
+
+        assert Listener().watcher_main(args) == 1
+        assert called == []
+
+
+class TestReloadHandoffValidation:
+    def test_missing_handoff_is_not_a_healthy_idle_reload(self):
+        from watcher_runtime import validate_reload_handoff
+
+        error = validate_reload_handoff(
+            None,
+            nonce="n1",
+            identity_digest="digest",
+            current_pid=os.getpid(),
+            task_state=None,
+        )
+
+        assert error == "missing_handoff"
+
+    def test_active_claim_mismatch_is_not_a_healthy_idle_reload(self):
+        from watcher_runtime import validate_reload_handoff
+
+        handoff = ReloadHandoff(
+            nonce="n1", identity_digest="digest", task_id="t_active",
+            run_id=7, generation=2, claim_lock="host:1:test",
+            worker_pid=os.getpid(), original_pid=os.getpid(),
+        )
+        error = validate_reload_handoff(
+            handoff,
+            nonce="n1",
+            identity_digest="digest",
+            current_pid=os.getpid(),
+            task_state=("running", 8, 2, "host:1:test"),
+        )
+
+        assert error == "claim_state_mismatch"
+
+    def test_explicit_idle_handoff_is_valid(self):
+        from watcher_runtime import validate_reload_handoff
+
+        handoff = ReloadHandoff(
+            nonce="n1", identity_digest="digest", task_id="",
+            run_id=0, generation=0, claim_lock="",
+            worker_pid=os.getpid(), original_pid=os.getpid(),
+        )
+
+        assert validate_reload_handoff(
+            handoff,
+            nonce="n1",
+            identity_digest="digest",
+            current_pid=os.getpid(),
+            task_state=None,
+        ) is None
+
 
 # ── SIGUSR1 self-exec integration ────────────────────────────────────────────
 
