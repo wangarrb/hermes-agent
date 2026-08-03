@@ -795,10 +795,25 @@ class BaseInteractiveListener:
         self._idle_followup_task_id: str | None = None
         self._idle_followup_since: float | None = None
         self._idle_followup_sent: bool = False
+        self._goal_completion_last_sent_at: dict[str, float] = {}
 
     # An idle prompt is a safe input boundary, but brief idle flashes occur
     # between tool calls.  Require a stable idle interval before injecting.
     IDLE_FOLLOWUP_GRACE_S: float = 15.0
+    DAYTIME_GOAL_COMPLETION_INTERVAL_S: float = 2 * 60.0
+    OVERNIGHT_GOAL_COMPLETION_INTERVAL_S: float = 30 * 60.0
+    OVERNIGHT_GOAL_COMPLETION_START_HOUR: int = 1
+    OVERNIGHT_GOAL_COMPLETION_END_HOUR: int = 9
+
+    def _goal_completion_interval_s(self, now: float) -> float:
+        hour = time.localtime(now).tm_hour
+        if (
+            self.OVERNIGHT_GOAL_COMPLETION_START_HOUR
+            <= hour
+            < self.OVERNIGHT_GOAL_COMPLETION_END_HOUR
+        ):
+            return self.OVERNIGHT_GOAL_COMPLETION_INTERVAL_S
+        return self.DAYTIME_GOAL_COMPLETION_INTERVAL_S
 
     def _reset_idle_followup(self) -> None:
         self._idle_followup_task_id = None
@@ -869,6 +884,11 @@ class BaseInteractiveListener:
             return True
         if now - self._idle_followup_since < self.IDLE_FOLLOWUP_GRACE_S:
             return True
+        if task.goal_mode:
+            last_sent_at = self._goal_completion_last_sent_at.get(task_id)
+            interval_s = self._goal_completion_interval_s(now)
+            if last_sent_at is not None and now - last_sent_at < interval_s:
+                return True
 
         session = getattr(args, "zellij_session", "")
         pane_id = str(getattr(args, "zellij_pane_id", ""))
@@ -878,6 +898,8 @@ class BaseInteractiveListener:
         zellij_inject(session=session, pane_id=pane_id, text=text, log_path=log_path)
         time.sleep(0.5)
         zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
+        if task.goal_mode:
+            self._goal_completion_last_sent_at[task_id] = now
         self._idle_followup_sent = True
         return True
 

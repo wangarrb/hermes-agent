@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,12 @@ from plugins.kanban.hermes_listener.hermes_kanban_interactive import (
 from plugins.kanban.codex_listener.codex_kanban_interactive import (
     CodexInteractiveListener,
 )
+
+
+@pytest.fixture(autouse=True)
+def daytime_goal_check_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy idle-episode tests outside the overnight throttle window."""
+    monkeypatch.setattr(bl.time, "localtime", lambda _: SimpleNamespace(tm_hour=12))
 
 
 @pytest.fixture
@@ -108,7 +115,7 @@ def test_goal_task_gets_one_completion_check_per_idle_episode(
     assert "Continue the same goal" not in checks[0]
 
 
-def test_busy_activity_resets_goal_idle_episode(
+def test_goal_completion_check_is_throttled_to_2_minutes_outside_1_to_9(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     task_id = _running_task(assignee="planner", goal_mode=True)
@@ -130,6 +137,43 @@ def test_busy_activity_resets_goal_idle_episode(
         screen[0] = "planner ❯\n"
         listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
         now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+        assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 1
+        now[0] += listener.DAYTIME_GOAL_COMPLETION_INTERVAL_S
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 2
+
+
+def test_goal_completion_check_is_throttled_to_30_minutes_from_1_to_9(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="planner", goal_mode=True)
+    listener = _Listener()
+    now = [100.0]
+    screen = ["planner ❯\n"]
+    injected: list[str] = []
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bl.time, "localtime", lambda _: SimpleNamespace(tm_hour=2))
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: screen[0])
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]))
+
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+        screen[0] = "working\n"
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        screen[0] = "planner ❯\n"
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 60
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 1
+
+        now[0] += listener.OVERNIGHT_GOAL_COMPLETION_INTERVAL_S
         listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
 
     assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 2
