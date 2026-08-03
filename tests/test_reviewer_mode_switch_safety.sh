@@ -8,12 +8,19 @@ SWITCH="$ROOT/local/bin/hermes-kanban-switch-reviewer-mode"
 idle_screen=$'previous output\n\n› Run /review on my current changes\n\n  gpt-5.6-sol high · master · Context 20% used'
 busy_screen=$'• Working (20s • esc to interrupt)\n\n› Run /review on my current changes\n\n  gpt-5.6-sol high · master · Context 20% used'
 no_prompt_screen=$'previous output\n\n  gpt-5.6-sol high · master · Context 20% used'
+hermes_idle_screen=$'previous output\n\ncoordinator ❯'
+hermes_busy_screen=$'⚙ wait proc_abc 180s\n\n⚕ ❯ msg=interrupt · /queue · /bg'
 
 source "$HELPER"
 
 reviewer_screen_is_idle "$idle_screen"
+reviewer_screen_is_idle "$hermes_idle_screen"
 if reviewer_screen_is_idle "$busy_screen"; then
     echo "busy screen unexpectedly accepted" >&2
+    exit 1
+fi
+if reviewer_screen_is_idle "$hermes_busy_screen"; then
+    echo "busy Hermes screen unexpectedly accepted" >&2
     exit 1
 fi
 if reviewer_screen_is_idle "$no_prompt_screen"; then

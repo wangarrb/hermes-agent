@@ -4,10 +4,10 @@ reviewer_screen_is_idle() {
     local screen="$1"
     local tail
     tail="$(printf '%s\n' "$screen" | tail -n 12)"
-    if printf '%s\n' "$tail" | grep -Eiq '•[[:space:]]*(working|thinking|running)|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'; then
+    if printf '%s\n' "$tail" | grep -Eiq '•[[:space:]]*(working|thinking|running)|preparing process|wait proc_|msg=interrupt|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'; then
         return 1
     fi
-    printf '%s\n' "$tail" | grep -Eq '^[[:space:]]*›([[:space:]]|$)'
+    printf '%s\n' "$tail" | grep -Eq '(^[[:space:]]*›([[:space:]]|$))|(^[[:space:]]*([[:alnum:]_.-]+[[:space:]]+)?❯[[:space:]]*$)'
 }
 
 reviewer_screen_signature() {
