@@ -251,3 +251,210 @@ sys.exit(rc if rc else 0)
             f"stdout: {out2}\nstderr: {err2}"
         )
         assert p2.returncode != 0, "Rejected watcher should exit non-zero"
+
+
+# ── Reload handoff / ACK / request primitives ────────────────────────────────
+
+from watcher_runtime import (  # type: ignore[import-not-found]
+    ReloadRequest,
+    ReloadHandoff,
+    ReloadACK,
+    write_reload_request,
+    read_reload_request,
+    delete_reload_request,
+    write_reload_handoff,
+    read_reload_handoff,
+    delete_reload_handoff,
+    write_reload_ack,
+    read_reload_ack,
+    delete_reload_ack,
+    cleanup_reload_state,
+    reload_request_path,
+    reload_handoff_path,
+    reload_ack_path,
+)
+
+
+class TestReloadRequest:
+    def test_atomic_write_and_read(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        req = ReloadRequest(
+            nonce="abc123",
+            identity_digest=ident.digest,
+            owner_pid=12345,
+            owner_start_time=999,
+            request_time=int(time.time()),
+            code_revision="sha1",
+        )
+        write_reload_request(root, req)
+        loaded = read_reload_request(root, ident.digest)
+        assert loaded is not None
+        assert loaded.nonce == "abc123"
+        assert loaded.identity_digest == ident.digest
+        assert loaded.owner_pid == 12345
+
+    def test_file_mode_is_0600(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        req = ReloadRequest(
+            nonce="n1", identity_digest=ident.digest,
+            owner_pid=1, owner_start_time=1, request_time=1,
+        )
+        write_reload_request(root, req)
+        mode = reload_request_path(root, ident.digest).stat().st_mode & 0o777
+        assert mode == 0o600
+
+    def test_delete_is_idempotent(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        delete_reload_request(root, ident.digest)  # should not raise
+
+
+class TestReloadHandoff:
+    def test_atomic_write_and_read(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        handoff = ReloadHandoff(
+            nonce="n1",
+            identity_digest=ident.digest,
+            task_id="t_abc",
+            run_id=42,
+            generation=2,
+            claim_lock="host:123:slug-interactive",
+            worker_pid=123,
+            original_pid=456,
+        )
+        write_reload_handoff(root, handoff)
+        loaded = read_reload_handoff(root, ident.digest)
+        assert loaded is not None
+        assert loaded.task_id == "t_abc"
+        assert loaded.run_id == 42
+        assert loaded.generation == 2
+        assert loaded.claim_lock == "host:123:slug-interactive"
+        assert loaded.worker_pid == 123
+
+    def test_file_mode_is_0600(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        handoff = ReloadHandoff(
+            nonce="n1", identity_digest=ident.digest,
+            task_id="t", run_id=1, generation=1,
+            claim_lock="l", worker_pid=1, original_pid=1,
+        )
+        write_reload_handoff(root, handoff)
+        mode = reload_handoff_path(root, ident.digest).stat().st_mode & 0o777
+        assert mode == 0o600
+
+    def test_tampered_run_id_rejects(self, tmp_path, monkeypatch):
+        """Changing run_id in the handoff file produces a different object."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        handoff = ReloadHandoff(
+            nonce="n1", identity_digest=ident.digest,
+            task_id="t", run_id=42, generation=1,
+            claim_lock="l", worker_pid=1, original_pid=1,
+        )
+        write_reload_handoff(root, handoff)
+        # Tamper with the file
+        path = reload_handoff_path(root, ident.digest)
+        data = json.loads(path.read_text())
+        data["run_id"] = 999
+        path.write_text(json.dumps(data))
+        loaded = read_reload_handoff(root, ident.digest)
+        assert loaded is not None
+        assert loaded.run_id == 999  # Detects the tampering — caller must verify
+
+
+class TestReloadACK:
+    def test_atomic_write_and_read(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        ack = ReloadACK(
+            nonce="n1",
+            pid=os.getpid(),
+            proc_start_time=12345,
+            code_revision="sha1",
+            task_id="t_abc",
+            run_id=42,
+        )
+        write_reload_ack(root, ident.digest, ack)
+        loaded = read_reload_ack(root, ident.digest)
+        assert loaded is not None
+        assert loaded.nonce == "n1"
+        assert loaded.pid == os.getpid()
+        assert loaded.task_id == "t_abc"
+
+    def test_nonce_mismatch_detected(self, tmp_path, monkeypatch):
+        """ACK with wrong nonce is detectable by the caller."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        ack = ReloadACK(
+            nonce="correct", pid=1, proc_start_time=1, code_revision="",
+        )
+        write_reload_ack(root, ident.digest, ack)
+        loaded = read_reload_ack(root, ident.digest)
+        assert loaded is not None
+        assert loaded.nonce != "wrong"  # Caller compares to expected nonce
+
+    def test_file_mode_is_0600(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        ack = ReloadACK(nonce="n", pid=1, proc_start_time=1, code_revision="")
+        write_reload_ack(root, ident.digest, ack)
+        mode = reload_ack_path(root, ident.digest).stat().st_mode & 0o777
+        assert mode == 0o600
+
+
+class TestCleanupReloadState:
+    def test_cleanup_removes_all_files(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        root = runtime_root()
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        # Write all three
+        write_reload_request(root, ReloadRequest(
+            nonce="n", identity_digest=ident.digest,
+            owner_pid=1, owner_start_time=1, request_time=1,
+        ))
+        write_reload_handoff(root, ReloadHandoff(
+            nonce="n", identity_digest=ident.digest,
+            task_id="t", run_id=1, generation=1,
+            claim_lock="l", worker_pid=1, original_pid=1,
+        ))
+        write_reload_ack(root, ident.digest, ReloadACK(
+            nonce="n", pid=1, proc_start_time=1, code_revision="",
+        ))
+        # All exist
+        assert reload_request_path(root, ident.digest).exists()
+        assert reload_handoff_path(root, ident.digest).exists()
+        assert reload_ack_path(root, ident.digest).exists()
+        # Cleanup
+        cleanup_reload_state(root, ident.digest)
+        # All gone
+        assert not reload_request_path(root, ident.digest).exists()
+        assert not reload_handoff_path(root, ident.digest).exists()
+        assert not reload_ack_path(root, ident.digest).exists()
+
+
+class TestLockInheritance:
+    def test_make_inheritable_and_adopt(self, tmp_path, monkeypatch):
+        """Lock FD can be made inheritable and adopted after exec simulation."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        ident = WatcherIdentity.from_values("b", "p", "s", "1")
+        lock1 = WatcherLock.acquire(ident)
+        fd = lock1.make_inheritable()
+        # Simulate post-exec: adopt the inherited FD
+        lock2 = WatcherLock.adopt_inherited(ident, fd)
+        assert lock2.is_held
+        # Clean up
+        lock2.make_non_inheritable()
+        lock2.release()

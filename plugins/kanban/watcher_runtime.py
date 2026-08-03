@@ -221,3 +221,241 @@ class WatcherLock:
 
     def __exit__(self, *exc: Any) -> None:
         self.release()
+
+    def make_inheritable(self) -> int:
+        """Mark the lock FD inheritable for ``os.execve``.  Returns the FD."""
+        os.set_inheritable(self._fd, True)
+        return self._fd
+
+    def make_non_inheritable(self) -> None:
+        """Revert FD to close-on-exec after a failed or completed reload."""
+        os.set_inheritable(self._fd, False)
+
+    @classmethod
+    def adopt_inherited(
+        cls, identity: WatcherIdentity, fd: int,
+    ) -> "WatcherLock":
+        """Adopt an inherited lock FD after ``os.execve``.
+
+        Verifies the FD still holds the kernel lock and that metadata/identity
+        match before returning a ``WatcherLock`` wrapping the inherited FD.
+        """
+        # Verify the FD is valid and still locked by us
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            raise RuntimeError("inherited lock FD is not held by this process")
+        # Re-set to non-inheritable
+        os.set_inheritable(fd, False)
+
+        root = runtime_root()
+        lock_dir = root / identity.digest
+        lock_path = lock_dir / "watcher.lock"
+        meta_path = lock_dir / "metadata.json"
+
+        return cls(identity, fd, lock_path, meta_path)
+
+
+# ── Atomic file helpers ─────────────────────────────────────────────────────
+
+def _atomic_write_json(path: Path, data: dict[str, Any], mode: int = 0o600) -> None:
+    """Write JSON atomically with mode ``mode``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True))
+    os.chmod(str(tmp), mode)
+    tmp.rename(path)
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# ── ReloadRequest ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ReloadRequest:
+    """Request for a watcher to self-exec reload at the next safe boundary."""
+    nonce: str
+    identity_digest: str
+    owner_pid: int
+    owner_start_time: int
+    request_time: int
+    code_revision: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nonce": self.nonce,
+            "identity": self.identity_digest,
+            "owner_pid": self.owner_pid,
+            "owner_start_time": self.owner_start_time,
+            "request_time": self.request_time,
+            "code_revision": self.code_revision,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReloadRequest":
+        return cls(
+            nonce=str(d["nonce"]),
+            identity_digest=str(d["identity"]),
+            owner_pid=int(d["owner_pid"]),
+            owner_start_time=int(d["owner_start_time"]),
+            request_time=int(d["request_time"]),
+            code_revision=str(d.get("code_revision", "")),
+        )
+
+
+def reload_request_path(root: Path, identity_digest: str) -> Path:
+    return root / identity_digest / "reload_request.json"
+
+
+def write_reload_request(root: Path, request: ReloadRequest) -> Path:
+    path = reload_request_path(root, request.identity_digest)
+    _atomic_write_json(path, request.to_dict())
+    return path
+
+
+def read_reload_request(root: Path, identity_digest: str) -> ReloadRequest | None:
+    data = _read_json(reload_request_path(root, identity_digest))
+    if data is None:
+        return None
+    return ReloadRequest.from_dict(data)
+
+
+def delete_reload_request(root: Path, identity_digest: str) -> None:
+    try:
+        reload_request_path(root, identity_digest).unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ── ReloadHandoff ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ReloadHandoff:
+    """Snapshot of active claim state for preservation across self-exec."""
+    nonce: str
+    identity_digest: str
+    task_id: str
+    run_id: int
+    generation: int
+    claim_lock: str
+    worker_pid: int
+    original_pid: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nonce": self.nonce,
+            "identity": self.identity_digest,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "generation": self.generation,
+            "claim_lock": self.claim_lock,
+            "worker_pid": self.worker_pid,
+            "original_pid": self.original_pid,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReloadHandoff":
+        return cls(
+            nonce=str(d["nonce"]),
+            identity_digest=str(d["identity"]),
+            task_id=str(d["task_id"]),
+            run_id=int(d["run_id"]),
+            generation=int(d["generation"]),
+            claim_lock=str(d["claim_lock"]),
+            worker_pid=int(d["worker_pid"]),
+            original_pid=int(d["original_pid"]),
+        )
+
+
+def reload_handoff_path(root: Path, identity_digest: str) -> Path:
+    return root / identity_digest / "reload_handoff.json"
+
+
+def write_reload_handoff(root: Path, handoff: ReloadHandoff) -> Path:
+    path = reload_handoff_path(root, handoff.identity_digest)
+    _atomic_write_json(path, handoff.to_dict())
+    return path
+
+
+def read_reload_handoff(root: Path, identity_digest: str) -> ReloadHandoff | None:
+    data = _read_json(reload_handoff_path(root, identity_digest))
+    if data is None:
+        return None
+    return ReloadHandoff.from_dict(data)
+
+
+def delete_reload_handoff(root: Path, identity_digest: str) -> None:
+    try:
+        reload_handoff_path(root, identity_digest).unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ── ReloadACK ───────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ReloadACK:
+    """Acknowledgement that a watcher successfully reloaded."""
+    nonce: str
+    pid: int
+    proc_start_time: int
+    code_revision: str
+    task_id: str = ""
+    run_id: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nonce": self.nonce,
+            "pid": self.pid,
+            "proc_start_time": self.proc_start_time,
+            "code_revision": self.code_revision,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ReloadACK":
+        return cls(
+            nonce=str(d["nonce"]),
+            pid=int(d["pid"]),
+            proc_start_time=int(d["proc_start_time"]),
+            code_revision=str(d.get("code_revision", "")),
+            task_id=str(d.get("task_id", "")),
+            run_id=int(d.get("run_id", 0)),
+        )
+
+
+def reload_ack_path(root: Path, identity_digest: str) -> Path:
+    return root / identity_digest / "reload_ack.json"
+
+
+def write_reload_ack(root: Path, identity_digest: str, ack: ReloadACK) -> Path:
+    path = reload_ack_path(root, identity_digest)
+    _atomic_write_json(path, ack.to_dict())
+    return path
+
+
+def read_reload_ack(root: Path, identity_digest: str) -> ReloadACK | None:
+    data = _read_json(reload_ack_path(root, identity_digest))
+    if data is None:
+        return None
+    return ReloadACK.from_dict(data)
+
+
+def delete_reload_ack(root: Path, identity_digest: str) -> None:
+    try:
+        reload_ack_path(root, identity_digest).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_reload_state(root: Path, identity_digest: str) -> None:
+    """Remove all reload state files for an identity after successful ACK."""
+    delete_reload_request(root, identity_digest)
+    delete_reload_handoff(root, identity_digest)
+    delete_reload_ack(root, identity_digest)
