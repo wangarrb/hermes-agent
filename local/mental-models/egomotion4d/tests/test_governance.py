@@ -51,6 +51,7 @@ def test_kanban_collaboration_model_contract_is_complete():
         "sources/kanban_collaboration_current_evidence.md"
     ]
     assert spec["benchmark_file"] == "questions-kanban-collaboration.json"
+    assert spec["smoke_mode"] == "direct_content"
     assert "owner 发布 implementer 卡未显式 workspace 时默认继承发布者 workspace" in spec[
         "source_query"
     ]
@@ -134,6 +135,56 @@ def test_gate_question_keeps_forbidden_assertions_private_to_scorer(daily):
     assert "Required concept terms" in rendered
     assert "Forbidden assertions" not in rendered
     assert "same-profile default subscribe" not in rendered
+
+
+def test_direct_content_smoke_does_not_call_reflect(
+    tmp_path, monkeypatch, daily
+):
+    logical_id = "egomotion4d-kanban-collaboration"
+    root = tmp_path / "mental-models" / "egomotion4d"
+    (root / "specs").mkdir(parents=True)
+    (root / "benchmark").mkdir()
+    (root / "specs" / "kanban-collaboration.json").write_text(
+        json.dumps(
+            {
+                "benchmark_file": "questions-kanban-collaboration.json",
+                "smoke_ids": ["KB01"],
+                "smoke_mode": "direct_content",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "benchmark" / "questions-kanban-collaboration.json").write_text(
+        json.dumps(
+            {
+                "questions": [
+                    {
+                        "id": "KB01",
+                        "question": "dispatch?",
+                        "key_d_refs": [],
+                        "expected_pitfall_triggers": [
+                            "interactive watcher",
+                            "Zellij inject",
+                        ],
+                        "forbidden_assertions": ["headless is allowed"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daily, "HERMES_HOME", tmp_path)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_args, **_kwargs: pytest.fail("direct smoke called reflect"),
+    )
+
+    assert daily._run_smoke_regression(
+        "http://unused",
+        "interactive watcher uses Zellij inject",
+        logical_id=logical_id,
+        reports_dir_override=tmp_path / "reports",
+    ) == 0
 
 
 @pytest.fixture

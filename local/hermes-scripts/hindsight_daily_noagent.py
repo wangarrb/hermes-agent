@@ -2362,6 +2362,7 @@ def _run_smoke_regression(
     api_url: str,
     active_context_override: str | None = None,
     logical_id: str = "egomotion4d-research-guardrails",
+    reports_dir_override: Path | None = None,
 ) -> int:
     """Run 6-question smoke regression against active mental models.
 
@@ -2402,6 +2403,9 @@ def _run_smoke_regression(
     if not active_context.strip():
         print("NO_CLAIM_NO_ACCEPTED_MODELS: smoke has no treatment context")
         return 0
+    direct_content = (
+        _model_generation_spec(logical_id).get("smoke_mode") == "direct_content"
+    )
 
     passed = 0
     failed = 0
@@ -2410,26 +2414,29 @@ def _run_smoke_regression(
     for q in smoke_questions:
         qid = q["id"]
         try:
-            enhanced_query = f"{active_context}\n\n{_format_gate_question(q)}"
+            if direct_content:
+                text = active_context
+            else:
+                enhanced_query = f"{active_context}\n\n{_format_gate_question(q)}"
 
-            # Run reflect WITH exclude_mental_models=true (blocking gate rule)
-            # and inject exact accepted content as explicit context
-            reflect_req = urllib.request.Request(
-                f"{api_url}/v1/default/banks/hermes/reflect",
-                method="POST",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps({
-                    "query": enhanced_query,
-                    "max_tokens": 500,
-                    "budget": "low",
-                    "exclude_mental_models": True,
-                }).encode(),
-            )
-            with urllib.request.urlopen(reflect_req, timeout=120) as resp:
-                reflect_data = json.loads(resp.read())
-            text = reflect_data.get("text", "")
+                # Run reflect WITH exclude_mental_models=true (blocking gate rule)
+                # and inject exact accepted content as explicit context
+                reflect_req = urllib.request.Request(
+                    f"{api_url}/v1/default/banks/hermes/reflect",
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps({
+                        "query": enhanced_query,
+                        "max_tokens": 500,
+                        "budget": "low",
+                        "exclude_mental_models": True,
+                    }).encode(),
+                )
+                with urllib.request.urlopen(reflect_req, timeout=120) as resp:
+                    reflect_data = json.loads(resp.read())
+                text = reflect_data.get("text", "")
 
-            if not text or len(text) < 50:
+            if not text or (not direct_content and len(text) < 50):
                 print(f"  {qid}: ERROR (empty response)")
                 errors += 1
                 continue
@@ -2453,7 +2460,10 @@ def _run_smoke_regression(
 
     # Write smoke report
     today = time.strftime("%Y-%m-%d")
-    reports_dir = Path("/home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/reports")
+    reports_dir = reports_dir_override or Path(
+        "/home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/reports"
+    )
+    reports_dir.mkdir(parents=True, exist_ok=True)
     report_file = reports_dir / f"{today}-smoke-regression.md"
     with open(report_file, "w") as f:
         f.write(f"# Smoke Regression Report ({today})\n\n")

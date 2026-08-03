@@ -25,6 +25,7 @@
   "source_fact_retry_contract_version": 1,
   "adjudicator_contract_version": 4,
   "benchmark_file": "questions-kanban-collaboration.json",
+  "smoke_mode": "direct_content",
   "smoke_ids": [
     "KB01",
     "KB02",
