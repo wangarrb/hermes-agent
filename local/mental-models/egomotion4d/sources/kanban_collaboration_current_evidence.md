@@ -448,7 +448,7 @@ END_EXACT_BOUNDED_BYTES
 
 ## start-kanban
 path: /home/wyr/.hermes/hermes-agent-repo/local/bin/start-kanban.sh
-whole_file_sha256: 93252fa79c510a65acf1be09977006b7faa6eee4820ff304a3c25a2900c9560b
+whole_file_sha256: 940f27b80fee00f0617758c757effe4a971100ed131a066f736906fd76c053ce
 selector: {"kind": "shell_function", "value": "workspace_for_role"}
 bounded_byte_length: 229
 BEGIN_EXACT_BOUNDED_BYTES
@@ -465,9 +465,9 @@ END_EXACT_BOUNDED_BYTES
 
 ## start-kanban
 path: /home/wyr/.hermes/hermes-agent-repo/local/bin/start-kanban.sh
-whole_file_sha256: 93252fa79c510a65acf1be09977006b7faa6eee4820ff304a3c25a2900c9560b
+whole_file_sha256: 940f27b80fee00f0617758c757effe4a971100ed131a066f736906fd76c053ce
 selector: {"kind": "shell_function", "value": "build_role_command"}
-bounded_byte_length: 9331
+bounded_byte_length: 8846
 BEGIN_EXACT_BOUNDED_BYTES
 build_role_command() {
     local role="$1"
@@ -549,13 +549,7 @@ build_role_command() {
             # session for THAT role, not the global most-recent one.
             # Shared files (config, auth, skills) are symlinked from ~/.codex.
             local codex_home="${REAL_HOME}/.codex-kanban/${role}"
-            mkdir -p "$codex_home/sessions"
-            for f in config.toml auth.json hooks.json installation_id .personality_migration version.json AGENTS.md RTK.md models_cache.json; do
-                [ -e "${REAL_HOME}/.codex/$f" ] && [ ! -e "$codex_home/$f" ] && ln -sf "${REAL_HOME}/.codex/$f" "$codex_home/$f"
-            done
-            for d in claude-skills superpowers skills plugins; do
-                [ -d "${REAL_HOME}/.codex/$d" ] && [ ! -e "$codex_home/$d" ] && ln -sf "${REAL_HOME}/.codex/$d" "$codex_home/$d"
-            done
+            ensure_codex_role_home "$REAL_HOME" "$codex_home"
             local codex_home_q
             codex_home_q="$(shell_quote "$codex_home")"
             role_model="$CODEX_MODEL"
@@ -648,7 +642,7 @@ END_EXACT_BOUNDED_BYTES
 
 ## start-kanban
 path: /home/wyr/.hermes/hermes-agent-repo/local/bin/start-kanban.sh
-whole_file_sha256: 93252fa79c510a65acf1be09977006b7faa6eee4820ff304a3c25a2900c9560b
+whole_file_sha256: 940f27b80fee00f0617758c757effe4a971100ed131a066f736906fd76c053ce
 selector: {"kind": "shell_function", "value": "usage"}
 bounded_byte_length: 4956
 BEGIN_EXACT_BOUNDED_BYTES
@@ -727,7 +721,7 @@ END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
-whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
+whole_file_sha256: 2e19c44d2a0886f48722d83149562fff287a84783ae693f7ea3e6ebf4995ad0f
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener.wait_for_stable_composer_input"}
 bounded_byte_length: 2576
 BEGIN_EXACT_BOUNDED_BYTES
@@ -805,7 +799,7 @@ END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
-whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
+whole_file_sha256: 2e19c44d2a0886f48722d83149562fff287a84783ae693f7ea3e6ebf4995ad0f
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener._handle_idle_task_followup"}
 bounded_byte_length: 6491
 BEGIN_EXACT_BOUNDED_BYTES
@@ -953,7 +947,7 @@ END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
-whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
+whole_file_sha256: 2e19c44d2a0886f48722d83149562fff287a84783ae693f7ea3e6ebf4995ad0f
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener.pump_control_messages"}
 bounded_byte_length: 3074
 BEGIN_EXACT_BOUNDED_BYTES
@@ -1049,7 +1043,7 @@ END_EXACT_BOUNDED_BYTES
 
 ## base-listener
 path: /home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py
-whole_file_sha256: 10c17e468674b040843c9de31588701e2cc3450f42d8c9c7bf301c5d5006ed49
+whole_file_sha256: 2e19c44d2a0886f48722d83149562fff287a84783ae693f7ea3e6ebf4995ad0f
 selector: {"kind": "python_symbol", "value": "BaseInteractiveListener.pump_result_notifications"}
 bounded_byte_length: 3229
 BEGIN_EXACT_BOUNDED_BYTES
@@ -1856,9 +1850,9 @@ END_EXACT_BOUNDED_BYTES
 
 ## egomotion4d-agents
 path: /home/wyr/code/Egomotion4D/AGENTS.md
-whole_file_sha256: 521a704fae54ea1302c56ee3b25962941d48ff76c4201bc1a788cc796432d034
+whole_file_sha256: 3a950129db7e4eb151cc55563ecb57b1200723e55d51619735e33fa611fba852
 selector: {"kind": "markdown_heading", "value": "## 8. Kanban 任务系统"}
-bounded_byte_length: 30782
+bounded_byte_length: 30927
 BEGIN_EXACT_BOUNDED_BYTES
 ## 8. Kanban 任务系统
 
@@ -1914,7 +1908,7 @@ BEGIN_EXACT_BOUNDED_BYTES
 - reviewer 对总体推进效率负责：综合权衡算法/证据可靠性、墙钟时间、重复返工和 reviewer token；成功标准是目标更快收敛，不是审核次数更多。检查深度与是否阻断由 reviewer 按承重风险和决策价值灵活判断。
 - reviewer 资源模式只有 `economy / balanced / performance`，默认 `balanced`；旧“效率模式”也映射到 `balanced`。主模型分别为 `gpt-5.6-luna@max / gpt-5.6-sol@high / gpt-5.6-sol@max`。`personal` 只是 owner 自主执行方式，继承当前资源模式，不再是第四档模型模式。
 - 经济模式中，reviewer 主体用 `gpt-5.6-luna@max`，但算法方案、计划设计、承重算法纠偏必须让一个 `gpt-5.6-sol@high` 或 `@xhigh` 子代理做限域挑战，reviewer 吸收后自己给最终 verdict。均衡模式由 `gpt-5.6-sol@high` 主处理；高性能模式由 `gpt-5.6-sol@max` 主处理，仅在高风险含混结论上追加 `@xhigh` 挑战。
-- 启动时用 `start-kanban.sh --reviewer-mode <mode>`；运行中用 `start-kanban.sh -b <board> --switch-reviewer-mode <mode>`。热切换必须连续 3 次、每 10 秒确认 reviewer pane 无 busy marker 且 composer 不变，然后只原位替换 reviewer pane 并 `resume --last`；任一检查失败则不切换，不重启其他角色。
+- reviewer 资源模式由用户手动切换并宣布；reviewer 不主动调用 `--switch-reviewer-mode`、不启动后台切换 worker，也不把自动切换失败变成任务工作。用户宣布 `economy / balanced / performance` 后，reviewer 立即按该模式的模型路由和 token 预算执行；用户手动切换后的 pane/model 提示是权威状态。启动器和 `--switch-reviewer-mode` 仍可作为用户显式运维工具保留，但不属于 reviewer 的自动流程。
 - reviewer 应按收益主动卸载确定性工作：验收标准清晰、需要连续仓库/任务上下文或多步工具执行的整块交给 Kanban implementer；上下文可自包含、单次独立、读多写少且明显耗 token 的盘点、focused diff/测试审计、artifact 汇总优先交 `gpt-5.6-luna@max` 子代理。极小任务直接完成；委派的预计节省必须高于沟通与等待成本，禁止机械套用多阶段子审阅。子代理和 implementer 提供证据/挑战；正式成功率、verdict 和 handback 始终由 reviewer 决定。
 - 发现角色说明造成重复犯错或无效流程时，reviewer 可直接修改该角色的项目 prompt/skill。修改后先验证文件，再在确认目标 pane 位于安全输入边界时发送 `ROLE_GUIDANCE_UPDATED <path> <sha256> <reason>`；目标角色必须重读并回复 `ROLE_GUIDANCE_LOADED <path> <sha256>` 后继续。
 - 改动较广或更适合由该角色维护时，reviewer 通过 durable comment 写 `ROLE_GUIDANCE_CHANGE_REQUEST`，包含失败证据、所需行为和验收条件；zellij 只发送短唤醒通知。目标角色完成修改、验证、reload 和 SHA 回执。
@@ -2035,9 +2029,9 @@ END_EXACT_BOUNDED_BYTES
 
 ## reviewer-prompt
 path: /home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/reviewer/kanban-system-prompt.md
-whole_file_sha256: 37ebdf734bd3a8f64f26e2dc4b48a56246d5e79864311d5c02f44f36142479fd
+whole_file_sha256: a241b981052b2ee7fce64b1d9a99c45eefa816a6474194439f77c8a90b7a6006
 selector: {"kind": "whole_file"}
-bounded_byte_length: 8018
+bounded_byte_length: 8179
 BEGIN_EXACT_BOUNDED_BYTES
 # Reviewer Profile
 
@@ -2060,7 +2054,7 @@ reviewer→implementer 的可写任务必须显式声明绝对 workspace、branc
 - `balanced` / 旧“效率模式”：主 reviewer 默认 Sol high；确定性整块交 implementer，独立耗 token 盘点/审计交 Luna max。
 - `performance`：主 reviewer 用 Sol max 直接持有承重推理；只在高风险且证据含混时追加 Sol xhigh 挑战。implementer/Luna 仍只处理不改变方向的确定性工作。
 - 子代理只负责证据聚合或对承重假设定向挑战；正式 P 值、四态 verdict、路线 reset 与 handback 由主 reviewer 自己综合并落盘。指定模型不可用时必须明示记录，不得静默降级。
-- 运行中只用 `start-kanban.sh -b <board> --switch-reviewer-mode <mode>` 热切换；它在安全边界原位替换 reviewer pane 并 resume 原会话。不得把手工 `/model` 写成已完成模式切换。
+- reviewer 不主动切换 pane/model，也不启动后台模式切换 worker。资源模式由用户手动切换并宣布；收到 `economy / balanced / performance` 后立即按该模式运行，用户手动切换后的 pane/model 提示是权威状态。不得声称未实际发生的模型切换；启动器的 `--switch-reviewer-mode` 仅供用户显式运维使用。
 
 ## 审核方法
 
@@ -2184,9 +2178,9 @@ END_EXACT_BOUNDED_BYTES
 
 ## continuous-execution-mode-protocol
 path: /home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/continuous-execution-mode-protocol.md
-whole_file_sha256: 7330cb1d0c36167944b4d063143438948809d542139a4f43ef892ce1cf36c158
+whole_file_sha256: ebdd2b706c68b3f68869350271ccaee6c7a0560c12fcf4c0cb0eb3d31b7f25bb
 selector: {"kind": "whole_file"}
-bounded_byte_length: 9392
+bounded_byte_length: 9367
 BEGIN_EXACT_BOUNDED_BYTES
 # Continuous Execution Mode Protocol
 
@@ -2202,7 +2196,7 @@ BEGIN_EXACT_BOUNDED_BYTES
 
 `personal` / 个人模式改为正交的 owner 执行方式：同一 owner 自己制定、实现和验证，但继承当前三档资源模式。旧 `execution_mode: personal` 兼容解释为 `balanced + personal ownership`。
 
-未指定时用 `balanced`。启动时用 `start-kanban.sh --reviewer-mode economy|balanced|performance`；运行中用 `start-kanban.sh -b <board> --switch-reviewer-mode <mode>`。热切换连续 3 次、每 10 秒确认 reviewer pane 无 busy marker 且 composer 不变后，只原位替换 reviewer pane 并 resume 原 Codex 会话；检查失败时零变更退出。模式切换不重置已有证据、失败路线或连续无效轮次。
+未指定时用 `balanced`。资源模式由用户手动切换并宣布；reviewer 不主动调用 `--switch-reviewer-mode`，不启动后台切换 worker。用户手动切换后的 pane/model 提示是权威状态；reviewer 按用户宣布的模式继续执行。启动器和 `--switch-reviewer-mode` 仅作为用户显式运维工具保留。模式切换不重置已有证据、失败路线或连续无效轮次。
 
 每个持续目标只在一份 active 文档维护状态：符合 `AGENTS.md §8.5` 的长期主线用 `docs/roadmaps/`，其余用 `docs/plans/`。
 
