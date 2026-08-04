@@ -42,5 +42,6 @@ dry_run="$(bash "$SWITCH" --board egomotion4d --mode balanced --dry-run)"
 switch_source="$(<"$SWITCH")"
 [[ "$switch_source" == *"action focus-pane-id"* ]]
 [[ "$switch_source" != *"action focus-pane --pane-id"* ]]
+[[ "$switch_source" == *'nohup setsid "$SELF"'* ]]
 
 echo "reviewer mode switch safety: PASS"

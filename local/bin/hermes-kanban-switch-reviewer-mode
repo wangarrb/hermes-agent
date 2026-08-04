@@ -54,7 +54,7 @@ fi
 if (( ! WORKER )); then
     PANE_ID="$(find_reviewer_pane_id "$SESSION")"
     LOG="/home/wyr/.hermes/logs/reviewer-mode-switch-${BOARD}.log"
-    setsid "$SELF" --board "$BOARD" --mode "$MODE" --session "$SESSION" \
+    nohup setsid "$SELF" --board "$BOARD" --mode "$MODE" --session "$SESSION" \
         --workspace "$WORKSPACE" --sandbox "$SANDBOX" --timeout-s "$TIMEOUT_S" \
         --interval-s "$INTERVAL_S" --checks "$CHECKS" --worker \
         </dev/null >>"$LOG" 2>&1 &
