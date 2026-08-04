@@ -13,7 +13,7 @@ WORKSPACE="/home/wyr/code/Egomotion4D"
 SANDBOX="danger-full-access"
 TIMEOUT_S=600
 INTERVAL_S=10
-CHECKS=3
+CHECKS=1
 WORKER=0
 DRY_RUN=0
 
@@ -73,6 +73,15 @@ mapfile -t OLD_WATCHERS < <(
         fi
     done
 )
+
+FINAL_PANE_ID="$(find_reviewer_pane_id "$SESSION")"
+FINAL_SCREEN="$(zellij --session "$SESSION" action dump-screen --pane-id "$PANE_ID" 2>/dev/null || true)"
+FINAL_ANSI_SCREEN="$(zellij --session "$SESSION" action dump-screen --ansi --pane-id "$PANE_ID" 2>/dev/null || true)"
+if [[ "$FINAL_PANE_ID" != "$PANE_ID" ]] || \
+   ! reviewer_screen_is_idle "$FINAL_SCREEN" "$FINAL_ANSI_SCREEN"; then
+    echo "reviewer pane changed or left the safe boundary before replacement" >&2
+    exit 3
+fi
 
 ORIGINAL_FOCUS="$(zellij --session "$SESSION" action list-panes --all --json | jq -r '.[] | select(.is_plugin == false and .is_focused == true) | .id' | head -n 1)"
 zellij --session "$SESSION" action focus-pane-id "$PANE_ID"
