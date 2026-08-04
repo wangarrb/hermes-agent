@@ -49,6 +49,7 @@ dry_run="$(bash "$SWITCH" --board egomotion4d --mode balanced --dry-run)"
 switch_source="$(<"$SWITCH")"
 [[ "$switch_source" == *"action focus-pane-id"* ]]
 [[ "$switch_source" != *"action focus-pane --pane-id"* ]]
+[[ "$switch_source" == *'action focus-pane-id "$PANE_ID" 2>/dev/null || true'* ]]
 [[ "$switch_source" == *'nohup setsid "$SELF"'* ]]
 [[ "$switch_source" == *"CHECKS=1"* ]]
 [[ "$switch_source" == *"reviewer_screen_is_idle \"\$FINAL_SCREEN\" \"\$FINAL_ANSI_SCREEN\""* ]]
