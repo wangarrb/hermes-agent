@@ -1099,7 +1099,6 @@ def _render_blocked_review_page(
     errors: list[str],
     model: dict | None,
     generated_at: str,
-    last_valid_history: Path | None,
 ) -> bytes:
     accepted = _accepted_revision(model or {})
     lines = [
@@ -1124,9 +1123,9 @@ def _render_blocked_review_page(
     lines.extend(
         [
             "",
-            "## Last Valid History",
+            "## Review Export Retention",
             "",
-            f"`{last_valid_history}`" if last_valid_history else "无有效 history snapshot。",
+            "审核导出只保留 `exports/review/current/`；不再生成或保留 review history。",
             "",
         ]
     )
@@ -1151,9 +1150,7 @@ def _publish_review_exports(
     manifest = _load_review_export_manifest(manifest_path)
     review_root = (export_root or REVIEW_EXPORT_ROOT) / "review"
     current_dir = review_root / "current"
-    history_dir = review_root / "history"
     current_dir.mkdir(parents=True, exist_ok=True)
-    history_dir.mkdir(parents=True, exist_ok=True)
     fetch = fetch_model or (lambda physical_id: _fetch_mental_model(api_url, physical_id))
     timestamp = generated_at or time.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1268,8 +1265,6 @@ def _publish_review_exports(
             errors.append(str(exc))
 
         current_path = current_dir / f"{logical_id}.md"
-        existing_history = sorted(history_dir.glob(f"{logical_id}-*.md"))
-        last_valid = existing_history[-1] if existing_history else None
         if errors:
             _atomic_write_bytes(
                 current_path,
@@ -1278,52 +1273,30 @@ def _publish_review_exports(
                     errors=errors,
                     model=model,
                     generated_at=timestamp,
-                    last_valid_history=last_valid,
                 ),
             )
             results[logical_id] = {"status": "BLOCKED", "errors": errors}
             continue
 
-        history_path = history_dir / f"{logical_id}-{revision_sha[:12]}.md"
-        if history_path.exists():
-            history_bytes = history_path.read_bytes()
-            marker = f"review_revision_sha: {revision_sha}".encode()
-            if marker not in history_bytes:
-                error = "existing history snapshot revision header mismatch"
-                _atomic_write_bytes(
-                    current_path,
-                    _render_blocked_review_page(
-                        logical_id=logical_id,
-                        errors=[error],
-                        model=model,
-                        generated_at=timestamp,
-                        last_valid_history=last_valid,
-                    ),
-                )
-                results[logical_id] = {"status": "BLOCKED", "errors": [error]}
-                continue
-        else:
-            history_bytes = _render_review_export(
-                logical_id=logical_id,
-                model=model,
-                accepted=accepted,
-                accepted_content=accepted_content,
-                spec=spec,
-                evidence_entry=evidence_entry,
-                config=config,
-                decisions=decisions,
-                source_records=source_records,
-                review_revision_sha=revision_sha,
-                config_sha=config_sha,
-                first_generated_at=timestamp,
-            )
-            history_path.write_bytes(history_bytes)
-        _atomic_write_bytes(current_path, history_bytes)
+        review_bytes = _render_review_export(
+            logical_id=logical_id,
+            model=model,
+            accepted=accepted,
+            accepted_content=accepted_content,
+            spec=spec,
+            evidence_entry=evidence_entry,
+            config=config,
+            decisions=decisions,
+            source_records=source_records,
+            review_revision_sha=revision_sha,
+            config_sha=config_sha,
+            first_generated_at=timestamp,
+        )
+        _atomic_write_bytes(current_path, review_bytes)
         results[logical_id] = {
             "status": "PASS",
             "review_revision_sha": revision_sha,
             "current": str(current_path),
-            "history": str(history_path),
         }
 
     pass_count = sum(item["status"] == "PASS" for item in results.values())
