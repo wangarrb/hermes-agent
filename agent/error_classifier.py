@@ -121,6 +121,7 @@ _BILLING_PATTERNS = [
     "balance_depleted",
     "model_not_supported_on_free_tier",
     "not available on the free tier",
+    "freeusagelimit",  # opencode.ai zen-free: FreeUsageLimitError (429 but not transient)
 ]
 
 # xAI's explicit Grok credit-exhaustion code. Keep the HTTP 403 special case
@@ -1053,6 +1054,17 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # Free-tier usage limit exhausted (e.g. opencode.ai zen-free
+        # "FreeUsageLimitError") — not a transient rate limit, will not
+        # resolve on retry. Classify as billing so the loop fails fast
+        # instead of waiting 600s on an unreachable backoff. (#free-tier-429)
+        if any(p in error_msg for p in _BILLING_PATTERNS):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,
