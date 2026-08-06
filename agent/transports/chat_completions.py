@@ -309,6 +309,7 @@ class ChatCompletionsTransport(ProviderTransport):
             is_kimi: bool
             is_tokenhub: bool
             is_lmstudio: bool
+            is_xunfei_maas: bool
             is_custom_provider: bool
             ollama_num_ctx: int | None
             # Provider routing
@@ -381,6 +382,7 @@ class ChatCompletionsTransport(ProviderTransport):
         is_nvidia_nim = params.get("is_nvidia_nim", False)
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
+        is_xunfei_maas = params.get("is_xunfei_maas", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
 
         if ephemeral is not None and max_tokens_fn:
@@ -468,6 +470,19 @@ class ChatCompletionsTransport(ProviderTransport):
                     _kimi_thinking_enabled = False
             extra_body["thinking"] = {
                 "type": "enabled" if _kimi_thinking_enabled else "disabled",
+            }
+
+        # Xunfei MaaS (incl. via local One API gateway): DeepSeek/GLM thinking
+        # is opt-in. Emit extra_body["thinking"] so the upstream enters
+        # reasoning mode and returns reasoning_content. Respect a user
+        # reasoning_config that explicitly disables it.
+        if is_xunfei_maas:
+            _xunfei_thinking_enabled = True
+            if reasoning_config and isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    _xunfei_thinking_enabled = False
+            extra_body["thinking"] = {
+                "type": "enabled" if _xunfei_thinking_enabled else "disabled",
             }
 
         # Reasoning. LM Studio is handled above via top-level reasoning_effort,
