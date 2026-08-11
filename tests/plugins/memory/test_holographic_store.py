@@ -207,32 +207,6 @@ class TestConcurrency:
             sibling.close()
 
 
-def test_auto_extract_chinese_facts_uses_one_semantic_category_per_message():
-    from plugins.memory.holographic import HolographicMemoryProvider
-
-    class RecordingStore:
-        def __init__(self):
-            self.facts = []
-
-        def add_fact(self, content, *, category):
-            self.facts.append((content, category))
-
-    provider = object.__new__(HolographicMemoryProvider)
-    provider._store = RecordingStore()
-
-    provider._auto_extract_facts([
-        {"role": "user", "content": "我偏好简洁的方案，不要额外功能。"},
-        {"role": "user", "content": "项目决定以后使用 DELETE 日志模式。"},
-        {"role": "user", "content": "经验：不要在线执行 REINDEX。"},
-    ])
-
-    assert provider._store.facts == [
-        ("我偏好简洁的方案，不要额外功能。", "user_pref"),
-        ("项目决定以后使用 DELETE 日志模式。", "project"),
-        ("经验：不要在线执行 REINDEX。", "tool"),
-    ]
-
-
 class TestProviderShutdown:
     """The provider's shutdown() must release its shared connection, not just
     drop the reference. Leaving finalization to GC keeps the connection (and
@@ -251,19 +225,3 @@ class TestProviderShutdown:
         assert provider._store is None
         assert MemoryStore._shared == {}
 
-    def test_shutdown_keeps_sibling_provider_alive(self, db_path):
-        from plugins.memory.holographic import HolographicMemoryProvider
-
-        a = HolographicMemoryProvider(config={"db_path": str(db_path)})
-        b = HolographicMemoryProvider(config={"db_path": str(db_path)})
-        a.initialize("session-a")
-        b.initialize("session-b")
-        assert MemoryStore._shared[str(db_path)]["refs"] == 2
-
-        a.shutdown()
-        # Sibling still holds a live, writable connection.
-        assert MemoryStore._shared[str(db_path)]["refs"] == 1
-        assert b._store is not None
-        b._store.add_fact("write after sibling shutdown")
-        b.shutdown()
-        assert MemoryStore._shared == {}

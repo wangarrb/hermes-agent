@@ -1,0 +1,45 @@
+{
+  "assist": true,
+  "backend": "hermes",
+  "control_prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "declared_skills": [],
+  "effective_role": "implementer",
+  "errors": [],
+  "fixed_control_commit": "",
+  "manifest_path": "/home/wyr/.hermes/hermes-agent-repo/.hermes-kanban/egomotion4d/coordinator/task-t_1281e77c/role-context.json",
+  "pane_profile": "coordinator",
+  "project_prompt": {
+    "content": "",
+    "path": "",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "rendered_context": "## Effective Role Context\n\npane_profile=coordinator effective_role=implementer assist=true backend=hermes\n\nfixed_control_commit=\n\nrole_context_manifest=/home/wyr/.hermes/hermes-agent-repo/.hermes-kanban/egomotion4d/coordinator/task-t_1281e77c/role-context.json\n\nHERMES_KANBAN_CONTROL_PROMPT_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n### Project Role Prompt\n\n\n### Role Description\nEgomotion4D implementer role for task-scoped assist execution.\n\n### Workspace Contract\n{\"artifact_namespace\": null, \"auto_generated\": true, \"base_commit\": \"\", \"branch\": \"\", \"common_dir\": \"\", \"generation\": 1, \"mismatches\": [], \"repository\": \"\", \"target_branch\": \"\", \"task_id\": \"t_1281e77c\", \"valid\": true, \"version\": \"workspace_contract.v1\", \"workspace_kind\": \"dir\", \"worktree\": \"/home/wyr/.hermes/hermes-agent-repo\", \"write_set\": null}",
+  "role_description": "Egomotion4D implementer role for task-scoped assist execution.",
+  "schema_version": "kanban-role-context.v1",
+  "sources": {
+    "role_manifest": {
+      "path": "/home/wyr/.hermes/profiles/implementer/role-context.json",
+      "sha256": "e16f1b2679c321c815446c78a082bcebbe7d944396303a929c1a8177c4e4273d"
+    }
+  },
+  "status": "ready",
+  "task_skills": [],
+  "workspace": "/home/wyr/.hermes/hermes-agent-repo",
+  "workspace_contract": {
+    "artifact_namespace": null,
+    "auto_generated": true,
+    "base_commit": "",
+    "branch": "",
+    "common_dir": "",
+    "generation": 1,
+    "mismatches": [],
+    "repository": "",
+    "target_branch": "",
+    "task_id": "t_1281e77c",
+    "valid": true,
+    "version": "workspace_contract.v1",
+    "workspace_kind": "dir",
+    "worktree": "/home/wyr/.hermes/hermes-agent-repo",
+    "write_set": null
+  }
+}

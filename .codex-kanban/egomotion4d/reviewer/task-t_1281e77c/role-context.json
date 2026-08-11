@@ -1,0 +1,45 @@
+{
+  "assist": false,
+  "backend": "codex",
+  "control_prompt_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "declared_skills": [],
+  "effective_role": "reviewer",
+  "errors": [],
+  "fixed_control_commit": "",
+  "manifest_path": "/home/wyr/.hermes/hermes-agent-repo/.codex-kanban/egomotion4d/reviewer/task-t_1281e77c/role-context.json",
+  "pane_profile": "reviewer",
+  "project_prompt": {
+    "content": "",
+    "path": "",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "rendered_context": "## Effective Role Context\n\npane_profile=reviewer effective_role=reviewer assist=false backend=codex\n\nfixed_control_commit=\n\nrole_context_manifest=/home/wyr/.hermes/hermes-agent-repo/.codex-kanban/egomotion4d/reviewer/task-t_1281e77c/role-context.json\n\nHERMES_KANBAN_CONTROL_PROMPT_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\n### Project Role Prompt\n\n\n### Workspace Contract\n{\"artifact_namespace\": null, \"auto_generated\": true, \"base_commit\": \"\", \"branch\": \"\", \"common_dir\": \"\", \"generation\": 2, \"mismatches\": [], \"repository\": \"\", \"target_branch\": \"\", \"task_id\": \"t_1281e77c\", \"valid\": true, \"version\": \"workspace_contract.v1\", \"workspace_kind\": \"dir\", \"worktree\": \"/home/wyr/.hermes/hermes-agent-repo\", \"write_set\": null}",
+  "role_description": "",
+  "schema_version": "kanban-role-context.v1",
+  "sources": {
+    "role_manifest": {
+      "path": "/home/wyr/.hermes/profiles/reviewer/role-context.json",
+      "sha256": ""
+    }
+  },
+  "status": "ready",
+  "task_skills": [],
+  "workspace": "/home/wyr/.hermes/hermes-agent-repo",
+  "workspace_contract": {
+    "artifact_namespace": null,
+    "auto_generated": true,
+    "base_commit": "",
+    "branch": "",
+    "common_dir": "",
+    "generation": 2,
+    "mismatches": [],
+    "repository": "",
+    "target_branch": "",
+    "task_id": "t_1281e77c",
+    "valid": true,
+    "version": "workspace_contract.v1",
+    "workspace_kind": "dir",
+    "worktree": "/home/wyr/.hermes/hermes-agent-repo",
+    "write_set": null
+  }
+}
