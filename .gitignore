@@ -162,3 +162,7 @@ infographic/
 # Local agent-derived graph caches and live watcher logs are runtime state.
 graphify-out/
 kanban_logs/
+
+# Kanban runtime state
+.codex-kanban/
+.hermes-kanban/

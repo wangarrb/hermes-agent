@@ -549,11 +549,6 @@ def parse_codex_usage(target_date: str) -> dict | None:
         total['input'] += s['input']
         total['cached'] += s['cached']
         total['output'] += s['output']
-    # net input = total input - cached (same as before)
-    for s in sources.values():
-        s['input'] = s['input'] - s['cached']
-    total['input'] = total['input'] - total['cached']
-
     return {'sources': sources, 'total': total}
 
 
@@ -774,7 +769,6 @@ def main() -> int:
     now = datetime.now().astimezone()
     if args.date:
         target_date = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=now.tzinfo)
-        # 统计窗口：目标日期 08:30 ~ 次日 08:30
         end = target_date + timedelta(hours=8, minutes=30)
         start = target_date - timedelta(hours=15, minutes=30)
         report_date_str = args.date
@@ -817,13 +811,9 @@ def main() -> int:
     if prev:
         d_doc = total_docs - prev.get("documents", total_docs)
         d_obs = total_obs - prev.get("observations", total_obs)
-        pct_doc = f"({d_doc:+.0f})" if prev.get("documents") else ""
-        pct_obs = f"({d_obs:+.0f})" if prev.get("observations") else ""
-    print(f"概要: Documents={fmt_num(total_docs)}{f' (Δ{d_doc:+d})' if prev and 'documents' in prev else ''}  "
-          f"Observations={fmt_num(total_obs)}{f' (Δ{d_obs:+d})' if prev and 'observations' in prev else ''}  "
+    print(f"概要: Documents={fmt_num(total_docs)}{f' (Δ+{d_doc})' if prev and 'documents' in prev and d_doc >= 0 else f' (Δ{d_doc})' if prev and 'documents' in prev else ''}  "
+          f"Observations={fmt_num(total_obs)}{f' (Δ+{d_obs})' if prev and 'observations' in prev and d_obs >= 0 else f' (Δ{d_obs})' if prev and 'observations' in prev else ''}  "
           f"unconsolidated={fmt_num(uncons)}  failed_base={fmt_num(failed)}")
-    last_cons = (db.get("consolidation") or [["0"] * 6])[0]
-    # Try to extract last_consolidated_at from stats via direct API or fallback to db
     print(f"Consolidation: base_done={fmt_num(int(cons_meta[0]))}  "
           f"remaining={fmt_num(int(cons_meta[1]))}  "
           f"failed={fmt_num(int(cons_meta[2]))}")
@@ -833,22 +823,23 @@ def main() -> int:
     queue_rows = db.get("queue") or []
     alerts = current_operation_alerts(ops_rows, queue_rows)
     ready_models = sum(row["state"] == "READY" for row in model_rows)
+    published_models = sum(row["change"] == "PUBLISHED" for row in model_rows)
 
     print("【今日结论】")
     print(f"• Hindsight: {hindsight_health()}；consolidation backlog={fmt_num(uncons)}，failed_base={fmt_num(failed)}。")
-    print(f"• Mental Models: {ready_models}/{len(model_rows)} READY；本窗口发布 {sum(row['change'] == 'PUBLISHED' for row in model_rows)} 个。")
+    print(f"• Mental Models: {ready_models}/{len(model_rows)} READY；本窗口发布 {published_models} 个。")
     print(f"• 需关注事项: {len(alerts) + int(failed > 0)}；只统计窗口内失败与当前 active queue，不重复展示历史终态。")
     print()
 
+    # ── Research Digest (full) ──
     print(f"【研发进展（{digest_date}）】")
     if research_digest:
-        for line in research_digest.splitlines():
-            if not line.startswith("<!--") and not line.startswith("-->"):
-                print(line)
+        print(research_digest)
     else:
-        print("无 compact research digest；稳定项目知识请查看下方 KG/Graphify 入口。")
+        print("无 compact research digest")
     print()
 
+    # ── Mental Models (full table) ──
     print("【Mental Models】")
     if model_rows:
         print_table(
@@ -865,117 +856,115 @@ def main() -> int:
             ],
         )
     else:
-        print("未找到 mental-model registry。")
+        print("无 mental models")
     print()
 
+    # ── Hermes / Profiles 模型用量 (full table) ──
     print("【Hermes / Profiles 模型用量】")
     if hermes_rows:
-        table = []
-        total = defaultdict(int)
-        for r in hermes_rows:
-            for k in ("sessions", "turns", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"):
-                total[k] += int(r[k])
-            table.append(
+        # Aggregate by profile+model
+        print_table(
+            ["Profile", "模型", "会话", "轮数", "调用", "输入", "Cache读", "Cache写", "输出", "命中率"],
+            [
                 [
-                    str(r.get("profile", "default")),
+                    str(r["profile"]),
                     str(r["model"]),
-                    fmt_num(int(r["sessions"])),
-                    fmt_num(int(r["turns"])),
-                    fmt_num(int(r["calls"])),
+                    str(r["sessions"]),
+                    str(r["turns"]),
+                    str(r["calls"]),
                     fmt_tok(int(r["input_tokens"])),
                     fmt_tok(int(r["cache_read_tokens"])),
                     fmt_tok(int(r["cache_write_tokens"])),
                     fmt_tok(int(r["output_tokens"])),
+                    f"{int(r['cache_read_tokens']) / int(r['input_tokens']) * 100:.1f}%" if int(r["input_tokens"]) else "-",
                 ]
-            )
-        table.append(
-            [
-                "合计",
-                "",
-                fmt_num(total["sessions"]),
-                fmt_num(total["turns"]),
-                fmt_num(total["calls"]),
-                fmt_tok(total["input_tokens"]),
-                fmt_tok(total["cache_read_tokens"]),
-                fmt_tok(total["cache_write_tokens"]),
-                fmt_tok(total["output_tokens"]),
-            ]
+                for r in hermes_rows
+            ],
         )
-        print_table(["Profile", "模型", "会话", "轮数", "调用", "输入", "Cache读", "Cache写", "输出"], table)
+        # Totals row
+        total_calls = sum(int(r["calls"]) for r in hermes_rows)
+        total_sessions = sum(int(r["sessions"]) for r in hermes_rows)
+        total_turns = sum(int(r["turns"]) for r in hermes_rows)
+        total_inp = sum(int(r["input_tokens"]) for r in hermes_rows)
+        total_cr = sum(int(r["cache_read_tokens"]) for r in hermes_rows)
+        total_cw = sum(int(r["cache_write_tokens"]) for r in hermes_rows)
+        total_out = sum(int(r["output_tokens"]) for r in hermes_rows)
+        hit = f"{total_cr / total_inp * 100:.1f}%" if total_inp else "-"
+        print_table(
+            ["Profile", "模型", "会话", "轮数", "调用", "输入", "Cache读", "Cache写", "输出", "命中率"],
+            [["合计", "", str(total_sessions), str(total_turns), str(total_calls),
+              fmt_tok(total_inp), fmt_tok(total_cr), fmt_tok(total_cw), fmt_tok(total_out), hit]],
+        )
     else:
-        print("无 Hermes / profile 会话记录。")
+        print("无记录")
     print()
 
+    # ── 外部 CLI Agent 聚合用量 (full table) ──
     print("【外部 CLI Agent 聚合用量】")
     codex_usage = parse_codex_usage(report_date_str)
     if codex_usage:
-        print("注：输入(增量) = 真实新输入 = prompt - cache；Cache读为累计 cached_input_tokens。")
-        rows = []
-        for source_label, stats in codex_usage['sources'].items():
-            rows.append([
-                source_label,
-                fmt_tok(stats['input']),
-                fmt_tok(stats['cached']),
-                fmt_tok(stats['output']),
-            ])
-        # Add total row
-        t = codex_usage['total']
-        rows.append([
-            "合计",
-            fmt_tok(t['input']),
-            fmt_tok(t['cached']),
-            fmt_tok(t['output']),
-        ])
-        print_table(["来源", "输入", "Cache读", "输出"], rows)
+        print_table(
+            ["来源", "输入", "Cache读", "输出", "命中率"],
+            [
+                [
+                    src,
+                    fmt_tok(stats["input"]),
+                    fmt_tok(stats["cached"]),
+                    fmt_tok(stats["output"]),
+                    f"{stats['cached'] / stats['input'] * 100:.1f}%" if stats["input"] else "-",
+                ]
+                for src, stats in sorted(codex_usage["sources"].items())
+            ],
+        )
+        t = codex_usage["total"]
+        t_hit = f"{t['cached'] / t['input'] * 100:.1f}%" if t["input"] else "-"
+        print_table(
+            ["来源", "输入", "Cache读", "输出", "命中率"],
+            [["合计", fmt_tok(t["input"]), fmt_tok(t["cached"]), fmt_tok(t["output"]), t_hit]],
+        )
     else:
-        print("未采集到外部 CLI Agent 调用记录。")
+        print("未采集到外部 CLI Agent 调用记录")
     print()
 
+    # ── Hindsight 运行模型配置 (full table) ──
     print("【Hindsight 运行模型配置】")
     print(f"健康状态: {hindsight_health()}")
     if model_cfg:
-        grouped_cfg: dict[tuple[str, str, str, str], list[str]] = defaultdict(list)
-        for row in model_cfg:
-            key = (row["provider"], row["model"], row["base_url"], row["location"])
-            grouped_cfg[key].append(row["scope"])
         print_table(
             ["用途", "provider", "model", "base_url", "location"],
             [
-                [",".join(scopes), provider, model, base_url, location]
-                for (provider, model, base_url, location), scopes in grouped_cfg.items()
+                [row["scope"], row["provider"], row["model"], row["base_url"], row["location"]]
+                for row in model_cfg
             ],
         )
-    else:
-        print("未能读取 hindsight 容器模型环境。")
-    print(
-        f"enable_observations={env.get('HINDSIGHT_API_ENABLE_OBSERVATIONS', '?')}, "
-        f"worker_slots={env.get('HINDSIGHT_API_WORKER_MAX_SLOTS', '?')}, "
-        f"consolidation_slots={env.get('HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS', '?')}, "
-        f"retain_max_concurrent={env.get('HINDSIGHT_API_RETAIN_MAX_CONCURRENT', '?')}"
-    )
+    enable_obs = env.get("HINDSIGHT_API_ENABLE_OBSERVATIONS", "?")
+    worker_slots = env.get("WORKER_MAX_SLOTS", "?")
+    cons_slots = env.get("WORKER_CONSOLIDATION_MAX_SLOTS", "?")
+    retain_conc = env.get("RETAIN_MAX_CONCURRENT", "?")
+    print(f"enable_observations={enable_obs}, worker_slots={worker_slots}, consolidation_slots={cons_slots}, retain_max_concurrent={retain_conc}")
     print()
 
+    # ── Hindsight LLM 用量 (full table) ──
     print("【Hindsight LLM 用量（日志可见精确值；容器重建前日志可能无法回溯）】")
-    # Check if docker logs cover the full reporting window
-    _container_started_str = ""
+    # Check container start time vs window start
+    container_start_str = None
     try:
-        _cs_code, _cs_out, _ = run("docker inspect hindsight --format '{{.State.StartedAt}}'", timeout=10)
-        if _cs_code == 0 and _cs_out.strip():
-            _container_started_str = _cs_out.strip()
+        code, cs, _ = run("docker inspect hindsight --format '{{.State.StartedAt}}'", timeout=10)
+        if code == 0:
+            container_start_str = cs.strip()
     except Exception:
         pass
-    if _container_started_str:
+    if container_start_str:
         try:
-            from datetime import datetime as _dt
-            _cst = _dt.fromisoformat(_container_started_str).astimezone(now.tzinfo)
-            if _cst > start:
-                _gap = _cst - start
-                _gap_h = int(_gap.total_seconds() // 3600)
-                _gap_m = int((_gap.total_seconds() % 3600) // 60)
-                print(f"⚠️ 容器于 {_cst.strftime('%Y-%m-%d %H:%M')} 启动，晚于统计窗口起点 {start.strftime('%m-%d %H:%M')}，"
-                      f"缺 {_gap_h}h{_gap_m}m 日志（LLM 用量偏少）。")
+            container_start = _parse_timestamp(container_start_str)
+            if container_start and container_start.timestamp() > start.timestamp():
+                gap = container_start.timestamp() - start.timestamp()
+                gap_h = int(gap // 3600)
+                gap_m = int((gap % 3600) // 60)
+                print(f"⚠️ 容器于 {container_start.strftime('%H:%M')} 启动，晚于统计窗口起点，缺 {gap_h}h{gap_m}m 日志（LLM 用量偏少）。")
         except Exception:
             pass
+
     if llm_usage:
         print_table(
             ["模型", "scope", "调用", "输入", "输出", "总tokens", "耗时"],
@@ -983,96 +972,96 @@ def main() -> int:
                 [
                     str(r["model"]),
                     str(r["scope"]),
-                    fmt_num(int(r["calls"])),
+                    str(r["calls"]),
                     fmt_tok(int(r["input_tokens"])),
                     fmt_tok(int(r["output_tokens"])),
                     fmt_tok(int(r["total_tokens"])),
-                    f"{float(r['seconds'])/60:.1f}min",
+                    f"{float(r['seconds']) / 60:.1f}min",
                 ]
                 for r in llm_usage
             ],
         )
     else:
-        print("未从当前容器日志捕获 Hindsight LLM token 记录；保留 DB 工作量统计。")
+        print("无 LLM 调用记录")
     print()
 
+    # ── Hindsight 数据变化 (full table) ──
     print("【Hindsight 数据变化】")
-    docs = (db.get("docs") or [["0", "0", "0"]])[0]
-    cons = (db.get("consolidation") or [["0", "0", "0", "0", "0", "0"]])[0]
-    units_rows = db.get("units_by_type") or []
-    unit_changes = ", ".join(
-        f"{row[0]} +{fmt_num(int(row[1]))}" for row in units_rows if int(row[1])
-    ) or "无新增"
-    unit_totals = ", ".join(
-        f"{row[0]} {fmt_num(int(row[3]))}" for row in units_rows
-    ) or "未知"
     print_table(
         ["领域", "窗口变化", "当前状态"],
         [
             [
                 "Documents",
-                f"+{fmt_num(int(docs[0]))} / 更新 {fmt_num(int(docs[1]))}",
-                fmt_num(int(docs[2])),
-            ],
-            ["Memory units", unit_changes, unit_totals],
-            [
-                "Consolidation",
-                f"完成 {fmt_num(int(cons[0]))}",
-                f"待处理 {fmt_num(int(cons[1]))} / 失败 {fmt_num(int(cons[2]))}",
-            ],
-            ["Operations", window_operation_summary(ops_rows), "仅窗口内创建"],
-            [
-                "V2 cards",
-                f"rebuild {offline['v2_latest_mtime']}",
-                f"{offline['v2_card_count']} cards / {offline['v2_observation_count']} observations",
+                f"+{int(docs_meta[0])} / 更新 {int(docs_meta[1])}",
+                fmt_num(total_docs),
             ],
         ],
     )
-    sources = db.get("doc_sources") or []
-    if sources:
-        print("新增来源: " + "; ".join(f"{s}:{c}" for s, c in sources))
-    if consolidation_batch_logs.get("batches"):
-        print(
-            "Consolidation batches: "
-            f"{consolidation_batch_logs['batches']} 批 / {consolidation_batch_logs['memories']} memories / "
-            f"created {consolidation_batch_logs['created']} / updated {consolidation_batch_logs['updated']} / "
-            f"failed {consolidation_batch_logs['failed']}"
-        )
+    # Memory units by type: [fact_type, created, updated_existing, total]
+    units_rows = db.get("units_by_type") or []
+    for ur in units_rows:
+        if len(ur) >= 4:
+            fact_type = ur[0]
+            created = int(ur[1])
+            updated_existing = int(ur[2])
+            total = int(ur[3])
+            delta_parts = [f"+{created}"]
+            if updated_existing:
+                delta_parts.append(f"更新 {updated_existing}")
+            print(f"| {fact_type} | {' '.join(delta_parts)} | {fact_type} {fmt_num(total)} |")
+    print(f"| Consolidation | 完成 {fmt_num(int(cons_meta[0]))} | 待处理 {fmt_num(uncons)} / 失败 {fmt_num(failed)} |")
+
+    # Operations summary
+    ops_summary = window_operation_summary(ops_rows)
+    print(f"| Operations | {ops_summary} | 仅窗口内创建 |")
+
+    # V2 cards
+    v2_count = offline.get("v2_card_count", 0)
+    v2_obs = offline.get("v2_observation_count", 0)
+    v2_mtime = offline.get("v2_latest_mtime", "-")
+    print(f"| V2 cards | rebuild {v2_mtime} | {v2_count} cards / {fmt_num(v2_obs)} observations |")
+
+    # Doc sources
+    doc_sources = db.get("doc_sources") or []
+    if doc_sources:
+        src_parts = [f"{s}:{c}" for s, c in doc_sources[:8]]
+        print(f"新增来源: {'; '.join(src_parts)}")
+
+    # Consolidation batches
+    if consolidation_batch_logs and consolidation_batch_logs.get("batches", 0) > 0:
+        b = consolidation_batch_logs
+        print(f"Consolidation batches: {b['batches']} 批 / {b['memories']} memories / created {b['created']} / updated {b['updated']} / failed {b['failed']}")
     print()
 
+    # ── 算法坑 ──
     print("【算法坑】")
     pitfall_counts = pitfalls.get("counts", {})
-    print(
-        "当前: "
-        + ", ".join(
-            f"{status}={count}" for status, count in sorted(pitfall_counts.items())
-        )
-    )
+    print("当前: " + ", ".join(f"{s}={c}" for s, c in sorted(pitfall_counts.items())))
     changed_pitfalls = pitfalls.get("changes", [])
     if changed_pitfalls:
-        for entry in changed_pitfalls[:3]:
+        for entry in changed_pitfalls:
             print(f"• {entry['p_id']} [{entry['status']}]: {entry['title']}")
-        if len(changed_pitfalls) > 3:
-            print(f"• 其余 {len(changed_pitfalls) - 3} 条见 canonical catalog。")
     else:
         print("• 本窗口无可归因的 Pitfall lifecycle 变更。")
-    print("• 研发 digest 不分配 P-id；唯一 writer 为 pitfall_writer.py。")
+        print("• 研发 digest 不分配 P-id；唯一 writer 为 pitfall_writer.py。")
     print()
 
+    # ── 异常 ──
     print("【异常】")
     errors = db.get("errors") or []
-    failed_base = int(cons[2]) if cons and len(cons) > 2 else 0
+    failed_base = int(cons_meta[2]) if cons_meta and len(cons_meta) > 2 else 0
     if not errors and not alerts and failed_base == 0:
         print("• 无未解决 active queue 或 failed_base；窗口内终态失败已在数据表中展示。")
     else:
         for e in errors:
-            print(f"• Hindsight DB 统计异常: {e}")
+            print(f"• DB异常: {e}")
         for alert in alerts:
             print(f"• {alert}")
         if failed_base:
             print(f"• failed_base={failed_base}")
     print()
 
+    # ── 索引 ──
     print("【索引】")
     print("• 项目知识: /home/wyr/wiki/auto-maintenance/project/egomotion4d/knowledge/")
     print("• Mental Models: /home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/")

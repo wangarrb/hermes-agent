@@ -74,13 +74,29 @@ def get_summary() -> dict | None:
         return None
 
 
+# CLI --llm-* overrides (highest priority, set in main()). Applied before
+# docker env / host env / defaults in _get_hindsight_llm_config().
+_LLM_OVERRIDES: dict[str, str] = {}
+
+
 def _get_hindsight_llm_config() -> dict:
     """Read Hindsight's LLM config from its Docker container env vars.
 
     Returns dict with base_url, model, api_key, provider.
-    Falls back to HINDSIGHT_OFFLINE_LLM_* env vars, then to defaults.
+    Priority: CLI --llm-* overrides > docker env > HINDSIGHT_OFFLINE_LLM_*
+    host env vars > built-in defaults.
     """
     base_url = model = api_key = provider = None
+
+    # 0. Explicit CLI overrides win over everything.
+    if _LLM_OVERRIDES.get("base_url"):
+        base_url = _LLM_OVERRIDES["base_url"]
+    if _LLM_OVERRIDES.get("model"):
+        model = _LLM_OVERRIDES["model"]
+    if _LLM_OVERRIDES.get("api_key"):
+        api_key = _LLM_OVERRIDES["api_key"]
+    if _LLM_OVERRIDES.get("provider"):
+        provider = _LLM_OVERRIDES["provider"]
 
     # Known-dead provider base URLs (key expired or service unavailable).
     # If container points here, skip container config entirely and use fallback.
@@ -104,10 +120,14 @@ def _get_hindsight_llm_config() -> dict:
                     env_map[k] = v
             _container_base = env_map.get("HINDSIGHT_API_LLM_BASE_URL", "")
             if _container_base not in _DEAD_BASE_URLS:
-                base_url = _container_base
-                model = env_map.get("HINDSIGHT_API_LLM_MODEL")
-                api_key = env_map.get("HINDSIGHT_API_LLM_API_KEY")
-                provider = env_map.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
+                if not base_url:
+                    base_url = _container_base
+                if not model:
+                    model = env_map.get("HINDSIGHT_API_LLM_MODEL")
+                if not api_key:
+                    api_key = env_map.get("HINDSIGHT_API_LLM_API_KEY")
+                if not provider:
+                    provider = env_map.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
     except Exception:
         pass
 
@@ -473,7 +493,6 @@ def run_research_summary(
 ) -> int:
     """Generate one compact research delta for the 08:30 daily report."""
     print("\n[Research Summary]", flush=True)
-
     # Cron runs at 00:01, so the default source period is yesterday.
     report_date = report_date or REPORT_DATE
 
@@ -579,7 +598,7 @@ Regenerate the complete digest and fix only these contract errors."""
 
     # Print concise output for weixin delivery
     print("\n--- Research Digest ---", flush=True)
-    for line in result.strip().split("\n")[:25]:
+    for line in result.strip().split("\n")[:30]:
         print(line, flush=True)
 
     return 0
@@ -3009,7 +3028,33 @@ def main() -> int:
                      help="Print bounded consumption/outcome telemetry as JSON")
     _ap.add_argument("--research-digest-only", metavar="YYYY-MM-DD",
                      help="Generate one compact research digest without running the pipeline")
+    _ap.add_argument("--llm-model", default=None,
+                     help="Override pipeline LLM model (highest priority, wins over docker env/default)")
+    _ap.add_argument("--llm-provider", default=None,
+                     help="Override pipeline LLM provider (e.g. openai/minimax/ollama)")
+    _ap.add_argument("--llm-base-url", default=None,
+                     help="Override pipeline LLM base_url (e.g. http://127.0.0.1:3000/v1)")
+    _ap.add_argument("--llm-api-key-env", default=None,
+                     help="Override pipeline LLM API key env var name (e.g. ONEAPI_API_KEY)")
     _args, _ = _ap.parse_known_args()
+
+    # Apply explicit LLM overrides before any pipeline/mental-model step runs.
+    if _args.llm_model:
+        _LLM_OVERRIDES["model"] = _args.llm_model
+    if _args.llm_provider:
+        _LLM_OVERRIDES["provider"] = _args.llm_provider
+    if _args.llm_base_url:
+        _LLM_OVERRIDES["base_url"] = _args.llm_base_url
+    if _args.llm_api_key_env:
+        _key = os.environ.get(_args.llm_api_key_env) or ""
+        if not _key:
+            print(f"WARNING: --llm-api-key-env {_args.llm_api_key_env} not set in env", flush=True)
+        _LLM_OVERRIDES["api_key"] = _key
+    if _LLM_OVERRIDES:
+        print(f"[LLM override] model={_LLM_OVERRIDES.get('model', '(docker/env default)')} "
+              f"provider={_LLM_OVERRIDES.get('provider', '(docker/env default)')} "
+              f"base_url={_LLM_OVERRIDES.get('base_url', '(docker/env default)')} "
+              f"api_key={'set' if _LLM_OVERRIDES.get('api_key') else 'inherit'}", flush=True)
 
     # Mental model preflight: output and exit, skip pipeline entirely
     if _args.mental_model_preflight is not None:
@@ -3072,10 +3117,7 @@ def main() -> int:
         return 1
 
     # Pre-step: auto-clean orphaned consolidation units before pipeline runs.
-    # Hindsight's consolidation can leave memory_units with consolidation_failed_at
-    # set but no actual pending work, causing pending_consolidation to never drop
-    # and blocking the wait_native_consolidation gate forever.
-    print("  Pre-clean orphaned consolidation units...", flush=True)
+    print("  Pre-clean...", flush=True)
     try:
         fix_script = HERMES_HOME / "scripts" / "fix_orphaned_consolidation.py"
         if fix_script.exists():
@@ -3111,6 +3153,23 @@ def main() -> int:
             "HERMES_ACCEPT_HOOKS": "1",
             "PYTHONUNBUFFERED": "1",
         }
+        # Propagate explicit --llm-* overrides into the pipeline subprocess so
+        # hindsight_memory_pipeline.py / hindsight_minimax_import.py use them too.
+        if _LLM_OVERRIDES.get("model"):
+            env["HINDSIGHT_OFFLINE_LLM_MODEL"] = _LLM_OVERRIDES["model"]
+        if _LLM_OVERRIDES.get("base_url"):
+            env["HINDSIGHT_OFFLINE_LLM_BASE_URL"] = _LLM_OVERRIDES["base_url"]
+        if _LLM_OVERRIDES.get("api_key"):
+            env["HINDSIGHT_OFFLINE_LLM_API_KEY"] = _LLM_OVERRIDES["api_key"]
+        if _LLM_OVERRIDES.get("provider"):
+            env["HINDSIGHT_OFFLINE_HINDSIGHT_PROVIDER"] = _LLM_OVERRIDES["provider"]
+        if _LLM_OVERRIDES.get("model") or _LLM_OVERRIDES.get("base_url"):
+            env["HINDSIGHT_OFFLINE_LLM_PROFILE"] = "custom"
+            # custom profile needs a full set; default to the local oneapi
+            # gateway + ONEAPI key when the user only overrode the model name.
+            env.setdefault("HINDSIGHT_OFFLINE_LLM_BASE_URL", "http://127.0.0.1:3000/v1")
+            env.setdefault("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "ONEAPI_API_KEY")
+            env.setdefault("HINDSIGHT_OFFLINE_HINDSIGHT_PROVIDER", "openai")
         proc = subprocess.run(
             [
                 sys.executable, "-u",
