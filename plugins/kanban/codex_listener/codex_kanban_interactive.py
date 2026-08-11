@@ -155,11 +155,20 @@ class CodexInteractiveListener(BaseInteractiveListener):
 
         last_line = tail_lines[-1].lower()
         is_status_bar = "context" in last_line and "%" in last_line
-        check_line = (
-            tail_lines[-2].lower()
-            if is_status_bar and len(tail_lines) >= 2
-            else last_line
-        )
+        # Codex TUI may render the composer prompt and status bar on the same
+        # line (e.g. "› Implement {feature}  gpt-5.6-sol · Context 20% used").
+        # In that case the idle marker is on the status-bar line itself, so
+        # check the last line rather than skipping to the second-to-last.
+        if is_status_bar and not any(
+            marker.lower() in last_line for marker in self.idle_markers
+        ):
+            check_line = (
+                tail_lines[-2].lower()
+                if len(tail_lines) >= 2
+                else last_line
+            )
+        else:
+            check_line = last_line
         return any(marker.lower() in check_line for marker in self.idle_markers)
 
     _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s?(.*))?$")
