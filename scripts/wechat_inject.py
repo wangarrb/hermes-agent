@@ -20,6 +20,20 @@ ROLE_PANE_MAP = {
     "coordinator": "terminal_4",
 }
 
+def resolve_pane_id(role: str) -> str:
+    """从 watcher 进程参数动态获取角色对应的 zellij pane id，fallback 到硬编码。"""
+    try:
+        r = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            if "--watch-child" in line and f"--profile {role}" in line and "zellij-pane-id" in line:
+                m = re.search(r"--zellij-pane-id\s+(\d+)", line)
+                if m:
+                    return f"terminal_{m.group(1)}"
+    except Exception:
+        pass
+    return ROLE_PANE_MAP.get(role, f"terminal_0")
+
 def zellij(*args):
     subprocess.run(["zellij", "--session", ZELLIJ_SESSION, "action"] + list(args),
                    capture_output=True, timeout=10)
@@ -94,7 +108,7 @@ def main():
         print(f"未知角色: {role}", file=sys.stderr)
         sys.exit(1)
 
-    pane = ROLE_PANE_MAP[role]
+    pane = resolve_pane_id(role)
 
     if not is_idle(pane):
         print(f"[{role}] 正忙，拒绝注入", file=sys.stderr)
