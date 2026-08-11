@@ -1110,11 +1110,17 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # Xunfei MaaS (or a local One API gateway in front of it) — DeepSeek /
     # GLM thinking is opt-in via extra_body["thinking"]; without it the
     # upstream never enters reasoning mode and never emits reasoning_content.
-    _is_xunfei_maas = (
-        (agent.provider or "").strip().lower() == "xunfei-coding"
-        or "127.0.0.1:3000" in agent._base_url_lower
-        or "3000" in agent._base_url_lower and agent.provider == "custom"
-    )
+    # Detection: (a) provider name is xunfei-coding, or (b) base_url points
+    # at a loopback host (One API gateway runs locally).
+    _xunfei_provider = (agent.provider or "").strip().lower() == "xunfei-coding"
+    _xunfei_gateway = False
+    try:
+        from urllib.parse import urlparse
+        _host = (urlparse(agent._base_url_lower or "").hostname or "").lower()
+        _xunfei_gateway = _host in {"127.0.0.1", "localhost"}
+    except Exception:
+        pass
+    _is_xunfei_maas = _xunfei_provider or _xunfei_gateway
 
     # Temperature: _fixed_temperature_for_model may return OMIT_TEMPERATURE
     # sentinel (temperature omitted entirely), a numeric override, or None.
@@ -1178,6 +1184,25 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
+        # Xunfei MaaS thinking injection for the profile path.
+        # When a named custom provider (e.g. xunfei-coding) is resolved to
+        # provider="custom" by _resolve_named_custom_runtime, get_provider_profile
+        # returns a CustomProfile and we enter this branch — bypassing the
+        # legacy flag path where is_xunfei_maas would have injected
+        # extra_body["thinking"]. Without thinking, the upstream never enters
+        # reasoning mode and reasoning_content is never returned. Mirror the
+        # legacy injection here via request_overrides so the profile path also
+        # gets thinking when the endpoint is a Xunfei MaaS gateway.
+        _profile_request_overrides = dict(agent.request_overrides or {})
+        if _is_xunfei_maas:
+            _xunfei_thinking_enabled = True
+            if agent.reasoning_config and isinstance(agent.reasoning_config, dict):
+                if agent.reasoning_config.get("enabled") is False:
+                    _xunfei_thinking_enabled = False
+            _eb = dict(_profile_request_overrides.get("extra_body") or {})
+            _eb["thinking"] = {"type": "enabled" if _xunfei_thinking_enabled else "disabled"}
+            _profile_request_overrides["extra_body"] = _eb
+
         return _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
@@ -1188,7 +1213,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
+            request_overrides=_profile_request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
