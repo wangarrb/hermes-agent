@@ -38,6 +38,7 @@ from base_listener import (  # noqa: E402
     _pane_can_accept_new_kanban_task,
     _tail_nonempty_lines,
 )
+from session_scope import latest_codex_thread  # noqa: E402
 
 
 class CodexInteractiveListener(BaseInteractiveListener):
@@ -63,9 +64,9 @@ class CodexInteractiveListener(BaseInteractiveListener):
         provider: str | None = None,
         extra_args: list[str] | None = None,
     ) -> list[str]:
-        if continue_session:
-            # Codex v0.100+ uses 'codex resume --last' instead of 'codex --continue'
-            cmd = ["codex", "resume", "--last"]
+        resume_session_id = getattr(self, "_resume_session_id", None)
+        if continue_session and resume_session_id:
+            cmd = ["codex", "resume", str(resume_session_id)]
         else:
             cmd = ["codex"]
         if provider:
@@ -79,50 +80,10 @@ class CodexInteractiveListener(BaseInteractiveListener):
         return cmd
 
     def has_saved_sessions(self, workspace: Path) -> bool:
-        """Check if Codex has saved sessions for this workspace.
-
-        Codex v0.100+ stores sessions in CODEX_HOME/sessions/YYYY/MM/DD/.
-        When using per-role CODEX_HOME (e.g. ~/.codex-kanban/<role>/),
-        check that path first, then fall back to ~/.codex/sessions/.
-        Older versions used ~/.codex/projects/<encoded-cwd>/.
-        """
-        import os
-
-        # Determine CODEX_HOME: env var takes priority, then ~/.codex
-        codex_home = os.environ.get("CODEX_HOME")
-        if codex_home:
-            codex_home_path = Path(codex_home)
-        else:
-            codex_home_path = Path.home() / ".codex"
-
-        # v0.100+ path: CODEX_HOME/sessions/
-        sessions_dir = codex_home_path / "sessions"
-        if sessions_dir.is_dir():
-            try:
-                for child in sessions_dir.rglob("rollout-*.jsonl"):
-                    return True
-            except OSError:
-                pass
-
-        # Also check ~/.codex/sessions/ (global sessions when using per-role CODEX_HOME)
-        global_sessions = Path.home() / ".codex" / "sessions"
-        if global_sessions != sessions_dir and global_sessions.is_dir():
-            try:
-                for child in global_sessions.rglob("rollout-*.jsonl"):
-                    return True
-            except OSError:
-                pass
-
-        # Legacy path: CODEX_HOME/projects/<base64-cwd>/
-        projects_dir = codex_home_path / "projects"
-        if projects_dir.is_dir():
-            import base64
-            encoded = base64.urlsafe_b64encode(str(workspace).encode()).decode().rstrip("=")
-            project_dir = projects_dir / encoded
-            if project_dir.is_dir() and any(project_dir.iterdir()):
-                return True
-
-        return False
+        """Resolve an explicit saved thread for this exact workspace."""
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        self._resume_session_id = latest_codex_thread(codex_home, workspace)
+        return self._resume_session_id is not None
 
     def inject_text(
         self, task_id: str, title: str, assignee: str,

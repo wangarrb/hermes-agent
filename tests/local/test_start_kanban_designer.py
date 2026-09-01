@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import stat
 import subprocess
@@ -48,7 +49,7 @@ def _sandboxed_launcher(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
     test_lib = tmp_path / "local/lib"
     test_lib.mkdir(parents=True)
-    for name in ("reviewer_mode.sh", "owner_workspace.sh"):
+    for name in ("reviewer_mode.sh", "owner_workspace.sh", "codex_role_home.sh"):
         (test_lib / name).write_text(
             (REPO_ROOT / "local/lib" / name).read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -110,6 +111,68 @@ def _pane(layout: str, role: str) -> str:
     )
     assert match, f"missing {role} pane in:\n{layout}"
     return match.group(0)
+
+
+def _write_board_binding(fake_home: Path, board: str, workspace: Path) -> None:
+    board_dir = fake_home / ".hermes/kanban/boards" / board
+    board_dir.mkdir(parents=True)
+    (board_dir / "board.json").write_text(
+        json.dumps(
+            {
+                "slug": board,
+                "default_workdir": str(workspace.resolve()),
+                "archived": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_board_binding_supplies_workspace_when_w_is_omitted(tmp_path: Path) -> None:
+    launcher, fake_home, env = _sandboxed_launcher(tmp_path)
+    workspace = tmp_path / "SeqScale"
+    workspace.mkdir()
+    _write_board_binding(fake_home, "seqscale", workspace)
+
+    result = subprocess.run(
+        [str(launcher), "--board", "seqscale", "--dry-run"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"workspace: {workspace.resolve()}" in result.stdout
+    assert "/code/Egomotion4D" not in result.stdout
+
+
+def test_explicit_workspace_must_match_board_binding(tmp_path: Path) -> None:
+    launcher, fake_home, env = _sandboxed_launcher(tmp_path)
+    seqscale = tmp_path / "SeqScale"
+    egomotion = tmp_path / "Egomotion4D"
+    seqscale.mkdir()
+    egomotion.mkdir()
+    _write_board_binding(fake_home, "seqscale", seqscale)
+
+    result = subprocess.run(
+        [
+            str(launcher),
+            "--board", "seqscale",
+            "--workspace", str(egomotion),
+            "--dry-run",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "workspace" in result.stderr.lower()
+    assert "board" in result.stderr.lower()
+    assert str(seqscale.resolve()) in result.stderr
+    assert str(egomotion.resolve()) in result.stderr
 
 
 def test_default_layout_has_designer_and_no_critic(tmp_path: Path) -> None:

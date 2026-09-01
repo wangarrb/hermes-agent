@@ -120,32 +120,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Auto-detect: add --continue only if the profile has a session to resume
-CONTINUE_ARG=""
+# Resume only a session whose canonical cwd matches this workspace.
+RESUME_ARGS=()
 SESSION_DB="/home/wyr/.hermes/profiles/${PROFILE:-implementer}/state.db"
+SESSION_SELECTOR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/kanban-session-scope.py"
 if [ "${HERMES_KANBAN_FRESH:-0}" = "1" ]; then
     echo "$log_prefix Fresh session requested, skipping resume" >&2
-elif [ -f "$SESSION_DB" ]; then
-    HAS_SESSION=$(python3 -c "
-import sqlite3
-try:
-    c = sqlite3.connect('$SESSION_DB')
-    cur = c.execute('SELECT COUNT(*) FROM sessions')
-    n = cur.fetchone()[0]
-    c.close()
-    print(int(n > 0))
-except:
-    print(0)
-" 2>/dev/null || echo 0)
-    if [ "$HAS_SESSION" = "1" ]; then
-        CONTINUE_ARG="--continue"
-        echo "$log_prefix Session DB found with entries, will resume" >&2
-    else
-        echo "$log_prefix Session DB found but empty, starting new session" >&2
-    fi
 else
-    echo "$log_prefix No session DB for profile ${PROFILE:-implementer}, starting new session" >&2
+    RESUME_ID="$(python3 "$SESSION_SELECTOR" hermes --db "$SESSION_DB" --workspace "$WORKSPACE" 2>/dev/null || true)"
+    if [ -n "$RESUME_ID" ]; then
+        RESUME_ARGS=(--resume "$RESUME_ID" --no-restore-cwd)
+        echo "$log_prefix Matching workspace session found, will resume id=$RESUME_ID" >&2
+    else
+        echo "$log_prefix No session for profile ${PROFILE:-implementer} in workspace $WORKSPACE; starting fresh" >&2
+    fi
 fi
 
-echo "$log_prefix Starting hermes ${HERMES_ARGS[*]} $CONTINUE_ARG" >&2
-exec hermes "${HERMES_ARGS[@]}" $CONTINUE_ARG
+echo "$log_prefix Starting hermes ${HERMES_ARGS[*]} ${RESUME_ARGS[*]}" >&2
+exec hermes "${HERMES_ARGS[@]}" "${RESUME_ARGS[@]}"

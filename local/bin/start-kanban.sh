@@ -26,7 +26,7 @@ usage() {
 
 核心参数:
   -b, --board <board>              Kanban board 名称，例如 egomotion4d
-  -w, --workspace <path>           项目主工作目录
+  -w, --workspace <path>           项目主工作目录；省略时读取 board default_workdir
   --designer-workspace <path>      designer 工作目录，默认 <primary>-designer
   --coordinator-workspace <path>   coordinator 工作目录，默认 <primary>-coordinator
   -n, --dry-run                    只生成并打印 zellij layout，不启动/不清理
@@ -153,7 +153,9 @@ clean_session_name() {
 }
 
 BOARD=""
-WORKSPACE="${KANBAN_WORKSPACE:-${CODEWHALE_KANBAN_WORKSPACE:-${CODEX_KANBAN_WORKSPACE:-${DEEPSEEK_KANBAN_WORKSPACE:-${REAL_HOME}/code/Egomotion4D}}}}"
+WORKSPACE="${KANBAN_WORKSPACE:-${CODEWHALE_KANBAN_WORKSPACE:-${CODEX_KANBAN_WORKSPACE:-${DEEPSEEK_KANBAN_WORKSPACE:-}}}}"
+WORKSPACE_EXPLICIT=0
+[ -z "$WORKSPACE" ] || WORKSPACE_EXPLICIT=1
 DESIGNER_WORKSPACE="${KANBAN_DESIGNER_WORKSPACE:-}"
 COORDINATOR_WORKSPACE="${KANBAN_COORDINATOR_WORKSPACE:-}"
 COORDINATOR_AGENT="${KANBAN_COORDINATOR_AGENT:-hermes}"
@@ -363,7 +365,7 @@ while [[ $# -gt 0 ]]; do
         -b|--board)
             need_value "$1" "${2:-}"; BOARD="$2"; shift 2 ;;
         -w|--workspace)
-            need_value "$1" "${2:-}"; WORKSPACE="$2"; shift 2 ;;
+            need_value "$1" "${2:-}"; WORKSPACE="$2"; WORKSPACE_EXPLICIT=1; shift 2 ;;
         --designer-workspace)
             need_value "$1" "${2:-}"; DESIGNER_WORKSPACE="$2"; shift 2 ;;
         --coordinator-workspace)
@@ -509,6 +511,40 @@ case "$TASK_DELIVERY" in
         exit 1
         ;;
 esac
+
+BOARD_METADATA="${REAL_HOME}/.hermes/kanban/boards/${BOARD}/board.json"
+BOARD_WORKSPACE=""
+if [ -f "$BOARD_METADATA" ]; then
+    BOARD_WORKSPACE="$(python3 - "$BOARD_METADATA" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    if not data.get("archived", False):
+        print(data.get("default_workdir") or "")
+except (OSError, ValueError, TypeError):
+    pass
+PY
+)"
+fi
+
+if [ -n "$BOARD_WORKSPACE" ]; then
+    BOARD_WORKSPACE="$(readlink -m "$BOARD_WORKSPACE")"
+    if [ "$WORKSPACE_EXPLICIT" = "1" ]; then
+        EXPLICIT_WORKSPACE="$(readlink -m "$WORKSPACE")"
+        if [ "$EXPLICIT_WORKSPACE" != "$BOARD_WORKSPACE" ]; then
+            echo "错误: workspace 与 board 绑定不一致: board=$BOARD bound=$BOARD_WORKSPACE requested=$EXPLICIT_WORKSPACE" >&2
+            exit 2
+        fi
+    else
+        WORKSPACE="$BOARD_WORKSPACE"
+    fi
+elif [ -z "$WORKSPACE" ]; then
+    echo "错误: board $BOARD 没有 default_workdir；请显式传入 --workspace" >&2
+    exit 2
+fi
 
 if [ ! -d "$WORKSPACE" ]; then
     echo "错误: workspace 不存在: $WORKSPACE" >&2
