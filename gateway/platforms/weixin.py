@@ -1513,7 +1513,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 try:
                     result = await asyncio.to_thread(
                         lambda: subprocess.run(
-                            ["python3", "/home/wyr/.hermes/hermes-agent-pre-v019-20260722-153835/scripts/wechat_inject.py",
+                            ["python3", "/home/wyr/.hermes/hermes-agent/scripts/wechat_inject.py",
                              "--role", role, "--message", msg, "--timeout", "300"],
                             capture_output=True, text=True, timeout=310
                         )

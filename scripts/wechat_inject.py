@@ -5,7 +5,8 @@
   python3 scripts/wechat_inject.py --role implementer --message "查一下任务状态"
   echo "@implementer 查一下任务状态" | python3 scripts/wechat_inject.py --from-stdin
 
-依赖: zellij session (默认 kanban-egomotion4d)
+依赖: zellij session（自动从 watcher 进程参数解析 --zellij-session/--zellij-pane-id，
+无 watcher 时 fallback: env ZELLIJ_SESSION → kanban-egomotion4d）
 """
 
 import subprocess, sys, time, re, os, argparse
@@ -20,19 +21,41 @@ ROLE_PANE_MAP = {
     "coordinator": "terminal_4",
 }
 
-def resolve_pane_id(role: str) -> str:
-    """从 watcher 进程参数动态获取角色对应的 zellij pane id，fallback 到硬编码。"""
+def _watcher_lines(role: str):
+    """从 watcher 进程参数里找 role 对应的行（含 --zellij-session/--zellij-pane-id）。"""
     try:
-        r = subprocess.run(
-            ["ps", "aux"], capture_output=True, text=True, timeout=5)
-        for line in r.stdout.splitlines():
-            if "--watch-child" in line and f"--profile {role}" in line and "zellij-pane-id" in line:
-                m = re.search(r"--zellij-pane-id\s+(\d+)", line)
-                if m:
-                    return f"terminal_{m.group(1)}"
+        r = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
     except Exception:
-        pass
-    return ROLE_PANE_MAP.get(role, f"terminal_0")
+        return []
+    return [l for l in r.stdout.splitlines()
+            if "--watch-child" in l and f"--profile {role}" in l and "zellij-pane-id" in l]
+
+def _live_sessions() -> set:
+    try:
+        r = subprocess.run(["zellij", "list-sessions"], capture_output=True, text=True, timeout=5)
+        return {l.strip().split()[0] for l in r.stdout.splitlines() if l.strip()}
+    except Exception:
+        return set()
+
+def resolve_target(role: str):
+    """解析 (zellij_session, pane)。
+
+    2026-09-03 fix: board 切换后 session 名不再固定（seqscale=kanban-seqscale，
+    egomotion4d=kanban-egomotion4d），watcher 参数里带 --zellij-session。
+    优先现存 session 的 watcher，避免多 board watcher 并存时选错；fallback 硬编码。"""
+    live = _live_sessions()
+    for line in _watcher_lines(role):
+        sm = re.search(r"--zellij-session\s+(\S+)", line)
+        pm = re.search(r"--zellij-pane-id\s+(\d+)", line)
+        if sm and pm and (not live or sm.group(1) in live):
+            return sm.group(1), f"terminal_{pm.group(1)}"
+    for line in _watcher_lines(role):
+        sm = re.search(r"--zellij-session\s+(\S+)", line)
+        pm = re.search(r"--zellij-pane-id\s+(\d+)", line)
+        if sm and pm:
+            return sm.group(1), f"terminal_{pm.group(1)}"
+    return (os.environ.get("ZELLIJ_SESSION", "kanban-egomotion4d"),
+            ROLE_PANE_MAP.get(role, "terminal_0"))
 
 def zellij(*args):
     subprocess.run(["zellij", "--session", ZELLIJ_SESSION, "action"] + list(args),
@@ -108,7 +131,8 @@ def main():
         print(f"未知角色: {role}", file=sys.stderr)
         sys.exit(1)
 
-    pane = resolve_pane_id(role)
+    global ZELLIJ_SESSION
+    ZELLIJ_SESSION, pane = resolve_target(role)
 
     if not is_idle(pane):
         print(f"[{role}] 正忙，拒绝注入", file=sys.stderr)
