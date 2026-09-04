@@ -421,3 +421,50 @@ def test_old_claim_heartbeats_do_not_refresh_replacement_run(kanban_home):
     assert after_task.last_heartbeat_at == before_task.last_heartbeat_at
     assert after_run.claim_expires == before_run.claim_expires
     assert after_run.last_heartbeat_at == before_run.last_heartbeat_at
+
+
+def test_workspace_contract_error_comments_and_blocks_needs_input(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A deterministic WorkspaceContractError must NOT reclaim into a claim
+    loop: the listener comments the exact failure on the task and blocks it
+    as needs_input so the publisher learns and fixes the record."""
+    pane_workspace = tmp_path / "pane-workspace"
+    pane_workspace.mkdir()
+    listener = _listener(pane_workspace)
+    injected = []
+    monkeypatch.setattr(
+        bl, "zellij_inject",
+        lambda **kwargs: injected.append(kwargs["text"]) or True,
+    )
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
+
+    from hermes_cli.kanban_workspace_contract import WorkspaceContractError
+
+    def resolve_workspace(task, *, board=None):
+        raise WorkspaceContractError(
+            f"base commit is not reachable in repository: {task.base_commit}"
+        )
+
+    monkeypatch.setattr(kb, "resolve_workspace", resolve_workspace)
+
+    with kb.connect() as conn:
+        task_id = _ready_worktree_task(conn)
+        claimed_id, run_id = listener.claim_and_inject_one(
+            _args(pane_workspace), log_path=listener._log_path, conn=conn,
+        )
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert claimed_id is None
+    assert run_id is None
+    # Blocked for the publisher (needs_input), NOT reclaimed back to ready.
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert injected == []
+    assert len(comments) == 1
+    assert "deterministic workspace-contract failure" in comments[0].body
+    assert "base commit is not reachable" in comments[0].body
+    assert "unblock" in comments[0].body
+    log_text = listener._log_path.read_text(encoding="utf-8")
+    assert "commented + blocked needs_input" in log_text

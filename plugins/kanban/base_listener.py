@@ -872,6 +872,7 @@ class BaseInteractiveListener:
             # cycle starts fresh
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._api_retry_kind = None
             self._reset_idle_followup()
             return
 
@@ -917,6 +918,7 @@ class BaseInteractiveListener:
         self._log_path: Path = Path("/tmp/kanban.log")
         self._api_retry_count: int = 0       # per-task API failure retry counter
         self._api_retry_first_at: float | None = None  # when first API-idle was seen
+        self._api_retry_kind: str | None = None  # generic vs model-capacity failure
         self._active_control_id: int | None = None
         self._active_task_id: str | None = None
         self._active_run_id: int | None = None
@@ -1105,6 +1107,9 @@ class BaseInteractiveListener:
         self._active_run_id = None
         self._active_generation = None
         self._active_claim_lock = None
+        self._api_retry_count = 0
+        self._api_retry_first_at = None
+        self._api_retry_kind = None
         self._reset_idle_followup()
 
     # ── API failure retry on idle ──
@@ -1114,6 +1119,14 @@ class BaseInteractiveListener:
     # Retry intervals: 5min → 10min → 20min (total ~35min window).
     API_RETRY_MAX: int = 3
     API_RETRY_BACKOFF: list[float] = [300.0, 600.0, 1200.0]  # 5min, 10min, 20min
+    # Capacity can recover faster than a transport outage, but retries remain
+    # bounded and stay in the same Codex session/work item.
+    API_CAPACITY_RETRY_BACKOFF: list[float] = [30.0, 90.0, 300.0]
+    API_CAPACITY_ERROR_MARKERS: tuple[str, ...] = (
+        "selected model is at capacity",
+        "model capacity exhausted",
+        "model is at capacity",
+    )
     API_ERROR_MARKERS: tuple[str, ...] = (
             # ── Generic API errors ──
             "api call failed", "api error", "api request failed",
@@ -1187,16 +1200,30 @@ class BaseInteractiveListener:
             return False
 
         tail = "\n".join(_tail_nonempty_lines(screen)).lower()
-        has_error = any(m.lower() in tail for m in self.API_ERROR_MARKERS)
+        capacity_matches = [
+            marker for marker in self.API_CAPACITY_ERROR_MARKERS
+            if marker.lower() in tail
+        ]
+        generic_matches = [
+            marker for marker in self.API_ERROR_MARKERS
+            if marker.lower() in tail
+        ]
+        error_kind = "capacity" if capacity_matches else "generic" if generic_matches else None
 
-        if not has_error:
+        if error_kind is None:
             # No API error visible — reset retry state
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._api_retry_kind = None
             return False
 
+        if self._api_retry_kind != error_kind:
+            self._api_retry_count = 0
+            self._api_retry_first_at = None
+            self._api_retry_kind = error_kind
+
         # API error detected — record which markers matched
-        matched = [m for m in self.API_ERROR_MARKERS if m.lower() in tail]
+        matched = capacity_matches + generic_matches
         log_line(log_path, f"api-error-matched for task {task_id}: markers={matched} (retry {self._api_retry_count}/{self.API_RETRY_MAX})")
 
         # check if we should retry now
@@ -1206,7 +1233,12 @@ class BaseInteractiveListener:
             log_line(log_path, f"api-error-idle observed for task {task_id} (retry {self._api_retry_count}/{self.API_RETRY_MAX})")
 
         elapsed = now - self._api_retry_first_at
-        backoff = self.API_RETRY_BACKOFF[self._api_retry_count] if self._api_retry_count < len(self.API_RETRY_BACKOFF) else 60.0
+        schedule = (
+            self.API_CAPACITY_RETRY_BACKOFF
+            if error_kind == "capacity"
+            else self.API_RETRY_BACKOFF
+        )
+        backoff = schedule[self._api_retry_count] if self._api_retry_count < len(schedule) else schedule[-1]
 
         if elapsed < backoff:
             return True  # still waiting for backoff; skip reclaim this tick
@@ -1221,7 +1253,7 @@ class BaseInteractiveListener:
             return True
         self._api_retry_count += 1
         self._api_retry_first_at = None  # reset timer; next error detection starts fresh
-        log_line(log_path, f"api-error-retry {self._api_retry_count}/{self.API_RETRY_MAX} for task {task_id}: injecting 继续 after {elapsed:.0f}s")
+        log_line(log_path, f"api-error-retry kind={error_kind} {self._api_retry_count}/{self.API_RETRY_MAX} for task {task_id}: injecting 继续 after {elapsed:.0f}s")
 
         zellij_inject(
             session=session,
@@ -1639,6 +1671,52 @@ class BaseInteractiveListener:
             ):
                 raise RuntimeError("stale claim after writing task prompt")
         except Exception as exc:
+            # A deterministic workspace-contract failure (bad base_commit,
+            # branch mismatch, missing worktree) will NEVER clear on its own:
+            # reclaiming would make the watcher claim the same broken task on
+            # the next poll and loop forever without the publisher ever
+            # learning.  Notify the publisher on the task and block it as
+            # needs_input instead of reclaiming into the retry storm.
+            from hermes_cli.kanban_workspace_contract import WorkspaceContractError
+
+            if isinstance(exc, WorkspaceContractError):
+                contract_note = (
+                    f"{self.agent_slug}-listener could not claim {claimed.id}: "
+                    f"deterministic workspace-contract failure "
+                    f"({type(exc).__name__}: {exc}). The task record needs a "
+                    f"publisher fix (base_commit/branch/workspace) before it can "
+                    f"run; blocked as needs_input to stop the claim loop. "
+                    f"Fix the record then unblock."
+                )
+                try:
+                    kb.add_comment(
+                        conn, claimed.id,
+                        f"{self.agent_slug}-interactive-listener",
+                        contract_note,
+                        **claim_fence,
+                    )
+                    kb.block_task(
+                        conn, claimed.id,
+                        reason=contract_note[:400],
+                        kind="needs_input",
+                        expected_run_id=claim_fence["expected_run_id"],
+                        expected_generation=claim_fence["expected_generation"],
+                    )
+                except Exception as comment_exc:
+                    log_line(
+                        log_path,
+                        f"task {claimed.id} contract-failure notify/block failed: "
+                        f"{type(comment_exc).__name__}: {comment_exc}",
+                    )
+                log_line(
+                    log_path,
+                    f"task {claimed.id} deterministic workspace-contract failure; "
+                    f"commented + blocked needs_input (publisher must fix record); "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                self._clear_active_claim_identity()
+                return None, None
+
             reason = (
                 f"{self.agent_slug}-interactive workspace resolution/identity failed: "
                 f"{type(exc).__name__}: {exc}"
