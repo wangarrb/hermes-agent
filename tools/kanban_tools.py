@@ -767,13 +767,14 @@ def _handle_complete(args: dict, **kw) -> str:
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
+                transport_failed = False
                 try:
                     # judge_goal returns (verdict, reason, parse_failed,
                     # wait_directive, transport_failed) — see
                     # hermes_cli/goals.py. Unpacking fewer raises ValueError,
                     # which the defensive handler below swallows, leaving
                     # verdict="done" and silently disabling the gate.
-                    verdict, reason, _, _, _ = judge_goal(
+                    verdict, reason, _, _, transport_failed = judge_goal(
                         goal=kanban_goal_text(task.title, task.body or ""),
                         last_response=(summary or result or "").strip(),
                     )
@@ -785,7 +786,9 @@ def _handle_complete(args: dict, **kw) -> str:
                         judge_exc,
                         exc_info=True,
                     )
-                if verdict != "done":
+                # judge_goal is explicitly fail-open on transport/API errors;
+                # a transient RateLimitError must not wedge goal completion.
+                if verdict != "done" and not transport_failed:
                     return tool_error(
                         f"Goal completion rejected by judge: {reason}. "
                         f"To proceed, either: (1) provide explicit acceptance "

@@ -2572,13 +2572,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     from hermes_cli.goals import judge_goal, kanban_goal_text
                     verdict = "done"
                     reason = ""
+                    transport_failed = False
                     try:
                         # judge_goal returns (verdict, reason, parse_failed,
                         # wait_directive, transport_failed) — see
                         # hermes_cli/goals.py. Unpacking fewer raises
                         # ValueError into the fail-open handler below,
                         # silently disabling the gate.
-                        verdict, reason, _, _, _ = judge_goal(
+                        verdict, reason, _, _, transport_failed = judge_goal(
                             goal=kanban_goal_text(task.title, task.body or ""),
                             last_response=(summary or args.result or "").strip(),
                         )
@@ -2589,7 +2590,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                             judge_exc,
                             exc_info=True,
                         )
-                    if verdict != "done":
+                    # Transport/API failures are transient and judge_goal's
+                    # contract is fail-open.  Do not turn a RateLimitError,
+                    # timeout, or DNS failure into a false completion reject.
+                    if verdict != "done" and not transport_failed:
                         print(
                             f"kanban: goal completion of {tid} rejected by judge: {reason}. "
                             f"Provide evidence matching the task's acceptance criteria.",
