@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+from plugins.kanban import base_listener as base
 from plugins.kanban.codex_listener import codex_kanban_interactive as codex
 
 
@@ -169,3 +171,41 @@ def test_codex_claim_precheck_ignores_stale_busy_words_in_completed_output(
     monkeypatch.setattr(time, "sleep", lambda _: None)
 
     assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+
+
+def test_capacity_error_uses_bounded_retry_path(tmp_path: Path, monkeypatch) -> None:
+    """Model-capacity failures must retry the same live session after backoff."""
+    listener = codex.CodexInteractiveListener()
+    calls: list[dict] = []
+    clock = [1000.0]
+    screen = "Selected model is at capacity. Please try a different model.\n› \n"
+
+    runtime_base = sys.modules.get("base_listener", base)
+    monkeypatch.setattr(runtime_base.time, "time", lambda: clock[0])
+    monkeypatch.setattr(runtime_base.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        listener,
+        "wait_for_stable_composer_input",
+        lambda **_: True,
+    )
+    monkeypatch.setattr(runtime_base, "zellij_inject", lambda **kwargs: calls.append(kwargs))
+
+    assert listener.check_api_failure_retry(
+        session="kanban-test",
+        pane_id="2",
+        screen=screen,
+        task_id="t_capacity",
+        log_path=tmp_path / "listener.log",
+    )
+    assert calls == []
+
+    clock[0] += listener.API_CAPACITY_RETRY_BACKOFF[0]
+    assert listener.check_api_failure_retry(
+        session="kanban-test",
+        pane_id="2",
+        screen=screen,
+        task_id="t_capacity",
+        log_path=tmp_path / "listener.log",
+    )
+    assert listener._api_retry_count == 1
+    assert len(calls) == 2
