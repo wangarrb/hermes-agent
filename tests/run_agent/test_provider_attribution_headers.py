@@ -87,6 +87,21 @@ def test_nvidia_cloud_base_url_applies_billing_origin_header(mock_openai):
     assert headers["X-BILLING-INVOKE-ORIGIN"] == "HermesAgent"
 
 
+@patch("run_agent.OpenAI")
+def test_cch_base_url_uses_codex_product_ua_without_version(mock_openai):
+    agent = AIAgent.__new__(AIAgent)
+    agent.api_mode = "codex_responses"
+    agent.provider = "custom"
+    agent._client_kwargs = {}
+
+    with patch("agent.auxiliary_client._apply_user_default_headers", side_effect=lambda headers: headers), patch(
+        "hermes_cli.config.apply_custom_provider_extra_headers_to_client_kwargs"
+    ):
+        agent._apply_client_headers_for_base_url("http://cch.jmadas.com/v1")
+
+    assert agent._client_kwargs["default_headers"]["User-Agent"] == "openai-codex"
+
+
 
 
 @patch("run_agent.OpenAI")
@@ -212,5 +227,4 @@ def test_openrouter_headers_no_cache_when_disabled(mock_openai):
     assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
     assert "X-OpenRouter-Cache" not in headers
     assert "X-OpenRouter-Cache-TTL" not in headers
-
 

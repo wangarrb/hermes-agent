@@ -1906,6 +1906,7 @@ class AIAgent:
         def _persist_and_drain() -> None:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
+            self._stamp_missing_message_timestamps(messages)
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point (turn
@@ -2922,6 +2923,27 @@ class AIAgent:
                 redacted.append(part)
             return redacted
         return content
+
+    def _stamp_missing_message_timestamps(self, messages: List[Dict]) -> None:
+        """Stamp an ISO wall-clock ``timestamp`` on messages that lack one.
+
+        Persist-time stamping gives every message a durable timestamp visible to
+        both downstream consumers: the optional JSON session snapshot
+        (``sessions/session_{sid}.json``) and the state.db row written by
+        ``_flush_messages_to_session_db`` (which already reads
+        ``msg.get("timestamp")``). Messages that already carry a timestamp
+        (e.g. platform persist overrides) are left untouched. Idempotent: the
+        stamp is written once, at the first persist point after the message
+        appeared, so resumed/compacted history keeps its original times.
+        """
+        now = datetime.now().isoformat()
+        for msg in messages:
+            if isinstance(msg, dict) and not msg.get("timestamp"):
+                try:
+                    msg["timestamp"] = now
+                except Exception:
+                    # Read-only or exotic mapping: skip rather than break persist.
+                    pass
 
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
         """Optional per-session JSON snapshot writer.
@@ -5620,9 +5642,9 @@ class AIAgent:
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "cch.jmadas.com"):
-            # CCH routes Codex Responses requests by User-Agent. Its streaming
-            # route rejects the SDK default with format_type_mismatch.
-            self._client_kwargs["default_headers"] = {"User-Agent": "openai-codex/0.121.0"}
+            # CCH routes Codex Responses requests by the product User-Agent.
+            # The product marker is required, but the Codex version is not.
+            self._client_kwargs["default_headers"] = {"User-Agent": "openai-codex"}
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.auxiliary_client import _codex_cloudflare_headers
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
