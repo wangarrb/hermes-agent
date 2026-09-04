@@ -930,6 +930,10 @@ class BaseInteractiveListener:
         self._goal_completion_last_sent_at: dict[str, float] = {}
         self._goal_result_wait_since: dict[str, float] = {}
         self._goals_waiting_on_results: set[str] = set()
+        self._goal_check_stall_counts: dict[str, int] = {}
+        self._goal_check_watermark_event: dict[str, int] = {}
+        self._goal_check_watermark_comment: dict[str, int] = {}
+        self._goal_check_suspended: set[str] = set()
         self._stable_composer_cache: dict[tuple[str, str], tuple[str, float]] = {}
 
     # An idle prompt is a safe input boundary, but brief idle flashes occur
@@ -955,6 +959,138 @@ class BaseInteractiveListener:
         self._idle_followup_task_id = None
         self._idle_followup_since = None
         self._idle_followup_sent = False
+
+    # After this many consecutive GOAL_COMPLETION_CHECK injections with no
+    # durable progress on the task, stop re-injecting the check.  The goal
+    # stays running; the stall is recorded durably and the circuit breaker
+    # auto-resets as soon as real progress appears.
+    GOAL_COMPLETION_STALL_LIMIT: int = 3
+
+    # Events that count as durable progress.  Heartbeats and comment echoes
+    # are excluded — the check loop itself generates both.
+    _GOAL_PROGRESS_EVENTS: frozenset[str] = frozenset({
+        "created", "claimed", "promoted", "promoted_manual", "spawned",
+        "linked", "completed", "blocked", "block_loop_detected",
+        "dependency_wait", "returned_for_rework", "invalidated_for_rework",
+        "unblocked", "gave_up", "reclaimed",
+    })
+
+    def _goal_check_has_progress(
+        self, conn: Any, task_id: str, marker: str,
+    ) -> bool | None:
+        """Whether durable progress happened since the last check injection.
+
+        Progress = (a) any non-heartbeat/non-commented task_event newer than
+        the last observed one, or (b) any new comment that is not an echo of
+        this same check loop (echo comments start with ``marker`` — the
+        agent's ``GOAL_COMPLETION_CHECK #N …`` responses and this loop's own
+        suspension note all do).  Returns ``None`` on the first observation
+        for a task (baseline established, no judgment possible).
+        """
+        last_event = self._goal_check_watermark_event.get(task_id, -1)
+        last_comment = self._goal_check_watermark_comment.get(task_id, -1)
+        row = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        max_event = int(row[0]) if row and row[0] is not None else 0
+        row = conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        max_comment = int(row[0]) if row and row[0] is not None else 0
+        if last_event < 0 and last_comment < 0:
+            self._goal_check_watermark_event[task_id] = max_event
+            self._goal_check_watermark_comment[task_id] = max_comment
+            return None
+        progress = False
+        if last_event >= 0:
+            for r in conn.execute(
+                "SELECT DISTINCT kind FROM task_events "
+                "WHERE task_id = ? AND id > ?",
+                (task_id, last_event),
+            ):
+                if r[0] in self._GOAL_PROGRESS_EVENTS:
+                    progress = True
+                    break
+        if not progress and last_comment >= 0:
+            for r in conn.execute(
+                "SELECT body FROM task_comments "
+                "WHERE task_id = ? AND id > ? ORDER BY id DESC",
+                (task_id, last_comment),
+            ):
+                body = str(r[0]).lstrip()
+                if f"[{marker}]" in body or body.startswith(marker):
+                    continue
+                progress = True
+                break
+        self._goal_check_watermark_event[task_id] = max_event
+        self._goal_check_watermark_comment[task_id] = max_comment
+        return progress
+
+    def _goal_check_circuit_breaker(
+        self,
+        conn: Any,
+        task_id: str,
+        marker: str,
+        log_path: Path,
+    ) -> bool:
+        """Evaluate the stall circuit right before a check injection.
+
+        Called only at the moment the watcher is about to inject (or is
+        suspended from injecting) a GOAL_COMPLETION_CHECK, so a stall counts
+        injections-without-progress, not idle ticks.  Returns True when the
+        injection must be suppressed.
+
+        - Suspended + no progress → keep suppressing.
+        - Suspended + progress → reset the breaker and allow.
+        - Active + progress → clear the stall count.
+        - Active + stall reaching GOAL_COMPLETION_STALL_LIMIT → suspend,
+          write one durable note, and suppress this round.
+        """
+        progress = self._goal_check_has_progress(conn, task_id, marker)
+        if task_id in self._goal_check_suspended:
+            if not progress:
+                # Keep suppressing but keep the episode alive so every
+                # eligible window re-evaluates (fast progress detection).
+                return True
+            # Real progress → reset the breaker and let the check through.
+            self._goal_check_stall_counts.pop(task_id, None)
+            self._goal_check_suspended.discard(task_id)
+            return False
+        if progress is None:
+            # First observation for this task: baseline only, no judgment.
+            return False
+        stall = 0 if progress else self._goal_check_stall_counts.get(task_id, 0) + 1
+        self._goal_check_stall_counts[task_id] = stall
+        if stall < self.GOAL_COMPLETION_STALL_LIMIT:
+            return False
+        self._goal_check_suspended.add(task_id)
+        stall_note = (
+            f"[{marker}] goal-check circuit breaker: {stall} consecutive "
+            "checks produced no durable progress (no new non-echo comments, "
+            "no lifecycle events). Suspending further GOAL_COMPLETION_CHECK "
+            "injections to stop the no-op loop. The goal stays running; the "
+            "watcher resumes checks automatically after any real durable "
+            "progress (or an operator note) on this task."
+        )
+        try:
+            kb.add_comment(
+                conn, task_id,
+                f"{self.agent_slug}-interactive-listener",
+                stall_note,
+            )
+        except Exception as exc:
+            log_line(
+                log_path,
+                f"goal-check stall note failed for {task_id}: {exc}",
+            )
+        log_line(
+            log_path,
+            f"goal completion check suspended for {task_id} "
+            f"after {stall} stalled injections",
+        )
+        return True
 
     def _handle_idle_task_followup(
         self,
@@ -1018,6 +1154,8 @@ class BaseInteractiveListener:
                     self._goals_waiting_on_results.discard(task_id)
                     self._goal_result_wait_since.pop(task_id, None)
                     self._goal_completion_last_sent_at.pop(task_id, None)
+                    self._goal_check_stall_counts.pop(task_id, None)
+                    self._goal_check_suspended.discard(task_id)
                     self._idle_followup_task_id = task_id
                     self._idle_followup_since = now
                     self._idle_followup_sent = False
@@ -1067,6 +1205,8 @@ class BaseInteractiveListener:
                 last_sent_at = self._goal_completion_last_sent_at.get(task_id)
                 interval_s = self._goal_completion_interval_s(now)
                 if last_sent_at is not None and now - last_sent_at < interval_s:
+                    return True
+                if self._goal_check_circuit_breaker(conn, task_id, marker, log_path):
                     return True
 
         session = getattr(args, "zellij_session", "")

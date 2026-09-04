@@ -538,3 +538,122 @@ def test_hermes_status_bar_does_not_look_idle_while_activity_is_visible(
         listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
 
     assert not [text for text in injected if "GOAL_COMPLETION_CHECK" in text]
+
+
+def _drive_stalled_goal_checks(
+    listener: bl.BaseInteractiveListener,
+    task_id: str,
+    tmp_path: Path,
+    now: list[float],
+    screen: list[str],
+    rounds: int,
+) -> None:
+    """Run ``rounds`` full inject cycles through the real episode lifecycle.
+
+    Each round: idle tick past grace (throttle + circuit-breaker eval, may
+    inject) → agent works on the prompt (busy tick resets the episode) →
+    idle again (new episode starts).  This mirrors a real pane, where the
+    busy→idle transitions are what let the next throttle window elapse.
+    """
+    with kb.connect() as conn:
+        for _ in range(rounds):
+            now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+            listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+            now[0] += listener.DAYTIME_GOAL_COMPLETION_INTERVAL_S
+            screen[0] = "working\n"
+            listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+            screen[0] = "planner ❯\n"
+            listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+
+def test_goal_completion_check_circuit_breaks_after_three_stalled_rounds(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="planner", goal_mode=True)
+    listener = _Listener()
+    now = [100.0]
+    screen = ["planner ❯\n"]
+    injected: list[str] = []
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: screen[0])
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]))
+
+    # One round past the limit: after three injected checks (r1-r3) the
+    # r4 window trips the breaker (stall=3) and writes the durable note.
+    _drive_stalled_goal_checks(listener, task_id, tmp_path, now, screen, 5)
+
+    checks = [text for text in injected if "GOAL_COMPLETION_CHECK" in text]
+    assert len(checks) == listener.GOAL_COMPLETION_STALL_LIMIT
+    with kb.connect() as conn:
+        bodies = [c.body for c in kb.list_comments(conn, task_id)]
+    stall_notes = [b for b in bodies if "goal-check circuit breaker" in b]
+    assert len(stall_notes) == 1
+
+    # Still suspended on a subsequent eligible window.
+    now[0] += listener.DAYTIME_GOAL_COMPLETION_INTERVAL_S
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+    assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == (
+        listener.GOAL_COMPLETION_STALL_LIMIT
+    )
+    with kb.connect() as conn:
+        assert len(kb.list_comments(conn, task_id)) == len(bodies)
+
+
+def test_goal_check_circuit_breaker_resumes_after_real_progress(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="planner", goal_mode=True)
+    listener = _Listener()
+    now = [100.0]
+    screen = ["planner ❯\n"]
+    injected: list[str] = []
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: screen[0])
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]))
+
+    # r1-r3 inject three checks with no durable progress; the r4 window
+    # trips the breaker (stall=3) → durable note, no more injections.
+    _drive_stalled_goal_checks(listener, task_id, tmp_path, now, screen, 4)
+    assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 3
+    now[0] += listener.DAYTIME_GOAL_COMPLETION_INTERVAL_S
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+    assert len([text for text in injected if "GOAL_COMPLETION_CHECK" in text]) == 3
+    with kb.connect() as conn:
+        notes = [
+            c.body for c in kb.list_comments(conn, task_id)
+            if "goal-check circuit breaker" in c.body
+        ]
+    assert len(notes) == 1
+
+    # A non-echo operator comment is real durable progress → auto-resume.
+    with kb.connect() as conn:
+        kb.add_comment(conn, task_id, author="user", body="approve and continue")
+    now[0] += listener.DAYTIME_GOAL_COMPLETION_INTERVAL_S
+    screen[0] = "working\n"
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+    screen[0] = "planner ❯\n"
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+    now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    checks = [text for text in injected if "GOAL_COMPLETION_CHECK" in text]
+    assert len(checks) == 4
+
+    # The breaker re-arms: resume injection (5th check), then stalled
+    # rounds trip it a second time.
+    _drive_stalled_goal_checks(listener, task_id, tmp_path, now, screen, 5)
+    checks = [text for text in injected if "GOAL_COMPLETION_CHECK" in text]
+    assert len(checks) == 6
+    with kb.connect() as conn:
+        notes = [
+            c.body for c in kb.list_comments(conn, task_id)
+            if "goal-check circuit breaker" in c.body
+        ]
+    assert len(notes) == 2
