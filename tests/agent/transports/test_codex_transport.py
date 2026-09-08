@@ -39,6 +39,55 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    def test_tool_choice_omitted_for_thinking_strict_hosts(self, transport):
+        """cch.jmadas.com routes reasoning+tools requests to a DeepSeek
+        thinking-mode backend that rejects ANY explicit tool_choice (even
+        "auto") with HTTP 400 "Thinking mode does not support this tool_choice".
+        Omitting the parameter is semantically equivalent to "auto"."""
+        tools = [{
+            "type": "function",
+            "function": {"name": "get_time", "description": "Get time",
+                         "parameters": {"type": "object", "properties": {}}},
+        }]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            base_url="http://cch.jmadas.com/v1",
+        )
+        assert "tool_choice" not in kw
+        assert kw["tools"], "tools must still be sent"
+        assert kw["parallel_tool_calls"] is True
+
+    def test_tool_choice_auto_kept_for_other_hosts(self, transport):
+        tools = [{
+            "type": "function",
+            "function": {"name": "get_time", "description": "Get time",
+                         "parameters": {"type": "object", "properties": {}}},
+        }]
+        kw = transport.build_kwargs(
+            model="gpt-5",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            base_url="https://api.openai.com/v1",
+        )
+        assert kw["tool_choice"] == "auto"
+
+    def test_tool_choice_auto_default_without_base_url(self, transport):
+        tools = [{
+            "type": "function",
+            "function": {"name": "get_time", "description": "Get time",
+                         "parameters": {"type": "object", "properties": {}}},
+        }]
+        kw = transport.build_kwargs(
+            model="gpt-5",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+        )
+        assert kw["tool_choice"] == "auto"
+
+
+
 
 
 

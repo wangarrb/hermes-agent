@@ -312,7 +312,21 @@ class ResponsesApiTransport(ProviderTransport):
         }
         if response_tools:
             kwargs["tools"] = response_tools
-            kwargs["tool_choice"] = "auto"
+            # Some DeepSeek-hosting gateways route ``reasoning``+``tools``
+            # requests to a thinking-mode backend that rejects ANY explicit
+            # ``tool_choice`` — even ``"auto"`` — with HTTP 400
+            # "Thinking mode does not support this tool_choice". Omitting the
+            # parameter is equivalent to ``"auto"`` semantically, so skip the
+            # injection for those hosts (observed on the ``cch.jmadas.com``
+            # Codex-protocol channel; see deepseek-ai/DeepSeek-V3 #1376 and
+            # can1357/oh-my-pi #1207 for the stricter-backend reports).
+            from utils import base_url_hostname
+
+            thinking_backend_rejects_tool_choice = base_url_hostname(
+                str(params.get("base_url") or "")
+            ) in {"cch.jmadas.com"}
+            if not thinking_backend_rejects_tool_choice:
+                kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
 
         session_id = params.get("session_id")
