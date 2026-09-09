@@ -101,7 +101,8 @@ rtk git commit -m "fix(kanban): resume Codex root threads only"
 **Files:**
 - Read: `local/bin/hermes-kanban-switch-reviewer-mode`
 - Read: `/home/wyr/.hermes/kanban/boards/seqscale/logs/codex-interactive-reviewer.log`
-- Runtime: Zellij session `kanban-seqscale`, reviewer pane 2
+- Runtime: Zellij session `kanban-seqscale`, reviewer pane resolved from its
+  `terminal_command` immediately before replacement
 
 - [ ] **Step 1: Confirm the selector returns the parent**
 
@@ -111,25 +112,77 @@ Call `latest_codex_thread` against `/home/wyr/.codex-kanban/reviewer` and `/home
 01a08481-82dd-7b00-8798-2fc8ac752592
 ```
 
-- [ ] **Step 2: Check replacement preconditions**
+- [ ] **Step 2: Capture and check replacement preconditions**
 
-Confirm the pane still shows the bootstrap error and no reviewer `--watch-child` or reviewer-owned Codex process is live. Abort replacement if work is active.
+Resolve exactly one reviewer pane, require it to be exited/held, capture the
+error-screen fingerprint, and require no reviewer watcher or Codex process:
+
+```bash
+SESSION=kanban-seqscale
+PANES_JSON="$(rtk proxy zellij --session "$SESSION" action list-panes --all --json)"
+REVIEWER_COUNT="$(jq '[.[] | select(.is_plugin == false) | select((.terminal_command // "") | contains("--profile reviewer"))] | length' <<<"$PANES_JSON")"
+test "$REVIEWER_COUNT" = 1
+REVIEWER_PANE="$(jq -r '.[] | select(.is_plugin == false) | select((.terminal_command // "") | contains("--profile reviewer")) | .id' <<<"$PANES_JSON")"
+jq -e --argjson id "$REVIEWER_PANE" '.[] | select(.is_plugin == false and .id == $id) | .exited == true and .is_held == true' <<<"$PANES_JSON"
+ERROR_SCREEN="$(rtk proxy zellij --session "$SESSION" action dump-screen --full --pane-id "$REVIEWER_PANE")"
+grep -Fq 'cannot resume an unloaded multi-agent v2 sub-agent' <<<"$ERROR_SCREEN"
+ERROR_SIGNATURE="$(sha256sum <<<"$ERROR_SCREEN" | awk '{print $1}')"
+test -z "$(ps -eo args= | awk '/[c]odex_kanban_interactive.py --watch-child/ && /--profile reviewer/ && /--board seqscale/ {print}')"
+test -z "$(ps -eo args= | awk '/[c]odex resume/ && /01a084(ee-dcf0-7140-9c71-7dba149e6138|81-82dd-7b00-8798-2fc8ac752592)/ {print}')"
+```
+
+Abort replacement if any assertion fails.
 
 - [ ] **Step 3: Generate the canonical launch command**
 
-Run:
+Capture only the emitted launch command (the dry-run also prints one metadata
+line):
 
 ```bash
-rtk local/bin/hermes-kanban-switch-reviewer-mode \
-  --board seqscale --mode balanced --session kanban-seqscale \
-  --workspace /home/wyr/code/SeqScale --dry-run
+LAUNCH_CMD="$(rtk proxy local/bin/hermes-kanban-switch-reviewer-mode \
+  --board seqscale --mode balanced --session "$SESSION" \
+  --workspace /home/wyr/code/SeqScale --dry-run | tail -n 1)"
+test -n "$LAUNCH_CMD"
 ```
 
-Use the emitted command verbatim for the replacement.
+Use this exact captured line for the replacement.
 
 - [ ] **Step 4: Replace only reviewer pane 2**
 
-Record the focused pane, focus pane 2, and run `zellij action new-pane --in-place --close-replaced-pane` with the generated launch command. Restore the prior focus. Do not restart the full board or mutate saved sessions.
+Immediately re-resolve the pane and recheck its identity, exited state, screen
+fingerprint, and process absence. Then install an EXIT trap before changing
+focus so failures restore the user's prior focus:
+
+```bash
+CURRENT_JSON="$(rtk proxy zellij --session "$SESSION" action list-panes --all --json)"
+CURRENT_REVIEWER_COUNT="$(jq '[.[] | select(.is_plugin == false) | select((.terminal_command // "") | contains("--profile reviewer"))] | length' <<<"$CURRENT_JSON")"
+test "$CURRENT_REVIEWER_COUNT" = 1
+CURRENT_REVIEWER_PANE="$(jq -r '.[] | select(.is_plugin == false) | select((.terminal_command // "") | contains("--profile reviewer")) | .id' <<<"$CURRENT_JSON")"
+test "$CURRENT_REVIEWER_PANE" = "$REVIEWER_PANE"
+jq -e --argjson id "$REVIEWER_PANE" '.[] | select(.is_plugin == false and .id == $id) | .exited == true and .is_held == true' <<<"$CURRENT_JSON"
+CURRENT_SCREEN="$(rtk proxy zellij --session "$SESSION" action dump-screen --full --pane-id "$REVIEWER_PANE")"
+test "$(sha256sum <<<"$CURRENT_SCREEN" | awk '{print $1}')" = "$ERROR_SIGNATURE"
+grep -Fq 'cannot resume an unloaded multi-agent v2 sub-agent' <<<"$CURRENT_SCREEN"
+test -z "$(ps -eo args= | awk '/[c]odex_kanban_interactive.py --watch-child/ && /--profile reviewer/ && /--board seqscale/ {print}')"
+test -z "$(ps -eo args= | awk '/[c]odex resume/ && /01a084(ee-dcf0-7140-9c71-7dba149e6138|81-82dd-7b00-8798-2fc8ac752592)/ {print}')"
+
+ORIGINAL_FOCUS="$(jq -r '.[] | select(.is_plugin == false and .is_focused == true) | .id' <<<"$CURRENT_JSON" | head -n 1)"
+restore_focus() {
+  if test -n "$ORIGINAL_FOCUS"; then
+    rtk proxy zellij --session "$SESSION" action focus-pane-id "$ORIGINAL_FOCUS" >/dev/null 2>&1 || true
+  fi
+}
+trap restore_focus EXIT
+rtk proxy zellij --session "$SESSION" action focus-pane-id "$REVIEWER_PANE"
+NEW_PANE="$(rtk proxy zellij --session "$SESSION" action new-pane \
+  --in-place --close-replaced-pane --name codex-kanban \
+  --cwd /home/wyr/code/SeqScale -- bash -lc "$LAUNCH_CMD")"
+restore_focus
+trap - EXIT
+test -n "$NEW_PANE"
+```
+
+Do not restart the full board or mutate saved sessions.
 
 - [ ] **Step 5: Verify end to end**
 
