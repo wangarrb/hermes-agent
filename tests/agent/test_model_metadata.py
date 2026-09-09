@@ -420,50 +420,59 @@ class TestCodexOAuthContextLength:
             for key in mm._codex_oauth_context_cache
         )
 
-    def test_luna_uses_live_max_context_window_as_explicit_long_context_opt_in(self):
-        """The configured Luna path may opt into Codex's advertised max window.
-
-        Codex publishes both the default ``context_window`` (272K) and the
-        larger ``max_context_window`` (872K). Hermes should use the latter for
-        the explicitly supported Luna long-context path, while leaving other
-        Codex models on their normal ``context_window`` value.
-        """
+    def test_all_models_use_live_max_context_window_when_available(self):
+        """Every Codex model uses its valid account-specific maximum."""
         from agent.model_metadata import get_model_context_length
 
         fake_response = MagicMock()
         fake_response.status_code = 200
         fake_response.json.return_value = {
             "models": [
-                {
-                    "slug": "gpt-5.6-luna",
-                    "context_window": 272_000,
-                    "max_context_window": 872_000,
-                },
-                {
-                    "slug": "gpt-5.6-terra",
-                    "context_window": 272_000,
-                    "max_context_window": 872_000,
-                },
+                {"slug": "gpt-5.6-luna", "context_window": 272_000, "max_context_window": 872_000},
+                {"slug": "gpt-5.6-sol", "context_window": 272_000, "max_context_window": 872_000},
+                {"slug": "gpt-5.6-terra", "context_window": 272_000, "max_context_window": 872_000},
+                {"slug": "gpt-6-astra", "context_window": 272_000, "max_context_window": 872_000},
+                {"slug": "gpt-reserve", "context_window": 272_000, "max_context_window": 872_000},
+                {"slug": "codex-auto-review", "context_window": 272_000, "max_context_window": 872_000},
+                {"slug": "gpt-5.5", "context_window": 272_000, "max_context_window": 272_000},
+                {"slug": "gpt-5.3-codex-spark", "context_window": 128_000, "max_context_window": 128_000},
+                {"slug": "gpt-5.4", "context_window": 272_000},
             ]
         }
 
         with patch("agent.model_metadata.requests.get", return_value=fake_response), \
              patch("agent.model_metadata.save_context_length"):
-            luna = get_model_context_length(
-                model="gpt-5.6-luna",
-                base_url="https://chatgpt.com/backend-api/codex",
-                api_key="fake-token",
-                provider="openai-codex",
-            )
-            terra = get_model_context_length(
-                model="gpt-5.6-terra",
-                base_url="https://chatgpt.com/backend-api/codex",
-                api_key="fake-token",
-                provider="openai-codex",
-            )
+            resolved = {
+                model: get_model_context_length(
+                    model=model,
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    api_key="fake-token",
+                    provider="openai-codex",
+                )
+                for model in (
+                    "gpt-5.6-luna",
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-6-astra",
+                    "gpt-reserve",
+                    "codex-auto-review",
+                    "gpt-5.5",
+                    "gpt-5.3-codex-spark",
+                    "gpt-5.4",
+                )
+            }
 
-        assert luna == 872_000
-        assert terra == 272_000
+        assert resolved == {
+            "gpt-5.6-luna": 872_000,
+            "gpt-5.6-sol": 872_000,
+            "gpt-5.6-terra": 872_000,
+            "gpt-6-astra": 872_000,
+            "gpt-reserve": 872_000,
+            "codex-auto-review": 872_000,
+            "gpt-5.5": 272_000,
+            "gpt-5.3-codex-spark": 128_000,
+            "gpt-5.4": 272_000,
+        }
 
     def test_probe_failure_falls_back_to_hardcoded(self):
         """If the probe fails (non-200 / network error), we still return

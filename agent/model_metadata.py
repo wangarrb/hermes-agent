@@ -424,12 +424,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
     # Source: https://developers.openai.com/api/docs/models
     # GPT-5.5 (launched Apr 23 2026) is 1.05M on the direct OpenAI API and
-    # ChatGPT Codex OAuth defaults to 272K; provider-specific long-context
-    # opt-ins are handled by _resolve_codex_oauth_context_length.
+    # ChatGPT Codex OAuth defaults to 272K; a valid live
+    # max_context_window is used for every Codex model when available.
     # This hardcoded value is only reached when every probe misses.
     # GPT-5.6 series (Sol/Terra/Luna, GA 2026-07-09) — 1.05M on the direct
-    # OpenAI API. Codex OAuth defaults to 272K; Luna's local long-context
-    # opt-in uses the live max_context_window when available.
+    # OpenAI API. Codex OAuth uses each model's live max_context_window when
+    # available, otherwise its normal context_window/fallback value.
     # (Lookups length-sort keys at match time, so dict order is cosmetic.)
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
@@ -2225,11 +2225,9 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 }
 
 
-# Explicit Hermes-local long-context opt-in.  Do not treat every Codex
-# `max_context_window` as the default: the catalogue's `context_window` remains
-# the normal budget, while this allowlist records the model the operator asked
-# Hermes to run at its advertised Codex maximum.
-_CODEX_OAUTH_MAX_CONTEXT_MODELS = frozenset({"gpt-5.6-luna"})
+# Codex exposes both a normal context window and an account-specific maximum.
+# Use the maximum for every model when it is valid; when the field is absent or
+# malformed, retain the normal context_window value returned by Codex.
 
 
 _codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
@@ -2325,11 +2323,7 @@ def _fetch_codex_oauth_context_lengths_with_source(
 
         slug = slug.strip()
         max_ctx = item.get("max_context_window")
-        if (
-            slug.lower() in _CODEX_OAUTH_MAX_CONTEXT_MODELS
-            and isinstance(max_ctx, int)
-            and max_ctx >= ctx
-        ):
+        if isinstance(max_ctx, int) and max_ctx >= ctx:
             ctx = max_ctx
         result[slug] = ctx
 
@@ -2343,8 +2337,8 @@ def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
 
     Codex OAuth imposes its own context limits that differ from the direct
     OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K by default on Codex).
-    For the Hermes-local Luna long-context opt-in, a valid
-    `max_context_window` is selected from the same model entry.
+    When Codex returns a valid `max_context_window`, it is selected for every
+    model entry; otherwise the entry's normal `context_window` is retained.
 
     Returns a ``{slug: selected_context_window}`` dict. Empty on failure.
     """
