@@ -25,7 +25,7 @@ def _is_codex_subagent(thread_source: object, source: object) -> bool:
         return True
     try:
         parsed_source = json.loads(source_text)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return False
     return isinstance(parsed_source, dict) and "subagent" in parsed_source
 

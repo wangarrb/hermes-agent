@@ -164,6 +164,36 @@ def test_codex_listener_uses_json_source_for_transitional_subagent(
     assert cmd[:3] == ["codex", "resume", "seq-root"]
 
 
+def test_codex_listener_prefers_nonempty_root_thread_source_over_json_source(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    seqscale = tmp_path / "SeqScale"
+    seqscale.mkdir()
+    _codex_db(
+        codex_home / "state_5.sqlite",
+        [
+            ("seq-older-root", str(seqscale), 10, "root", "cli"),
+            (
+                "seq-user-root",
+                str(seqscale),
+                20,
+                "user",
+                '{"subagent":{"parent_thread_id":"seq-older-root"}}',
+            ),
+        ],
+        source_columns=("thread_source", "source"),
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    listener = CodexInteractiveListener()
+
+    assert listener.has_saved_sessions(seqscale)
+    cmd = listener.build_tui_cmd(seqscale, continue_session=True)
+
+    assert cmd[:3] == ["codex", "resume", "seq-user-root"]
+
+
 @pytest.mark.parametrize("eligible_source", ["cli", "{not-json"])
 def test_codex_listener_keeps_plain_and_malformed_root_sources_eligible(
     tmp_path: Path, monkeypatch, eligible_source: str,
@@ -193,6 +223,37 @@ def test_codex_listener_keeps_plain_and_malformed_root_sources_eligible(
     cmd = listener.build_tui_cmd(seqscale, continue_session=True)
 
     assert cmd[:3] == ["codex", "resume", "seq-eligible"]
+
+
+def test_codex_listener_keeps_deeply_nested_source_eligible(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    seqscale = tmp_path / "SeqScale"
+    seqscale.mkdir()
+    deeply_nested_source = "[" * 100_000 + "0" + "]" * 100_000
+    _codex_db(
+        codex_home / "state_5.sqlite",
+        [
+            ("seq-older-root", str(seqscale), 10, "cli"),
+            ("seq-deep-root", str(seqscale), 20, deeply_nested_source),
+            (
+                "seq-subagent",
+                str(seqscale),
+                30,
+                '{"subagent":{"parent_thread_id":"seq-older-root"}}',
+            ),
+        ],
+        source_columns=("source",),
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    listener = CodexInteractiveListener()
+
+    assert listener.has_saved_sessions(seqscale)
+    cmd = listener.build_tui_cmd(seqscale, continue_session=True)
+
+    assert cmd[:3] == ["codex", "resume", "seq-deep-root"]
 
 
 def test_codex_listener_does_not_resume_unrelated_rollout(
