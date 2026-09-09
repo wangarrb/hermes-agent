@@ -24,6 +24,12 @@ if "127.0.0.1" not in _no_proxy and "localhost" not in _no_proxy:
 import time
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from hindsight_minimax_import import get_llm_profile
+
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).expanduser()
 # Do not use Path.home() here: Hermes CLI/profile sessions intentionally
 # redirect HOME to ~/.hermes/profiles/<profile>/home, which would make a manual
@@ -83,8 +89,7 @@ def _get_hindsight_llm_config() -> dict:
     """Read Hindsight's LLM config from its Docker container env vars.
 
     Returns dict with base_url, model, api_key, provider.
-    Priority: CLI --llm-* overrides > docker env > HINDSIGHT_OFFLINE_LLM_*
-    host env vars > built-in defaults.
+    Priority: CLI --llm-* overrides > docker env > central offline profile.
     """
     base_url = model = api_key = provider = None
 
@@ -106,7 +111,7 @@ def _get_hindsight_llm_config() -> dict:
         "https://api.minimaxi.com/v1",
     }
 
-    # 1. Try reading from Hindsight container env vars
+    # 1. Try reading from Hindsight container env vars.
     try:
         result = subprocess.run(
             ["docker", "exec", "hindsight", "env"],
@@ -116,40 +121,43 @@ def _get_hindsight_llm_config() -> dict:
             env_map = {}
             for line in result.stdout.strip().split("\n"):
                 if "=" in line:
-                    k, _, v = line.partition("=")
-                    env_map[k] = v
-            _container_base = env_map.get("HINDSIGHT_API_LLM_BASE_URL", "")
-            if _container_base not in _DEAD_BASE_URLS:
+                    key, _, value = line.partition("=")
+                    env_map[key] = value
+            container_base = env_map.get("HINDSIGHT_API_LLM_BASE_URL", "")
+            container_model = env_map.get("HINDSIGHT_API_LLM_MODEL", "")
+            container_api_key = env_map.get("HINDSIGHT_API_LLM_API_KEY", "")
+            container_provider = env_map.get("HINDSIGHT_API_LLM_PROVIDER", "")
+            if (
+                container_base not in _DEAD_BASE_URLS
+                and all((container_base, container_model, container_api_key, container_provider))
+            ):
                 if not base_url:
-                    base_url = _container_base
+                    base_url = container_base
                 if not model:
-                    model = env_map.get("HINDSIGHT_API_LLM_MODEL")
+                    model = container_model
                 if not api_key:
-                    api_key = env_map.get("HINDSIGHT_API_LLM_API_KEY")
+                    api_key = container_api_key
                 if not provider:
-                    provider = env_map.get("HINDSIGHT_API_LLM_PROVIDER", "openai")
+                    provider = container_provider
     except Exception:
         pass
 
-    # 2. Fallback: host env vars (for offline pipeline)
-    if not base_url:
-        base_url = os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL")
-    if not model:
-        model = os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL")
-    if not api_key:
-        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "ONEAPI_API_KEY")
-        api_key = os.environ.get(key_env)
-
-    # 3. Final defaults (oneapi deepseek-v4-flash via local oneapi gateway)
-    _FALLBACK_KEY_ENV = "ONEAPI_API_KEY"
-    if not api_key:
-        key_env = os.environ.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", _FALLBACK_KEY_ENV)
-        api_key = os.environ.get(key_env)
+    # 2. Fallback: use the same profile resolver as the offline pipeline.
+    if not all((base_url, model, api_key, provider)):
+        fallback = get_llm_profile()
+        if not base_url:
+            base_url = fallback["base_url"]
+        if not model:
+            model = fallback["model"]
+        if not api_key:
+            api_key = fallback["api_key"]
+        if not provider:
+            provider = fallback["hindsight_provider"]
     return {
-        "base_url": base_url or os.environ.get("HINDSIGHT_OFFLINE_LLM_BASE_URL", "http://127.0.0.1:3000/v1"),
-        "model": model or os.environ.get("HINDSIGHT_OFFLINE_LLM_MODEL", "xopdeepseekv4flash"),
+        "base_url": base_url,
+        "model": model,
         "api_key": api_key,
-        "provider": provider or "openai",
+        "provider": provider,
     }
 
 
@@ -465,7 +473,92 @@ def _collect_today_context(today: str) -> str:
             except OSError:
                 pass
 
+    # 6. Non-Egomotion4D work: substantive conversations from default + kanban
+    # profile state.db on the report date. Egomotion4D has dedicated sources
+    # above; this section covers everything else (paper analysis, algorithm
+    # design, tooling, kanban tasks) so the digest reflects all real work.
+    parts.append(_collect_general_sessions_context(today))
+
     return "\n".join(parts) if parts else "(no experiment data found)"
+
+
+def _collect_general_sessions_context(today: str, max_sessions: int = 6, max_chars_per_session: int = 900) -> str:
+    """Collect substantive user/assistant text from today's active sessions.
+
+    Reads per-profile state.db directly (kanban profiles keep write_json_snapshots
+    off, so the session JSON snapshots the offline ingest scans do not exist for
+    them). Picks the longest assistant replies per session as the most
+    substantive evidence and truncates to keep the LLM prompt bounded.
+    """
+    import sqlite3
+
+    profile_dbs = [
+        ("/home/wyr/.hermes/state.db", "default"),
+        ("/home/wyr/.hermes/profiles/designer/state.db", "designer"),
+        ("/home/wyr/.hermes/profiles/coordinator/state.db", "coordinator"),
+        ("/home/wyr/.hermes/profiles/planner/state.db", "planner"),
+    ]
+    day_start = f"{today} 00:00:00"
+    # epoch bounds for state.db messages.timestamp (epoch-second strings)
+    try:
+        import datetime as _dt
+        start_epoch = int(_dt.datetime.strptime(today, "%Y-%m-%d").replace(
+            hour=0, minute=0, tzinfo=_dt.timezone(_dt.timedelta(hours=8))).timestamp())
+        end_epoch = start_epoch + 86400
+    except Exception:
+        return ""
+
+    blocks = []
+    for db_path, profile in profile_dbs:
+        if not Path(db_path).exists():
+            continue
+        try:
+            # immutable=1: live Hermes holds write locks on state.db; a plain
+            # read-only connection can stall for minutes on the 2.9GB default
+            # db and 50s+ on planner. Snapshot-read semantics are fine here —
+            # we only need message text, and slightly stale data is acceptable
+            # for a daily digest.
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=5)
+            # Find sessions with activity today (messages written in window)
+            rows = conn.execute(
+                """
+                SELECT m.session_id, s.title, m.role, m.content, m.timestamp
+                FROM messages m JOIN sessions s ON s.id = m.session_id
+                WHERE CAST(m.timestamp AS INTEGER) >= ? AND CAST(m.timestamp AS INTEGER) < ?
+                  AND m.role IN ('user','assistant')
+                  AND m.content IS NOT NULL AND length(m.content) >= 60
+                ORDER BY length(m.content) DESC
+                LIMIT 60
+                """,
+                (start_epoch, end_epoch),
+            ).fetchall()
+            conn.close()
+        except sqlite3.Error:
+            continue
+        if not rows:
+            continue
+        # group by session, keep top messages
+        by_session: dict = {}
+        for sid, title, role, content, ts in rows:
+            by_session.setdefault(sid, {"title": title, "msgs": []})["msgs"].append((role, content, ts))
+        taken = 0
+        for sid, info in by_session.items():
+            if taken >= 2:
+                break
+            msgs = info["msgs"][:3]
+            lines = []
+            for role, content, ts in msgs:
+                text = re.sub(r"\s+", " ", content)[:max_chars_per_session]
+                lines.append(f"[{role}] {text}")
+            if lines:
+                title = (info.get("title") or "(untitled)")[:40]
+                blocks.append(
+                    f"#### {profile}/{sid} 「{title}」\n" + "\n".join(lines)
+                )
+                taken += 1
+    if not blocks:
+        return ""
+    return "\n### General work sessions (" + today + ", non-Egomotion4D)\n" + "\n".join(blocks[:max_sessions])
 
 
 def _research_digest_errors(content: str) -> list[str]:
@@ -1666,7 +1759,10 @@ def _refresh_model_once(api_url: str, physical_id: str) -> tuple[str, str, dict 
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         operation_id = json.loads(response.read()).get("operation_id", "?")
-    for _ in range(18):
+    # 60 x 10s = 10 min: LLM generation of a full mental model (long doc with
+    # many D-decision anchors) regularly exceeds the old 180 s budget, which
+    # surfaced as refresh "timeout" and left models permanently STALE/BLOCKED.
+    for _ in range(60):
         time.sleep(10)
         try:
             with urllib.request.urlopen(

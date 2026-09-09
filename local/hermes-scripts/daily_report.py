@@ -552,12 +552,49 @@ def parse_codex_usage(target_date: str) -> dict | None:
     return {'sources': sources, 'total': total}
 
 
-def docker_env() -> dict[str, str]:
+HINDSIGHT_ENV_FILE = Path("/home/wyr/.hindsight-docker/hindsight-native.env")
+_HINDSIGHT_ENV_FILTER = re.compile(
+    r"HINDSIGHT_API_(LLM|RETAIN_LLM|REFLECT_LLM|CONSOLIDATION_LLM|"
+    r"ENABLE_OBSERVATIONS|WORKER_CONSOLIDATION_MAX_SLOTS|WORKER_MAX_SLOTS|RETAIN_MAX_CONCURRENT)"
+)
+# docker 时代环境变量名（无 HINDSIGHT_API_ 前缀）→ native env 文件中的带前缀名
+_HINDSIGHT_ENV_ALIASES = {
+    "WORKER_MAX_SLOTS": "HINDSIGHT_API_WORKER_MAX_SLOTS",
+    "WORKER_CONSOLIDATION_MAX_SLOTS": "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
+    "RETAIN_MAX_CONCURRENT": "HINDSIGHT_API_RETAIN_MAX_CONCURRENT",
+}
+
+
+def hindsight_env() -> dict[str, str]:
+    """读取 Hindsight 运行配置。
+
+    优先解析 systemd EnvironmentFile（hindsight.service，native pip 部署）；
+    docker 容器仍在运行时用 docker exec 兜底（旧部署）。
+    """
+    env: dict[str, str] = {}
+    if HINDSIGHT_ENV_FILE.is_file():
+        for line in HINDSIGHT_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if not _HINDSIGHT_ENV_FILTER.match(k):
+                continue
+            if any(secret in k.upper() for secret in ("API_KEY", "TOKEN", "SECRET", "PASSWORD")):
+                continue
+            env[k] = v.strip().strip('"').strip("'")
+    if env:
+        # 别名归一化：docker 时代的无前缀变量名 → 带前缀值
+        for dst, src in _HINDSIGHT_ENV_ALIASES.items():
+            if src in env and dst not in env:
+                env[dst] = env[src]
+        return env
+    # docker 兜底（旧部署，容器仍在运行时）
     cmd = "docker exec hindsight sh -lc 'env | grep -E \"HINDSIGHT_API_(LLM|RETAIN_LLM|REFLECT_LLM|CONSOLIDATION_LLM|ENABLE_OBSERVATIONS|WORKER_CONSOLIDATION_MAX_SLOTS|WORKER_MAX_SLOTS|RETAIN_MAX_CONCURRENT).*\" | sort'"
     code, out, _ = run(cmd, timeout=20)
     if code != 0:
         return {}
-    env: dict[str, str] = {}
     for line in out.splitlines():
         if "=" not in line:
             continue
@@ -587,19 +624,50 @@ def hindsight_model_config(env: dict[str, str]) -> list[dict[str, str]]:
                     "provider": provider or "?",
                     "model": model or "?",
                     "base_url": base_url or "?",
-                    "location": "docker:hindsight",
+                    "location": "systemd:hindsight",
                 }
             )
     return rows
 
 
-def docker_logs_since(start: datetime) -> str:
-    since = start.astimezone(timezone.utc).isoformat()
-    cmd = f"docker logs --since {shlex.quote(since)} hindsight 2>&1"
-    code, out, err = run(cmd, timeout=90)
-    if code != 0:
-        return out + "\n" + err
-    return out
+def hindsight_logs_since(start: datetime, end: datetime) -> str:
+    """读取 Hindsight 日志文本（窗口 start~end）。
+
+    native pip 部署下从 systemd journald 读取（hindsight.service，日志持久化，
+    服务重启不影响回溯）；迁移期补齐：journal 首条日志晚于窗口起点时，拼接
+    docker 容器段日志（docker 容器已停止也可读）。journal 完全无日志时 docker 兜底。
+    """
+    since = start.strftime("%Y-%m-%d %H:%M:%S")
+    until = end.strftime("%Y-%m-%d %H:%M:%S")
+    # 1) journald 主数据源
+    code, out, err = run(
+        f"journalctl -u hindsight.service --since {shlex.quote(since)} --until {shlex.quote(until)} -o cat 2>&1",
+        timeout=90,
+    )
+    if code != 0 and not out.strip():
+        return ""  # journalctl 不可用且无输出（无权限等），放弃
+    journal_text = out
+    # 2) 迁移期补齐：journal 首条日志时间 vs 窗口起点
+    try:
+        code2, first_line, _ = run(
+            f"journalctl -u hindsight.service --since {shlex.quote(since)} -o short-iso 2>&1 | head -1",
+            timeout=30,
+        )
+        m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", first_line)
+        if m:
+            first_ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=start.tzinfo)
+            if first_ts.timestamp() > start.timestamp():
+                d_since = start.astimezone(timezone.utc).isoformat()
+                d_until = first_ts.astimezone(timezone.utc).isoformat()
+                code3, dout, _ = run(
+                    f"docker logs --since {shlex.quote(d_since)} --until {shlex.quote(d_until)} hindsight 2>&1",
+                    timeout=90,
+                )
+                if code3 == 0 and dout.strip():
+                    journal_text = dout + journal_text
+    except Exception:
+        pass
+    return journal_text
 
 
 def parse_hindsight_llm_logs(log_text: str) -> tuple[list[dict[str, int | float | str]], dict[str, int]]:
@@ -780,9 +848,9 @@ def main() -> int:
         now_for_print = now
 
     hermes_rows = hermes_model_usage(start, end)
-    env = docker_env()
+    env = hindsight_env()
     model_cfg = hindsight_model_config(env)
-    logs = docker_logs_since(start)
+    logs = hindsight_logs_since(start, end)
     llm_usage, consolidation_batch_logs = parse_hindsight_llm_logs(logs)
     db = hindsight_db_stats(start, end)
     offline = offline_output_counts(now_for_print)
@@ -945,25 +1013,41 @@ def main() -> int:
     print()
 
     # ── Hindsight LLM 用量 (full table) ──
-    print("【Hindsight LLM 用量（日志可见精确值；容器重建前日志可能无法回溯）】")
-    # Check container start time vs window start
-    container_start_str = None
+    print("【Hindsight LLM 用量（journald 日志精确值）】")
+    # journald 持久化下 --since 过滤准确，服务重启不影响；仅当窗口起点前无任何
+    # hindsight 日志（服务尚未启动或 journal 被清理）时提示缺失。
+    # 注意：journal 首条晚于窗口起点时，docker 段已在 hindsight_logs_since() 补齐，
+    # 此处用 docker 容器启动时间判断补齐覆盖，只提示真正缺失的段。
+    log_gap_note = None
     try:
-        code, cs, _ = run("docker inspect hindsight --format '{{.State.StartedAt}}'", timeout=10)
-        if code == 0:
-            container_start_str = cs.strip()
+        cmd = f"journalctl -u hindsight.service --since {shlex.quote(start.strftime('%Y-%m-%d %H:%M:%S'))} -o short-iso 2>&1"
+        code, jout, _ = run(cmd, timeout=30)
+        first_line = (jout.strip().splitlines() or [""])[0]
+        m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", first_line)
+        if m:
+            first_ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=start.tzinfo)
+            if first_ts.timestamp() > start.timestamp():
+                cover_start = first_ts
+                try:
+                    code2, cs, _ = run("docker inspect hindsight --format '{{.State.StartedAt}}'", timeout=10)
+                    if code2 == 0 and cs.strip():
+                        container_start = _parse_timestamp(cs.strip())
+                        if container_start and container_start.timestamp() < cover_start.timestamp():
+                            cover_start = container_start
+                except Exception:
+                    pass
+                if cover_start.timestamp() > start.timestamp() + 300:  # 缺 <5min 视为正常
+                    gap = int(cover_start.timestamp() - start.timestamp())
+                    log_gap_note = (
+                        f"⚠️ 日志最早从 {cover_start.astimezone(start.tzinfo).strftime('%H:%M')} 起（journal+docker 段），"
+                        f"窗口起点 {start.strftime('%H:%M')} 前缺 {gap // 3600}h{(gap % 3600) // 60}m（LLM 用量偏少）。"
+                    )
+        elif not jout.strip():
+            log_gap_note = "⚠️ journal 中无该窗口的 hindsight 日志（服务未运行或 journal 被清理），LLM 用量可能缺失。"
     except Exception:
         pass
-    if container_start_str:
-        try:
-            container_start = _parse_timestamp(container_start_str)
-            if container_start and container_start.timestamp() > start.timestamp():
-                gap = container_start.timestamp() - start.timestamp()
-                gap_h = int(gap // 3600)
-                gap_m = int((gap % 3600) // 60)
-                print(f"⚠️ 容器于 {container_start.strftime('%H:%M')} 启动，晚于统计窗口起点，缺 {gap_h}h{gap_m}m 日志（LLM 用量偏少）。")
-        except Exception:
-            pass
+    if log_gap_note:
+        print(log_gap_note)
 
     if llm_usage:
         print_table(

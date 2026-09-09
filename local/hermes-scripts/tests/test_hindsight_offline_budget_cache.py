@@ -29,6 +29,254 @@ def reflect_args(**overrides):
     return argparse.Namespace(**defaults)
 
 
+def test_get_llm_profile_uses_pipeline_config_default_from_override_path(tmp_path, monkeypatch):
+    config_path = tmp_path / 'pipeline_config.json'
+    config_path.write_text(json.dumps({'llm_profile': 'deepseek'}), encoding='utf-8')
+    hermes_home = tmp_path / 'hermes'
+    hermes_home.mkdir()
+    (hermes_home / '.env').write_text('DEEPSEEK_API_KEY=test-key\n', encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    monkeypatch.delenv('HINDSIGHT_PIPELINE_CONFIG', raising=False)
+    monkeypatch.delenv('HINDSIGHT_OFFLINE_LLM_PROFILE', raising=False)
+    monkeypatch.delenv('HINDSIGHT_OFFLINE_LLM_MODEL', raising=False)
+
+    mod = load_module('hindsight_minimax_import')
+    monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(config_path))
+
+    assert mod.get_llm_profile()['label'] == 'deepseek'
+
+
+def test_get_llm_profile_config_beats_env_and_dotenv_profile_values(tmp_path, monkeypatch):
+    config_path = tmp_path / 'pipeline_config.json'
+    config_path.write_text(json.dumps({'llm_profile': 'deepseek'}), encoding='utf-8')
+    hermes_home = tmp_path / 'hermes'
+    hermes_home.mkdir()
+    (hermes_home / '.env').write_text(
+        'HINDSIGHT_OFFLINE_LLM_PROFILE=minimax\n'
+        'DEEPSEEK_API_KEY=test-key\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(config_path))
+    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'xunfei-coding')
+
+    mod = load_module('hindsight_minimax_import')
+
+    assert mod.get_llm_profile()['label'] == 'deepseek'
+
+
+def test_get_llm_profile_missing_config_uses_static_default_not_env_profile(tmp_path, monkeypatch):
+    hermes_home = tmp_path / 'hermes'
+    hermes_home.mkdir()
+    (hermes_home / '.env').write_text(
+        'HINDSIGHT_OFFLINE_LLM_PROFILE=minimax\n'
+        'HINDSIGHT_OFFLINE_LLM_MODEL=dotenv-model\n'
+        'ONEAPI_API_KEY=test-key\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(tmp_path / 'missing.json'))
+    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'minimax')
+
+    mod = load_module('hindsight_minimax_import')
+
+    assert mod.get_llm_profile()['label'] == 'xunfei-coding'
+
+
+def test_xunfei_profile_model_comes_only_from_dotenv(tmp_path, monkeypatch):
+    config_path = tmp_path / 'pipeline_config.json'
+    config_path.write_text(json.dumps({'llm_profile': 'xunfei-coding'}), encoding='utf-8')
+    hermes_home = tmp_path / 'hermes'
+    hermes_home.mkdir()
+    (hermes_home / '.env').write_text(
+        'HINDSIGHT_OFFLINE_LLM_MODEL=dotenv-model\n'
+        'ONEAPI_API_KEY=test-key\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(config_path))
+    monkeypatch.delenv('HINDSIGHT_OFFLINE_LLM_PROFILE', raising=False)
+    monkeypatch.delenv('HINDSIGHT_OFFLINE_LLM_MODEL', raising=False)
+
+    mod = load_module('hindsight_minimax_import')
+    profile = mod.get_llm_profile()
+
+    assert 'model' not in mod.BUILTIN_LLM_PROFILES['xunfei-coding']
+    assert profile['model'] == 'dotenv-model'
+
+
+def test_get_llm_profile_explicit_argument_and_env_model_override_config(tmp_path, monkeypatch):
+    config_path = tmp_path / 'pipeline_config.json'
+    config_path.write_text(json.dumps({'llm_profile': 'deepseek'}), encoding='utf-8')
+    hermes_home = tmp_path / 'hermes'
+    hermes_home.mkdir()
+    (hermes_home / '.env').write_text('BAILIAN_API_KEY=test-key\n', encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(config_path))
+    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'xunfei-coding')
+    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_MODEL', 'explicit-model')
+
+    mod = load_module('hindsight_minimax_import')
+    profile = mod.get_llm_profile('glm')
+
+    assert profile['label'] == 'glm'
+    assert profile['model'] == 'explicit-model'
+
+
+def test_switch_mode_implicit_import_resolves_pipeline_default(monkeypatch):
+    mod = load_module('hindsight_minimax_import')
+    requested_names = []
+    resolved_profile = {'label': 'config-profile', 'model': 'config-model'}
+    captured_profiles = []
+    monkeypatch.setattr(
+        mod,
+        'get_llm_profile',
+        lambda name=None: requested_names.append(name) or resolved_profile,
+    )
+    monkeypatch.setattr(mod, 'ensure_hermes_hindsight_idle_config', lambda: None)
+    monkeypatch.setattr(mod, 'try_disable_observations_before_restart', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        'paid_llm_env',
+        lambda profile, **kwargs: captured_profiles.append(profile) or {},
+    )
+    monkeypatch.setattr(mod, 'recreate_container', lambda env: None)
+    monkeypatch.setattr(mod, 'wait_health', lambda timeout: None)
+    monkeypatch.setattr(mod, 'patch_json_parser_and_restart', lambda: None)
+    monkeypatch.setattr(mod, 'patch_bank_config', lambda **kwargs: None)
+
+    mod.switch_mode('import-minimax', allow_existing_queue=True)
+
+    assert requested_names == [None]
+    assert captured_profiles == [resolved_profile]
+
+
+def test_switch_mode_normal_restore_resolves_pipeline_default(monkeypatch):
+    mod = load_module('hindsight_minimax_import')
+    requested_names = []
+    resolved_profile = {'label': 'config-profile', 'model': 'config-model'}
+    captured_profiles = []
+    monkeypatch.setattr(
+        mod,
+        'get_llm_profile',
+        lambda name=None: requested_names.append(name) or resolved_profile,
+    )
+    monkeypatch.setattr(mod, 'ensure_hermes_hindsight_idle_config', lambda: None)
+    monkeypatch.setattr(
+        mod,
+        'paid_llm_env',
+        lambda profile, **kwargs: captured_profiles.append(profile) or {},
+    )
+    monkeypatch.setattr(mod, 'recreate_container', lambda env: None)
+    monkeypatch.setattr(mod, 'patch_hindsight_container_and_restart', lambda: None)
+    monkeypatch.setattr(mod, 'wait_health', lambda timeout: None)
+    monkeypatch.setattr(mod, 'patch_bank_config', lambda **kwargs: None)
+
+    mod.switch_mode('normal-local')
+
+    assert requested_names == [None]
+    assert captured_profiles == [resolved_profile]
+
+
+def test_daily_llm_config_uses_central_profile_as_fallback(monkeypatch):
+    mod = load_module('hindsight_daily_noagent')
+    expected = {
+        'base_url': 'http://central.example/v1',
+        'model': 'central-model',
+        'api_key': 'central-key',
+        'hindsight_provider': 'central-provider',
+    }
+    monkeypatch.setattr(mod, 'get_llm_profile', lambda: expected, raising=False)
+    monkeypatch.setattr(
+        mod.subprocess,
+        'run',
+        lambda *args, **kwargs: argparse.Namespace(returncode=1, stdout=''),
+    )
+    for key in (
+        'HINDSIGHT_OFFLINE_LLM_BASE_URL',
+        'HINDSIGHT_OFFLINE_LLM_MODEL',
+        'HINDSIGHT_OFFLINE_LLM_API_KEY_ENV',
+        'ONEAPI_API_KEY',
+    ):
+        monkeypatch.delenv(key, raising=False)
+    mod._LLM_OVERRIDES.clear()
+
+    assert mod._get_hindsight_llm_config() == {
+        'base_url': 'http://central.example/v1',
+        'model': 'central-model',
+        'api_key': 'central-key',
+        'provider': 'central-provider',
+    }
+
+
+def test_daily_llm_config_keeps_cli_and_container_ahead_of_central_fallback(monkeypatch):
+    mod = load_module('hindsight_daily_noagent')
+
+    def unexpected_fallback():
+        raise AssertionError('central fallback must not run when higher-priority config is complete')
+
+    monkeypatch.setattr(mod, 'get_llm_profile', unexpected_fallback)
+    monkeypatch.setattr(
+        mod.subprocess,
+        'run',
+        lambda *args, **kwargs: argparse.Namespace(
+            returncode=0,
+            stdout=(
+                'HINDSIGHT_API_LLM_BASE_URL=http://container.example/v1\n'
+                'HINDSIGHT_API_LLM_MODEL=container-model\n'
+                'HINDSIGHT_API_LLM_API_KEY=container-key\n'
+                'HINDSIGHT_API_LLM_PROVIDER=container-provider\n'
+            ),
+        ),
+    )
+    mod._LLM_OVERRIDES.clear()
+    mod._LLM_OVERRIDES['model'] = 'cli-model'
+
+    assert mod._get_hindsight_llm_config() == {
+        'base_url': 'http://container.example/v1',
+        'model': 'cli-model',
+        'api_key': 'container-key',
+        'provider': 'container-provider',
+    }
+
+
+def test_daily_llm_config_rejects_partial_container_profile_atomically(monkeypatch):
+    mod = load_module('hindsight_daily_noagent')
+    central_profile = {
+        'base_url': 'http://central.example/v1',
+        'model': 'central-model',
+        'api_key': 'central-key',
+        'hindsight_provider': 'central-provider',
+    }
+    monkeypatch.setattr(mod, 'get_llm_profile', lambda: central_profile)
+    container_fields = {
+        'HINDSIGHT_API_LLM_BASE_URL': 'http://container.example/v1',
+        'HINDSIGHT_API_LLM_MODEL': 'container-model',
+        'HINDSIGHT_API_LLM_API_KEY': 'container-key',
+        'HINDSIGHT_API_LLM_PROVIDER': 'container-provider',
+    }
+    mod._LLM_OVERRIDES.clear()
+
+    for missing_field in container_fields:
+        stdout = ''.join(
+            f'{key}={value}\n'
+            for key, value in container_fields.items()
+            if key != missing_field
+        )
+        monkeypatch.setattr(
+            mod.subprocess,
+            'run',
+            lambda *args, stdout=stdout, **kwargs: argparse.Namespace(returncode=0, stdout=stdout),
+        )
+
+        assert mod._get_hindsight_llm_config() == {
+            'base_url': 'http://central.example/v1',
+            'model': 'central-model',
+            'api_key': 'central-key',
+            'provider': 'central-provider',
+        }, missing_field
+
+
 def test_unit_progress_key_ignores_period_but_tracks_versions_and_sources():
     mod = load_module('offline_hindsight_reflect_consolidate')
     unit_w19 = mod.ReflectUnit(
@@ -112,16 +360,21 @@ def test_query_facts_for_days_includes_legacy_and_native_session_ids(monkeypatch
     assert facts[0].topic
 
 
-def test_budget_report_counts_cached_pending_and_blocks_when_over_threshold():
+def test_budget_report_counts_cached_pending_and_blocks_when_over_threshold(tmp_path):
     mod = load_module('offline_hindsight_reflect_consolidate')
     units = [
         mod.ReflectUnit('weekly', 'history-through-2026-W20', 'topic-a', 0, 'period: history-through-2026-W20\nA', 1, ['daily/a.md'], 's', 'e'),
         mod.ReflectUnit('weekly', 'history-through-2026-W20', 'topic-a', 1, 'period: history-through-2026-W20\nB', 1, ['daily/b.md'], 's', 'e'),
     ]
     cached_key = mod.unit_progress_key(units[0], args=reflect_args())
+    stale_key = mod.unit_progress_key(units[1], args=reflect_args())
+    cached_output = tmp_path / 'weekly' / 'a.md'
+    cached_output.parent.mkdir(parents=True)
+    cached_output.write_text('result', encoding='utf-8')
     progress = {
         'processed_units_v2': {
-            cached_key: {'document_id': 'doc-a', 'output_markdown': 'a.md'}
+            cached_key: {'document_id': 'doc-a', 'output_markdown': str(cached_output)},
+            stale_key: {'document_id': 'doc-b', 'output_markdown': str(tmp_path / 'weekly' / 'missing.md')},
         },
         'processed_unit_keys': [],
         'processed_document_ids': [],
@@ -130,7 +383,11 @@ def test_budget_report_counts_cached_pending_and_blocks_when_over_threshold():
     report = mod.build_budget_report(
         units,
         progress,
-        args=reflect_args(budget_max_pending_units=0, budget_max_pending_chars=100000),
+        args=reflect_args(
+            budget_max_pending_units=0,
+            budget_max_pending_chars=100000,
+            output_dir=str(tmp_path),
+        ),
     )
 
     assert report['total_units'] == 2
@@ -140,6 +397,25 @@ def test_budget_report_counts_cached_pending_and_blocks_when_over_threshold():
     assert report['block_reasons'] == ['pending_units 1 > max 0']
     assert report['cache']['reused_v2'] == 1
     assert report['cache']['new'] == 1
+
+
+def test_budget_report_does_not_reuse_daily_legacy_key(tmp_path):
+    mod = load_module('offline_hindsight_reflect_consolidate')
+    unit = mod.ReflectUnit('daily', '2026-05-07', 'topic-a', 0, 'daily input', 1, ['fact-a'], 's', 'e')
+    progress = {
+        'processed_units_v2': {},
+        'processed_unit_keys': [mod.legacy_unit_progress_key(unit)],
+        'processed_document_ids': [],
+    }
+
+    report = mod.build_budget_report(
+        [unit],
+        progress,
+        args=reflect_args(output_dir=str(tmp_path)),
+    )
+
+    assert report['cached_units'] == 0
+    assert report['pending_units'] == 1
 
 
 def test_cron_weekly_budget_command_uses_direct_offline_script_not_paid_wrapper():
@@ -211,24 +487,33 @@ def test_daily_completion_report_detects_partial_existing_day(tmp_path, monkeypa
         mod.ReflectUnit('daily', '2026-05-07', 'topic-b', 0, 'b', 1, ['src-b'], 's', 'e'),
     ]
 
-    def fake_build_daily_for_args(args):
-        assert args.scope == 'daily'
-        assert args.date == '2026-05-07'
-        return expected_units, None, None
-
-    monkeypatch.setattr(mod, 'build_daily_for_args', fake_build_daily_for_args)
+    monkeypatch.setattr(
+        mod,
+        'build_daily_fact_units_for_days',
+        lambda args, days: {'2026-05-07': expected_units},
+    )
     day_dir = tmp_path / 'daily' / '2026-05-07'
     day_dir.mkdir(parents=True)
-    (day_dir / 'topic-a__00__hash.md').write_text(
-        '# Daily\n\n'
-        'scope: daily\n'
-        'period: 2026-05-07\n'
-        'topic: topic-a\n\n'
-        '## Source IDs\n'
-        '- src-a\n',
+    output = day_dir / 'topic-a__00__hash.md'
+    output.write_text('result', encoding='utf-8')
+    args = reflect_args(llm_base_url='http://127.0.0.1:3000/v1')
+    args.output_dir = str(tmp_path)
+    args.bank = 'hermes'
+    args.max_input_chars = 60000
+    first_key = mod.unit_progress_key(expected_units[0], args)
+    first_entry = mod.progress_entry(expected_units[0], args, output_markdown=str(output))
+    progress_path = tmp_path / 'progress.json'
+    progress_path.write_text(
+        json.dumps(
+            {
+                'processed_units_v2': {
+                    first_key: first_entry
+                }
+            }
+        ),
         encoding='utf-8',
     )
-    args = argparse.Namespace(output_dir=str(tmp_path), scope='weekly', date=None, daily_source='facts', group_by='topic')
+    monkeypatch.setattr(mod, 'DEFAULT_PROGRESS_FILE', progress_path)
 
     report = mod.daily_completion_report(args, ['2026-05-07'])
 
