@@ -420,6 +420,51 @@ class TestCodexOAuthContextLength:
             for key in mm._codex_oauth_context_cache
         )
 
+    def test_luna_uses_live_max_context_window_as_explicit_long_context_opt_in(self):
+        """The configured Luna path may opt into Codex's advertised max window.
+
+        Codex publishes both the default ``context_window`` (272K) and the
+        larger ``max_context_window`` (872K). Hermes should use the latter for
+        the explicitly supported Luna long-context path, while leaving other
+        Codex models on their normal ``context_window`` value.
+        """
+        from agent.model_metadata import get_model_context_length
+
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-luna",
+                    "context_window": 272_000,
+                    "max_context_window": 872_000,
+                },
+                {
+                    "slug": "gpt-5.6-terra",
+                    "context_window": 272_000,
+                    "max_context_window": 872_000,
+                },
+            ]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=fake_response), \
+             patch("agent.model_metadata.save_context_length"):
+            luna = get_model_context_length(
+                model="gpt-5.6-luna",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+            terra = get_model_context_length(
+                model="gpt-5.6-terra",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
+
+        assert luna == 872_000
+        assert terra == 272_000
+
     def test_probe_failure_falls_back_to_hardcoded(self):
         """If the probe fails (non-200 / network error), we still return
         the hardcoded 272k rather than leaking through to models.dev 1.05M."""

@@ -424,11 +424,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
     # Source: https://developers.openai.com/api/docs/models
     # GPT-5.5 (launched Apr 23 2026) is 1.05M on the direct OpenAI API and
-    # ChatGPT Codex OAuth caps it at 272K; both paths resolve via their own
-    # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
+    # ChatGPT Codex OAuth defaults to 272K; provider-specific long-context
+    # opt-ins are handled by _resolve_codex_oauth_context_length.
     # This hardcoded value is only reached when every probe misses.
     # GPT-5.6 series (Sol/Terra/Luna, GA 2026-07-09) — 1.05M on the direct
-    # OpenAI API (same as gpt-5.5). Codex OAuth caps these at 272K.
+    # OpenAI API. Codex OAuth defaults to 272K; Luna's local long-context
+    # opt-in uses the live max_context_window when available.
     # (Lookups length-sort keys at match time, so dict order is cosmetic.)
     "gpt-5.6-luna": 1050000,
     "gpt-5.6-terra": 1050000,
@@ -2195,9 +2196,10 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 
 # Known ChatGPT Codex OAuth context windows (observed via live
 # chatgpt.com/backend-api/codex/models probe, Apr 2026). These are the
-# `context_window` values, which are what Codex actually enforces — the
-# direct OpenAI API has larger limits for the same slugs, but Codex OAuth
-# caps lower (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex).
+# default `context_window` values used when the live catalogue is unavailable.
+# The direct OpenAI API has larger limits for the same slugs, while Codex OAuth
+# exposes an account-specific `max_context_window` for explicitly opted-in
+# long-context models.
 #
 # Used as a fallback when the live probe fails (no token, network error).
 # Longest keys first so substring match picks the most specific entry.
@@ -2221,6 +2223,13 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.2": 272_000,
     "gpt-5": 272_000,
 }
+
+
+# Explicit Hermes-local long-context opt-in.  Do not treat every Codex
+# `max_context_window` as the default: the catalogue's `context_window` remains
+# the normal budget, while this allowlist records the model the operator asked
+# Hermes to run at its advertised Codex maximum.
+_CODEX_OAUTH_MAX_CONTEXT_MODELS = frozenset({"gpt-5.6-luna"})
 
 
 _codex_oauth_context_cache: Dict[str, Tuple[Dict[str, int], float]] = {}
@@ -2311,8 +2320,18 @@ def _fetch_codex_oauth_context_lengths_with_source(
             continue
         slug = item.get("slug")
         ctx = item.get("context_window")
-        if isinstance(slug, str) and isinstance(ctx, int) and ctx > 0:
-            result[slug.strip()] = ctx
+        if not isinstance(slug, str) or not isinstance(ctx, int) or ctx <= 0:
+            continue
+
+        slug = slug.strip()
+        max_ctx = item.get("max_context_window")
+        if (
+            slug.lower() in _CODEX_OAUTH_MAX_CONTEXT_MODELS
+            and isinstance(max_ctx, int)
+            and max_ctx >= ctx
+        ):
+            ctx = max_ctx
+        result[slug] = ctx
 
     if result:
         _codex_oauth_context_cache[cache_key] = (result, now)
@@ -2323,10 +2342,11 @@ def _fetch_codex_oauth_context_lengths(access_token: str) -> Dict[str, int]:
     """Probe the ChatGPT Codex /models endpoint for per-slug context windows.
 
     Codex OAuth imposes its own context limits that differ from the direct
-    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex). The
-    `context_window` field in each model entry is the authoritative source.
+    OpenAI API (e.g. gpt-5.5 is 1.05M on the API, 272K by default on Codex).
+    For the Hermes-local Luna long-context opt-in, a valid
+    `max_context_window` is selected from the same model entry.
 
-    Returns a ``{slug: context_window}`` dict. Empty on failure.
+    Returns a ``{slug: selected_context_window}`` dict. Empty on failure.
     """
     result, _fresh = _fetch_codex_oauth_context_lengths_with_source(access_token)
     return result
