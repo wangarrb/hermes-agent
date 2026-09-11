@@ -524,7 +524,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
         correlation: str | None = None,
     ) -> str:
         """Confirm that an injected payload left Hermes' current composer."""
-        del args, pre_write_composer
+        del args
         marker = str(injected_marker or "").strip()
         if not marker:
             return "unknown"
@@ -572,6 +572,17 @@ class HermesInteractiveListener(BaseInteractiveListener):
                 return "confirmed"
             composer = self.composer_input_text(screen)
             if composer is None:
+                # During Hermes bootstrap the composer is not rendered yet,
+                # but a submitted prompt can already be present in the
+                # transcript.  With a known-empty pre-write composer and a
+                # unique post-write marker, this is consumed input rather
+                # than an unsent draft; avoid replaying it.
+                if (
+                    pre_write_composer == ""
+                    and re.sub(r"\s+", "", marker)
+                    in re.sub(r"\s+", "", screen)
+                ):
+                    return "confirmed"
                 return "unknown"
             if marker_present(composer):
                 saw_marker = True
