@@ -433,7 +433,6 @@ _LIFECYCLE_IMMUTABLE_FIELDS = (
     "target_branch",
     "branch",
     "task_id",
-    "generation",
     "source_branch",
     "source_sha",
     "upstream",
@@ -478,12 +477,15 @@ def prepare_generation_worktree(
     path, repository, common_dir = _linked_worktree_identity(worktree)
     _require_clean(path)
     task_role = str(role or getattr(task, "assignee", None) or "").strip().lower()
-    expected_branch = generation_branch(task_role, task.id, task.generation)
     declared_branch = str(getattr(task, "branch_name", None) or "").strip()
-    if declared_branch and declared_branch != expected_branch:
+    # A generation is a rework counter, not a workspace identity. Reuse the
+    # declared owner branch across rework generations; only fresh tasks without
+    # a declared branch derive the initial g1 name.
+    expected_branch = declared_branch or generation_branch(task_role, task.id, 1)
+    if declared_branch and not declared_branch.startswith(f"{task_role}/{task.id}/"):
         raise WorkspaceContractError(
-            f"generation branch mismatch: declared {declared_branch!r}, "
-            f"expected {expected_branch!r}"
+            f"workspace branch ownership mismatch: declared {declared_branch!r}, "
+            f"expected prefix {task_role}/{task.id}/"
         )
 
     resolved = resolve_fetched_base(
@@ -530,6 +532,14 @@ def prepare_generation_worktree(
             raise WorkspaceContractError(
                 f"lifecycle manifest branch ownership mismatch: {current_branch!r}"
             )
+        if existing.get("generation") != expected["generation"]:
+            existing = {
+                **existing,
+                "generation": expected["generation"],
+                "valid": True,
+                "mismatches": [],
+            }
+            _atomic_write_manifest(manifest_path, existing)
         return existing
 
     owned_prefix = f"{task_role}/{task.id}/g"
