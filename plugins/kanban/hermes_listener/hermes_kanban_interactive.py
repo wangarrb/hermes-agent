@@ -47,7 +47,7 @@ from base_listener import (  # noqa: E402
     role_guidance,
     zellij_dump_screen,
     zellij_inject,
-    zellij_submit,
+    zellij_submit_enter,
     tag_injected_text,
     zellij_rename_pane,
 )
@@ -104,6 +104,69 @@ class HermesInteractiveListener(BaseInteractiveListener):
     idle_markers = _HERMES_IDLE_MARKERS
     busy_markers = _HERMES_BUSY_MARKERS
     queued_input_markers = _HERMES_QUEUED_INPUT_MARKERS
+    semantic_delivery_required = True
+
+    _COMPOSER_PROMPT_RE = re.compile(
+        r"^\s*(?:(?:coordinator|planner|implementer|critic|reviewer|designer)\s+)?"
+        r"[›❯](?:\s?(.*))?$"
+    )
+
+    def composer_input_text(self, screen: str) -> str | None:
+        """Return the current Hermes composer text.
+
+        ``""`` means a supported, visibly empty composer. ``None`` means the
+        pane does not expose a recognisable Hermes composer (or is showing a
+        live interrupt/status row). Only the last prompt row is considered;
+        transcript text containing ``❯`` is never treated as current input.
+        """
+        if not screen or not screen.strip():
+            return None
+        lines = screen.splitlines()
+        prompt_index: int | None = None
+        first_text = ""
+        for index in range(len(lines) - 1, -1, -1):
+            match = self._COMPOSER_PROMPT_RE.match(lines[index])
+            if match:
+                prompt_index = index
+                first_text = (match.group(1) or "").strip()
+                break
+        if prompt_index is None:
+            return None
+        # The interrupt command-hint row is rendered while the agent is live,
+        # not as a user-editable composer.
+        if "msg=interrupt" in lines[prompt_index].lower():
+            return None
+
+        parts = [first_text] if first_text else []
+        for line in lines[prompt_index + 1 :]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if self._DECORATIVE_LINE_RE.match(stripped):
+                break
+            lowered = stripped.lower()
+            if lowered.startswith("⚕") or "context" in lowered and "│" in stripped:
+                break
+            if stripped.startswith(("└", "┌", "╭", "╰")) and any(
+                marker in lowered for marker in ("preparing", "activity", "error")
+            ):
+                break
+            parts.append(stripped)
+        return "\n".join(parts).strip()
+
+    def wait_for_stable_composer_input(
+        self, *, session: str, pane_id: str, log_path: Path,
+        initial_screen: str | None = None,
+        screen_reader: object | None = None,
+    ) -> bool:
+        """Permit automation only at a known-empty Hermes composer boundary."""
+        read_screen = screen_reader or self.read_pane_screen
+        screen = initial_screen
+        if screen is None:
+            screen = read_screen(session=session, pane_id=pane_id, log_path=log_path)
+        if not screen or not self.pane_is_idle(screen):
+            return False
+        return self.composer_input_text(screen) == ""
 
     # ── Build TUI command (not used in watch-only mode) ──
     def build_tui_cmd(
@@ -201,9 +264,9 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if not screen:
             return
 
-        # Use last 20 lines for error detection (Hermes error boxes span 15+ lines)
+        # Use the current live error box only.  A stale API-error sentence in
+        # transcript scrollback must not trigger a retry after Hermes is idle.
         tail_lines = _tail_nonempty_lines(screen, limit=20)
-        tail = "\n".join(tail_lines).lower()
 
         # Idle marker must be the last meaningful line (prompt/status bar at
         # bottom), not just anywhere in tail — › can appear in tool output and
@@ -218,16 +281,58 @@ class HermesInteractiveListener(BaseInteractiveListener):
             # Pane is busy or not showing idle prompt — reset retry state
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._api_retry_kind = None
+            self._hermes_retry_key = None
             self._reset_idle_followup()
             return
 
-        # Check for API error in the tail (Hermes error boxes are wide)
-        has_error = any(m in tail for m in self._HERMES_STRICT_ERROR_MARKERS)
-        if not has_error:
+        prompt_index = None
+        for index in range(len(tail_lines) - 1, -1, -1):
+            if self._is_truly_idle_line(tail_lines[index]):
+                prompt_index = index
+                break
+        error_kind: str | None = None
+        if prompt_index is not None:
+            before_prompt = tail_lines[:prompt_index]
+            # Simple API failures are rendered immediately above the prompt.
+            short_region = before_prompt[-6:]
+            for marker in self._HERMES_STRICT_ERROR_MARKERS:
+                if any(
+                    marker in line.lower()
+                    and line.lstrip().startswith(
+                        ("⚠", "✗", "error", "api", "╭", "│", "┌", "└")
+                    )
+                    for line in short_region
+                ):
+                    error_kind = marker
+                    break
+            # Structured Hermes error boxes can span many lines, but always
+            # include a visible box edge in the same live suffix.
+            if error_kind is None:
+                wide_region = before_prompt[-20:]
+                has_box_edge = any(
+                    line.lstrip().startswith(("┌", "╭", "╰", "└", "│", "┃"))
+                    for line in wide_region
+                )
+                if has_box_edge:
+                    for marker in self._HERMES_STRICT_ERROR_MARKERS:
+                        if any(marker in line.lower() for line in wide_region):
+                            error_kind = marker
+                            break
+
+        if error_kind is None:
             self._api_retry_count = 0
             self._api_retry_first_at = None
+            self._api_retry_kind = None
             self._handle_idle_task_followup(args, conn, task_id, log_path)
             return
+
+        retry_key = (str(task_id), error_kind)
+        if getattr(self, "_hermes_retry_key", None) != retry_key:
+            self._hermes_retry_key = retry_key
+            self._api_retry_count = 0
+            self._api_retry_first_at = None
+            self._api_retry_kind = error_kind
 
         # API error confirmed in last 5 lines — retry with backoff
         if self._api_retry_count >= self.API_RETRY_MAX:
@@ -244,10 +349,16 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if elapsed < backoff:
             return
 
+        if not self.wait_for_stable_composer_input(
+            session=zellij_session,
+            pane_id=zellij_pane_id,
+            log_path=log_path,
+            initial_screen=screen,
+        ):
+            return
         self._api_retry_count += 1
         self._api_retry_first_at = None
         log_line(log_path, f"api-error-retry {self._api_retry_count}/{self.API_RETRY_MAX} for task {task_id}: injecting 继续 after {elapsed:.0f}s")
-
         zellij_inject(
             session=zellij_session,
             pane_id=zellij_pane_id,
@@ -256,9 +367,10 @@ class HermesInteractiveListener(BaseInteractiveListener):
             log_path=log_path,
         )
         time.sleep(0.5)
-        zellij_submit(
+        zellij_submit_enter(
             session=zellij_session, pane_id=zellij_pane_id,
-            expected_pane_prefix="hermes-kanban", log_path=log_path,
+            expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=f"task:{task_id}:api:{error_kind}", log_path=log_path,
         )
 
     # ── Override on_claim_pre_check: only last line → idle ──
@@ -335,6 +447,13 @@ class HermesInteractiveListener(BaseInteractiveListener):
             if has_busy:
                 log_line(log_path, f"on_claim_pre_check attempt {attempt+1}/2: busy marker detected, NOT idle")
                 return False
+            composer = self.composer_input_text(screen)
+            if composer is None:
+                log_line(log_path, f"on_claim_pre_check attempt {attempt+1}/2: composer unknown")
+                return False
+            if composer:
+                log_line(log_path, "on_claim_pre_check: composer has draft text")
+                return False
             if attempt == 0:
                 time.sleep(2.0)
         return True
@@ -345,7 +464,23 @@ class HermesInteractiveListener(BaseInteractiveListener):
     # coordinator from stealing implementer tasks.
     def on_claim_post_confirm(self, args: argparse.Namespace, log_path: Path,
                               task_id: str | None = None) -> bool:
-        return True  # identity: we override claim_and_inject_one instead
+        """Close the race between claim pre-check and prompt injection."""
+        del task_id
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if not session or not pane_id:
+            return False
+        screen = zellij_dump_screen(session=session, pane_id=pane_id, log_path=log_path)
+        if not screen or not self.pane_is_idle(screen):
+            return False
+        composer = self.composer_input_text(screen)
+        if composer != "":
+            if composer:
+                log_line(log_path, "on_claim_post_confirm: composer has draft text")
+            else:
+                log_line(log_path, "on_claim_post_confirm: composer unknown")
+            return False
+        return True
 
     def claim_and_inject_one(
         self, args: argparse.Namespace, *, log_path: Path, conn: Any | None = None,
@@ -377,6 +512,86 @@ class HermesInteractiveListener(BaseInteractiveListener):
         except Exception as exc:
             log_line(log_path, f"role guard check failed (non-fatal): {exc}")
         return result
+
+    _POST_INJECT_CONFIRM_S = 1.5
+    _POST_INJECT_MAX_RETRIES = 3
+
+    def on_post_inject(
+        self, args: argparse.Namespace, *,
+        zellij_session: str, zellij_pane_id: str, log_path: Path,
+        injected_marker: str | None = None,
+        pre_write_composer: str | None = None,
+        correlation: str | None = None,
+    ) -> str:
+        """Confirm that an injected payload left Hermes' current composer."""
+        del args, pre_write_composer
+        marker = str(injected_marker or "").strip()
+        if not marker:
+            return "unknown"
+        saw_marker = False
+        submit_correlation = correlation or (
+            f"task:{getattr(self, '_active_task_id', '')}"
+            if getattr(self, "_active_task_id", None)
+            else (
+                f"control:{getattr(self, '_active_control_id', '')}"
+                if getattr(self, "_active_control_id", None) is not None
+                else "result:"
+            )
+        )
+
+        def marker_present(composer: str | None) -> bool:
+            if composer is None:
+                return False
+            return " ".join(marker.split()) in " ".join(composer.split())
+
+        def live_busy(screen: str) -> bool:
+            lines = _tail_nonempty_lines(screen, limit=5)
+            for index, line in enumerate(lines):
+                lower = line.lower()
+                if not any(item.lower() in lower for item in self.busy_markers):
+                    continue
+                # Busy rows above a currently editable prompt are stale output.
+                if any(self._is_truly_idle_line(tail) for tail in lines[index + 1 :]):
+                    continue
+                return True
+            return False
+
+        for attempt in range(1, self._POST_INJECT_MAX_RETRIES + 1):
+            time.sleep(self._POST_INJECT_CONFIRM_S)
+            try:
+                screen = zellij_dump_screen(
+                    session=zellij_session,
+                    pane_id=zellij_pane_id,
+                    log_path=log_path,
+                )
+            except Exception:
+                return "unknown"
+            if not screen:
+                return "unknown"
+            if live_busy(screen):
+                return "confirmed"
+            composer = self.composer_input_text(screen)
+            if composer is None:
+                return "unknown"
+            if marker_present(composer):
+                saw_marker = True
+                zellij_submit_enter(
+                    session=zellij_session,
+                    pane_id=zellij_pane_id,
+                    expected_pane_prefix=self.expected_pane_prefix(),
+                    correlation=submit_correlation,
+                    log_path=log_path,
+                )
+                log_line(
+                    log_path,
+                    f"hermes post-inject: queued prompt remained; sent Enter "
+                    f"(attempt {attempt}/{self._POST_INJECT_MAX_RETRIES})",
+                )
+                continue
+            if saw_marker:
+                return "confirmed"
+            return "unknown"
+        return "known_unsubmitted" if saw_marker else "unknown"
 
     # ── Override launcher_main: hermes is already running in the pane ──
     def launcher_main(self, args: argparse.Namespace) -> int:
