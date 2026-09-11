@@ -4152,7 +4152,8 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
 
     OpenCode routes different models behind different API surfaces:
 
-    - GPT-5 / Codex models on Zen use ``/v1/responses``
+    - GPT / Grok / Muse Spark models on Go use ``/v1/responses``
+    - GPT-5 / Codex / Grok / Muse Spark models on Zen use ``/v1/responses``
     - Claude models on Zen use ``/v1/messages``
     - MiniMax and Qwen models on Go use ``/v1/messages``
     - GLM / Kimi / DeepSeek / MiMo on Go use ``/v1/chat/completions``
@@ -4175,12 +4176,22 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             # All Qwen models on Go (qwen3.7-max, qwen3.7-plus, qwen3.6-plus)
             # are served via /v1/messages per the published Go endpoint table.
             return "anthropic_messages"
+        # GPT / Grok / Muse Spark models on Go are Responses-API models per
+        # the published endpoint table (https://opencode.ai/docs/go/#endpoints).
+        # Routing them to /chat/completions returns a bare HTTP 500 from the
+        # gateway (reproduced with muse-spark-1.3-contributor, 2026-09-11).
+        if normalized.startswith(("gpt-", "grok-", "muse-spark-")):
+            return "codex_responses"
         return "chat_completions"
 
     if provider == "opencode-zen":
         if normalized.startswith("claude-"):
             return "anthropic_messages"
         if normalized.startswith("gpt-"):
+            return "codex_responses"
+        # Grok and Muse Spark (incl. the free contributor SKUs) are served
+        # via /v1/responses on Zen too (published Zen endpoint table).
+        if normalized.startswith(("grok-", "muse-spark-")):
             return "codex_responses"
         if normalized.startswith("qwen"):
             # Qwen models on Zen moved to /v1/messages per the published

@@ -269,6 +269,21 @@ class TestCopilotNormalization:
         assert opencode_model_api_mode("opencode-go", "kimi-k2.7-code") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "glm-5.2") == "chat_completions"
         assert opencode_model_api_mode("opencode-go", "minimax-m3") == "anthropic_messages"
+        # GPT / Grok / Muse Spark on Go are Responses-API models per the
+        # published endpoint table; chat/completions returns a bare HTTP 500
+        # (muse-spark-1.3-contributor regression, 2026-09-11).
+        assert opencode_model_api_mode("opencode-go", "gpt-5.6-luna") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "grok-4.6") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.3-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/muse-spark-1.3-contributor") == "codex_responses"
+
+    def test_opencode_zen_responses_models(self):
+        # Zen serves Grok and Muse Spark (incl. free contributor SKUs) via
+        # /v1/responses per the published Zen endpoint table.
+        assert opencode_model_api_mode("opencode-zen", "muse-spark-1.3-contributor-free") == "codex_responses"
+        assert opencode_model_api_mode("opencode-zen", "muse-spark-1.2-contributor-free") == "codex_responses"
+        assert opencode_model_api_mode("opencode-zen", "grok-4.6") == "codex_responses"
 
 
 class TestNormalizeOpencodeBaseUrl:
