@@ -795,6 +795,10 @@ class BaseInteractiveListener:
     idle_markers: tuple[str, ...] = ()
     busy_markers: tuple[str, ...] = ()
     queued_input_markers: tuple[str, ...] = ()
+    # Backends can opt into strict semantic acknowledgement.  Legacy
+    # backends retain transport-only delivery until they implement the
+    # tri-state hook explicitly.
+    semantic_delivery_required: bool = False
 
     # ── Abstract methods (subclass MUST implement) ──
 
@@ -989,10 +993,7 @@ class BaseInteractiveListener:
         e.g. sending an additional Enter for TUIs that queue input.
         Default: no-op.
         """
-        # The base transport performs a synchronous write + Enter and treats
-        # that as its explicit acknowledgement. Backend overrides that need
-        # stronger screen-level evidence return another tri-state value.
-        return "confirmed"
+        return None
 
     def _post_injection_contract(
         self, args: argparse.Namespace, *,
@@ -1021,7 +1022,7 @@ class BaseInteractiveListener:
             # contract.  Calling the old shape preserves their retry behavior,
             # while their implicit ``None`` remains non-confirming.
             if "injected_marker" not in str(exc) and "pre_write_composer" not in str(exc):
-                log_line(log_path, f"event=delivery_unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
+                log_line(log_path, f"event=delivery_unknown state=unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
                 return "unknown"
             try:
                 result = self.on_post_inject(
@@ -1031,15 +1032,20 @@ class BaseInteractiveListener:
                     log_path=log_path,
                 )
             except Exception as retry_exc:
-                log_line(log_path, f"event=delivery_unknown correlation={correlation!r} hook_error={type(retry_exc).__name__}: {retry_exc}")
+                log_line(log_path, f"event=delivery_unknown state=unknown correlation={correlation!r} hook_error={type(retry_exc).__name__}: {retry_exc}")
                 return "unknown"
         except Exception as exc:
-            log_line(log_path, f"event=delivery_unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
+            log_line(log_path, f"event=delivery_unknown state=unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
             return "unknown"
 
         state = str(result or "").strip().lower()
         if state in {"confirmed", "known_unsubmitted", "unknown"}:
             return state
+
+        if not self.semantic_delivery_required:
+            # Explicitly preserve legacy transport-only semantics without
+            # presenting this as a semantic confirmation.
+            return "transport_accepted"
 
         # A hook that predates the tri-state API can still be classified from
         # the pane when possible.  Failure to observe a decisive boundary is
@@ -1055,11 +1061,6 @@ class BaseInteractiveListener:
                 return "known_unsubmitted"
             tail = "\n".join(_tail_nonempty_lines(screen, limit=20)).lower()
             if any(marker.lower() in tail for marker in self.busy_markers):
-                return "confirmed"
-            # The marker was written but is no longer present at the prompt;
-            # this is the positive screen-level acknowledgement for legacy
-            # hooks that return ``None``.
-            if injected_marker:
                 return "confirmed"
             observed = self.composer_input_text(screen)
             if pre_write_composer is not None and observed != pre_write_composer:
@@ -1084,6 +1085,24 @@ class BaseInteractiveListener:
             return self.composer_input_text(screen) if screen else None
         except Exception:
             return None
+
+    def _log_delivery_event(
+        self, log_path: Path, *, state: str, correlation_kind: str,
+        correlation_id: str, task_id: str | None = None,
+        run_id: int | None = None, generation: int | None = None,
+        pane_id: str = "", reclaimed: bool | None = None,
+    ) -> None:
+        fields = {
+            "event": f"delivery_{state}", "state": state,
+            "correlation_kind": correlation_kind,
+            "correlation_id": correlation_id, "task_id": task_id or "-",
+            "run_id": "-" if run_id is None else run_id,
+            "generation": "-" if generation is None else generation,
+            "pane_id": pane_id, "pane_prefix": self.expected_pane_prefix(),
+        }
+        if reclaimed is not None:
+            fields["reclaimed"] = reclaimed
+        log_line(log_path, " ".join(f"{key}={value!r}" for key, value in fields.items()))
 
     def on_task_running_monitor(
         self, args: argparse.Namespace, conn: Any,
@@ -1824,13 +1843,32 @@ class BaseInteractiveListener:
             pre_write_composer=pre_write_composer,
             correlation=correlation,
         )
-        if state != "confirmed":
+        if state not in {"confirmed", "transport_accepted"}:
             released = kb.release_control_lease(conn, leased.id, receiver=receiver)
             event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
-            log_line(log_path, f"event={event} correlation={correlation!r} released={released}")
+            self._log_delivery_event(
+                log_path, state=event.removeprefix("delivery_"),
+                correlation_kind="control", correlation_id=str(leased.id),
+                task_id=leased.task_id, run_id=leased.run_id,
+                generation=leased.generation, pane_id=pane_id,
+                reclaimed=released,
+            )
             if not released:
-                log_line(log_path, f"event=delivery_reclaim_race correlation={correlation!r}")
+                self._log_delivery_event(
+                    log_path, state="reclaim_race", correlation_kind="control",
+                    correlation_id=str(leased.id), task_id=leased.task_id,
+                    run_id=leased.run_id, generation=leased.generation,
+                    pane_id=pane_id,
+                )
             return True
+
+        self._log_delivery_event(
+            log_path,
+            state="confirmed" if state == "confirmed" else "transport_accepted",
+            correlation_kind="control", correlation_id=str(leased.id),
+            task_id=leased.task_id, run_id=leased.run_id,
+            generation=leased.generation, pane_id=pane_id,
+        )
 
         if not kb.mark_control_delivered(conn, leased.id, receiver=receiver):
             log_line(log_path, f"control {leased.id} injected but delivery CAS failed")
@@ -1949,15 +1987,30 @@ class BaseInteractiveListener:
             pre_write_composer=pre_write_composer,
             correlation=correlation,
         )
-        if state != "confirmed":
+        first_item = items[0]
+        if state not in {"confirmed", "transport_accepted"}:
             released = kb.release_result_notification_lease(
                 conn, queue_ids, lease_owner=receiver,
             )
             event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
-            log_line(log_path, f"event={event} correlation={correlation!r} released={released}")
+            self._log_delivery_event(
+                log_path, state=event.removeprefix("delivery_"),
+                correlation_kind="result", correlation_id=",".join(map(str, queue_ids)),
+                task_id=first_item.task_id, pane_id=pane_id, reclaimed=released,
+            )
             if not released:
-                log_line(log_path, f"event=delivery_reclaim_race correlation={correlation!r}")
+                self._log_delivery_event(
+                    log_path, state="reclaim_race", correlation_kind="result",
+                    correlation_id=",".join(map(str, queue_ids)),
+                    task_id=first_item.task_id, pane_id=pane_id,
+                )
             return True
+        self._log_delivery_event(
+            log_path,
+            state="confirmed" if state == "confirmed" else "transport_accepted",
+            correlation_kind="result", correlation_id=",".join(map(str, queue_ids)),
+            task_id=first_item.task_id, pane_id=pane_id,
+        )
         if not kb.mark_result_notifications_delivered(
             conn, queue_ids, lease_owner=receiver,
         ):
@@ -2263,7 +2316,7 @@ class BaseInteractiveListener:
             pre_write_composer=pre_write_composer,
             correlation=correlation,
         )
-        if state != "confirmed":
+        if state not in {"confirmed", "transport_accepted"}:
             reclaimed = _reclaim_task_without_signaling_worker(
                 conn, claimed.id,
                 reason=(
@@ -2272,14 +2325,30 @@ class BaseInteractiveListener:
                 **claim_fence,
             )
             event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
-            log_line(
-                log_path,
-                f"event={event} correlation={correlation!r} task={claimed.id} reclaimed={reclaimed}",
+            self._log_delivery_event(
+                log_path, state=event.removeprefix("delivery_"),
+                correlation_kind="task", correlation_id=claimed.id,
+                task_id=claimed.id, run_id=claim_run_id,
+                generation=claim_generation, pane_id=str(zellij_pane_id),
+                reclaimed=reclaimed,
             )
             if not reclaimed:
-                log_line(log_path, f"event=delivery_reclaim_race correlation={correlation!r} task={claimed.id}")
+                self._log_delivery_event(
+                    log_path, state="reclaim_race", correlation_kind="task",
+                    correlation_id=claimed.id, task_id=claimed.id,
+                    run_id=claim_run_id, generation=claim_generation,
+                    pane_id=str(zellij_pane_id),
+                )
             self._clear_active_claim_identity()
             return None, None
+
+        self._log_delivery_event(
+            log_path,
+            state="confirmed" if state == "confirmed" else "transport_accepted",
+            correlation_kind="task", correlation_id=claimed.id,
+            task_id=claimed.id, run_id=claim_run_id,
+            generation=claim_generation, pane_id=str(zellij_pane_id),
+        )
 
         # Post-inject DB ops
         try:

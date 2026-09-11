@@ -32,6 +32,41 @@ class _Listener(bl.BaseInteractiveListener):
         return "known_unsubmitted"
 
 
+class _StrictListener(_Listener):
+    semantic_delivery_required = True
+
+    def on_post_inject(self, *args, **kwargs):
+        return None
+
+
+def test_required_semantic_backend_never_infers_confirmation(tmp_path):
+    listener = _StrictListener()
+    listener.read_pane_screen = lambda **_: "❯"
+    state = listener._post_injection_contract(
+        Namespace(), zellij_session="s", zellij_pane_id="0",
+        log_path=tmp_path / "watch.log", injected_marker="prompt",
+        pre_write_composer=None, correlation="task:t_1",
+    )
+    assert state == "unknown"
+
+
+def test_post_inject_receives_marker_and_pre_write_composer(tmp_path):
+    seen = {}
+
+    class Capture(_Listener):
+        def on_post_inject(self, args, **kwargs):
+            seen.update(kwargs)
+            return "confirmed"
+
+    Capture()._post_injection_contract(
+        Namespace(), zellij_session="s", zellij_pane_id="0",
+        log_path=tmp_path / "watch.log", injected_marker="m",
+        pre_write_composer="before", correlation="control:3",
+    )
+    assert seen["injected_marker"] == "m"
+    assert seen["pre_write_composer"] == "before"
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
