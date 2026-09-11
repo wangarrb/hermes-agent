@@ -209,3 +209,31 @@ def test_hermes_api_retry_is_bounded_per_task_and_error_kind(
         now[0] += listener.API_RETRY_BACKOFF[index] + 1
 
     assert len([item for item in injections if "api:" in item.get("correlation", "")]) <= listener.API_RETRY_MAX
+
+
+def test_base_post_injection_contract_forwards_hermes_correlation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = hermes.HermesInteractiveListener()
+    received: dict[str, object] = {}
+
+    def capture(*args, **kwargs):
+        received.update(kwargs)
+        return "confirmed"
+
+    monkeypatch.setattr(listener, "on_post_inject", capture)
+    state = listener._post_injection_contract(
+        _args(),
+        zellij_session="kanban-test",
+        zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker="payload",
+        pre_write_composer="",
+        correlation="task:t1:run:7:generation:3",
+        run_id=7,
+        generation=3,
+        task_id="t1",
+    )
+
+    assert state == "confirmed"
+    assert received["correlation"] == "task:t1:run:7:generation:3"

@@ -1017,12 +1017,17 @@ class BaseInteractiveListener:
                 log_path=log_path,
                 injected_marker=injected_marker,
                 pre_write_composer=pre_write_composer,
+                correlation=correlation,
             )
         except TypeError as exc:
             # Existing backend listeners may not yet accept the expanded
             # contract.  Calling the old shape preserves their retry behavior,
             # while their implicit ``None`` remains non-confirming.
-            if "injected_marker" not in str(exc) and "pre_write_composer" not in str(exc):
+            if (
+                "injected_marker" not in str(exc)
+                and "pre_write_composer" not in str(exc)
+                and "correlation" not in str(exc)
+            ):
                 kind, ident = (correlation.split(":", 1) + [""])[:2]
                 self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
                     correlation_id=ident, task_id=task_id, run_id=run_id,
