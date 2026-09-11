@@ -67,6 +67,50 @@ def test_post_inject_receives_marker_and_pre_write_composer(tmp_path):
     assert seen["pre_write_composer"] == "before"
 
 
+class _TaskListener(_Listener):
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+    def on_post_inject(self, args, **kwargs):
+        return self.state
+
+
+def _task_args(tmp_path):
+    return Namespace(profile="reviewer", claim_assignees="reviewer",
+                      assist_role=None, zellij_session="s", zellij_pane_id="0",
+                      workspace=str(tmp_path), board="default", ttl=900)
+
+
+@pytest.mark.parametrize("state", ["known_unsubmitted", "unknown"])
+def test_nonconfirmed_task_delivery_reclaims_immediately(kanban_home, tmp_path, monkeypatch, state):
+    listener = _TaskListener(state)
+    args = _task_args(tmp_path)
+    listener._init_from_args(args)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "on_claim_post_confirm", lambda *a, **k: True)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **_: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", assignee="reviewer", workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        claimed, run_id = listener.claim_and_inject_one(args, log_path=tmp_path / "watch.log", conn=conn)
+        row = kb.get_task(conn, task_id)
+    assert claimed is None and run_id is None
+    assert row is not None and row.status != "running"
+    log_text = (tmp_path / "watch.log").read_text(encoding="utf-8")
+    assert "correlation_kind=task" in log_text
+    assert f"correlation_id={task_id}" in log_text
+    assert "task_id=" in log_text and "run_id=" in log_text
+    assert "generation=" in log_text and "pane_id=0" in log_text
+    assert "pane_prefix=test-kanban" in log_text
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -96,6 +140,21 @@ def test_nonconfirmed_control_ack_is_not_marked_delivered(kanban_home, tmp_path,
         assert listener.pump_control_messages(_args(tmp_path), conn, tmp_path / "watch.log")
         row = kb.list_control_messages(conn)[0]
     assert row.status == "pending"
+
+
+def test_control_release_cas_race_is_logged(kanban_home, tmp_path, monkeypatch):
+    listener = _Listener()
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+    monkeypatch.setattr(kb, "release_control_lease", lambda *a, **k: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.claim_task(conn, task_id, claimer="review-pane")
+        kb.return_task_for_rework(conn, task_id, actor="reviewer", reason="redo")
+        listener.pump_control_messages(_args(tmp_path), conn, tmp_path / "watch.log")
+    text = (tmp_path / "watch.log").read_text(encoding="utf-8")
+    assert "event=delivery_reclaim_race" in text
+    assert "correlation_kind=control" in text
 
 
 def test_nonconfirmed_result_ack_releases_lease(kanban_home, tmp_path, monkeypatch):

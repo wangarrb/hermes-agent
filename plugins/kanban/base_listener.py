@@ -1022,7 +1022,9 @@ class BaseInteractiveListener:
             # contract.  Calling the old shape preserves their retry behavior,
             # while their implicit ``None`` remains non-confirming.
             if "injected_marker" not in str(exc) and "pre_write_composer" not in str(exc):
-                log_line(log_path, f"event=delivery_unknown state=unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
+                kind, ident = (correlation.split(":", 1) + [""])[:2]
+                self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
+                    correlation_id=ident, pane_id=zellij_pane_id)
                 return "unknown"
             try:
                 result = self.on_post_inject(
@@ -1032,10 +1034,14 @@ class BaseInteractiveListener:
                     log_path=log_path,
                 )
             except Exception as retry_exc:
-                log_line(log_path, f"event=delivery_unknown state=unknown correlation={correlation!r} hook_error={type(retry_exc).__name__}: {retry_exc}")
+                kind, ident = (correlation.split(":", 1) + [""])[:2]
+                self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
+                    correlation_id=ident, pane_id=zellij_pane_id)
                 return "unknown"
         except Exception as exc:
-            log_line(log_path, f"event=delivery_unknown state=unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
+            kind, ident = (correlation.split(":", 1) + [""])[:2]
+            self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
+                correlation_id=ident, pane_id=zellij_pane_id)
             return "unknown"
 
         state = str(result or "").strip().lower()
@@ -1102,7 +1108,7 @@ class BaseInteractiveListener:
         }
         if reclaimed is not None:
             fields["reclaimed"] = reclaimed
-        log_line(log_path, " ".join(f"{key}={value!r}" for key, value in fields.items()))
+        log_line(log_path, " ".join(f"{key}={value}" for key, value in fields.items()))
 
     def on_task_running_monitor(
         self, args: argparse.Namespace, conn: Any,
@@ -1988,6 +1994,17 @@ class BaseInteractiveListener:
             correlation=correlation,
         )
         first_item = items[0]
+        first_task = kb.get_task(conn, first_item.task_id)
+        event_row = conn.execute(
+            "SELECT run_id, payload FROM task_events WHERE id = ?",
+            (first_item.event_id,),
+        ).fetchone()
+        result_run_id = (
+            int(event_row["run_id"])
+            if event_row is not None and event_row["run_id"] is not None
+            else (first_task.current_run_id if first_task is not None else None)
+        )
+        result_generation = first_task.generation if first_task is not None else None
         if state not in {"confirmed", "transport_accepted"}:
             released = kb.release_result_notification_lease(
                 conn, queue_ids, lease_owner=receiver,
@@ -1996,20 +2013,23 @@ class BaseInteractiveListener:
             self._log_delivery_event(
                 log_path, state=event.removeprefix("delivery_"),
                 correlation_kind="result", correlation_id=",".join(map(str, queue_ids)),
-                task_id=first_item.task_id, pane_id=pane_id, reclaimed=released,
+                task_id=first_item.task_id, run_id=result_run_id,
+                generation=result_generation, pane_id=pane_id, reclaimed=released,
             )
             if not released:
                 self._log_delivery_event(
                     log_path, state="reclaim_race", correlation_kind="result",
                     correlation_id=",".join(map(str, queue_ids)),
-                    task_id=first_item.task_id, pane_id=pane_id,
+                    task_id=first_item.task_id, run_id=result_run_id,
+                    generation=result_generation, pane_id=pane_id,
                 )
             return True
         self._log_delivery_event(
             log_path,
             state="confirmed" if state == "confirmed" else "transport_accepted",
             correlation_kind="result", correlation_id=",".join(map(str, queue_ids)),
-            task_id=first_item.task_id, pane_id=pane_id,
+            task_id=first_item.task_id, run_id=result_run_id,
+            generation=result_generation, pane_id=pane_id,
         )
         if not kb.mark_result_notifications_delivered(
             conn, queue_ids, lease_owner=receiver,
