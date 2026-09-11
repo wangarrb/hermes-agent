@@ -25,6 +25,11 @@ from the manual_review pool, so repeated runs with different samples are safe.
 Usage (typically from hindsight_memory_pipeline.py as a step before retain):
     python3 hindsight_manual_review_sampler.py --manifest <manifest.jsonl> \
         --sample-size 5 --execute --confirm retain-hindsight-session-manifest
+
+Daily cap: review LLM calls are capped per calendar day (default 5,
+--max-daily-reviews) across ALL invocations — the daily pipeline and the
+Sunday weekly full run share one budget, so a calendar day never exceeds
+N judgment calls.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_SAMPLE_SIZE = 5
+DEFAULT_MAX_DAILY_REVIEWS = 5
 DEFAULT_MANIFEST_DIR = "/home/wyr/.hermes/hindsight/session_ingest/manifests"
 DEFAULT_REVIEW_DIR = "/home/wyr/.hermes/hindsight/review_repair"
 # Domain/task keywords that indicate real work content (any language).
@@ -73,6 +79,28 @@ def load_reviewed_state(state_path: Path) -> dict[str, Any]:
         except Exception:
             pass
     return {"reviewed": {}, "history": []}
+
+
+def reviews_done_today(state: dict[str, Any], tz=None) -> int:
+    """Count review-LLM calls already recorded for the current calendar day.
+
+    The daily pipeline (00:01) and the Sunday weekly full run (05:00) both
+    invoke this sampler; the per-day cap must span both invocations so a
+    calendar day never exceeds ``--max-daily-reviews`` judgment calls.
+    History timestamps are stored in UTC — compare in local time.
+    """
+    if tz is None:
+        tz = datetime.now().astimezone().tzinfo
+    today = datetime.now(tz).date()
+    count = 0
+    for entry in state.get("history", []):
+        try:
+            at = datetime.fromisoformat(str(entry.get("at", "")).replace("Z", "+00:00"))
+            if at.astimezone(tz).date() == today:
+                count += len(entry.get("decisions") or [])
+        except Exception:
+            continue
+    return count
 
 
 def importance_score(record: dict[str, Any]) -> float:
@@ -223,6 +251,8 @@ def main() -> int:
     parser.add_argument("--manifest", default=None, help="manifest JSONL path (default: latest in manifest dir)")
     parser.add_argument("--manifest-dir", default=DEFAULT_MANIFEST_DIR)
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
+    parser.add_argument("--max-daily-reviews", type=int, default=DEFAULT_MAX_DAILY_REVIEWS,
+                        help="hard cap on review-LLM calls per calendar day across all runs (default 5)")
     parser.add_argument("--review-dir", default=DEFAULT_REVIEW_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_MANIFEST_DIR)
     parser.add_argument("--execute", action="store_true", help="run LLM review and write curated manifest (default: report only)")
@@ -261,6 +291,21 @@ def main() -> int:
     if not sample:
         print(f"manual_review pending={pending_count}; nothing new to sample")
         return 0
+
+    done_today = reviews_done_today(state)
+    remaining = max(args.max_daily_reviews - done_today, 0)
+    if remaining == 0:
+        print(
+            f"manual_review pending={pending_count}; daily review cap reached "
+            f"({done_today}/{args.max_daily_reviews}) — skipping"
+        )
+        return 0
+    if len(sample) > remaining:
+        print(
+            f"daily review cap: {done_today}/{args.max_daily_reviews} used today; "
+            f"reviewing {remaining} of {len(sample)} sampled"
+        )
+        sample = sample[:remaining]
 
     print(
         f"manifest={manifest_path.name} pending_manual_review={pending_count} "
