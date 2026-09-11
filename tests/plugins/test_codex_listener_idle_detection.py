@@ -25,7 +25,14 @@ def test_codex_post_inject_retries_raw_enter_while_prompt_is_queued(
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda command, **_: commands.append(command),
+        lambda command, **_: (
+            commands.append(command)
+            or subprocess.CompletedProcess(
+                command, 0,
+                stdout='[{"pane_id":"2","title":"codex-kanban","is_plugin":false,"exited":false,"terminal_command":"codex"}]',
+                stderr="",
+            )
+        ),
     )
 
     listener.on_post_inject(
@@ -39,7 +46,8 @@ def test_codex_post_inject_retries_raw_enter_while_prompt_is_queued(
         "zellij", "--session", "kanban-test", "action",
         "write", "-p", "2", "13",
     ]
-    assert commands == [expected] * listener._POST_INJECT_MAX_RETRIES
+    writes = [command for command in commands if "write" in command and "--json" not in command]
+    assert writes == [expected] * listener._POST_INJECT_MAX_RETRIES
 
 
 def test_codex_post_inject_stops_when_agent_is_busy(
