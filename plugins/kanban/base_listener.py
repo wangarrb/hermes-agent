@@ -1785,7 +1785,7 @@ class BaseInteractiveListener:
                 # migration fallback.  Claimed runs persist workspace_path.
                 if task is not None and getattr(task, "workspace_path", None):
                     workspace = Path(
-                        kb.resolve_workspace(task, board=self._board)
+                        task.workspace_path
                     ).expanduser().resolve(strict=False)
             except Exception:
                 workspace = self._workspace
