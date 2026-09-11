@@ -229,6 +229,74 @@ def test_rework_generation_does_not_invalidate_workspace_contract(
     assert final_contract["mismatches"] == []
 
 
+def test_rework_reprepare_refreshes_source_snapshot_and_rejects_same_generation_drift(
+    kanban_home, tmp_path,
+):
+    """A rework generation may re-prepare its long-lived worktree after the
+    owner lane advanced: the source/upstream snapshot is refreshed in place.
+    Without a generation bump the same drift must still fail closed.
+    """
+    repo = tmp_path / "repo"
+    base_commit = _init_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="rework prepare",
+            assignee="implementer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="implementer/{task_id}/g1",
+            base_commit=base_commit,
+            target_branch="main",
+        )
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        assert kb.set_workspace_path(conn, task_id, workspace)
+        task = kb.get_task(conn, task_id)
+    contracts = _contracts()
+    _git(repo, "remote", "add", "origin", str(repo))
+
+    first = contracts.prepare_generation_worktree(
+        task, workspace, source_branch="main", upstream="origin",
+    )
+    assert first["generation"] == 1
+    manifest_path = Path(contracts.manifest_path_for(task, workspace))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["generation"] == 1
+    assert manifest["source_sha"] == first["source_sha"]
+
+    # The owner lane advances while the task waits for rework.
+    (repo / "advance.txt").write_text("advance\n", encoding="utf-8")
+    _git(repo, "add", "advance.txt")
+    _git(repo, "commit", "-m", "advance main")
+    advanced = _git(repo, "rev-parse", "HEAD")
+    assert advanced != first["source_sha"]
+
+    # Same generation: source drift is still rejected (fail-closed).
+    with pytest.raises(contracts.WorkspaceContractError, match="source_sha"):
+        contracts.prepare_generation_worktree(
+            task, workspace, source_branch="main", upstream="origin",
+        )
+
+    # Rework generation: the refreshed snapshot is accepted and persisted.
+    with kb.connect() as conn:
+        kb.return_task_for_rework(
+            conn, task.id, actor="reviewer", reason="rework",
+        )
+        reworked = kb.get_task(conn, task.id)
+    assert int(reworked.generation) == 2
+    refreshed = contracts.prepare_generation_worktree(
+        reworked, workspace, source_branch="main", upstream="origin",
+    )
+    assert refreshed["generation"] == 2
+    assert refreshed["source_sha"] == advanced
+    assert refreshed["upstream_sha"] == advanced
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["generation"] == 2
+    assert manifest["source_sha"] == advanced
+    assert manifest["upstream_sha"] == advanced
+
+
 def test_legacy_db_migrates_contract_columns_and_old_tasks_remain_readable(tmp_path):
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(db_path)

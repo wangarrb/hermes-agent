@@ -523,7 +523,20 @@ def prepare_generation_worktree(
     existing = _read_manifest(manifest_path)
     current_branch = _run_git(path, "branch", "--show-current").stdout.strip()
     if existing is not None:
-        mismatches = _manifest_mismatches(existing, expected)
+        # A rework generation re-prepares the same long-lived worktree while the
+        # owner lane keeps advancing, so the source/upstream snapshot recorded
+        # at creation legitimately goes stale.  Refresh those snapshot fields in
+        # place for the new generation; the workspace identity fields remain
+        # strictly immutable.
+        rework = existing.get("generation") != expected["generation"]
+        refreshable = (
+            frozenset({"source_sha", "upstream_sha"}) if rework else frozenset()
+        )
+        mismatches = [
+            field
+            for field in _manifest_mismatches(existing, expected)
+            if field not in refreshable
+        ]
         if mismatches:
             raise WorkspaceContractError(
                 "lifecycle manifest mismatch: " + ", ".join(mismatches)
@@ -532,10 +545,15 @@ def prepare_generation_worktree(
             raise WorkspaceContractError(
                 f"lifecycle manifest branch ownership mismatch: {current_branch!r}"
             )
-        if existing.get("generation") != expected["generation"]:
+        refreshed = {
+            field: expected[field]
+            for field in ("generation", "source_sha", "upstream_sha")
+            if existing.get(field) != expected[field]
+        }
+        if refreshed:
             existing = {
                 **existing,
-                "generation": expected["generation"],
+                **refreshed,
                 "valid": True,
                 "mismatches": [],
             }
