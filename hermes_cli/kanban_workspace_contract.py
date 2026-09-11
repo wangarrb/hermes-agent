@@ -550,10 +550,21 @@ def prepare_generation_worktree(
         )
 
     if current_branch == expected_branch:
-        if _resolve_ref(path, "HEAD", label="worktree HEAD") != resolved["base_commit"]:
-            raise WorkspaceContractError(
-                "existing generation branch does not start at resolved base commit"
+        current_head = _resolve_ref(path, "HEAD", label="worktree HEAD")
+        if current_head != resolved["base_commit"]:
+            descendant = _run_git(
+                path,
+                "merge-base",
+                "--is-ancestor",
+                resolved["base_commit"],
+                current_head,
+                check=False,
             )
+            if descendant.returncode != 0:
+                raise WorkspaceContractError(
+                    "existing generation branch does not start at or descend from "
+                    "resolved base commit"
+                )
     elif _branch_exists(repository, expected_branch):
         branch_tip = _resolve_ref(
             repository, f"refs/heads/{expected_branch}", label="generation branch",
