@@ -32,6 +32,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
     return home
 
 
@@ -258,7 +259,7 @@ def test_goal_waiting_on_subscribed_task_uses_120_minute_insurance_interval(
         now[0] = 100.0 + listener.RESULT_WAIT_GOAL_INTERVAL_S + 1
         listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
 
-    assert len(injected) == 2  # prompt plus the existing CR compatibility write
+    assert len(injected) == 1  # carriage return is now a separate submit helper
     assert "WAITING_ON_TASK_RESULTS" in injected[0]
     assert watched in injected[0]
     assert "120" in injected[0]

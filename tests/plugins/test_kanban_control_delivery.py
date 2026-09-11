@@ -18,6 +18,7 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
     return home
 
 
@@ -139,7 +140,7 @@ def test_busy_pane_keeps_control_pending(kanban_home, tmp_path, monkeypatch):
     assert message.id == control_id
     assert message.status == "pending"
     assert injected == []
-    assert titles[-1] == f"[PAUSE {message.task_id}]"
+    assert titles[-1] == f"dummy-kanban [PAUSE {message.task_id}]"
 
 
 @pytest.mark.parametrize("screen", [None, "", "   \n"])
@@ -222,7 +223,7 @@ def test_idle_pane_receives_control_once_and_blocks_claim_until_ack(
     assert f"control-ack {control_id}" in injected[0]
     assert task_id in injected[0]
     assert message.status == "delivered"
-    assert titles[-1] == f"[PAUSE {task_id}]"
+    assert titles[-1] == f"dummy-kanban [PAUSE {task_id}]"
     assert "SUPERSEDED" in prompt.read_text(encoding="utf-8")
 
 

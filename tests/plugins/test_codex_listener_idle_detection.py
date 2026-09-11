@@ -208,4 +208,4 @@ def test_capacity_error_uses_bounded_retry_path(tmp_path: Path, monkeypatch) -> 
         log_path=tmp_path / "listener.log",
     )
     assert listener._api_retry_count == 1
-    assert len(calls) == 2
+    assert len(calls) == 1

@@ -251,6 +251,7 @@ def test_claim_path_emits_manifest_and_exposes_control_sha_in_prompt(
         "zellij_inject",
         lambda **kwargs: injected.append(kwargs["text"]) or True,
     )
+    monkeypatch.setattr(listener_base, "zellij_submit", lambda **kwargs: True)
     monkeypatch.setattr(listener_base, "zellij_rename_pane", lambda **kwargs: True)
 
     kb.init_db(db_path)

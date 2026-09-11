@@ -47,6 +47,7 @@ from base_listener import (  # noqa: E402
     role_guidance,
     zellij_dump_screen,
     zellij_inject,
+    zellij_submit,
     tag_injected_text,
     zellij_rename_pane,
 )
@@ -251,10 +252,14 @@ class HermesInteractiveListener(BaseInteractiveListener):
             session=zellij_session,
             pane_id=zellij_pane_id,
             text=tag_injected_text("继续", source_profile="watcher"),
+            expected_pane_prefix="hermes-kanban",
             log_path=log_path,
         )
         time.sleep(0.5)
-        zellij_inject(session=zellij_session, pane_id=zellij_pane_id, text="\r", log_path=log_path)
+        zellij_submit(
+            session=zellij_session, pane_id=zellij_pane_id,
+            expected_pane_prefix="hermes-kanban", log_path=log_path,
+        )
 
     # ── Override on_claim_pre_check: only last line → idle ──
     # Hermes shows the › prompt between every turn.  Checking 40 lines

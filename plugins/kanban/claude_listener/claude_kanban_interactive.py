@@ -45,6 +45,7 @@ from base_listener import (  # noqa: E402
     role_guidance,
     zellij_dump_screen,
     zellij_inject,
+    zellij_submit,
     zellij_rename_pane,
     _noop_signal,
     _pane_can_accept_new_kanban_task,
@@ -180,12 +181,13 @@ class ClaudeInteractiveListener(BaseInteractiveListener):
         After the initial write-chars + Enter, Claude shows "Press up to edit queued
         messages". A second Enter submits the queued prompt.
         """
-        cmd_base = ["zellij", "--session", zellij_session, "action"] if zellij_session else ["zellij", "action"]
         # Wait for Claude Code to register the queued input
         time.sleep(1.5)
-        subprocess.run(
-            cmd_base + ["send-keys", "-p", zellij_pane_id, "Enter"],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        zellij_submit(
+            session=zellij_session,
+            pane_id=zellij_pane_id,
+            expected_pane_prefix="claude-kanban",
+            log_path=log_path,
         )
         log_line(log_path, "claude post-inject: sent second Enter for queued input")
 

@@ -56,6 +56,8 @@ from base_listener import (  # noqa: E402
     role_guidance,
     zellij_dump_screen,
     zellij_inject,
+    zellij_submit,
+    _zellij_validate_pane,
     zellij_rename_pane,
     _noop_signal,
     _pid_alive,
@@ -224,14 +226,18 @@ def _auto_dismiss_steering(
         return False
     log_line(log_path, "auto-dismissing codewhale Steering menu (Tab+Enter)")
     try:
+        if not _zellij_validate_pane(session=session, pane_id=str(pane_id), expected_pane_prefix=f"{profile}-deepseek", log_path=log_path):
+            return False
         subprocess.run(
             ["zellij", "--session", session, "action", "write", "-p", str(pane_id), "9", "13"],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=5,
         )
         _last_steering_dismiss_at[profile] = now
         return True
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         err = getattr(exc, "stderr", "") or str(exc)
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
         log_line(log_path, f"auto-dismiss Steering failed: {err}")
         return False
 
@@ -512,7 +518,7 @@ def _has_saved_session_for_workspace(*, role_home: Path, workspace: Path) -> boo
 
 
 def _send_operate_command(
-    *, session: str, pane_id: str, log_path: Path,
+    *, session: str, pane_id: str, log_path: Path, expected_pane_prefix: str,
 ) -> bool:
     """Switch an idle fresh CodeWhale pane to Operate mode."""
     cmd_base = (
@@ -521,12 +527,15 @@ def _send_operate_command(
         else ["zellij", "action"]
     )
     try:
+        if not _zellij_validate_pane(session=session, pane_id=str(pane_id), expected_pane_prefix=expected_pane_prefix, log_path=log_path):
+            return False
         subprocess.run(
             cmd_base + ["send-keys", "-p", str(pane_id), "Ctrl u"],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=5,
         )
         subprocess.run(
             cmd_base + ["write-chars", "-p", str(pane_id), "/mode operate"],
@@ -534,6 +543,7 @@ def _send_operate_command(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=5,
         )
         time.sleep(0.2)
         subprocess.run(
@@ -542,12 +552,13 @@ def _send_operate_command(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=5,
         )
         return True
-    except subprocess.CalledProcessError as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         log_line(
             log_path,
-            f"CodeWhale Operate command failed rc={exc.returncode}: {exc.stderr.strip()}",
+        f"CodeWhale Operate command failed rc={getattr(exc, 'returncode', '?')}: {(getattr(exc, 'stderr', '') or str(exc)).strip()}",
         )
         return False
 
@@ -613,6 +624,9 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
             return f"{profile}-deepseek [{task_id}]"
         return f"{profile}-deepseek listening"
 
+    def expected_pane_prefix(self) -> str:
+        return f"{self._profile or 'implementer'}-deepseek"
+
     def on_post_inject(
         self, args: argparse.Namespace, *,
         zellij_session: str, zellij_pane_id: str, log_path: Path,
@@ -624,11 +638,6 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
         time for the queued prompt.  Stop as soon as the prompt is gone (sent)
         or a busy marker appears (agent started processing).
         """
-        cmd_base = (
-            ["zellij", "--session", zellij_session, "action"]
-            if zellij_session
-            else ["zellij", "action"]
-        )
         for attempt in range(1, _POST_INJECT_MAX_RETRIES + 1):
             time.sleep(_POST_INJECT_CONFIRM_S)
             screen = zellij_dump_screen(
@@ -646,13 +655,11 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
                     )
                 return
             # Prompt still queued — send another Enter
-            subprocess.run(
-                cmd_base + ["write", "-p", zellij_pane_id, "13"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
+            zellij_submit(
+                session=zellij_session,
+                pane_id=zellij_pane_id,
+                expected_pane_prefix=self.expected_pane_prefix(),
+                log_path=log_path,
             )
             log_line(
                 log_path,
@@ -709,6 +716,7 @@ class CodeWhaleInteractiveListener(BaseInteractiveListener):
             return False
         if _send_operate_command(
             session=session, pane_id=pane_id, log_path=log_path,
+            expected_pane_prefix=self.expected_pane_prefix(),
         ):
             self._fresh_operate_requested_at = time.time()
             log_line(log_path, "fresh CodeWhale pane requested Operate mode")

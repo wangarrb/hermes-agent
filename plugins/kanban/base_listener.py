@@ -370,8 +370,120 @@ def tag_injected_text(text: str, *, source_profile: str) -> str:
     return f"{payload} {marker}" if payload else marker
 
 
-def zellij_inject(*, session: str, pane_id: str, text: str, log_path: Path) -> bool:
-    """Inject text into a Zellij pane and press Enter.
+def _zellij_cmd_base(session: str) -> list[str]:
+    return ["zellij", "--session", session, "action"] if session else ["zellij", "action"]
+
+
+def _zellij_pane_title_matches(title: str, expected_prefix: str) -> bool:
+    """Match a role title without accepting a similarly named foreign pane."""
+    title = str(title or "").strip().casefold()
+    prefix = str(expected_prefix or "").strip().casefold()
+    if not prefix or not title.startswith(prefix):
+        return False
+    if len(title) == len(prefix):
+        return True
+    return title[len(prefix)] == "[" or title[len(prefix)].isspace()
+
+
+def _zellij_validate_pane(
+    *, session: str, pane_id: str, expected_pane_prefix: str | None,
+    log_path: Path,
+) -> bool:
+    """Confirm the pane still exists and belongs to the expected role.
+
+    Zellij 0.44.1 exits successfully for unknown pane IDs, so action return
+    codes cannot be used as an existence check.  ``list-panes --all --json``
+    is authoritative and lets us fail closed before writing into a reassigned
+    pane.  Generic callers may omit ``expected_pane_prefix`` and only require
+    a live non-plugin pane with the requested ID.
+    """
+    try:
+        result = subprocess.run(
+            _zellij_cmd_base(session) + ["list-panes", "--all", "--json"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        if result is None:
+            raise ValueError("list-panes returned no result")
+        payload = json.loads(getattr(result, "stdout", "") or "[]")
+        if not isinstance(payload, list):
+            raise ValueError("list-panes JSON must be a list")
+        for pane in payload:
+            if not isinstance(pane, dict):
+                continue
+            if str(pane.get("pane_id")) != str(pane_id):
+                continue
+            if pane.get("is_plugin") is True or pane.get("exited") is True:
+                continue
+            title_valid = expected_pane_prefix is None or _zellij_pane_title_matches(
+                str(pane.get("title", "")), expected_pane_prefix,
+            )
+            if not title_valid:
+                continue
+            if expected_pane_prefix is not None:
+                command = str(pane.get("terminal_command") or pane.get("pane_command") or "").casefold()
+                if command and "<defunct>" not in command and "conda" not in command:
+                    prefix_tokens = expected_pane_prefix.casefold().split("-")
+                    role = prefix_tokens[0]
+                    backend = {"codex": "codex", "hermes": "hermes", "claude": "claude", "codewhale": "codewhale", "deepseek": "deepseek", "reasonix": "reasonix"}.get(role, prefix_tokens[-1])
+                    if role == "implementer" and "deepseek" in prefix_tokens:
+                        backend = "deepseek"
+                    if role == "implementer" and "reasonix" in prefix_tokens:
+                        backend = "reasonix"
+                    known_roles = {"codex", "hermes", "claude", "codewhale", "deepseek", "reasonix"}
+                    tokens = set(re.findall(r"[a-z0-9_-]+", command))
+                    foreign = (tokens & known_roles) - {role, backend}
+                    backend_tokens = {backend}
+                    if backend == "deepseek":
+                        backend_tokens.add("codewhale")
+                    if foreign or not (backend_tokens & tokens):
+                        continue
+            return True
+        log_line(log_path, f"event=transport_rejected pane={pane_id!r} prefix={expected_pane_prefix!r}")
+        return False
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        log_line(log_path, f"event=transport_rejected pane={pane_id!r} prefix={expected_pane_prefix!r} error={str(detail).strip()}")
+        return False
+
+
+def zellij_write_text(
+    *, session: str, pane_id: str, text: str, log_path: Path,
+    expected_pane_prefix: str | None = None, correlation: str | None = None,
+) -> bool:
+    """Write one text payload to a Zellij pane; submission is separate."""
+    allow_lf = str(expected_pane_prefix or "").casefold().endswith("-reasonix")
+    if any((ord(ch) < 0x20 and not (allow_lf and ch == "\n")) or ord(ch) == 0x7F for ch in str(text)):
+        log_line(log_path, f"event=transport_rejected pane={pane_id!r} prefix={expected_pane_prefix!r} correlation={correlation!r} reason=control_byte")
+        return False
+    if not _zellij_validate_pane(
+        session=session, pane_id=pane_id,
+        expected_pane_prefix=expected_pane_prefix, log_path=log_path,
+    ):
+        return False
+    try:
+        subprocess.run(
+            _zellij_cmd_base(session) + ["write-chars", "-p", str(pane_id), str(text)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=5,
+        )
+        log_line(log_path, f"event=transport_accepted pane={pane_id!r} prefix={expected_pane_prefix!r} correlation={correlation!r}")
+        return True
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        rc = getattr(exc, "returncode", "?")
+        log_line(log_path, f"event=transport_failed pane={pane_id!r} prefix={expected_pane_prefix!r} rc={rc} error={str(detail).strip()}")
+        return False
+
+
+def zellij_inject(
+    *, session: str, pane_id: str, text: str, log_path: Path,
+    expected_pane_prefix: str | None = None, correlation: str | None = None,
+) -> bool:
+    """Compatibility name for writing one text payload (without Enter).
 
     IMPORTANT: *text* must NOT contain ``\\n`` (LF) characters.
     In PTY raw mode, LF (0x0A) is NOT the same as Enter (CR, 0x0D).
@@ -379,21 +491,42 @@ def zellij_inject(*, session: str, pane_id: str, text: str, log_path: Path) -> b
     prompt, causing the "typed but not sent" bug.
     Use single-line text only; the TUI will word-wrap.
     """
-    try:
-        cmd_base = ["zellij", "--session", session, "action"] if session else ["zellij", "action"]
-        subprocess.run(
-            cmd_base + ["write-chars", "-p", str(pane_id), text],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-        )
-        time.sleep(0.8)
-        subprocess.run(
-            cmd_base + ["write", "-p", str(pane_id), "13"],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-        )
-        return True
-    except subprocess.CalledProcessError as exc:
-        log_line(log_path, f"zellij injection failed rc={exc.returncode}: {exc.stderr.strip()}")
+    return zellij_write_text(
+        session=session, pane_id=pane_id, text=text, log_path=log_path,
+        expected_pane_prefix=expected_pane_prefix,
+        correlation=correlation,
+    )
+
+
+def zellij_submit(
+    *, session: str, pane_id: str, log_path: Path,
+    expected_pane_prefix: str | None = None, correlation: str | None = None,
+) -> bool:
+    """Send exactly one raw carriage return (byte 13) to a live pane."""
+    if not _zellij_validate_pane(
+        session=session, pane_id=pane_id,
+        expected_pane_prefix=expected_pane_prefix, log_path=log_path,
+    ):
         return False
+    try:
+        subprocess.run(
+            _zellij_cmd_base(session) + ["write", "-p", str(pane_id), "13"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=5,
+        )
+        log_line(log_path, f"event=submit_sent pane={pane_id!r} prefix={expected_pane_prefix!r} correlation={correlation!r}")
+        return True
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        rc = getattr(exc, "returncode", "?")
+        log_line(log_path, f"event=submit_failed pane={pane_id!r} prefix={expected_pane_prefix!r} rc={rc} error={str(detail).strip()}")
+        return False
+
+
+# Descriptive public alias used by listener integrations and tests.
+zellij_submit_enter = zellij_submit
 
 
 def zellij_rename_pane(*, session: str, pane_id: str, name: str, log_path: Path) -> bool:
@@ -401,11 +534,15 @@ def zellij_rename_pane(*, session: str, pane_id: str, name: str, log_path: Path)
         cmd_base = ["zellij", "--session", session, "action"] if session else ["zellij", "action"]
         subprocess.run(
             cmd_base + ["rename-pane", "-p", str(pane_id), name],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=5,
         )
         return True
-    except subprocess.CalledProcessError as exc:
-        log_line(log_path, f"zellij rename-pane failed rc={exc.returncode}: {exc.stderr.strip()}")
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        log_line(log_path, f"zellij rename-pane failed rc={getattr(exc, 'returncode', '?')}: {str(detail).strip()}")
         return False
 
 
@@ -688,6 +825,9 @@ class BaseInteractiveListener:
     def pane_label(self, task_id: str | None = None) -> str:
         """Return the zellij pane title."""
         raise NotImplementedError
+
+    def expected_pane_prefix(self) -> str:
+        return f"{self.agent_slug}-kanban"
 
     def render_effective_role_context(
         self,
@@ -1220,14 +1360,21 @@ class BaseInteractiveListener:
         ):
             return True
         log_line(log_path, f"idle followup for {task_id}: {marker}")
-        zellij_inject(
+        ok = zellij_inject(
             session=session,
             pane_id=pane_id,
             text=tag_injected_text(text, source_profile="watcher"),
+            expected_pane_prefix=self.expected_pane_prefix(),
             log_path=log_path,
         )
+        if ok is False:
+            return True
         time.sleep(0.5)
-        zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
+        if not zellij_submit(
+            session=session, pane_id=pane_id,
+            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+        ):
+            return True
         if task.goal_mode:
             if task_id in self._goals_waiting_on_results:
                 self._goal_result_wait_since[task_id] = now
@@ -1395,14 +1542,21 @@ class BaseInteractiveListener:
         self._api_retry_first_at = None  # reset timer; next error detection starts fresh
         log_line(log_path, f"api-error-retry kind={error_kind} {self._api_retry_count}/{self.API_RETRY_MAX} for task {task_id}: injecting 继续 after {elapsed:.0f}s")
 
-        zellij_inject(
+        ok = zellij_inject(
             session=session,
             pane_id=pane_id,
             text=tag_injected_text("继续", source_profile="watcher"),
+            expected_pane_prefix=self.expected_pane_prefix(),
             log_path=log_path,
         )
+        if ok is False:
+            return True
         time.sleep(0.5)
-        zellij_inject(session=session, pane_id=pane_id, text="\r", log_path=log_path)
+        if not zellij_submit(
+            session=session, pane_id=pane_id,
+            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+        ):
+            return True
 
         return True
 
@@ -1510,7 +1664,7 @@ class BaseInteractiveListener:
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
-                name=f"[PAUSE {control.task_id}]",
+                name=f"{self.agent_slug}-kanban [PAUSE {control.task_id}]",
                 log_path=log_path,
             )
             return True
@@ -1520,7 +1674,7 @@ class BaseInteractiveListener:
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
-                name=f"[PAUSE {control.task_id}]",
+                name=f"{self.agent_slug}-kanban [PAUSE {control.task_id}]",
                 log_path=log_path,
             )
             return True
@@ -1544,11 +1698,19 @@ class BaseInteractiveListener:
             session=session,
             pane_id=pane_id,
             text=prompt,
+            expected_pane_prefix=self.expected_pane_prefix(),
             log_path=log_path,
         )
         if not ok:
             kb.release_control_lease(conn, leased.id, receiver=receiver)
             log_line(log_path, f"control injection failed; released {leased.id}")
+            return True
+        if not zellij_submit(
+            session=session, pane_id=pane_id,
+            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+        ):
+            kb.release_control_lease(conn, leased.id, receiver=receiver)
+            log_line(log_path, f"control submit failed; released {leased.id}")
             return True
 
         if not kb.mark_control_delivered(conn, leased.id, receiver=receiver):
@@ -1557,7 +1719,7 @@ class BaseInteractiveListener:
         zellij_rename_pane(
             session=session,
             pane_id=pane_id,
-            name=f"[PAUSE {leased.task_id}]",
+            name=f"{self.agent_slug}-kanban [PAUSE {leased.task_id}]",
             log_path=log_path,
         )
         log_line(
@@ -1635,6 +1797,7 @@ class BaseInteractiveListener:
             session=session,
             pane_id=pane_id,
             text=prompt,
+            expected_pane_prefix=self.expected_pane_prefix(),
             log_path=log_path,
         )
         if not ok:
@@ -1642,6 +1805,15 @@ class BaseInteractiveListener:
                 conn, queue_ids, lease_owner=receiver,
             )
             log_line(log_path, f"result injection failed; released {queue_ids}")
+            return True
+        if not zellij_submit(
+            session=session, pane_id=pane_id,
+            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+        ):
+            kb.release_result_notification_lease(
+                conn, queue_ids, lease_owner=receiver,
+            )
+            log_line(log_path, f"result submit failed; released {queue_ids}")
             return True
         if not kb.mark_result_notifications_delivered(
             conn, queue_ids, lease_owner=receiver,
@@ -1901,13 +2073,29 @@ class BaseInteractiveListener:
 
         ok = zellij_inject(
             session=zellij_session, pane_id=str(zellij_pane_id),
-            text=inject_str, log_path=log_path,
+            text=inject_str, expected_pane_prefix=self.expected_pane_prefix(),
+            log_path=log_path,
         )
         if not ok:
             try:
                 _reclaim_task_without_signaling_worker(
                     conn, claimed.id,
                     reason=f"{self.agent_slug}-interactive zellij injection failed",
+                    **claim_fence,
+                )
+            except Exception:
+                pass
+            self._clear_active_claim_identity()
+            return None, None
+
+        if not zellij_submit(
+            session=zellij_session, pane_id=str(zellij_pane_id),
+            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+        ):
+            try:
+                _reclaim_task_without_signaling_worker(
+                    conn, claimed.id,
+                    reason=f"{self.agent_slug}-interactive zellij submit failed",
                     **claim_fence,
                 )
             except Exception:

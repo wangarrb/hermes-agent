@@ -35,6 +35,7 @@ from base_listener import (  # noqa: E402
     prompt_dir,
     role_guidance,
     zellij_dump_screen,
+    zellij_submit_enter,
     _pane_can_accept_new_kanban_task,
     _tail_nonempty_lines,
 )
@@ -259,13 +260,12 @@ class CodexInteractiveListener(BaseInteractiveListener):
                     )
                 return
             # Prompt still queued — send another Enter
-            _sp.run(
-                cmd_base + ["write", "-p", zellij_pane_id, "13"],
-                check=False,
-                stdout=_sp.DEVNULL,
-                stderr=_sp.PIPE,
-                text=True,
-                timeout=5,
+            zellij_submit_enter(
+                session=zellij_session,
+                pane_id=zellij_pane_id,
+                expected_pane_prefix=self.expected_pane_prefix(),
+                correlation=f"task:{getattr(self, '_active_task_id', '')}",
+                log_path=log_path,
             )
             log_line(
                 log_path,

@@ -82,7 +82,7 @@ cw auto · operate · Full Access
     monkeypatch.setattr(
         deepseek_kanban_interactive.subprocess,
         "run",
-        lambda command, **kwargs: commands.append(command),
+        lambda command, **kwargs: (commands.append(command) or __import__("subprocess").CompletedProcess(command, 0, stdout='[{"pane_id":"7","title":"implementer-deepseek","is_plugin":false,"exited":false}]', stderr="")),
     )
 
     listener.on_post_inject(
@@ -104,7 +104,8 @@ cw auto · operate · Full Access
         "7",
         "13",
     ]
-    assert commands == [expected_cmd] * deepseek_kanban_interactive._POST_INJECT_MAX_RETRIES
+    writes = [command for command in commands if "write" in command and "--json" not in command]
+    assert writes == [expected_cmd] * deepseek_kanban_interactive._POST_INJECT_MAX_RETRIES
 
 
 def test_codewhale_post_inject_does_not_resubmit_busy_prompt(
@@ -269,7 +270,7 @@ def test_fresh_act_pane_switches_to_operate_before_claim(
     monkeypatch.setattr(
         deepseek_kanban_interactive,
         "_send_operate_command",
-        lambda *, session, pane_id, log_path: sent.append((session, pane_id)) or True,
+        lambda *, session, pane_id, log_path, expected_pane_prefix: sent.append((session, pane_id)) or True,
     )
     args = Namespace(zellij_session="kanban-test", zellij_pane_id="4")
 

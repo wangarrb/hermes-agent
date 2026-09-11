@@ -18,6 +18,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
     return home
 
 

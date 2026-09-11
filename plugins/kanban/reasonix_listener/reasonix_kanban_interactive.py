@@ -280,6 +280,9 @@ class ReasonixInteractiveListener(BaseInteractiveListener):
             return f"{profile}-reasonix [{task_id}]"
         return f"{profile}-reasonix listening"
 
+    def expected_pane_prefix(self) -> str:
+        return f"{self._profile or 'implementer'}-reasonix"
+
     # ── Override: on_claim_pre_check with Reasonix-specific idle detection ──
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
         session = getattr(args, "zellij_session", "")
