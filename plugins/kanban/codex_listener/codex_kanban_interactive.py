@@ -15,6 +15,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 # ── Base class import ──
@@ -49,11 +50,12 @@ class CodexInteractiveListener(BaseInteractiveListener):
 
     # ── Idle/busy markers ──
     # Codex CLI uses › (U+203A) as its prompt symbol since v0.9+
-    idle_markers: tuple[str, ...] = ("› ",)
+    idle_markers: tuple[str, ...] = ("›",)
     # Text busy states are live Codex status rows, not arbitrary transcript
     # prose (for example, a completed answer may say a goal remains running).
     busy_markers: tuple[str, ...] = ("• thinking", "• working", "• running", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     queued_input_markers: tuple[str, ...] = ()
+    semantic_delivery_required = True
 
     # ── Abstract method implementations ──
 
@@ -115,23 +117,10 @@ class CodexInteractiveListener(BaseInteractiveListener):
         if any(marker.lower() in viewport for marker in self.busy_markers):
             return False
 
-        last_line = tail_lines[-1].lower()
-        is_status_bar = "context" in last_line and "%" in last_line
-        # Codex TUI may render the composer prompt and status bar on the same
-        # line (e.g. "› Implement {feature}  gpt-5.6-sol · Context 20% used").
-        # In that case the idle marker is on the status-bar line itself, so
-        # check the last line rather than skipping to the second-to-last.
-        if is_status_bar and not any(
-            marker.lower() in last_line for marker in self.idle_markers
-        ):
-            check_line = (
-                tail_lines[-2].lower()
-                if len(tail_lines) >= 2
-                else last_line
-            )
-        else:
-            check_line = last_line
-        return any(marker.lower() in check_line for marker in self.idle_markers)
+        # The prompt may be bare, followed by role/status text, or share a
+        # row with the status bar.  Only a prompt glyph at the start of a
+        # current line counts; transcript prose containing › is ignored.
+        return any(re.match(r"^\s*›(?:\s|$)", line) for line in tail_lines)
 
     _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s?(.*))?$")
 
@@ -149,6 +138,17 @@ class CodexInteractiveListener(BaseInteractiveListener):
         if prompt_index is None:
             return None
 
+        # Strip an inline role/status suffix while preserving composer text,
+        # e.g. ``› marker  gpt-5.6-sol high · Context 20% used``.  A row made
+        # entirely of role/status metadata is therefore treated as empty.
+        if first_text and "context" in first_text.lower() and "%" in first_text:
+            inline_status = re.search(
+                r"(?:\s{2,}|^)(?:[\w.-]+(?:\s+\w+)*\s*)?·.*?context\b.*$",
+                first_text,
+                flags=re.IGNORECASE,
+            )
+            if inline_status:
+                first_text = first_text[:inline_status.start()].rstrip()
         parts = [first_text] if first_text else []
         for line in lines[prompt_index + 1 :]:
             stripped = line.strip()
@@ -161,13 +161,30 @@ class CodexInteractiveListener(BaseInteractiveListener):
         payload = "\n".join(parts).strip()
         return payload or None
 
+    def wait_for_stable_composer_input(
+        self, *, session: str, pane_id: str, log_path: Path,
+        initial_screen: str | None = None,
+        screen_reader: object | None = None,
+    ) -> bool:
+        """Allow automation only when Codex's composer is currently empty.
+
+        Codex keeps user drafts in a persistent composer; waiting for a stable
+        draft would still overwrite it.  Automatic task/control/result paths
+        therefore require an idle prompt with no composer text.
+        """
+        read_screen = screen_reader or zellij_dump_screen
+        screen = initial_screen
+        if screen is None:
+            screen = read_screen(
+                session=session, pane_id=pane_id, log_path=log_path,
+            )
+        return bool(screen and self.pane_is_idle(screen) and not self.composer_input_text(screen))
+
     # ── Override on_claim_pre_check: check last 5 lines, not just last line ──
-    # Codex TUI layout puts the "›" prompt 2-3 lines above the bottom status
-    # bar (model name, workspace path).  The base class only checks the very
-    # last non-empty line, which is the status bar and never contains "›",
-    # so the pane is never deemed ready. We check the live viewport and, when
-    # the persistent composer contains text, require three unchanged 10-second
-    # intervals. Content changes reset the count.
+    # Codex TUI layout puts the "›" prompt above the bottom status bar (model
+    # name, workspace path).  The base class only checks the very last
+    # non-empty line, so use the live viewport and refuse to overwrite any
+    # persistent composer draft.
     def on_claim_pre_check(self, args: argparse.Namespace, log_path: Path) -> bool:
         if not self.idle_markers:
             return True
@@ -188,13 +205,10 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 f"last={last_line[:60]})"
             ))
             return False
-        return self.wait_for_stable_composer_input(
-            session=session,
-            pane_id=str(pane_id),
-            log_path=log_path,
-            initial_screen=screen,
-            screen_reader=zellij_dump_screen,
-        )
+        if self.composer_input_text(screen):
+            log_line(log_path, "on_claim_pre_check: not ready (composer has draft text)")
+            return False
+        return True
 
     def on_claim_post_confirm(
         self, args: argparse.Namespace, log_path: Path,
@@ -204,12 +218,15 @@ class CodexInteractiveListener(BaseInteractiveListener):
         pane_id = str(getattr(args, "zellij_pane_id", ""))
         if not session or not pane_id:
             return False
-        return self.wait_for_stable_composer_input(
-            session=session,
-            pane_id=pane_id,
-            log_path=log_path,
-            screen_reader=zellij_dump_screen,
+        screen = zellij_dump_screen(
+            session=session, pane_id=pane_id, log_path=log_path,
         )
+        if not screen or not self.pane_is_idle(screen):
+            return False
+        if self.composer_input_text(screen):
+            log_line(log_path, "on_claim_post_confirm: composer has draft text")
+            return False
+        return True
 
     # ── Post-inject: retry Enter if prompt stays in composer ──
     _POST_INJECT_CONFIRM_S = 1.5
@@ -218,59 +235,83 @@ class CodexInteractiveListener(BaseInteractiveListener):
     def on_post_inject(
         self, args: argparse.Namespace, *,
         zellij_session: str, zellij_pane_id: str, log_path: Path,
-    ) -> None:
-        """Submit a Codex prompt that remained queued after the first Enter.
+        injected_marker: str | None = None,
+        pre_write_composer: str | None = None,
+        correlation: str | None = None,
+    ) -> str:
+        """Confirm that the injected prompt left Codex's current composer.
 
-        Codex TUI sometimes does not submit on the first CR (raw byte 13).
-        Retry up to _POST_INJECT_MAX_RETRIES times, checking the screen each
-        time for the queued prompt.  Stop as soon as the prompt is gone (sent)
-        or a busy marker appears (agent started processing).
+        Only the live composer is inspected.  A marker must first be observed
+        there, then disappear (or transition to a live busy state) before
+        returning ``confirmed``.  A marker that remains queued after bounded
+        retries is ``known_unsubmitted``; missing/unsupported screens are
+        ``unknown``.
         """
-        import time as _t
-        import subprocess as _sp
-        cmd_base = (
-            ["zellij", "--session", zellij_session, "action"]
-            if zellij_session
-            else ["zellij", "action"]
+        del args, pre_write_composer
+        marker = str(injected_marker or "").strip()
+        if not marker:
+            return "unknown"
+        saw_marker = False
+        submit_correlation = correlation or (
+            f"task:{getattr(self, '_active_task_id', '')}"
+            if getattr(self, "_active_task_id", None)
+            else (
+                f"control:{getattr(self, '_active_control_id', '')}"
+                if getattr(self, "_active_control_id", None) is not None
+                else "result:"
+            )
         )
+
+        def _marker_present(composer: str | None) -> bool:
+            if not composer:
+                return False
+            compact = " ".join(composer.split())
+            target = " ".join(marker.split())
+            return target in compact
+
+        def _busy(screen: str) -> bool:
+            live_lines = _tail_nonempty_lines(screen, limit=5)
+            for index, line in enumerate(live_lines):
+                lowered = line.lower()
+                if not any(item.lower() in lowered for item in self.busy_markers):
+                    continue
+                # A busy-looking transcript row above the current composer is
+                # stale output, not a live transition.
+                if any(re.match(r"^\s*›(?:\s|$)", tail)
+                       for tail in live_lines[index + 1 :]):
+                    continue
+                return True
+            return False
+
         for attempt in range(1, self._POST_INJECT_MAX_RETRIES + 1):
-            _t.sleep(self._POST_INJECT_CONFIRM_S)
+            time.sleep(self._POST_INJECT_CONFIRM_S)
             screen = zellij_dump_screen(
                 session=zellij_session,
                 pane_id=zellij_pane_id,
                 log_path=log_path,
             )
             if not screen:
-                return
-            tail = _tail_nonempty_lines(screen, limit=20)
-            tail_lower = "\n".join(tail).lower()
-            # Check if any busy marker appeared (agent started)
-            if any(m.lower() in tail_lower for m in self.busy_markers):
-                return
-            # Check if the injected prompt is still visible (unsent)
-            has_queued = any(
-                "请读取" in line and "kanban" in line.lower()
-                for line in tail
-            )
-            if not has_queued:
-                if attempt > 1:
-                    log_line(
-                        log_path,
-                        f"codex post-inject: queued prompt cleared after {attempt} Enter(s)",
-                    )
-                return
-            # Prompt still queued — send another Enter
-            zellij_submit_enter(
-                session=zellij_session,
-                pane_id=zellij_pane_id,
-                expected_pane_prefix=self.expected_pane_prefix(),
-                correlation=f"task:{getattr(self, '_active_task_id', '')}",
-                log_path=log_path,
-            )
-            log_line(
-                log_path,
-                f"codex post-inject: queued Kanban prompt remained; sent raw Enter (attempt {attempt}/{self._POST_INJECT_MAX_RETRIES})",
-            )
+                return "unknown"
+            composer = self.composer_input_text(screen)
+            if _busy(screen):
+                return "confirmed"
+            if _marker_present(composer):
+                saw_marker = True
+                zellij_submit_enter(
+                    session=zellij_session,
+                    pane_id=zellij_pane_id,
+                    expected_pane_prefix=self.expected_pane_prefix(),
+                    correlation=submit_correlation,
+                    log_path=log_path,
+                )
+                log_line(log_path, f"codex post-inject: queued prompt remained; sent Enter (attempt {attempt}/{self._POST_INJECT_MAX_RETRIES})")
+                continue
+            if saw_marker:
+                return "confirmed"
+            # Non-empty unrelated composer or a screen without a supported
+            # composer is inconclusive; never scan transcript tail for marker.
+            return "unknown"
+        return "known_unsubmitted" if saw_marker else "unknown"
 
 
 # ── Entry point ──

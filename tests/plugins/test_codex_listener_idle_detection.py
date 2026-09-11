@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,67 +13,186 @@ def _args() -> argparse.Namespace:
     return argparse.Namespace(zellij_session="kanban-test", zellij_pane_id="2")
 
 
-def test_codex_post_inject_retries_raw_enter_while_prompt_is_queued(
+def test_codex_requires_semantic_delivery_acknowledgement() -> None:
+    listener = codex.CodexInteractiveListener()
+    assert listener.semantic_delivery_required is True
+
+
+def test_codex_idle_detection_accepts_bare_prompt_and_role_status_forms() -> None:
+    listener = codex.CodexInteractiveListener()
+
+    assert listener.pane_is_idle("›\n")
+    assert listener.pane_is_idle("› reviewer · Context 20% used\n")
+    assert listener.pane_is_idle("›\n  reviewer · Context 20% used\n")
+
+
+def test_codex_composer_parser_preserves_marker_before_inline_status() -> None:
+    listener = codex.CodexInteractiveListener()
+
+    assert listener.composer_input_text(
+        "› marker text  gpt-5.6-sol high · Context 20% used\n",
+    ) == "marker text"
+    assert listener.composer_input_text(
+        "› reviewer · Context 20% used\n",
+    ) is None
+
+
+def test_codex_claim_precheck_rejects_nonempty_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:
     listener = codex.CodexInteractiveListener()
-    commands: list[list[str]] = []
-    screen = "› 请读取 /tmp/task.md 中的 Kanban 任务并执行。\n"
+    draft_screen = "› existing draft\n  gpt-5.6-sol · Context 20% used\n"
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: draft_screen)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert not listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+    assert sleeps == []
+
+
+def test_codex_post_inject_confirms_marker_transition_via_current_composer(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    marker = "请读取 task.md 中的 Kanban 任务并执行。 [任务 t1: title]"
+    screens = iter([
+        f"› {marker}\n  reviewer · Context 20% used\n",
+        "›\n  reviewer · Context 20% used\n",
+    ])
+    enters: list[dict] = []
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: next(screens))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **kwargs: enters.append(kwargs) or True)
+
+    state = listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log", injected_marker=marker,
+        pre_write_composer=None,
+    )
+
+    assert state == "confirmed"
+    assert len(enters) == 1
+    assert enters[0]["expected_pane_prefix"] == "codex-kanban"
+    assert enters[0]["correlation"].split(":", 1)[0] in {"task", "control", "result"}
+
+
+def test_codex_post_inject_ignores_marker_in_transcript_tail(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    marker = "请读取 task.md 中的 Kanban 任务并执行。 [任务 t1: title]"
+    screen = f"previous output {marker}\n› unrelated draft\n  reviewer · Context 20% used\n"
+    enters: list[dict] = []
     monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: screen)
     monkeypatch.setattr(time, "sleep", lambda _: None)
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **_: (
-            commands.append(command)
-            or subprocess.CompletedProcess(
-                command, 0,
-                stdout='[{"pane_id":"2","title":"codex-kanban","is_plugin":false,"exited":false,"terminal_command":"codex"}]',
-                stderr="",
-            )
-        ),
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **kwargs: enters.append(kwargs) or True)
+
+    state = listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log", injected_marker=marker,
+        pre_write_composer=None,
     )
 
-    listener.on_post_inject(
-        _args(),
-        zellij_session="kanban-test",
-        zellij_pane_id="2",
-        log_path=tmp_path / "listener.log",
-    )
-
-    expected = [
-        "zellij", "--session", "kanban-test", "action",
-        "write", "-p", "2", "13",
-    ]
-    writes = [command for command in commands if "write" in command and "--json" not in command]
-    assert writes == [expected] * listener._POST_INJECT_MAX_RETRIES
+    assert state == "unknown"
+    assert enters == []
 
 
-def test_codex_post_inject_stops_when_agent_is_busy(
+def test_codex_post_inject_returns_known_unsubmitted_after_bounded_retries(
     tmp_path: Path, monkeypatch,
 ) -> None:
     listener = codex.CodexInteractiveListener()
-    commands: list[list[str]] = []
-    monkeypatch.setattr(
-        codex,
-        "zellij_dump_screen",
-        lambda **_: "› 请读取 task 中的 Kanban 任务\n• Working (1s)\n",
-    )
+    marker = "kanban_task_boundary [任务 control-3]"
+    screen = f"› {marker}\n  reviewer · Context 20% used\n"
+    enters: list[dict] = []
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: screen)
     monkeypatch.setattr(time, "sleep", lambda _: None)
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda command, **_: commands.append(command),
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **kwargs: enters.append(kwargs) or True)
+
+    state = listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log", injected_marker=marker,
+        pre_write_composer=None,
     )
 
-    listener.on_post_inject(
-        _args(),
-        zellij_session="kanban-test",
-        zellij_pane_id="2",
-        log_path=tmp_path / "listener.log",
+    assert state == "known_unsubmitted"
+    assert len(enters) == listener._POST_INJECT_MAX_RETRIES
+
+
+def test_codex_post_inject_returns_confirmed_on_live_busy_transition(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    marker = "kanban_task_boundary [任务 result-7]"
+    screens = iter([
+        f"› {marker}\n  reviewer · Context 20% used\n",
+        "• Working (1s)\n",
+    ])
+    enters: list[dict] = []
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: next(screens))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **kwargs: enters.append(kwargs) or True)
+
+    state = listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log", injected_marker=marker,
+        pre_write_composer=None,
     )
 
-    assert commands == []
+    assert state == "confirmed"
+    assert len(enters) == 1
+
+
+def test_codex_post_inject_confirms_when_busy_is_first_observation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: "• Working (1s)\n")
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **_: True)
+
+    assert listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log", injected_marker="marker",
+        pre_write_composer=None,
+    ) == "confirmed"
+
+
+def test_codex_post_inject_ignores_stale_busy_line_above_current_composer(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    marker = "kanban_task_boundary [任务 t1]"
+    screen = (
+        "• Working (stale transcript)\n"
+        f"› {marker}\n"
+        "  reviewer · Context 20% used\n"
+    )
+    enters: list[dict] = []
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: screen)
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **kwargs: enters.append(kwargs) or True)
+
+    assert listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log", injected_marker=marker,
+        pre_write_composer=None,
+    ) == "known_unsubmitted"
+    assert len(enters) == listener._POST_INJECT_MAX_RETRIES
+
+
+def test_codex_post_inject_returns_unknown_for_empty_or_unsupported_screen(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    for screen in ("", "  status only\n"):
+        monkeypatch.setattr(codex, "zellij_dump_screen", lambda screen=screen, **_: screen)
+        monkeypatch.setattr(codex, "zellij_submit_enter", lambda **_: True)
+        assert listener.on_post_inject(
+            _args(), zellij_session="kanban-test", zellij_pane_id="2",
+            log_path=tmp_path / "listener.log", injected_marker="marker",
+            pre_write_composer=None,
+        ) == "unknown"
 
 
 def test_codex_claim_precheck_rejects_working_view_with_idle_composer(
@@ -85,7 +203,7 @@ def test_codex_claim_precheck_rejects_working_view_with_idle_composer(
     working_screen = """\
 • Working (3s • esc to interrupt) · 1 background terminal running
 
-› Run /review on my current changes
+›
 
   gpt-5.6-sol high · master · Context 64% used
 """
@@ -95,7 +213,7 @@ def test_codex_claim_precheck_rejects_working_view_with_idle_composer(
     assert not listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
 
 
-def test_codex_claim_precheck_accepts_idle_composer(
+def test_codex_claim_precheck_rejects_nonempty_idle_composer(
     tmp_path: Path, monkeypatch,
 ) -> None:
     listener = codex.CodexInteractiveListener()
@@ -110,11 +228,11 @@ def test_codex_claim_precheck_accepts_idle_composer(
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
-    assert sleeps == [10.0, 10.0, 10.0]
+    assert not listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+    assert sleeps == []
 
 
-def test_codex_claim_precheck_resets_stability_when_composer_changes(
+def test_codex_claim_precheck_rejects_changing_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:
     listener = codex.CodexInteractiveListener()
@@ -141,8 +259,8 @@ def test_codex_claim_precheck_resets_stability_when_composer_changes(
     monkeypatch.setattr(codex, "zellij_dump_screen", lambda **_: next(screens))
     monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
-    assert sleeps == [10.0, 10.0, 10.0, 10.0]
+    assert not listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+    assert sleeps == []
 
 
 def test_codex_claim_precheck_accepts_empty_composer_without_stability_delay(
@@ -171,7 +289,7 @@ def test_codex_claim_precheck_ignores_stale_busy_words_in_completed_output(
 • The previous goal remains running in its working directory.
 ─ Worked for 6m 35s ─
 
-› Run /review on my current changes
+›
 
   gpt-5.6-sol high · master · Context 22% used
 """
