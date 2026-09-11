@@ -233,6 +233,11 @@ def test_claim_path_emits_manifest_and_exposes_control_sha_in_prompt(
 
     monkeypatch.setattr(listener, "on_claim_pre_check", lambda args, log_path: True)
     monkeypatch.setattr(listener, "on_claim_post_confirm", lambda args, log_path: True)
+    # Codex requires an explicit post-injection semantic acknowledgement;
+    # this fixture stubs transport, so provide the contract result directly.
+    monkeypatch.setattr(
+        listener, "on_post_inject", lambda *args, **kwargs: "confirmed",
+    )
 
     def render_context(**kwargs):
         rendered_calls.append(kwargs)
