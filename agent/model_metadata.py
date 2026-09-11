@@ -466,6 +466,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4.1-flash": 1_000_000,  # 2026-09-10 release; longest-first match beats the "deepseek" 128K fallback
     "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000,
     "deepseek": 128000,
