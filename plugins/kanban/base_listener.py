@@ -30,6 +30,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -437,6 +438,36 @@ def _zellij_pane_title_matches(title: str, expected_prefix: str) -> bool:
     return title[len(prefix)] == "[" or title[len(prefix)].isspace()
 
 
+_ZELLIJ_BACKEND_TOKENS = {
+    "codex", "hermes", "claude", "codewhale", "deepseek", "reasonix",
+}
+_ZELLIJ_BACKEND_SUFFIXES = (
+    "-tui", "-interactive", "-kanban", "-continue", "-reasonix", "-deepseek",
+)
+
+
+def _zellij_command_backend_tokens(command: str) -> set[str]:
+    """Extract backend identity from command names, ignoring path/env noise."""
+    observed: set[str] = set()
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    for word in words:
+        if "=" in word and not word.startswith("/"):
+            # Environment assignments such as HERMES_KANBAN_BOARD=... and
+            # CODEX_HOME=... are not executable identity.
+            continue
+        candidate = Path(word).name.casefold() if "/" in word else word.casefold()
+        candidate = re.sub(r"[^a-z0-9_-]", "", candidate)
+        for backend in _ZELLIJ_BACKEND_TOKENS:
+            if candidate == backend or candidate.startswith(
+                f"{backend}-"
+            ) and candidate.endswith(_ZELLIJ_BACKEND_SUFFIXES):
+                observed.add(backend)
+    return observed
+
+
 def _zellij_validate_pane(
     *, session: str, pane_id: str, expected_pane_prefix: str | None,
     log_path: Path,
@@ -481,13 +512,11 @@ def _zellij_validate_pane(
                         backend = "deepseek"
                     if role == "implementer" and "reasonix" in prefix_tokens:
                         backend = "reasonix"
-                    known_roles = {"codex", "hermes", "claude", "codewhale", "deepseek", "reasonix"}
-                    tokens = set(re.findall(r"[a-z0-9_-]+", command))
-                    foreign = (tokens & known_roles) - {role, backend}
                     backend_tokens = {backend}
                     if backend == "deepseek":
                         backend_tokens.add("codewhale")
-                    if foreign or not (backend_tokens & tokens):
+                    command_backends = _zellij_command_backend_tokens(command)
+                    if not (backend_tokens & command_backends):
                         continue
             return True
         log_line(log_path, f"event=transport_rejected pane={pane_id!r} prefix={expected_pane_prefix!r}")

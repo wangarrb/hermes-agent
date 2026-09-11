@@ -41,6 +41,34 @@ def test_validator_accepts_real_zellij_id_field(tmp_path, monkeypatch):
     assert calls == [["zellij", "--session", "s", "action", "list-panes", "--all", "--json"]]
 
 
+def test_validator_ignores_repository_path_tokens_in_codex_command(
+    tmp_path, monkeypatch,
+):
+    calls = []
+    panes = [{
+        "id": 2,
+        "title": "codex-kanban",
+        "is_plugin": False,
+        "exited": False,
+        "terminal_command": (
+            "bash -lc cd /home/wyr/.hermes/hermes-agent-repo && "
+            "CODEX_HOME=/home/wyr/.codex-kanban/reviewer "
+            "/home/wyr/.local/bin/codex-kanban-interactive "
+            "--profile reviewer --board seqscale"
+        ),
+    }]
+    monkeypatch.setattr(
+        bl.subprocess,
+        "run",
+        lambda *a, **kw: _run_stub(panes=panes, calls=calls, args=a[0], **kw),
+    )
+
+    assert bl._zellij_validate_pane(
+        session="s", pane_id="2", expected_pane_prefix="codex-kanban",
+        log_path=tmp_path / "inject.log",
+    )
+
+
 @pytest.mark.parametrize(
     ("title", "expected"),
     [
