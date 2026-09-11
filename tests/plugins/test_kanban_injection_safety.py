@@ -22,3 +22,16 @@ def test_injection_provenance_rejects_invalid_profile_names() -> None:
         assert "source_profile" in str(exc)
     else:
         raise AssertionError("invalid injection source profile must be rejected")
+
+
+def test_task_title_rejects_multiline_and_control_bytes() -> None:
+    for title in ("line one\nline two", "line one\rline two", "bad\x00title", "bad\ttitle"):
+        try:
+            bl.build_interactive_prompt(
+                agent_name="Codex", board="default", profile="planner",
+                task_id="t_test", task_assignee="planner", task_title=title,
+                context="context", workspace=None,  # type: ignore[arg-type]
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"unsafe title was accepted: {title!r}")

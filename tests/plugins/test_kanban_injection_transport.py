@@ -69,6 +69,18 @@ def test_transport_rejects_control_bytes_before_subprocess(tmp_path, monkeypatch
     )
 
 
+def test_reasonix_multiline_boundary_is_the_only_lf_exception(tmp_path, monkeypatch):
+    monkeypatch.setattr(bl.subprocess, "run", lambda *_a, **_kw: pytest.fail("must not run"))
+    assert not bl.zellij_inject(
+        session="s", pane_id="7", text="ordinary\ntext",
+        expected_pane_prefix="implementer-reasonix", log_path=tmp_path / "inject.log",
+    )
+    assert not bl.zellij_inject(
+        session="s", pane_id="7", text="KANBAN_TASK_BOUNDARY\ntext\rmore",
+        expected_pane_prefix="implementer-reasonix", log_path=tmp_path / "inject.log",
+    )
+
+
 def test_text_then_single_raw_submit_sequence(tmp_path, monkeypatch):
     calls = []
     panes = [{"pane_id": "7", "title": "claude-kanban", "is_plugin": False, "exited": False}]

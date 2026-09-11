@@ -287,6 +287,7 @@ def build_interactive_prompt(
     run_id: int | None = None, generation: int = 1,
 ) -> str:
     """Build the full task prompt (written to a file, not injected directly)."""
+    task_title = sanitize_single_line(task_title, field="task_title")
     assist_note = ""
     if task_assignee != profile:
         assist_note = f"（注意：当前 profile={profile}，但本任务 assignee={task_assignee}，按 {task_assignee} 职责执行）"
@@ -326,6 +327,54 @@ def prompt_dir(workspace: Path, board: str, pane_profile: str, *, agent_slug: st
     return workspace / f".{agent_slug}-kanban" / safe_board / safe_profile
 
 
+def sanitize_single_line(value: str, *, field: str = "text") -> str:
+    """Validate untrusted text before it crosses a terminal input boundary.
+
+    Task titles and injected instructions must remain one physical line.  C0
+    bytes (including LF/CR and tabs) and DEL are rejected rather than silently
+    rewritten, so callers cannot accidentally alter the task's meaning.
+    """
+    text = str(value)
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+        raise ValueError(f"{field} must be a single line without control bytes")
+    return text
+
+
+def task_prompt_path(
+    workspace: Path, board: str, profile: str, agent_slug: str, task_id: str,
+    *, run_id: int | None = None, generation: int = 1,
+) -> Path:
+    """Return the durable path for one task prompt generation.
+
+    ``task-<id>.md`` is retained as the legacy path when no run identity is
+    available.  Claimed runs always include both run id and generation, which
+    prevents a later run from overwriting an earlier prompt.
+    """
+    directory = prompt_dir(workspace, board, profile, agent_slug=agent_slug)
+    if run_id is None:
+        return directory / f"task-{task_id}.md"
+    return directory / f"task-{task_id}-run-{int(run_id)}-generation-{int(generation)}.md"
+
+
+def resolve_task_prompt_path(
+    workspace: Path, board: str, profile: str, agent_slug: str, task_id: str,
+    *, run_id: int | None = None, generation: int = 1,
+) -> Path:
+    """Resolve a generated prompt, falling back to the legacy path for migration."""
+    generated = task_prompt_path(
+        workspace, board, profile, agent_slug, task_id,
+        run_id=run_id, generation=generation,
+    )
+    if run_id is not None and generated.exists():
+        return generated
+    legacy = task_prompt_path(
+        workspace, board, profile, agent_slug, task_id,
+    )
+    if legacy.exists():
+        return legacy
+    return generated
+
+
 def write_task_prompt(
     *, agent_name: str, agent_slug: str, board: str, profile: str,
     task_id: str, task_assignee: str, task_title: str, context: str,
@@ -333,7 +382,10 @@ def write_task_prompt(
 ) -> Path:
     d = prompt_dir(workspace, board, profile, agent_slug=agent_slug)
     d.mkdir(parents=True, exist_ok=True)
-    p = d / f"task-{task_id}.md"
+    p = task_prompt_path(
+        workspace, board, profile, agent_slug, task_id,
+        run_id=run_id, generation=generation,
+    )
     p.write_text(
         build_interactive_prompt(
             agent_name=agent_name, board=board, profile=profile,
@@ -453,8 +505,16 @@ def zellij_write_text(
     expected_pane_prefix: str | None = None, correlation: str | None = None,
 ) -> bool:
     """Write one text payload to a Zellij pane; submission is separate."""
-    allow_lf = str(expected_pane_prefix or "").casefold().endswith("-reasonix")
-    if any((ord(ch) < 0x20 and not (allow_lf and ch == "\n")) or ord(ch) == 0x7F for ch in str(text)):
+    payload = str(text)
+    is_reasonix_boundary = (
+        str(expected_pane_prefix or "").casefold().endswith("-reasonix")
+        and payload.startswith("KANBAN_TASK_BOUNDARY\n")
+    )
+    if any(
+        (ord(ch) < 0x20 and not (is_reasonix_boundary and ch == "\n"))
+        or ord(ch) == 0x7F
+        for ch in payload
+    ):
         log_line(log_path, f"event=transport_rejected pane={pane_id!r} prefix={expected_pane_prefix!r} correlation={correlation!r} reason=control_byte")
         return False
     if not _zellij_validate_pane(
@@ -1710,10 +1770,26 @@ class BaseInteractiveListener:
         )
 
     def _mark_prompt_superseded(self, control: kb.ControlMessage) -> Path:
-        path = prompt_dir(
+        path = resolve_task_prompt_path(
             self._workspace, self._board, self._profile,
-            agent_slug=self.agent_slug,
-        ) / f"task-{control.task_id}.md"
+            self.agent_slug, control.task_id,
+            run_id=control.run_id, generation=control.generation,
+        )
+        # A control can arrive after a watcher restart, before the new
+        # generation prompt has been written.  Keep the legacy artifact usable
+        # for migration (and for operators inspecting an older run) instead of
+        # manufacturing a marker-only generated file.
+        generated_path = task_prompt_path(
+            self._workspace, self._board, self._profile,
+            self.agent_slug, control.task_id,
+            run_id=control.run_id, generation=control.generation,
+        )
+        legacy_path = task_prompt_path(
+            self._workspace, self._board, self._profile,
+            self.agent_slug, control.task_id,
+        )
+        if path == generated_path and not generated_path.exists() and not legacy_path.exists():
+            path = legacy_path
         path.parent.mkdir(parents=True, exist_ok=True)
         marker = (
             f"\n\nSUPERSEDED by control {control.id}: run {control.run_id}, "
