@@ -980,14 +980,110 @@ class BaseInteractiveListener:
     def on_post_inject(
         self, args: argparse.Namespace, *,
         zellij_session: str, zellij_pane_id: str, log_path: Path,
-    ) -> None:
+        injected_marker: str | None = None,
+        pre_write_composer: str | None = None,
+    ) -> str | None:
         """Hook called after zellij_inject succeeds.
 
         Subclasses can override to perform extra actions after injection,
         e.g. sending an additional Enter for TUIs that queue input.
         Default: no-op.
         """
-        pass
+        # The base transport performs a synchronous write + Enter and treats
+        # that as its explicit acknowledgement. Backend overrides that need
+        # stronger screen-level evidence return another tri-state value.
+        return "confirmed"
+
+    def _post_injection_contract(
+        self, args: argparse.Namespace, *,
+        zellij_session: str, zellij_pane_id: str, log_path: Path,
+        injected_marker: str, pre_write_composer: str | None,
+        correlation: str,
+    ) -> str:
+        """Return the post-write delivery state.
+
+        A delivery is acknowledged only by an explicit ``confirmed`` result.
+        Legacy hooks are still called (without the new keyword arguments when
+        necessary), but an absent/invalid result is treated as unknown and the
+        caller must reclaim/release its lease.
+        """
+        try:
+            result = self.on_post_inject(
+                args,
+                zellij_session=zellij_session,
+                zellij_pane_id=zellij_pane_id,
+                log_path=log_path,
+                injected_marker=injected_marker,
+                pre_write_composer=pre_write_composer,
+            )
+        except TypeError as exc:
+            # Existing backend listeners may not yet accept the expanded
+            # contract.  Calling the old shape preserves their retry behavior,
+            # while their implicit ``None`` remains non-confirming.
+            if "injected_marker" not in str(exc) and "pre_write_composer" not in str(exc):
+                log_line(log_path, f"event=delivery_unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
+                return "unknown"
+            try:
+                result = self.on_post_inject(
+                    args,
+                    zellij_session=zellij_session,
+                    zellij_pane_id=zellij_pane_id,
+                    log_path=log_path,
+                )
+            except Exception as retry_exc:
+                log_line(log_path, f"event=delivery_unknown correlation={correlation!r} hook_error={type(retry_exc).__name__}: {retry_exc}")
+                return "unknown"
+        except Exception as exc:
+            log_line(log_path, f"event=delivery_unknown correlation={correlation!r} hook_error={type(exc).__name__}: {exc}")
+            return "unknown"
+
+        state = str(result or "").strip().lower()
+        if state in {"confirmed", "known_unsubmitted", "unknown"}:
+            return state
+
+        # A hook that predates the tri-state API can still be classified from
+        # the pane when possible.  Failure to observe a decisive boundary is
+        # deliberately fail-closed as ``unknown``.
+        try:
+            screen = self.read_pane_screen(
+                session=zellij_session, pane_id=zellij_pane_id,
+                log_path=log_path,
+            )
+            if not screen or not screen.strip():
+                return "unknown"
+            if injected_marker and injected_marker in screen:
+                return "known_unsubmitted"
+            tail = "\n".join(_tail_nonempty_lines(screen, limit=20)).lower()
+            if any(marker.lower() in tail for marker in self.busy_markers):
+                return "confirmed"
+            # The marker was written but is no longer present at the prompt;
+            # this is the positive screen-level acknowledgement for legacy
+            # hooks that return ``None``.
+            if injected_marker:
+                return "confirmed"
+            observed = self.composer_input_text(screen)
+            if pre_write_composer is not None and observed != pre_write_composer:
+                return "confirmed"
+        except Exception:
+            return "unknown"
+        return "unknown"
+
+    @staticmethod
+    def _delivery_marker(text: str, correlation: str) -> str:
+        """Return the visible payload marker passed to post-injection observers."""
+        del correlation  # correlation is carried separately in logs/transport
+        return str(text)
+
+    def _pre_write_composer(
+        self, *, session: str, pane_id: str, log_path: Path,
+    ) -> str | None:
+        try:
+            screen = self.read_pane_screen(
+                session=session, pane_id=pane_id, log_path=log_path,
+            )
+            return self.composer_input_text(screen) if screen else None
+        except Exception:
+            return None
 
     def on_task_running_monitor(
         self, args: argparse.Namespace, conn: Any,
@@ -1694,11 +1790,16 @@ class BaseInteractiveListener:
         prompt = tag_injected_text(
             self._control_prompt(leased), source_profile="watcher",
         )
+        correlation = f"control:{leased.id}"
+        pre_write_composer = self._pre_write_composer(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
         ok = zellij_inject(
             session=session,
             pane_id=pane_id,
             text=prompt,
             expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=correlation,
             log_path=log_path,
         )
         if not ok:
@@ -1707,10 +1808,28 @@ class BaseInteractiveListener:
             return True
         if not zellij_submit(
             session=session, pane_id=pane_id,
-            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+            expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=correlation, log_path=log_path,
         ):
             kb.release_control_lease(conn, leased.id, receiver=receiver)
             log_line(log_path, f"control submit failed; released {leased.id}")
+            return True
+
+        state = self._post_injection_contract(
+            args,
+            zellij_session=session,
+            zellij_pane_id=pane_id,
+            log_path=log_path,
+            injected_marker=self._delivery_marker(prompt, correlation),
+            pre_write_composer=pre_write_composer,
+            correlation=correlation,
+        )
+        if state != "confirmed":
+            released = kb.release_control_lease(conn, leased.id, receiver=receiver)
+            event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
+            log_line(log_path, f"event={event} correlation={correlation!r} released={released}")
+            if not released:
+                log_line(log_path, f"event=delivery_reclaim_race correlation={correlation!r}")
             return True
 
         if not kb.mark_control_delivered(conn, leased.id, receiver=receiver):
@@ -1793,11 +1912,16 @@ class BaseInteractiveListener:
             source_profile="watcher",
         )
         queue_ids = [item.id for item in items]
+        correlation = "result:" + ",".join(str(queue_id) for queue_id in queue_ids)
+        pre_write_composer = self._pre_write_composer(
+            session=session, pane_id=pane_id, log_path=log_path,
+        )
         ok = zellij_inject(
             session=session,
             pane_id=pane_id,
             text=prompt,
             expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=correlation,
             log_path=log_path,
         )
         if not ok:
@@ -1808,12 +1932,31 @@ class BaseInteractiveListener:
             return True
         if not zellij_submit(
             session=session, pane_id=pane_id,
-            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+            expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=correlation, log_path=log_path,
         ):
             kb.release_result_notification_lease(
                 conn, queue_ids, lease_owner=receiver,
             )
             log_line(log_path, f"result submit failed; released {queue_ids}")
+            return True
+        state = self._post_injection_contract(
+            args,
+            zellij_session=session,
+            zellij_pane_id=pane_id,
+            log_path=log_path,
+            injected_marker=self._delivery_marker(prompt, correlation),
+            pre_write_composer=pre_write_composer,
+            correlation=correlation,
+        )
+        if state != "confirmed":
+            released = kb.release_result_notification_lease(
+                conn, queue_ids, lease_owner=receiver,
+            )
+            event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
+            log_line(log_path, f"event={event} correlation={correlation!r} released={released}")
+            if not released:
+                log_line(log_path, f"event=delivery_reclaim_race correlation={correlation!r}")
             return True
         if not kb.mark_result_notifications_delivered(
             conn, queue_ids, lease_owner=receiver,
@@ -2070,10 +2213,16 @@ class BaseInteractiveListener:
 
         zellij_session = getattr(args, "zellij_session", "")
         zellij_pane_id = getattr(args, "zellij_pane_id", "")
+        correlation = f"task:{claimed.id}:run:{claim_run_id}:generation:{claim_generation}"
+        pre_write_composer = self._pre_write_composer(
+            session=str(zellij_session), pane_id=str(zellij_pane_id),
+            log_path=log_path,
+        )
 
         ok = zellij_inject(
             session=zellij_session, pane_id=str(zellij_pane_id),
             text=inject_str, expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=correlation,
             log_path=log_path,
         )
         if not ok:
@@ -2090,7 +2239,8 @@ class BaseInteractiveListener:
 
         if not zellij_submit(
             session=zellij_session, pane_id=str(zellij_pane_id),
-            expected_pane_prefix=self.expected_pane_prefix(), log_path=log_path,
+            expected_pane_prefix=self.expected_pane_prefix(),
+            correlation=correlation, log_path=log_path,
         ):
             try:
                 _reclaim_task_without_signaling_worker(
@@ -2104,7 +2254,32 @@ class BaseInteractiveListener:
             return None, None
 
         # Hook: subclass post-inject actions (e.g. extra Enter for queued-input TUIs)
-        self.on_post_inject(args, zellij_session=zellij_session, zellij_pane_id=str(zellij_pane_id), log_path=log_path)
+        state = self._post_injection_contract(
+            args,
+            zellij_session=str(zellij_session),
+            zellij_pane_id=str(zellij_pane_id),
+            log_path=log_path,
+            injected_marker=self._delivery_marker(inject_str, correlation),
+            pre_write_composer=pre_write_composer,
+            correlation=correlation,
+        )
+        if state != "confirmed":
+            reclaimed = _reclaim_task_without_signaling_worker(
+                conn, claimed.id,
+                reason=(
+                    f"{self.agent_slug}-interactive delivery {state} after injection"
+                ),
+                **claim_fence,
+            )
+            event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
+            log_line(
+                log_path,
+                f"event={event} correlation={correlation!r} task={claimed.id} reclaimed={reclaimed}",
+            )
+            if not reclaimed:
+                log_line(log_path, f"event=delivery_reclaim_race correlation={correlation!r} task={claimed.id}")
+            self._clear_active_claim_identity()
+            return None, None
 
         # Post-inject DB ops
         try:
