@@ -542,7 +542,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
         def marker_present(composer: str | None) -> bool:
             if composer is None:
                 return False
-            return " ".join(marker.split()) in " ".join(composer.split())
+            return re.sub(r"\s+", "", marker) in re.sub(r"\s+", "", composer)
 
         def live_busy(screen: str) -> bool:
             lines = _tail_nonempty_lines(screen, limit=5)
@@ -593,7 +593,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
             # result marker in the transcript plus an explicitly empty current
             # composer proves the input was submitted; do not replay it as an
             # unsent prompt merely because the model returned an error.
-            if composer == "" and " ".join(marker.split()) in " ".join(screen.split()):
+            if composer == "" and re.sub(r"\s+", "", marker) in re.sub(r"\s+", "", screen):
                 return "confirmed"
             if saw_marker:
                 return "confirmed"

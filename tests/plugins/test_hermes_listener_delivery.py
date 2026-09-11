@@ -167,6 +167,38 @@ def test_hermes_post_inject_confirms_consumed_marker_before_api_error(
     ) == "confirmed"
 
 
+def test_hermes_post_inject_confirms_wrapped_consumed_marker(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Terminal line wrapping must not turn a consumed prompt into a retry."""
+    listener = hermes.HermesInteractiveListener()
+    marker = "请读取 task-run.md 中的 Kanban 任务并执行。 [任务 t1: title] [by watcher]"
+    wrapped_screen = (
+        "● 请读取 task-\n"
+        "run.md 中的 Kanban 任务并执行。 [任务 t1: title] [by watcher]\n"
+        "⚠ API call failed (attempt 1/3): HTTP 400\n"
+        "planner ❯\n"
+        "────────────────────────\n"
+    )
+    monkeypatch.setattr(hermes, "zellij_dump_screen", lambda **_: wrapped_screen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        hermes,
+        "zellij_submit_enter",
+        lambda **_: pytest.fail("wrapped consumed marker must not be resubmitted"),
+    )
+
+    assert listener.on_post_inject(
+        _args(),
+        zellij_session="kanban-test",
+        zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker=marker,
+        pre_write_composer="",
+        correlation="task:t1:run:2:generation:1",
+    ) == "confirmed"
+
+
 def test_hermes_post_inject_ignores_marker_in_transcript_tail(
     tmp_path: Path, monkeypatch,
 ) -> None:
