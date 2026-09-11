@@ -230,6 +230,39 @@ def test_hermes_post_inject_confirms_consumed_marker_during_initialization(
     ) == "confirmed"
 
 
+def test_hermes_post_inject_waits_for_initialization_marker_with_unknown_prewrite(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A bootstrap dump may lag behind the PTY submit; do not reclaim early."""
+    listener = hermes.HermesInteractiveListener()
+    marker = "请读取 task-run.md 中的 Kanban 任务并执行。 [任务 t1: title] [by watcher]"
+    screens = iter([
+        "Initializing agent...\n",
+        (
+            f"● {marker}\n"
+            "Initializing agent...\n"
+            "┌─ Reasoning ─┐\n"
+        ),
+    ])
+    monkeypatch.setattr(hermes, "zellij_dump_screen", lambda **_: next(screens))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        hermes,
+        "zellij_submit_enter",
+        lambda **_: pytest.fail("bootstrap marker should confirm consumption"),
+    )
+
+    assert listener.on_post_inject(
+        _args(),
+        zellij_session="kanban-test",
+        zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker=marker,
+        pre_write_composer=None,
+        correlation="task:t1:run:4:generation:1",
+    ) == "confirmed"
+
+
 def test_hermes_post_inject_ignores_marker_in_transcript_tail(
     tmp_path: Path, monkeypatch,
 ) -> None:

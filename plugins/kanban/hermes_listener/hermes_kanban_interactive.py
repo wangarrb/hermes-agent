@@ -572,18 +572,14 @@ class HermesInteractiveListener(BaseInteractiveListener):
                 return "confirmed"
             composer = self.composer_input_text(screen)
             if composer is None:
-                # During Hermes bootstrap the composer is not rendered yet,
-                # but a submitted prompt can already be present in the
-                # transcript.  With a known-empty pre-write composer and a
-                # unique post-write marker, this is consumed input rather
-                # than an unsent draft; avoid replaying it.
-                if (
-                    pre_write_composer == ""
-                    and re.sub(r"\s+", "", marker)
-                    in re.sub(r"\s+", "", screen)
-                ):
+                # During Hermes bootstrap the composer may not be rendered yet,
+                # and the first dump can race the prompt entering the
+                # transcript.  A unique marker for this injection proves that
+                # the payload was consumed; without it, keep polling within the
+                # bounded confirmation window instead of reclaiming immediately.
+                if re.sub(r"\s+", "", marker) in re.sub(r"\s+", "", screen):
                     return "confirmed"
-                return "unknown"
+                continue
             if marker_present(composer):
                 saw_marker = True
                 zellij_submit_enter(
