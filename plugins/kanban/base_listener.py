@@ -1769,9 +1769,28 @@ class BaseInteractiveListener:
             f"{session}:{pane_id}"
         )
 
-    def _mark_prompt_superseded(self, control: kb.ControlMessage) -> Path:
+    def _mark_prompt_superseded(
+        self, control: kb.ControlMessage, *, conn: Any | None = None,
+    ) -> Path:
+        # Prompt files are written beneath the task's resolved workspace, not
+        # necessarily the watcher pane workspace (worktrees and explicit
+        # workspace paths commonly differ).  Resolve from the durable task row
+        # when available; retain the pane workspace as a migration fallback.
+        workspace = self._workspace
+        if conn is not None:
+            try:
+                task = kb.get_task(conn, control.task_id)
+                # Unclaimed legacy scratch tasks have no persisted workspace;
+                # resolving them would invent a board workspace and break the
+                # migration fallback.  Claimed runs persist workspace_path.
+                if task is not None and getattr(task, "workspace_path", None):
+                    workspace = Path(
+                        kb.resolve_workspace(task, board=self._board)
+                    ).expanduser().resolve(strict=False)
+            except Exception:
+                workspace = self._workspace
         path = resolve_task_prompt_path(
-            self._workspace, self._board, self._profile,
+            workspace, self._board, self._profile,
             self.agent_slug, control.task_id,
             run_id=control.run_id, generation=control.generation,
         )
@@ -1780,12 +1799,12 @@ class BaseInteractiveListener:
         # for migration (and for operators inspecting an older run) instead of
         # manufacturing a marker-only generated file.
         generated_path = task_prompt_path(
-            self._workspace, self._board, self._profile,
+            workspace, self._board, self._profile,
             self.agent_slug, control.task_id,
             run_id=control.run_id, generation=control.generation,
         )
         legacy_path = task_prompt_path(
-            self._workspace, self._board, self._profile,
+            workspace, self._board, self._profile,
             self.agent_slug, control.task_id,
         )
         if path == generated_path and not generated_path.exists() and not legacy_path.exists():
@@ -1896,7 +1915,7 @@ class BaseInteractiveListener:
             self._active_control_id = leased.id
             return True
 
-        self._mark_prompt_superseded(leased)
+        self._mark_prompt_superseded(leased, conn=conn)
         prompt = tag_injected_text(
             self._control_prompt(leased), source_profile="watcher",
         )

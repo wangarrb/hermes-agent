@@ -227,6 +227,50 @@ def test_idle_pane_receives_control_once_and_blocks_claim_until_ack(
     assert "SUPERSEDED" in prompt.read_text(encoding="utf-8")
 
 
+def test_control_supersedes_prompt_under_resolved_task_workspace(
+    kanban_home, tmp_path, monkeypatch,
+):
+    pane_workspace = tmp_path / "pane-workspace"
+    task_workspace = tmp_path / "task-workspace"
+    pane_workspace.mkdir()
+    task_workspace.mkdir()
+    args = _listener_args(pane_workspace)
+    listener = _listener(pane_workspace)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **kwargs: "ready>")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kwargs: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="review", assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(task_workspace),
+        )
+        assert kb.claim_task(conn, task_id, claimer="review-pane")
+        returned = kb.return_task_for_rework(
+            conn, task_id, actor="reviewer", reason="old contract is invalid",
+        )
+        control = kb.list_control_messages(conn)[0]
+        generated = bl.write_task_prompt(
+            agent_name="Dummy", agent_slug="dummy", board="default",
+            profile="reviewer", task_id=task_id, task_assignee="reviewer",
+            task_title="review", context="context", workspace=task_workspace,
+            run_id=control.run_id, generation=control.generation,
+        )
+        assert listener.pump_control_messages(
+            args, conn, pane_workspace / "listener.log",
+        )
+
+    assert returned.control_ids == [control.id]
+    assert generated.is_file()
+    assert "SUPERSEDED" in generated.read_text(encoding="utf-8")
+    assert not (
+        bl.task_prompt_path(
+            pane_workspace, "default", "reviewer", "dummy", task_id,
+            run_id=control.run_id, generation=control.generation,
+        ).exists()
+    )
+
+
 def test_failed_listener_injection_releases_lease(kanban_home, tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
