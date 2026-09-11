@@ -588,6 +588,13 @@ class HermesInteractiveListener(BaseInteractiveListener):
                     f"(attempt {attempt}/{self._POST_INJECT_MAX_RETRIES})",
                 )
                 continue
+            # The TUI can consume the prompt and then fail at the model/API
+            # boundary before it renders a busy row.  A unique run/control/
+            # result marker in the transcript plus an explicitly empty current
+            # composer proves the input was submitted; do not replay it as an
+            # unsent prompt merely because the model returned an error.
+            if composer == "" and " ".join(marker.split()) in " ".join(screen.split()):
+                return "confirmed"
             if saw_marker:
                 return "confirmed"
             return "unknown"

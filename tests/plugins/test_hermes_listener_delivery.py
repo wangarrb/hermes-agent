@@ -4,6 +4,8 @@ import argparse
 import time
 from pathlib import Path
 
+import pytest
+
 from plugins.kanban.hermes_listener import hermes_kanban_interactive as hermes
 
 
@@ -130,6 +132,38 @@ def test_hermes_post_inject_confirms_on_live_busy_transition(
         injected_marker=marker,
         pre_write_composer="",
         correlation="result:7",
+    ) == "confirmed"
+
+
+def test_hermes_post_inject_confirms_consumed_marker_before_api_error(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """An API failure after submit is not an unsent composer prompt."""
+    listener = hermes.HermesInteractiveListener()
+    marker = "请读取 task-run.md 中的 Kanban 任务并执行。 [任务 t1: title] [by watcher]"
+    screen = (
+        f"● {marker}\n"
+        "────────────────────────\n"
+        "⚠ API call failed (attempt 1/3): HTTP 400\n"
+        "planner ❯\n"
+        "────────────────────────\n"
+    )
+    monkeypatch.setattr(hermes, "zellij_dump_screen", lambda **_: screen)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        hermes,
+        "zellij_submit_enter",
+        lambda **_: pytest.fail("consumed marker must not be resubmitted"),
+    )
+
+    assert listener.on_post_inject(
+        _args(),
+        zellij_session="kanban-test",
+        zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker=marker,
+        pre_write_composer="",
+        correlation="task:t1:run:1:generation:1",
     ) == "confirmed"
 
 
