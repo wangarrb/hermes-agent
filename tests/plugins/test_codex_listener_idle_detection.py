@@ -37,6 +37,14 @@ def test_codex_composer_parser_preserves_marker_before_inline_status() -> None:
     ) is None
 
 
+def test_codex_composer_parser_treats_default_placeholder_as_empty() -> None:
+    listener = codex.CodexInteractiveListener()
+
+    assert listener.composer_input_text(
+        "› Ask Codex to do anything\n",
+    ) is None
+
+
 def test_codex_claim_precheck_rejects_nonempty_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:

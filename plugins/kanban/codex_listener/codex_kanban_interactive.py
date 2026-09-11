@@ -123,6 +123,9 @@ class CodexInteractiveListener(BaseInteractiveListener):
         return any(re.match(r"^\s*›(?:\s|$)", line) for line in tail_lines)
 
     _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s?(.*))?$")
+    _EMPTY_COMPOSER_PLACEHOLDERS = frozenset({
+        "ask codex to do anything",
+    })
 
     def composer_input_text(self, screen: str) -> str | None:
         """Extract the current Codex composer buffer, excluding its status bar."""
@@ -159,6 +162,8 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 break
             parts.append(stripped)
         payload = "\n".join(parts).strip()
+        if payload.casefold() in self._EMPTY_COMPOSER_PLACEHOLDERS:
+            return None
         return payload or None
 
     def wait_for_stable_composer_input(
