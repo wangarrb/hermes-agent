@@ -140,6 +140,20 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
+
+def _git_timeout() -> float:
+    """Git subprocess timeout (seconds); env-tunable for saturated disks.
+
+    Default raised for this deployment because /home can be under heavy
+    external IO pressure where ``git worktree list``/``git status`` exceed
+    30 seconds (kanban freeze/complete otherwise fail spuriously).
+    """
+
+    try:
+        return float(os.environ.get("HERMES_KANBAN_GIT_TIMEOUT", "180"))
+    except ValueError:
+        return 180.0
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
@@ -4168,7 +4182,7 @@ def workspace_fingerprint(task: Task) -> Optional[str]:
             ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
             check=True,
             capture_output=True,
-            timeout=30,
+            timeout=_git_timeout(),
         ).stdout
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return None
@@ -8121,7 +8135,7 @@ def _git_toplevel(path: Path) -> Optional[Path]:
             ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=30,
+            timeout=_git_timeout(),
             check=False,
         )
     except Exception:
@@ -8143,7 +8157,7 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
             ["git", "-C", str(repo_root), "show-ref", "--verify", f"refs/heads/{branch_name}"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=30,
+            timeout=_git_timeout(),
             check=False,
         )
     except Exception:
@@ -8157,7 +8171,7 @@ def _git_common_dir(path: Path) -> Optional[Path]:
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=30,
+            timeout=_git_timeout(),
             check=False,
         )
     except Exception:
@@ -8176,7 +8190,7 @@ def _git_dir(path: Path) -> Optional[Path]:
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=30,
+            timeout=_git_timeout(),
             check=False,
         )
     except Exception:
@@ -8195,7 +8209,7 @@ def _git_current_branch(path: Path) -> Optional[str]:
             ["git", "-C", str(path), "branch", "--show-current"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
-            timeout=30,
+            timeout=_git_timeout(),
             check=False,
         )
     except Exception:

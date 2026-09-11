@@ -15,6 +15,20 @@ CONTRACT_VERSION = "workspace_contract.v1"
 _BRANCH_FIELDS = frozenset({"task_id", "generation", "assignee"})
 
 
+
+def _git_timeout() -> float:
+    """Git subprocess timeout (seconds); env-tunable for saturated disks.
+
+    Default raised for this deployment because /home can be under heavy
+    external IO pressure where ``git worktree list``/``git status`` exceed
+    30 seconds (kanban freeze/complete otherwise fail spuriously).
+    """
+
+    try:
+        return float(os.environ.get("HERMES_KANBAN_GIT_TIMEOUT", "180"))
+    except ValueError:
+        return 180.0
+
 class WorkspaceContractError(ValueError):
     """A task's declared repository identity does not match its worktree."""
 
@@ -27,7 +41,7 @@ def _run_git(
             ["git", "-C", str(path), *args],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_git_timeout(),
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -47,7 +61,7 @@ def validate_branch_name(branch: str) -> str:
         ["git", "check-ref-format", "--branch", value],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=_git_timeout(),
         check=False,
     )
     if result.returncode != 0:
@@ -597,8 +611,20 @@ def prepare_generation_worktree(
 
     if _run_git(path, "branch", "--show-current").stdout.strip() != expected_branch:
         raise WorkspaceContractError("failed to activate generation branch")
-    if _resolve_ref(path, "HEAD", label="worktree HEAD") != resolved["base_commit"]:
-        raise WorkspaceContractError("generation branch HEAD does not match resolved base")
+    final_head = _resolve_ref(path, "HEAD", label="worktree HEAD")
+    if final_head != resolved["base_commit"]:
+        descendant = _run_git(
+            path,
+            "merge-base",
+            "--is-ancestor",
+            resolved["base_commit"],
+            final_head,
+            check=False,
+        )
+        if descendant.returncode != 0:
+            raise WorkspaceContractError(
+                "generation branch HEAD is neither the resolved base nor its descendant"
+            )
     _require_clean(path)
     _atomic_write_manifest(manifest_path, expected)
     return expected

@@ -32,6 +32,20 @@ REQUIRED_FIELDS = frozenset(
 )
 
 
+
+def _git_timeout() -> float:
+    """Git subprocess timeout (seconds); env-tunable for saturated disks.
+
+    Default raised for this deployment because /home can be under heavy
+    external IO pressure where ``git worktree list``/``git status`` exceed
+    30 seconds (kanban freeze/complete otherwise fail spuriously).
+    """
+
+    try:
+        return float(os.environ.get("HERMES_KANBAN_GIT_TIMEOUT", "180"))
+    except ValueError:
+        return 180.0
+
 class IndependentReviewError(ValueError):
     """Raised when an implementer delivery lacks a valid independent review."""
 
@@ -76,7 +90,7 @@ def _run_git(repository: Path, *args: str) -> bytes:
     proc = subprocess.run(
         ["git", "-C", str(repository), *args],
         capture_output=True,
-        timeout=30,
+        timeout=_git_timeout(),
         check=False,
     )
     if proc.returncode != 0:

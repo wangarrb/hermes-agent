@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -38,6 +39,20 @@ AUTHORIZATION_FIELDS = (
     "integrator",
 )
 
+
+
+def _git_timeout() -> float:
+    """Git subprocess timeout (seconds); env-tunable for saturated disks.
+
+    Default raised for this deployment because /home can be under heavy
+    external IO pressure where ``git worktree list``/``git status`` exceed
+    30 seconds (kanban freeze/complete otherwise fail spuriously).
+    """
+
+    try:
+        return float(os.environ.get("HERMES_KANBAN_GIT_TIMEOUT", "180"))
+    except ValueError:
+        return 180.0
 
 class DeliveryError(ValueError):
     """A delivery identity or operation is invalid."""
@@ -169,7 +184,7 @@ def _git(path: Path, *args: str) -> str:
         ["git", "-C", str(path), *args],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=_git_timeout(),
         check=False,
     )
     if result.returncode != 0:
