@@ -29,6 +29,18 @@ def test_injection_rejects_nonexistent_pane_even_when_zellij_returns_zero(tmp_pa
     assert not any("write-chars" in c for c in calls)
 
 
+def test_validator_accepts_real_zellij_id_field(tmp_path, monkeypatch):
+    calls = []
+    panes = [{"id": 7, "title": "claude-kanban", "is_plugin": False, "exited": False}]
+    monkeypatch.setattr(bl.subprocess, "run", lambda *a, **kw: _run_stub(panes=panes, calls=calls, args=a[0], **kw))
+
+    assert bl._zellij_validate_pane(
+        session="s", pane_id="7", expected_pane_prefix="claude-kanban",
+        log_path=tmp_path / "inject.log",
+    )
+    assert calls == [["zellij", "--session", "s", "action", "list-panes", "--all", "--json"]]
+
+
 @pytest.mark.parametrize(
     ("title", "expected"),
     [

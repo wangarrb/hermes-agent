@@ -462,7 +462,7 @@ def _zellij_validate_pane(
         for pane in payload:
             if not isinstance(pane, dict):
                 continue
-            if str(pane.get("pane_id")) != str(pane_id):
+            if str(pane.get("id", pane.get("pane_id"))) != str(pane_id):
                 continue
             if pane.get("is_plugin") is True or pane.get("exited") is True:
                 continue
