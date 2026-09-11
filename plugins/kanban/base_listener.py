@@ -621,11 +621,18 @@ zellij_submit_enter = zellij_submit
 def zellij_rename_pane(*, session: str, pane_id: str, name: str, log_path: Path) -> bool:
     try:
         cmd_base = ["zellij", "--session", session, "action"] if session else ["zellij", "action"]
-        subprocess.run(
+        result = subprocess.run(
             cmd_base + ["rename-pane", "-p", str(pane_id), name],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             text=True, timeout=5,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or "rename-pane failed").strip()
+            log_line(
+                log_path,
+                f"zellij rename-pane failed rc={result.returncode}: {detail}",
+            )
+            return False
         return True
     except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", "") or str(exc)
