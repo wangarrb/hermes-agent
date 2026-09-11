@@ -2148,28 +2148,28 @@ class BaseInteractiveListener:
             run_id=result_run_id, generation=result_generation,
             task_id=first_item.task_id,
         )
-        if state not in {"confirmed", "transport_accepted"}:
+        if state == "known_unsubmitted":
+            # Only an explicit indication that submit did not take the text is
+            # retryable. Once submit succeeded but confirmation is uncertain,
+            # consume exactly once to avoid an injection loop.
             released = kb.release_result_notification_lease(
                 conn, queue_ids, lease_owner=receiver,
             )
-            event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
             self._log_delivery_event(
-                log_path, state=event.removeprefix("delivery_"),
+                log_path, state="requeued",
                 correlation_kind="result", correlation_id=",".join(map(str, queue_ids)),
                 task_id=first_item.task_id, run_id=result_run_id,
                 generation=result_generation, pane_id=pane_id, reclaimed=released,
             )
-            if not released:
-                self._log_delivery_event(
-                    log_path, state="reclaim_race", correlation_kind="result",
-                    correlation_id=",".join(map(str, queue_ids)),
-                    task_id=first_item.task_id, run_id=result_run_id,
-                    generation=result_generation, pane_id=pane_id,
-                )
             return True
+
+        consumed_state = (
+            "confirmed" if state == "confirmed" else
+            "transport_accepted" if state == "transport_accepted" else
+            "transport_uncertain"
+        )
         self._log_delivery_event(
-            log_path,
-            state="confirmed" if state == "confirmed" else "transport_accepted",
+            log_path, state=consumed_state,
             correlation_kind="result", correlation_id=",".join(map(str, queue_ids)),
             task_id=first_item.task_id, run_id=result_run_id,
             generation=result_generation, pane_id=pane_id,

@@ -123,7 +123,27 @@ def test_failed_injection_releases_result_lease(
         row = conn.execute(
             "SELECT status, lease_owner, lease_expires FROM kanban_result_queue"
         ).fetchone()
-        assert tuple(row) == ("pending", None, None)
+    assert tuple(row) == ("pending", None, None)
+
+
+def test_uncertain_post_injection_is_consumed_once(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enqueue_results(1)
+    listener = _Listener()
+    monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
+    monkeypatch.setattr(listener, "_post_injection_contract", lambda *args, **kwargs: "unknown")
+
+    with kb.connect() as conn:
+        assert listener.pump_result_notifications(_args(), conn, tmp_path / "watch.log")
+        row = conn.execute(
+            "SELECT status, lease_owner, lease_expires FROM kanban_result_queue"
+        ).fetchone()
+    assert tuple(row) == ("delivered", None, None)
 
 
 def test_disabled_result_delivery_leaves_queue_untouched(
