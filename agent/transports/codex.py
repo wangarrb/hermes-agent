@@ -140,6 +140,7 @@ class ResponsesApiTransport(ProviderTransport):
             messages,
             is_xai_responses=kwargs.get("is_xai_responses") is True,
             is_github_responses=kwargs.get("is_github_responses") is True,
+            is_codex_backend=kwargs.get("is_codex_backend") is True,
             replay_encrypted_reasoning=bool(
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
@@ -305,6 +306,7 @@ class ResponsesApiTransport(ProviderTransport):
                 payload_messages,
                 is_xai_responses=is_xai_responses,
                 is_github_responses=is_github_responses,
+                is_codex_backend=is_codex_backend,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
             ),
@@ -558,6 +560,7 @@ class ResponsesApiTransport(ProviderTransport):
         *,
         allow_stream: bool = False,
         is_github_responses: bool = False,
+        is_codex_backend: bool = False,
         sanitize_harmony_tokens: bool = False,
     ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
@@ -572,6 +575,7 @@ class ResponsesApiTransport(ProviderTransport):
             api_kwargs,
             allow_stream=allow_stream,
             is_github_responses=is_github_responses,
+            is_codex_backend=is_codex_backend,
             sanitize_harmony_tokens=sanitize_harmony_tokens,
         )
         if "prompt_cache_key" in normalized:

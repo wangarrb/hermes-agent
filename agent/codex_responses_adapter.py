@@ -412,6 +412,7 @@ def _chat_messages_to_responses_input(
     *,
     is_xai_responses: bool = False,
     is_github_responses: bool = False,
+    is_codex_backend: bool = False,
     replay_encrypted_reasoning: bool = True,
     current_issuer_kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -443,8 +444,14 @@ def _chat_messages_to_responses_input(
     or routine load-balancer churn between turns all invalidate it — and
     rejects a stale id with HTTP 401 "input item ID does not belong to
     this connection" even for short ids (see #32716). ``phase``/
-    ``status``/``content`` are still replayed; only ``id`` is unsafe to
+    ``phase``/``status``/``content`` are still replayed; only ``id`` is unsafe to
     reuse across a Copilot connection.
+
+    ``is_codex_backend`` drops type-invalid IDs from replayed assistant message
+    items.  The native ChatGPT Codex backend accepts server-generated ``msg_``
+    message IDs; custom Responses providers may return generic ``item_`` IDs
+    that must not be replayed across providers.  The message content and phase
+    remain portable.
 
     ``current_issuer_kind`` enables a per-item cross-issuer guard. The
     Responses API's ``encrypted_content`` blob is decryptable only by the
@@ -582,6 +589,10 @@ def _chat_messages_to_responses_input(
                             not is_github_responses
                             and isinstance(item_id, str)
                             and item_id.strip()
+                            and (
+                                not is_codex_backend
+                                or item_id.strip().startswith("msg_")
+                            )
                         ):
                             stripped_id = item_id.strip()
                             if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
@@ -701,6 +712,7 @@ def _preflight_codex_input_items(
     raw_items: Any,
     *,
     is_github_responses: bool = False,
+    is_codex_backend: bool = False,
     sanitize_harmony_tokens: bool = False,
 ) -> List[Dict[str, Any]]:
     if not isinstance(raw_items, list):
@@ -859,6 +871,10 @@ def _preflight_codex_input_items(
                 not is_github_responses
                 and isinstance(item_id, str)
                 and item_id.strip()
+                and (
+                    not is_codex_backend
+                    or item_id.strip().startswith("msg_")
+                )
             ):
                 stripped_id = item_id.strip()
                 if len(stripped_id) <= _MAX_RESPONSES_ITEM_ID_LENGTH:
@@ -935,6 +951,7 @@ def _preflight_codex_api_kwargs(
     *,
     allow_stream: bool = False,
     is_github_responses: bool = False,
+    is_codex_backend: bool = False,
     sanitize_harmony_tokens: bool = False,
 ) -> Dict[str, Any]:
     if not isinstance(api_kwargs, dict):
@@ -962,6 +979,7 @@ def _preflight_codex_api_kwargs(
     normalized_input = _preflight_codex_input_items(
         api_kwargs.get("input"),
         is_github_responses=is_github_responses,
+        is_codex_backend=is_codex_backend,
         sanitize_harmony_tokens=sanitize_harmony_tokens,
     )
 

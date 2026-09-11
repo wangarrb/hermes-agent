@@ -185,6 +185,68 @@ class TestCodexBuildKwargs:
         message_item = next(item for item in kw["input"] if item.get("type") == "message")
         assert message_item["id"] == "msg_short_id"
 
+    def test_codex_backend_drops_foreign_message_item_id(self, transport):
+        """Cross-provider item_ message IDs must not reach ChatGPT Codex.
+
+        CCH/custom Responses providers return generic ``item_...`` IDs, while
+        the native Codex backend only accepts server-generated ``msg_...`` IDs
+        for assistant message input items. Content and phase remain portable.
+        """
+        messages = [
+            {"role": "system", "content": "You are Hermes."},
+            {
+                "role": "assistant",
+                "content": "pong",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "pong"}],
+                        "id": "item_foreign_message",
+                        "phase": "final_answer",
+                    }
+                ],
+            },
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[],
+            is_codex_backend=True,
+        )
+        message_item = next(item for item in kw["input"] if item.get("type") == "message")
+        assert "id" not in message_item
+        assert message_item["phase"] == "final_answer"
+        assert message_item["content"] == [{"type": "output_text", "text": "pong"}]
+
+    def test_codex_backend_preflight_drops_foreign_message_item_id(self, transport):
+        messages = [
+            {"role": "system", "content": "You are Hermes."},
+            {
+                "role": "assistant",
+                "content": "pong",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "pong"}],
+                        "id": "item_foreign_message",
+                    }
+                ],
+            },
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=messages, tools=[],
+            is_codex_backend=True,
+        )
+        normalized = transport.preflight_kwargs(
+            kw,
+            is_codex_backend=True,
+            sanitize_harmony_tokens=True,
+        )
+        message_item = next(item for item in normalized["input"] if item.get("type") == "message")
+        assert "id" not in message_item
+
     @pytest.mark.parametrize("model", [
         "gpt-5.5",
         "gpt-5.5-pro",
