@@ -13,7 +13,12 @@ would poison tags/classification.
 Usage:
     python3 hindsight_backfill_codex_rollouts.py --dry-run
     python3 hindsight_backfill_codex_rollouts.py --write
-Safety: never overwrites existing session_*.json; DB/input files opened read-only.
+
+Runs nightly (23:00, hindsight_codex_sync.sh) so fresh codex content reaches the
+offline Hindsight pipeline the same night (converted files must be ≥15 min old
+before the 00:01 manifest scan). Idempotent: a snapshot is (re)written only when
+the source rollout is missing from, or newer than, its session JSON — growing /
+live sessions refresh their snapshot on later runs. DB/input files opened read-only.
 """
 
 from __future__ import annotations
@@ -108,7 +113,7 @@ def main() -> int:
     if not (args.dry_run or args.write):
         args.dry_run = True
 
-    total_msgs = total_chars = written = skipped = 0
+    total_msgs = total_chars = written = updated = skipped = 0
     for label, base in SOURCES:
         if not os.path.isdir(base):
             continue
@@ -126,13 +131,19 @@ def main() -> int:
             else:
                 profile_dir = OUT_BASE / label
                 out_path = profile_dir / "sessions" / f"session_{snap['session_id']}.json"
-            exists = out_path.exists()
-            status = "EXISTS-skip" if exists else ("write" if args.write else "dry")
+            out_mtime = out_path.stat().st_mtime if out_path.exists() else None
+            up_to_date = out_mtime is not None and out_mtime >= os.path.getmtime(path)
+            if up_to_date:
+                status = "up-to-date"
+            elif out_mtime is not None:
+                status = "update" if args.write else "would-update"
+            else:
+                status = "write" if args.write else "new"
             print(
                 f"{label:15s} {snap['session_id'][:40]:40s} {snap['message_count']:5d} msgs "
                 f"{n_chars:8d} chars [{status}]"
             )
-            if exists:
+            if up_to_date:
                 skipped += 1
                 continue
             if args.write:
@@ -141,10 +152,13 @@ def main() -> int:
                 tmp.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
                 tmp.chmod(0o600)
                 tmp.replace(out_path)
-                written += 1
+                if out_mtime is None:
+                    written += 1
+                else:
+                    updated += 1
     print(
         f"\nTOTAL: {total_msgs} msgs, {total_chars} chars (~{total_chars // 8000} chunks); "
-        f"written={written} skipped_exists={skipped}"
+        f"written={written} updated={updated} skipped_up_to_date={skipped}"
     )
     if args.dry_run and not args.write:
         print("dry-run only — rerun with --write")
