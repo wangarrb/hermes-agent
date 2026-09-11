@@ -999,7 +999,8 @@ class BaseInteractiveListener:
         self, args: argparse.Namespace, *,
         zellij_session: str, zellij_pane_id: str, log_path: Path,
         injected_marker: str, pre_write_composer: str | None,
-        correlation: str,
+        correlation: str, run_id: int | None = None,
+        generation: int | None = None, task_id: str | None = None,
     ) -> str:
         """Return the post-write delivery state.
 
@@ -1024,7 +1025,8 @@ class BaseInteractiveListener:
             if "injected_marker" not in str(exc) and "pre_write_composer" not in str(exc):
                 kind, ident = (correlation.split(":", 1) + [""])[:2]
                 self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
-                    correlation_id=ident, pane_id=zellij_pane_id)
+                    correlation_id=ident, task_id=task_id, run_id=run_id,
+                    generation=generation, pane_id=zellij_pane_id)
                 return "unknown"
             try:
                 result = self.on_post_inject(
@@ -1036,12 +1038,14 @@ class BaseInteractiveListener:
             except Exception as retry_exc:
                 kind, ident = (correlation.split(":", 1) + [""])[:2]
                 self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
-                    correlation_id=ident, pane_id=zellij_pane_id)
+                    correlation_id=ident, task_id=task_id, run_id=run_id,
+                    generation=generation, pane_id=zellij_pane_id)
                 return "unknown"
         except Exception as exc:
             kind, ident = (correlation.split(":", 1) + [""])[:2]
             self._log_delivery_event(log_path, state="unknown", correlation_kind=kind,
-                correlation_id=ident, pane_id=zellij_pane_id)
+                correlation_id=ident, task_id=task_id, run_id=run_id,
+                generation=generation, pane_id=zellij_pane_id)
             return "unknown"
 
         state = str(result or "").strip().lower()
@@ -1848,6 +1852,8 @@ class BaseInteractiveListener:
             injected_marker=self._delivery_marker(prompt, correlation),
             pre_write_composer=pre_write_composer,
             correlation=correlation,
+            run_id=leased.run_id, generation=leased.generation,
+            task_id=leased.task_id,
         )
         if state not in {"confirmed", "transport_accepted"}:
             released = kb.release_control_lease(conn, leased.id, receiver=receiver)
@@ -1956,6 +1962,17 @@ class BaseInteractiveListener:
             source_profile="watcher",
         )
         queue_ids = [item.id for item in items]
+        first_item = items[0]
+        first_task = kb.get_task(conn, first_item.task_id)
+        event_row = conn.execute(
+            "SELECT run_id FROM task_events WHERE id = ?", (first_item.event_id,),
+        ).fetchone()
+        result_run_id = (
+            int(event_row["run_id"])
+            if event_row is not None and event_row["run_id"] is not None
+            else (first_task.current_run_id if first_task is not None else None)
+        )
+        result_generation = first_task.generation if first_task is not None else None
         correlation = "result:" + ",".join(str(queue_id) for queue_id in queue_ids)
         pre_write_composer = self._pre_write_composer(
             session=session, pane_id=pane_id, log_path=log_path,
@@ -1992,19 +2009,9 @@ class BaseInteractiveListener:
             injected_marker=self._delivery_marker(prompt, correlation),
             pre_write_composer=pre_write_composer,
             correlation=correlation,
+            run_id=result_run_id, generation=result_generation,
+            task_id=first_item.task_id,
         )
-        first_item = items[0]
-        first_task = kb.get_task(conn, first_item.task_id)
-        event_row = conn.execute(
-            "SELECT run_id, payload FROM task_events WHERE id = ?",
-            (first_item.event_id,),
-        ).fetchone()
-        result_run_id = (
-            int(event_row["run_id"])
-            if event_row is not None and event_row["run_id"] is not None
-            else (first_task.current_run_id if first_task is not None else None)
-        )
-        result_generation = first_task.generation if first_task is not None else None
         if state not in {"confirmed", "transport_accepted"}:
             released = kb.release_result_notification_lease(
                 conn, queue_ids, lease_owner=receiver,
@@ -2335,6 +2342,8 @@ class BaseInteractiveListener:
             injected_marker=self._delivery_marker(inject_str, correlation),
             pre_write_composer=pre_write_composer,
             correlation=correlation,
+            run_id=claim_run_id, generation=claim_generation,
+            task_id=claimed.id,
         )
         if state not in {"confirmed", "transport_accepted"}:
             reclaimed = _reclaim_task_without_signaling_worker(

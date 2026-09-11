@@ -76,6 +76,11 @@ class _TaskListener(_Listener):
         return self.state
 
 
+class _ConfirmedListener(_Listener):
+    def on_post_inject(self, args, **kwargs):
+        return "confirmed"
+
+
 def _task_args(tmp_path):
     return Namespace(profile="reviewer", claim_assignees="reviewer",
                       assist_role=None, zellij_session="s", zellij_pane_id="0",
@@ -155,6 +160,62 @@ def test_control_release_cas_race_is_logged(kanban_home, tmp_path, monkeypatch):
     text = (tmp_path / "watch.log").read_text(encoding="utf-8")
     assert "event=delivery_reclaim_race" in text
     assert "correlation_kind=control" in text
+
+
+def test_task_reclaim_cas_race_is_logged(kanban_home, tmp_path, monkeypatch):
+    listener = _TaskListener("unknown")
+    args = _task_args(tmp_path)
+    listener._init_from_args(args)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "on_claim_post_confirm", lambda *a, **k: True)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **_: True)
+    monkeypatch.setattr(bl, "_reclaim_task_without_signaling_worker", lambda *a, **k: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="task", assignee="reviewer", workspace_kind="dir", workspace_path=str(tmp_path))
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        listener.claim_and_inject_one(args, log_path=tmp_path / "watch.log", conn=conn)
+    text = (tmp_path / "watch.log").read_text(encoding="utf-8")
+    assert "event=delivery_reclaim_race" in text and "correlation_kind=task" in text
+
+
+def test_result_release_cas_race_is_logged(kanban_home, tmp_path, monkeypatch):
+    listener = _Listener()
+    monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+    monkeypatch.setattr(kb, "release_result_notification_lease", lambda *a, **k: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="result", assignee="reviewer", result_subscriber="reviewer")
+        kb.complete_task(conn, task_id, summary="done")
+        listener.pump_result_notifications(_args(tmp_path), conn, tmp_path / "watch.log")
+    text = (tmp_path / "watch.log").read_text(encoding="utf-8")
+    assert "event=delivery_reclaim_race" in text and "correlation_kind=result" in text
+
+
+@pytest.mark.parametrize("kind", ["control", "result"])
+def test_confirmed_hook_runs_before_delivery_mark(kanban_home, tmp_path, monkeypatch, kind):
+    seen = []
+    listener = _ConfirmedListener()
+    if kind == "control":
+        monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+        monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+        monkeypatch.setattr(kb, "mark_control_delivered", lambda *a, **k: seen.append("mark") or True)
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="review", assignee="reviewer")
+            kb.claim_task(conn, task_id, claimer="review-pane")
+            kb.return_task_for_rework(conn, task_id, actor="reviewer", reason="redo")
+            listener.pump_control_messages(_args(tmp_path), conn, tmp_path / "watch.log")
+    else:
+        monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: True)
+        monkeypatch.setattr(bl, "zellij_inject", lambda **_: True)
+        monkeypatch.setattr(kb, "mark_result_notifications_delivered", lambda *a, **k: seen.append("mark") or True)
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="result", assignee="reviewer", result_subscriber="reviewer")
+            kb.complete_task(conn, task_id, summary="done")
+            listener.pump_result_notifications(_args(tmp_path), conn, tmp_path / "watch.log")
+    assert seen == ["mark"]
 
 
 def test_nonconfirmed_result_ack_releases_lease(kanban_home, tmp_path, monkeypatch):
