@@ -513,6 +513,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
+        "muse-spark-1.3-contributor",
     ],
     "kilocode": [
         "anthropic/claude-opus-4.6",
