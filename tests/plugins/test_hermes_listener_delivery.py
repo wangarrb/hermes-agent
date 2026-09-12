@@ -102,6 +102,29 @@ def test_hermes_post_inject_accepts_transport_when_marker_already_consumed(
     ) == "transport_accepted"
 
 
+def test_hermes_post_inject_accepts_transport_when_composer_is_temporarily_unparsed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A supported idle pane can transiently lack a parseable composer row."""
+    listener = hermes.HermesInteractiveListener()
+    monkeypatch.setattr(
+        hermes, "zellij_dump_screen",
+        lambda **_: "planner ❯\n⚕ status transition\n",
+    )
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(hermes, "zellij_submit_enter", lambda **_: True)
+
+    assert listener.on_post_inject(
+        _args(),
+        zellij_session="kanban-test",
+        zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker="marker",
+        pre_write_composer="",
+        correlation="task:t1:run:1:generation:1",
+    ) == "transport_accepted"
+
+
 def test_hermes_post_inject_returns_known_unsubmitted_after_bounded_retries(
     tmp_path: Path, monkeypatch,
 ) -> None:

@@ -579,6 +579,20 @@ class HermesInteractiveListener(BaseInteractiveListener):
                 # bounded confirmation window instead of reclaiming immediately.
                 if re.sub(r"\s+", "", marker) in re.sub(r"\s+", "", screen):
                     return "confirmed"
+                # A supported idle Hermes pane can briefly expose no parseable
+                # composer while the submitted task is transitioning into the
+                # agent.  The pre-injection composer was known empty and the
+                # successful submit already crossed the PTY boundary, so keep
+                # the claim as transport-accepted instead of reclaiming it as
+                # delivery_unknown.  A generic/status-only screen still falls
+                # through to the fail-closed retry path.
+                if pre_write_composer == "" and self.pane_is_idle(screen):
+                    log_line(
+                        log_path,
+                        "hermes post-inject: supported idle pane after successful "
+                        "submit; accepting transport without semantic confirmation",
+                    )
+                    return "transport_accepted"
                 continue
             if marker_present(composer):
                 saw_marker = True
