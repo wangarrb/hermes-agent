@@ -438,6 +438,35 @@ def _zellij_pane_title_matches(title: str, expected_prefix: str) -> bool:
     return title[len(prefix)] == "[" or title[len(prefix)].isspace()
 
 
+def _zellij_get_pane_title(*, session: str, pane_id: str) -> str | None:
+    """Return the current title of a Zellij pane, or None if unreadable.
+
+    Read-only: used by the display-only title sync to avoid redundant
+    renames.  Returns None (fail closed, caller keeps the old title) when
+    the pane is gone, is a plugin, or the query fails.
+    """
+    try:
+        result = subprocess.run(
+            _zellij_cmd_base(session) + ["list-panes", "--all", "--json"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        payload = json.loads(getattr(result, "stdout", "") or "[]")
+        if not isinstance(payload, list):
+            return None
+        for pane in payload:
+            if not isinstance(pane, dict):
+                continue
+            if str(pane.get("id", pane.get("pane_id"))) != str(pane_id):
+                continue
+            if pane.get("is_plugin") is True or pane.get("exited") is True:
+                return None
+            return str(pane.get("title", "") or "")
+        return None
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as exc:
+        _ = exc
+        return None
+
+
 _ZELLIJ_BACKEND_TOKENS = {
     "codex", "hermes", "claude", "codewhale", "deepseek", "reasonix",
 }
@@ -1624,6 +1653,68 @@ class BaseInteractiveListener:
         self._api_retry_first_at = None
         self._api_retry_kind = None
         self._reset_idle_followup()
+
+    def _sync_pane_title_to_running_claim(
+        self, *, conn: Any, assignees: list[str],
+        session: str, pane_id: str, log_path: Path,
+    ) -> None:
+        """Display-only: reflect a running foreign claim in the pane title.
+
+        The watcher only renames its pane on its own confirmed delivery, so
+        a task claimed by another process (manual claim, pre-reload owner,
+        adopted run) leaves the title generic until it completes.  This sync
+        closes that visibility gap with a pure ``rename-pane`` — no injection,
+        no DB writes, no heartbeat adoption.  Cooperative-control ``[PAUSE]``
+        titles win: the caller must skip this while ``_active_control_id`` is
+        set, and a live ``[PAUSE`` title is never overridden here.
+        """
+        if getattr(self, "_active_control_id", None) is not None:
+            return
+        running_id: str | None = None
+        try:
+            for assignee in assignees:
+                try:
+                    tasks = kb.list_tasks(conn, assignee=assignee, status="running")
+                except Exception:
+                    continue
+                for task in tasks:
+                    if getattr(task, "id", None):
+                        running_id = task.id
+                        break
+                if running_id is not None:
+                    break
+        except Exception:
+            return
+        try:
+            current = _zellij_get_pane_title(session=session, pane_id=str(pane_id))
+        except Exception:
+            return
+        if current is None:
+            return
+        desired = (
+            self.pane_label(task_id=running_id)
+            if running_id is not None
+            else self.pane_label()
+        )
+        if current.strip() == desired.strip():
+            return
+        try:
+            prefix = self.expected_pane_prefix()
+        except Exception:
+            return
+        if not _zellij_pane_title_matches(current, prefix):
+            return
+        if "[PAUSE " in current:
+            return
+        if zellij_rename_pane(
+            session=session, pane_id=str(pane_id),
+            name=desired, log_path=log_path,
+        ):
+            log_line(
+                log_path,
+                f"title sync: pane {pane_id} -> {desired} "
+                f"(running {running_id or 'none'})",
+            )
 
     # ── API failure retry on idle ──
     # When agent goes idle mid-task due to API error, inject "继续"
@@ -3094,6 +3185,20 @@ class BaseInteractiveListener:
                     active_generation = None
                     active_claim_lock = None
                     self._clear_active_claim_identity()
+                    # Display-only: no own claim this tick (pane busy or no
+                    # ready task).  Still reflect a running foreign claim in
+                    # the title so a claimed task stays visible until it
+                    # leaves running state.  Pure rename-pane, no injection.
+                    try:
+                        self._sync_pane_title_to_running_claim(
+                            conn=conn,
+                            assignees=claim_assignees(args),
+                            session=zellij_session,
+                            pane_id=str(zellij_pane_id),
+                            log_path=log_path,
+                        )
+                    except Exception as exc:
+                        log_line(log_path, f"title sync skipped: {exc}")
                     if args.once:
                         log_line(log_path, "no ready task; exiting --once")
                         return 0
