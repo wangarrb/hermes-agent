@@ -252,7 +252,7 @@ class CodexInteractiveListener(BaseInteractiveListener):
         retries is ``known_unsubmitted``; missing/unsupported screens are
         ``unknown``.
         """
-        del args, pre_write_composer
+        del args
         marker = str(injected_marker or "").strip()
         if not marker:
             return "unknown"
@@ -313,6 +313,19 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 continue
             if saw_marker:
                 return "confirmed"
+            # The submit path can complete before Codex renders a busy marker.
+            # When the composer was empty before injection and is empty now,
+            # transport has accepted the submitted command even though semantic
+            # work has not appeared in the viewport yet.  Returning
+            # transport_accepted prevents a false delivery_unknown reclaim;
+            # the caller still distinguishes this from semantic confirmation.
+            if pre_write_composer == "" and self.pane_is_idle(screen):
+                log_line(
+                    log_path,
+                    "codex post-inject: composer empty after successful submit; "
+                    "accepting transport without semantic confirmation",
+                )
+                return "transport_accepted"
             # Non-empty unrelated composer or a screen without a supported
             # composer is inconclusive; never scan transcript tail for marker.
             return "unknown"
