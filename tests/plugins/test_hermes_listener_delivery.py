@@ -82,6 +82,26 @@ def test_hermes_post_inject_confirms_marker_transition_via_current_composer(
     assert enters[0]["correlation"] == "task:t1:run:1:generation:1"
 
 
+def test_hermes_post_inject_accepts_transport_when_marker_already_consumed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A fast Hermes submit may clear the composer before marker rendering."""
+    listener = hermes.HermesInteractiveListener()
+    monkeypatch.setattr(hermes, "zellij_dump_screen", lambda **_: "planner ❯\n────────────────\n")
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(hermes, "zellij_submit_enter", lambda **_: True)
+
+    assert listener.on_post_inject(
+        _args(),
+        zellij_session="kanban-test",
+        zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker="marker",
+        pre_write_composer="",
+        correlation="task:t1:run:1:generation:1",
+    ) == "transport_accepted"
+
+
 def test_hermes_post_inject_returns_known_unsubmitted_after_bounded_retries(
     tmp_path: Path, monkeypatch,
 ) -> None:

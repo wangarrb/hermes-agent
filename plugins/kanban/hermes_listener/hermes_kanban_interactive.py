@@ -604,6 +604,19 @@ class HermesInteractiveListener(BaseInteractiveListener):
                 return "confirmed"
             if saw_marker:
                 return "confirmed"
+            # zellij_submit_enter can be accepted before Hermes renders either
+            # its busy row or the consumed marker.  If the composer was empty
+            # before injection and is explicitly empty after submit, preserve
+            # the transport acknowledgement instead of reclaiming a live owner.
+            # This is deliberately transport-only; semantic confirmation still
+            # belongs to the owner handback.
+            if pre_write_composer == "" and composer == "":
+                log_line(
+                    log_path,
+                    "hermes post-inject: composer empty after successful submit; "
+                    "accepting transport without semantic confirmation",
+                )
+                return "transport_accepted"
             return "unknown"
         return "known_unsubmitted" if saw_marker else "unknown"
 
