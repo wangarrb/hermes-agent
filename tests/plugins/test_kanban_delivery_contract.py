@@ -191,7 +191,11 @@ def test_result_release_cas_race_is_logged(kanban_home, tmp_path, monkeypatch):
         kb.complete_task(conn, task_id, summary="done")
         listener.pump_result_notifications(_args(tmp_path), conn, tmp_path / "watch.log")
     text = (tmp_path / "watch.log").read_text(encoding="utf-8")
-    assert "event=delivery_reclaim_race" in text and "correlation_kind=result" in text
+    # Since 9909e58eac an uncertain result release logs a single requeued
+    # event carrying reclaimed=False (the separate reclaim_race event was
+    # consolidated away for the result path).
+    assert "event=delivery_requeued" in text and "correlation_kind=result" in text
+    assert "reclaimed=False" in text
 
 
 @pytest.mark.parametrize("kind", ["control", "result"])
