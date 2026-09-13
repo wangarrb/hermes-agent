@@ -12,6 +12,7 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -671,15 +672,23 @@ def hindsight_logs_since(start: datetime, end: datetime) -> str:
 
 
 def parse_hindsight_llm_logs(log_text: str) -> tuple[list[dict[str, int | float | str]], dict[str, int]]:
-    # Example:
+    # Examples（2026-09-13 起服务端补丁记录每一次调用；此前只记 >10s 的慢调用）：
     # slow llm call: scope=consolidation, model=openai/glm-5, input_tokens=50877, output_tokens=14188, total_tokens=65065, time=295.017s
-    llm_re = re.compile(
-        r"scope=(?P<scope>[\w.-]+), model=(?P<model>[^,]+), "
-        r"input_tokens=(?P<input>\d+), output_tokens=(?P<output>\d+), "
-        r"total_tokens=(?P<total>\d+), time=(?P<time>[\d.]+)s"
-    )
+    # llm call: scope=reflect, model=openai/auto_cheep_model, input_tokens=5000, output_tokens=200, total_tokens=5200, time=3.5s, cached_tokens=4500, ratio out/in=0.04
+    # 尾字段（cached_tokens/ratio）的位置随版本变化（旧版 cached 在 time= 之前），
+    # 逐字段独立提取，保证每一行调用都被计入、不因字段顺序被漏掉。
+    head_re = re.compile(r"(?:slow )?llm call: scope=(?P<scope>[\w.-]+), model=(?P<model>[^,]+)")
+    field_res = {
+        "input_tokens": re.compile(r"input_tokens=(\d+)"),
+        "output_tokens": re.compile(r"output_tokens=(\d+)"),
+        "total_tokens": re.compile(r"total_tokens=(\d+)"),
+        "seconds": re.compile(r"time=([\d.]+)s"),
+    }
     usage: dict[tuple[str, str], dict[str, int | float | str]] = {}
-    for m in llm_re.finditer(log_text):
+    for line in log_text.split("\n"):
+        m = head_re.search(line)
+        if not m:
+            continue
         key = (m.group("model"), m.group("scope"))
         row = usage.setdefault(
             key,
@@ -694,10 +703,14 @@ def parse_hindsight_llm_logs(log_text: str) -> tuple[list[dict[str, int | float 
             },
         )
         row["calls"] = int(row["calls"]) + 1
-        row["input_tokens"] = int(row["input_tokens"]) + int(m.group("input"))
-        row["output_tokens"] = int(row["output_tokens"]) + int(m.group("output"))
-        row["total_tokens"] = int(row["total_tokens"]) + int(m.group("total"))
-        row["seconds"] = float(row["seconds"]) + float(m.group("time"))
+        for field, field_re in field_res.items():
+            fm = field_re.search(line)
+            if fm is None:
+                continue
+            if field == "seconds":
+                row["seconds"] = float(row["seconds"]) + float(fm.group(1))
+            else:
+                row[field] = int(row[field]) + int(fm.group(1))
 
     batch_re = re.compile(
         r"\[CONSOLIDATION\].*?llm_batch #\d+ \((?P<mem>\d+) memories, (?P<calls>\d+) llm calls\)"
@@ -715,6 +728,43 @@ def parse_hindsight_llm_logs(log_text: str) -> tuple[list[dict[str, int | float 
         batch_stats["failed"] += int(m.group("failed") or 0)
 
     return sorted(usage.values(), key=lambda x: (str(x["scope"]), str(x["model"]))), batch_stats
+
+
+def parse_oneapi_auto_cheep_counts(db_path: str, start: datetime, end: datetime) -> dict[str, int]:
+    """从 One API 日志库副本统计 auto_cheep_model 的上游请求（全量口径交叉核对）。
+
+    渠道 3/4/5/6/7 = auto_cheep_model 专用渠道（zen-free / cch-bridge / cch-bridge-glm /
+    opencode-go-muse / opencode-go-mimo；3/4/5 已禁用但保留历史流量）。
+    created_at 为 unix 秒；type=2 为成功消费记录。覆盖 2026-09-13 服务端补丁前
+    journal 未记录的快调用，可作"实际产生调用数"的上游实测。
+    """
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "SELECT count(*),"
+            " COALESCE(SUM(prompt_tokens), 0),"
+            " COALESCE(SUM(completion_tokens), 0)"
+            " FROM logs"
+            " WHERE created_at >= ? AND created_at < ?"
+            " AND channel_id IN (3, 4, 5, 6, 7) AND type = 2",
+            (int(start.timestamp()), int(end.timestamp())),
+        ).fetchone()
+    finally:
+        con.close()
+    return {"requests": int(row[0]), "prompt_tokens": int(row[1]), "completion_tokens": int(row[2])}
+
+
+def oneapi_auto_cheep_counts(start: datetime, end: datetime) -> dict[str, int] | None:
+    """把 One API 的日志库拷出容器后统计；容器/库不可用时返回 None（不影响主报表）。"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="oneapi-report-") as tmp_dir:
+            db_path = os.path.join(tmp_dir, "one-api.db")
+            code, _out, _err = run(f"docker cp one-api:/data/one-api.db {shlex.quote(db_path)}", timeout=60)
+            if code != 0 or not os.path.exists(db_path):
+                return None
+            return parse_oneapi_auto_cheep_counts(db_path, start, end)
+    except Exception:
+        return None
 
 
 def hindsight_db_stats(start: datetime, end: datetime) -> dict:
@@ -1013,7 +1063,7 @@ def main() -> int:
     print()
 
     # ── Hindsight LLM 用量 (full table) ──
-    print("【Hindsight LLM 用量（journald 日志精确值）】")
+    print("【Hindsight LLM 用量（journald 全量调用日志）】")
     # journald 持久化下 --since 过滤准确，服务重启不影响；仅当窗口起点前无任何
     # hindsight 日志（服务尚未启动或 journal 被清理）时提示缺失。
     # 注意：journal 首条晚于窗口起点时，docker 段已在 hindsight_logs_since() 补齐，
@@ -1067,6 +1117,14 @@ def main() -> int:
         )
     else:
         print("无 LLM 调用记录")
+    oneapi = oneapi_auto_cheep_counts(start, end)
+    if oneapi and oneapi["requests"]:
+        journal_total = sum(int(r["calls"]) for r in llm_usage)
+        oneapi_line = f"上游实测（One API，auto_cheep 渠道全部请求）: {oneapi['requests']} 次"
+        delta = oneapi["requests"] - journal_total
+        if delta > 0:
+            oneapi_line += f"（较 journal 多 {delta} 次：含 2026-09-13 前未落日志的快调用、重试、非服务脚本与测试流量）"
+        print(oneapi_line)
     print()
 
     # ── Hindsight 数据变化 (full table) ──
