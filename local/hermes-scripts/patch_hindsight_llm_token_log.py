@@ -1,66 +1,51 @@
 #!/usr/bin/env python3
-"""Patch Hindsight openai_compatible_llm.py to log token usage for EVERY LLM call.
+"""Patch Hindsight (native pip install) to log token usage for EVERY LLM call.
 
-Why: The upstream code only logs token usage when duration > 10s ("slow llm call:").
-Most retain/reflect/consolidation calls finish under 10s and produce no token log at all.
-daily_stats.py relies on these logs to capture Hindsight LLM usage for the daily report.
+Why: upstream only logs token usage when duration > 10s ("slow llm call:").
+Most retain/reflect/consolidation calls finish under 10s and produce no token log;
+daily_report.py relies on these logs for the "Hindsight LLM 用量" table, so fast
+calls were silently missing (measured 2026-09-13 00:00-02:00: 144 logged vs 240
+actual bridge requests, ~40% missing; plus call_with_tools had no logging at all).
 
-This patch:
-1. In call(): removes the `duration > 10.0` condition — every call logs token usage.
-2. In call(): changes prefix from "slow llm call:" to "llm call:" (since it's no longer slow-only).
-3. In call_with_tools(): adds token logging (upstream has none).
-4. Uses a compatible format: `scope=xxx, model=xxx, input_tokens=xxx, output_tokens=xxx,
-   total_tokens=xxx, time=xxxs` — always putting time right after total_tokens,
-   with optional fields (cached_tokens, ratio) AFTER time, so the regex in
-   daily_stats.py always matches.
+History: the original patcher (2026-06-23) targeted the Docker container via
+`docker cp`. On 2026-08-13 Hindsight migrated docker -> native systemd
+(pip install, hindsight.service); the patch was lost and logs reverted to
+slow-only. This v2 targets the native install file directly.
 
-Format produced after patch:
-  llm call: scope=reflect, model=openai/deepseek-v4-flash, input_tokens=5000,
-  output_tokens=200, total_tokens=5200, time=3.5s, cached_tokens=4500,
-  ratio out/in=0.04
+Patches (idempotent, marker-guarded):
+1. call(): remove `duration > 10.0` gate; prefix "slow llm call:" -> "llm call:";
+   cache info moved AFTER time= so daily_report.py's regex always matches.
+2. call_with_tools(): add token logging before return (upstream has none).
 
-The regex in daily_stats.py will match the prefix up to `time=3.5s` and ignore
-the trailing optional fields.
+Usage:
+  python3 patch_hindsight_llm_token_log.py            # apply patches (+py_compile)
+  python3 patch_hindsight_llm_token_log.py --check    # verify markers, exit 0/1
+  python3 patch_hindsight_llm_token_log.py --restart  # apply then sudo systemctl restart
+
+NOTE: site-packages patches are overwritten by pip upgrades. After any
+hindsight-api upgrade, re-run --check and re-apply if needed.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import py_compile
 import re
 import subprocess
-import tempfile
+import sys
 from pathlib import Path
 
-CONTAINER = "hindsight"
-REMOTE = "/app/api/hindsight_api/engine/providers/openai_compatible_llm.py"
+TARGET = Path(
+    "/home/wyr/miniconda/lib/python3.13/site-packages/hindsight_api/engine/providers/openai_compatible_llm.py"
+)
 MARKER_CALL = "# HERMES_LLM_TOKEN_LOG_FIX_V1"
 MARKER_TOOLS = "# HERMES_LLM_TOKEN_LOG_FIX_V1_TOOLS"
+SERVICE = "hindsight.service"
 
-
-def _run(cmd: list[str], **kw) -> tuple[int, str, str]:
-    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
-    return r.returncode, r.stdout, r.stderr
-
-
-def apply_patch(restart: bool = False) -> None:
-    # Copy file out
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as tmp:
-        tmp_path = tmp.name
-    _run(["docker", "cp", f"{CONTAINER}:{REMOTE}", tmp_path])
-
-    content = Path(tmp_path).read_text()
-    changed = False
-
-    # --- Patch 1: call() method — replace "if duration > 10.0 and usage:" block ---
-    if MARKER_CALL in content:
-        print(f"[SKIP] call() already patched ({MARKER_CALL} found)")
-    else:
-        new_block = f"""                {MARKER_CALL}
+NEW_CALL_BLOCK = """                {marker}
                 # Log EVERY LLM call (not just slow ones) for usage tracking
                 if usage:
                     ratio = max(1, output_tokens) / max(1, input_tokens)
-                    cached_tokens = 0
-                    if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
-                        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
                     cache_info = f", cached_tokens={{cached_tokens}}" if cached_tokens > 0 else ""
                     logger.info(
                         f"llm call: scope={{scope}}, model={{self.provider}}/{{self.model}}, "
@@ -68,84 +53,105 @@ def apply_patch(restart: bool = False) -> None:
                         f"total_tokens={{total_tokens}}, time={{duration:.3f}}s{{cache_info}}, ratio out/in={{ratio:.2f}}"
                     )"""
 
-        simple_re = re.compile(
-            r"([ \t]+)# Log slow calls\n"
-            r"([ \t]+)if duration > 10\.0 and usage:.*?"
-            r'(?=\n[ \t]+if return_usage:)',
-            re.DOTALL,
-        )
-
-        new_content = simple_re.sub(new_block, content)
-        if new_content == content:
-            print("[ERROR] call() patch: substitution did not match")
-            for i, line in enumerate(content.split("\n"), 1):
-                if "Log slow calls" in line:
-                    print(f"  Found at line {i}: {line!r}")
-                    break
-        else:
-            content = new_content
-            changed = True
-            print(f"[OK] Patched call() — unconditional token logging")
-
-    # --- Patch 2: call_with_tools() method — add token logging before return ---
-    if MARKER_TOOLS in content:
-        print(f"[SKIP] call_with_tools() already patched ({MARKER_TOOLS} found)")
-    else:
-        tools_patch = """                # HERMES_LLM_TOKEN_LOG_FIX_V1_TOOLS
+TOOLS_BLOCK = """                # HERMES_LLM_TOKEN_LOG_FIX_V1_TOOLS
                 # Log EVERY LLM tool call for usage tracking
-                total_tokens = input_tokens + output_tokens
-                ratio = max(1, output_tokens) / max(1, input_tokens)
                 logger.info(
                     f"llm call: scope={scope}, model={self.provider}/{self.model}, "
                     f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
-                    f"total_tokens={total_tokens}, time={duration:.3f}s, ratio out/in={ratio:.2f}"
+                    f"total_tokens={input_tokens + output_tokens}, time={duration:.3f}s, "
+                    f"ratio out/in={max(1, output_tokens) / max(1, input_tokens):.2f}"
                 )
 
-                return LLMToolCallResult("""
+"""
 
-        old_return = "                return LLMToolCallResult("
-        # Only replace the one inside call_with_tools (after "Record OpenTelemetry span")
-        # Use a targeted approach: find the second occurrence (call_with_tools)
-        parts = content.split(old_return)
-        if len(parts) >= 3:
-            # First occurrence is in call(), second is in call_with_tools()
-            # Re-join with the patch before the second occurrence
-            content = old_return.join(parts[:2]) + tools_patch + old_return.join(parts[2:])
+
+def check() -> tuple[bool, bool]:
+    content = TARGET.read_text()
+    return MARKER_CALL in content, MARKER_TOOLS in content
+
+
+def apply() -> int:
+    content = TARGET.read_text()
+    changed = False
+
+    # --- Patch 1: call() ---
+    if MARKER_CALL in content:
+        print(f"[SKIP] call() already patched ({MARKER_CALL})")
+    else:
+        simple_re = re.compile(
+            r"([ \t]+)# Log slow calls\n"
+            r"([ \t]+)if duration > 10\.0 and usage:.*?"
+            r"(?=\n[ \t]+if return_usage:)",
+            re.DOTALL,
+        )
+        new_content = simple_re.sub(lambda m: NEW_CALL_BLOCK.format(marker=MARKER_CALL), content, count=1)
+        if new_content == content:
+            print("[ERROR] call() patch: substitution did not match")
+            return 2
+        content = new_content
+        changed = True
+        print("[OK] Patched call() — unconditional token logging")
+
+    # --- Patch 2: call_with_tools() ---
+    if MARKER_TOOLS in content:
+        print(f"[SKIP] call_with_tools() already patched ({MARKER_TOOLS})")
+    else:
+        anchor = "                return LLMToolCallResult("
+        parts = content.split(anchor)
+        if len(parts) == 2:
+            content = parts[0] + TOOLS_BLOCK + anchor + parts[1]
             changed = True
-            print(f"[OK] Patched call_with_tools() — token logging before return")
-        elif len(parts) == 2:
-            # Only one occurrence — it's in call_with_tools
-            content = parts[0] + tools_patch + parts[1]
-            changed = True
-            print(f"[OK] Patched call_with_tools() — token logging before return (single occurrence)")
+            print("[OK] Patched call_with_tools() — token logging before return")
         else:
-            print("[ERROR] call_with_tools() patch: 'return LLMToolCallResult(' not found")
+            print(f"[ERROR] call_with_tools() patch: expected 1 anchor, found {len(parts) - 1}")
+            return 2
 
     if not changed:
         print("[INFO] No changes needed — both patches already applied")
+        return 0
+
+    # backup once per day, then write + syntax check
+    bak = TARGET.with_suffix(TARGET.suffix + f".bak-{_dt.date.today().isoformat()}")
+    if not bak.exists():
+        bak.write_text(TARGET.read_text())
+        print(f"[OK] Backup: {bak}")
+    TARGET.write_text(content)
+    try:
+        py_compile.compile(str(TARGET), doraise=True)
+    except py_compile.PyCompileError as e:
+        print(f"[ERROR] syntax check failed, restoring backup: {e}")
+        TARGET.write_text(bak.read_text())
+        return 3
+    print("[OK] Written + py_compile passed")
+    return 0
+
+
+def restart() -> None:
+    r = subprocess.run(["sudo", "-n", "systemctl", "restart", SERVICE], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"[RESTART] {SERVICE} restarted (passwordless sudo)")
         return
-
-    Path(tmp_path).write_text(content)
-
-    # Copy back
-    _run(["docker", "cp", tmp_path, f"{CONTAINER}:{REMOTE}"])
-    print(f"[OK] Wrote patched {REMOTE} to container {CONTAINER}")
-
-    if restart:
-        print("[RESTART] Restarting hindsight container...")
-        _run(["/usr/bin/sg", "docker", "-c", "docker", "restart", CONTAINER])
-        print("[RESTART] Done. Wait ~10s for container to become ready.")
-    else:
-        print("[INFO] Container not restarted — existing workers will use old code.")
-        print("       Restart with: docker restart hindsight")
-        print("       Or the pipeline will restart it automatically next run.")
+    r2 = subprocess.run(["systemctl", "restart", SERVICE], capture_output=True, text=True)
+    print(f"[RESTART] direct attempt rc={r2.returncode}: {(r2.stderr or r2.stdout).strip()}")
+    print(f"[HINT] retry manually: echo <pw> | sudo -S systemctl restart {SERVICE}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Patch Hindsight to log every LLM call's token usage")
-    parser.add_argument("--restart", action="store_true", help="Restart container after patching")
-    args = parser.parse_args()
-    apply_patch(restart=args.restart)
+    ap = argparse.ArgumentParser(description="Patch Hindsight to log token usage for EVERY LLM call (native install)")
+    ap.add_argument("--check", action="store_true", help="verify markers and exit")
+    ap.add_argument("--restart", action="store_true", help="restart hindsight.service after applying")
+    args = ap.parse_args()
+
+    if args.check:
+        call_ok, tools_ok = check()
+        print(f"call() patched: {call_ok} | call_with_tools() patched: {tools_ok}")
+        sys.exit(0 if (call_ok and tools_ok) else 1)
+
+    rc = apply()
+    if rc != 0:
+        sys.exit(rc)
+    if args.restart:
+        restart()
 
 
 if __name__ == "__main__":
