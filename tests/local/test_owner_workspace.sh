@@ -100,4 +100,40 @@ fi
 assert_eq "$(git -C "$TMP/ConflictRepo-designer" rev-parse HEAD)" "$CONFLICT_BEFORE"
 [[ ! -e "$TMP/ConflictRepo-designer/.git/MERGE_HEAD" ]] || fail "merge conflict was not aborted"
 
+OWNER_PRIMARY="$TMP/OwnerRepo"
+new_repo "$OWNER_PRIMARY"
+mkdir -p "$OWNER_PRIMARY/docs/roadmap/owners"
+printf 'log v1\n' >"$OWNER_PRIMARY/docs/roadmap/owners/designer.md"
+git -C "$OWNER_PRIMARY" add docs/roadmap/owners/designer.md
+git -C "$OWNER_PRIMARY" commit -qm owner-log-base
+$HELPER prepare --role designer --workspace "$OWNER_PRIMARY" >/dev/null
+printf 'role update\n' >>"$TMP/OwnerRepo-designer/docs/roadmap/owners/designer.md"
+git -C "$TMP/OwnerRepo-designer" commit -qam role-log-update
+printf 'main update\n' >>"$OWNER_PRIMARY/docs/roadmap/owners/designer.md"
+git -C "$OWNER_PRIMARY" commit -qam main-log-update
+$HELPER sync --role designer --workspace "$OWNER_PRIMARY" >/dev/null 2>&1 || fail "owner-log conflict blocked sync"
+OWNER_LOG="$(cat "$TMP/OwnerRepo-designer/docs/roadmap/owners/designer.md")"
+assert_contains "$OWNER_LOG" "role update"
+assert_contains "$OWNER_LOG" "main update"
+[[ ! -e "$TMP/OwnerRepo-designer/.git/MERGE_HEAD" ]] || fail "owner-log merge left MERGE_HEAD"
+
+# With the union merge driver present in .gitattributes the same two-sided log
+# update merges natively (no script fallback needed).
+ATTR_PRIMARY="$TMP/AttrRepo"
+new_repo "$ATTR_PRIMARY"
+mkdir -p "$ATTR_PRIMARY/docs/roadmap/owners"
+printf 'docs/roadmap/owners/*.md merge=union\n' >"$ATTR_PRIMARY/.gitattributes"
+printf 'log v1\n' >"$ATTR_PRIMARY/docs/roadmap/owners/designer.md"
+git -C "$ATTR_PRIMARY" add .gitattributes docs/roadmap/owners/designer.md
+git -C "$ATTR_PRIMARY" commit -qm attr-base
+$HELPER prepare --role designer --workspace "$ATTR_PRIMARY" >/dev/null
+printf 'role update\n' >>"$TMP/AttrRepo-designer/docs/roadmap/owners/designer.md"
+git -C "$TMP/AttrRepo-designer" commit -qam role-log-update
+printf 'main update\n' >>"$ATTR_PRIMARY/docs/roadmap/owners/designer.md"
+git -C "$ATTR_PRIMARY" commit -qam main-log-update
+$HELPER sync --role designer --workspace "$ATTR_PRIMARY" >/dev/null 2>&1 || fail "union-attr owner-log merge blocked sync"
+ATTR_LOG="$(cat "$TMP/AttrRepo-designer/docs/roadmap/owners/designer.md")"
+assert_contains "$ATTR_LOG" "role update"
+assert_contains "$ATTR_LOG" "main update"
+
 echo "PASS: owner workspace contract"

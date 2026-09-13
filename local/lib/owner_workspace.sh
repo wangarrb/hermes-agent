@@ -51,6 +51,33 @@ owner_workspace_print_contract() {
         "$role" "$target" "$branch" "$base" "$integration_branch" "$primary"
 }
 
+# Owner roadmap logs（docs/roadmap/owners/*.md）是两侧并行维护的运行记录。
+# 仅当合并冲突全部落在这些日志文件时，用 union 方式两侧保留地解决并完成合并；
+# 任何其他文件的冲突仍按原逻辑失败退出（启动不应被日志冲突阻塞，2026-09-13）。
+owner_workspace_resolve_owner_log_conflicts() {
+    local target="$1" conflicted other f tmpd
+    conflicted="$(git -C "$target" diff --name-only --diff-filter=U)" || return 1
+    [[ -n "$conflicted" ]] || return 1
+    other="$(printf '%s\n' "$conflicted" | grep -vE '^docs/roadmap/owners/[^/]+\.md$' || true)"
+    [[ -z "$other" ]] || return 1
+    tmpd="$(mktemp -d)" || return 1
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if ! git -C "$target" show ":1:$f" >"$tmpd/base" 2>/dev/null ||
+            ! git -C "$target" show ":2:$f" >"$tmpd/ours" 2>/dev/null ||
+            ! git -C "$target" show ":3:$f" >"$tmpd/theirs" 2>/dev/null ||
+            ! git -C "$target" merge-file --union -q "$tmpd/ours" "$tmpd/base" "$tmpd/theirs"; then
+            rm -rf "$tmpd"
+            return 1
+        fi
+        cp "$tmpd/ours" "$target/$f" || { rm -rf "$tmpd"; return 1; }
+        git -C "$target" add -- "$f" || { rm -rf "$tmpd"; return 1; }
+    done <<<"$conflicted"
+    rm -rf "$tmpd"
+    git -C "$target" commit --no-edit >/dev/null 2>&1 || return 1
+    return 0
+}
+
 owner_workspace_prepare() {
     local action="$1" role="$2" workspace="$3" dry_run="${4:-0}" target_override="${5:-}"
     local primary target branch base integration_branch created_worktree=0 created_branch=0
@@ -127,13 +154,17 @@ owner_workspace_prepare() {
 
     if ! git -C "$target" merge-base --is-ancestor "$base" HEAD; then
         if ! git -C "$target" merge --no-edit "$base" >/dev/null; then
-            git -C "$target" merge --abort >/dev/null 2>&1 || true
-            if (( created_worktree )); then
-                git -C "$primary" worktree remove "$target" >/dev/null 2>&1 || true
-                (( created_branch == 0 )) || git -C "$primary" branch -D "$branch" >/dev/null 2>&1 || true
+            if owner_workspace_resolve_owner_log_conflicts "$target"; then
+                echo "resolved owner-log conflicts via union merge (docs/roadmap/owners/*.md)" >&2
+            else
+                git -C "$target" merge --abort >/dev/null 2>&1 || true
+                if (( created_worktree )); then
+                    git -C "$primary" worktree remove "$target" >/dev/null 2>&1 || true
+                    (( created_branch == 0 )) || git -C "$primary" branch -D "$branch" >/dev/null 2>&1 || true
+                fi
+                echo "failed to merge integration base $base into $branch" >&2
+                return 4
             fi
-            echo "failed to merge integration base $base into $branch" >&2
-            return 4
         fi
     fi
 }
