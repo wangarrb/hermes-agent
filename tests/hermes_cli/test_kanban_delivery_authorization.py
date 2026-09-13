@@ -232,6 +232,36 @@ def test_completion_closes_frozen_prepared_delivery(delivery_env):
         )
 
 
+def test_completion_closes_prepared_record_using_frozen_contract(delivery_env):
+    with kb.connect() as conn:
+        task, _worktree, _reservation, frozen, _delivered = _deliver(
+            conn, delivery_env, label="prepared-contract"
+        )
+        # Match the R0 failure mode: the lifecycle contract is frozen, but
+        # the prepared delivery row lost its copied delivery identities.
+        conn.execute(
+            "UPDATE tasks SET delivery_state = 'prepared', "
+            "delivery_json = json_set(delivery_json, '$.delivery_sha', NULL, "
+            "'$.delivery_tree', NULL) WHERE id = ?",
+            (task.id,),
+        )
+        assert kb.complete_task(
+            conn,
+            task.id,
+            result="contract-backed handback",
+            summary="contract-backed prepared delivery",
+            metadata={
+                "task_type": "code",
+                "independent_review_outcome": "TIMEOUT",
+                "independent_review_note": "lifecycle regression test",
+            },
+        )
+        current = kb.get_task(conn, task.id)
+        assert current.delivery_state == "delivered"
+        assert current.delivery.delivery_sha == frozen["delivery_commit"]
+        assert current.delivery.delivery_tree == frozen["delivery_tree"]
+
+
 def test_illegal_transition_fails_closed_with_durable_event(delivery_env):
     delivery = _delivery_module()
     with kb.connect() as conn:

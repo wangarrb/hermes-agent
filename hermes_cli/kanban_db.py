@@ -6661,15 +6661,27 @@ def complete_task(
             if prepared_delivery is not None
             else {}
         )
+        frozen_delivery_sha = (
+            prepared_delivery.delivery_sha
+            or contract.get("delivery_commit")
+        ) if prepared_delivery is not None else None
+        frozen_delivery_tree = (
+            prepared_delivery.delivery_tree
+            or contract.get("delivery_tree")
+        ) if prepared_delivery is not None else None
         if (
             prepared_delivery is not None
             and prepared_delivery.state == "prepared"
             and prepared_delivery.generation == int(current_task.generation)
             and contract.get("frozen") is True
-            and prepared_delivery.delivery_sha
-            and prepared_delivery.delivery_tree
+            and frozen_delivery_sha
+            and frozen_delivery_tree
         ):
-            delivered = prepared_delivery.with_state("delivered")
+            delivered = prepared_delivery.with_state(
+                "delivered",
+                delivery_sha=str(frozen_delivery_sha),
+                delivery_tree=str(frozen_delivery_tree),
+            )
             conn.execute(
                 "UPDATE tasks SET delivery_state = 'delivered', delivery_json = ? "
                 "WHERE id = ? AND generation = ? AND delivery_state = 'prepared'",
@@ -6690,8 +6702,8 @@ def complete_task(
                     "source": "completion",
                     "generation": current_task.generation,
                     "reservation_id": prepared_delivery.reservation_id,
-                    "delivery_sha": prepared_delivery.delivery_sha,
-                    "delivery_tree": prepared_delivery.delivery_tree,
+                    "delivery_sha": str(frozen_delivery_sha),
+                    "delivery_tree": str(frozen_delivery_tree),
                 },
                 run_id=current_task.current_run_id,
             )
