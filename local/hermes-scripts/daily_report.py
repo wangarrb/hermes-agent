@@ -312,49 +312,50 @@ def hermes_model_usage(start: datetime, end: datetime) -> list[dict[str, int | s
         r'cache=(\d+)/(\d+)'
     )
 
-    # Map profile → agent.log path
-    log_paths: list[tuple[str, Path]] = []
-    default_log = HERMES_HOME / "logs" / "agent.log"
-    if default_log.exists():
-        log_paths.append(("default", default_log))
+    # Map profile → agent.log 文件组（含轮转 .1/.2/.3；窗口跨轮转日时防止漏读）
+    log_groups: list[tuple[str, list[Path]]] = []
+    default_logs = sorted((HERMES_HOME / "logs").glob("agent.log*"))
+    if default_logs:
+        log_groups.append(("default", default_logs))
     if PROFILE_DIR.exists():
         for p in sorted(PROFILE_DIR.iterdir()):
-            agent_log = p / "logs" / "agent.log"
-            if agent_log.exists():
-                log_paths.append((p.name, agent_log))
+            profile_logs = sorted((p / "logs").glob("agent.log*"))
+            if profile_logs:
+                log_groups.append((p.name, profile_logs))
 
     start_ts_str = start.strftime("%Y-%m-%d %H:%M:%S")
     end_ts_str = end.strftime("%Y-%m-%d %H:%M:%S")
 
-    for profile, log_path in log_paths:
-        # Per-model aggregation
+    for profile, profile_logs in log_groups:
+        # Per-model aggregation（同一 profile 的当前+轮转文件合并统计）
         agg: dict[str, dict] = defaultdict(lambda: {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "sessions": set()})
-        try:
-            with open(log_path, "r", errors="replace") as f:
-                for line in f:
-                    # Quick filter by date prefix
-                    if len(line) < 20 or line[0] != '2':
-                        continue
-                    ts = line[:19]  # "2026-07-16 10:19:57"
-                    if ts < start_ts_str or ts >= end_ts_str:
-                        continue
-                    m = _call_re.search(line)
-                    if not m:
-                        continue
-                    model = m.group(1)
-                    inp = int(m.group(2))
-                    outp = int(m.group(3))
-                    cache_r = int(m.group(4))
-                    # Extract session_id from [session_id] in the log line
-                    sess_m = re.search(r'\[([0-9a-f_]+)\]', line)
-                    if sess_m:
-                        agg[model]["sessions"].add(sess_m.group(1))
-                    agg[model]["calls"] += 1
-                    agg[model]["input"] += inp
-                    agg[model]["output"] += outp
-                    agg[model]["cache_read"] += cache_r
-        except OSError:
-            continue
+        for log_path in profile_logs:
+            try:
+                with open(log_path, "r", errors="replace") as f:
+                    for line in f:
+                        # Quick filter by date prefix
+                        if len(line) < 20 or line[0] != '2':
+                            continue
+                        ts = line[:19]  # "2026-07-16 10:19:57"
+                        if ts < start_ts_str or ts >= end_ts_str:
+                            continue
+                        m = _call_re.search(line)
+                        if not m:
+                            continue
+                        model = m.group(1)
+                        inp = int(m.group(2))
+                        outp = int(m.group(3))
+                        cache_r = int(m.group(4))
+                        # Extract session_id from [session_id] in the log line
+                        sess_m = re.search(r'\[([0-9a-f_]+)\]', line)
+                        if sess_m:
+                            agg[model]["sessions"].add(sess_m.group(1))
+                        agg[model]["calls"] += 1
+                        agg[model]["input"] += inp
+                        agg[model]["output"] += outp
+                        agg[model]["cache_read"] += cache_r
+            except OSError:
+                continue
 
         for model, d in agg.items():
             rows_out.append({
@@ -445,28 +446,85 @@ def hindsight_health() -> str:
         return f"unavailable: {type(exc).__name__}"
 
 
+def _rollout_event_dt(ts: str) -> datetime | None:
+    """Parse a rollout line timestamp (RFC3339, usually UTC 'Z') to local time."""
+    try:
+        if ts.endswith("Z"):
+            return datetime.fromisoformat(ts[:-1]).replace(tzinfo=timezone.utc).astimezone()
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone()
+    except ValueError:
+        return None
+
+
+def parse_codex_rollout_events(
+    files: list[tuple[str, str]], start: datetime, end: datetime,
+) -> dict | None:
+    """Aggregate per-call rollout usage within [start, end).
+
+    每个 token_count 事件携带 last_token_usage（该次调用的增量），因此
+    事件数 = 真实 LLM 调用次数、tokens = 各事件增量求和。该口径对
+    cumulative 计数重置（会话 resume/重建）免疫——旧的"按日累计差"
+    （末次-首次）方法遇重置会产出负数并吞掉重置期间的用量（2026-09-13 修复：
+    Codex(kanban) 曾显示 -75.7M，真实为 1,312 次 / 588M input）。
+
+    Returns {'sources': {label: {'calls','input','cached','output'}}, 'total': {...}}
+    or None when nothing is found.
+    """
+    sources: dict[str, dict[str, int]] = {}
+    for source_label, session_file in files:
+        try:
+            with open(session_file) as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        ts = d.get("timestamp", "")
+                        if not ts or d.get("type") != "event_msg":
+                            continue
+                        payload = d.get("payload", {})
+                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                            continue
+                        dt = _rollout_event_dt(ts)
+                        if dt is None or not (start <= dt < end):
+                            continue
+                        last = payload.get("info", {}).get("last_token_usage") or {}
+                        if int(last.get("total_tokens") or 0) <= 0:
+                            continue
+                        s = sources.setdefault(
+                            source_label,
+                            {"calls": 0, "input": 0, "cached": 0, "output": 0},
+                        )
+                        s["calls"] += 1
+                        s["input"] += int(last.get("input_tokens") or 0)
+                        s["cached"] += int(last.get("cached_input_tokens") or 0)
+                        s["output"] += int(last.get("output_tokens") or 0)
+                    except Exception:
+                        pass
+        except OSError:
+            pass
+    if not sources:
+        return None
+    total = {k: sum(s[k] for s in sources.values()) for k in ("calls", "input", "cached", "output")}
+    return {"sources": sources, "total": total}
+
+
 def parse_codex_usage(target_date: str) -> dict | None:
-    """Parse aggregate Codex/CodeWhale rollout usage (cumulative, need delta).
+    """Scan Codex/CodeWhale rollout homes for the report window.
 
-    token_count events carry per-session cumulative totals. Different sessions
-    have independent counters starting from 0, so we must compute deltas per-session
-    first, then sum across sessions for the target date.
-
-    Returns a dict with per-source breakdown:
-      {
-        'sources': {
-            'Codex': {'input': N, 'cached': N, 'output': N},
-            'CodeWhale': {'input': N, 'cached': N, 'output': N},
-            'Codex(kanban)': {'input': N, 'cached': N, 'output': N},
-        },
-        'total': {'input': N, 'cached': N, 'output': N},
-      }
+    窗口 = target_date-1 08:30 → target_date 08:30（本地时区），逐事件精确过滤；
+    只读取窗口开始后写过（mtime 更新）的文件以跳过历史大文件。
     """
     codex_base = Path('/home/wyr/.codex/sessions')
     cw_base = Path('/home/wyr/.codewhale/sessions')
     codex_kanban_base = Path('/home/wyr/.codex-kanban')
 
-    # Map each scan dir to a source label
+    target_dt = datetime.strptime(target_date, '%Y-%m-%d')
+    tz = datetime.now().astimezone().tzinfo
+    end = target_dt.replace(tzinfo=tz) + timedelta(hours=8, minutes=30)
+    start = end - timedelta(days=1)
+
     source_dirs: list[tuple[str, Path]] = [
         ('Codex', codex_base),
         ('CodeWhale', cw_base),
@@ -477,80 +535,18 @@ def parse_codex_usage(target_date: str) -> dict | None:
             if role_sessions.is_dir():
                 source_dirs.append(('Codex(kanban)', role_sessions))
 
-    # Collect per-session first/last token_count per date, per source
-    # key = (source, session_file, date)
-    session_date_entries: dict[tuple, dict] = {}
-
+    files: list[tuple[str, str]] = []
     for source_label, base in source_dirs:
         if not base.exists():
             continue
-        for year_dir in sorted(base.glob('2026/*')):
-            if not year_dir.is_dir():
+        for session_file in base.glob('2026/*/*/rollout-*.jsonl'):
+            try:
+                if os.path.getmtime(session_file) < start.timestamp() - 60:
+                    continue  # 窗口开始后未再写入 → 不可能含窗口内事件
+            except OSError:
                 continue
-            for day_dir in sorted(year_dir.glob('*')):
-                if not day_dir.is_dir():
-                    continue
-                for session_file in day_dir.glob('rollout-*.jsonl'):
-                    try:
-                        with open(session_file) as f:
-                            for line in f:
-                                try:
-                                    d = json.loads(line)
-                                    ts = d.get('timestamp', '')
-                                    if not ts or ts[:10] < '2026-05-01':
-                                        continue
-                                    if d.get('type') == 'event_msg':
-                                        payload = d.get('payload', {})
-                                        if isinstance(payload, dict) and payload.get('type') == 'token_count':
-                                            info = payload.get('info', {})
-                                            total = info.get('total_token_usage', {})
-                                            date = ts[:10]
-                                            entry = {
-                                                'input': total.get('input_tokens', 0),
-                                                'cached': total.get('cached_input_tokens', 0),
-                                                'output': total.get('output_tokens', 0),
-                                            }
-                                            key = (source_label, str(session_file), date)
-                                            if key not in session_date_entries:
-                                                session_date_entries[key] = {'first': entry, 'last': entry}
-                                            else:
-                                                session_date_entries[key]['last'] = entry
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-
-    from datetime import datetime, timedelta
-    target_dt = datetime.strptime(target_date, '%Y-%m-%d')
-    prev_date = (target_dt - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    sources: dict[str, dict[str, int]] = {}
-    found_any = False
-
-    for (source_label, _sf, date), entries in session_date_entries.items():
-        if date not in (target_date, prev_date):
-            continue
-        found_any = True
-        first = entries['first']
-        last = entries['last']
-        d_input = last['input'] - first['input']
-        d_cached = last['cached'] - first['cached']
-        d_output = last['output'] - first['output']
-        if source_label not in sources:
-            sources[source_label] = {'input': 0, 'cached': 0, 'output': 0}
-        sources[source_label]['input'] += d_input
-        sources[source_label]['cached'] += d_cached
-        sources[source_label]['output'] += d_output
-
-    if not found_any:
-        return None
-
-    total = {'input': 0, 'cached': 0, 'output': 0}
-    for s in sources.values():
-        total['input'] += s['input']
-        total['cached'] += s['cached']
-        total['output'] += s['output']
-    return {'sources': sources, 'total': total}
+            files.append((source_label, str(session_file)))
+    return parse_codex_rollout_events(files, start, end)
 
 
 HINDSIGHT_ENV_FILE = Path("/home/wyr/.hindsight-docker/hindsight-native.env")
@@ -1022,10 +1018,11 @@ def main() -> int:
     codex_usage = parse_codex_usage(report_date_str)
     if codex_usage:
         print_table(
-            ["来源", "输入", "Cache读", "输出", "命中率"],
+            ["来源", "调用", "输入", "Cache读", "输出", "命中率"],
             [
                 [
                     src,
+                    str(stats["calls"]),
                     fmt_tok(stats["input"]),
                     fmt_tok(stats["cached"]),
                     fmt_tok(stats["output"]),
@@ -1037,8 +1034,8 @@ def main() -> int:
         t = codex_usage["total"]
         t_hit = f"{t['cached'] / t['input'] * 100:.1f}%" if t["input"] else "-"
         print_table(
-            ["来源", "输入", "Cache读", "输出", "命中率"],
-            [["合计", fmt_tok(t["input"]), fmt_tok(t["cached"]), fmt_tok(t["output"]), t_hit]],
+            ["来源", "调用", "输入", "Cache读", "输出", "命中率"],
+            [["合计", str(t["calls"]), fmt_tok(t["input"]), fmt_tok(t["cached"]), fmt_tok(t["output"]), t_hit]],
         )
     else:
         print("未采集到外部 CLI Agent 调用记录")
