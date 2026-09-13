@@ -195,3 +195,5 @@ native/fts5_cjk/*.so
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
 kanban_logs/
+# Kanban delivery-contract test sandbox (created by tests/plugins/test_kanban_delivery_contract.py)
+.test-kanban/
