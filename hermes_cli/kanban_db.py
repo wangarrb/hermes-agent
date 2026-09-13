@@ -6671,7 +6671,7 @@ def complete_task(
         ) if prepared_delivery is not None else None
         if (
             prepared_delivery is not None
-            and prepared_delivery.state == "prepared"
+            and prepared_delivery.state in {"prepared", "running"}
             and prepared_delivery.generation == int(current_task.generation)
             and contract.get("frozen") is True
             and frozen_delivery_sha
@@ -6684,11 +6684,12 @@ def complete_task(
             )
             conn.execute(
                 "UPDATE tasks SET delivery_state = 'delivered', delivery_json = ? "
-                "WHERE id = ? AND generation = ? AND delivery_state = 'prepared'",
+                "WHERE id = ? AND generation = ? AND delivery_state = ?",
                 (
                     delivery.dumps_delivery(delivered),
                     task_id,
                     current_task.generation,
+                    prepared_delivery.state,
                 ),
             )
             _append_event(
@@ -6696,7 +6697,7 @@ def complete_task(
                 task_id,
                 "delivery_delivered",
                 {
-                    "from_state": "prepared",
+                    "from_state": prepared_delivery.state,
                     "to_state": "delivered",
                     "actor": "complete",
                     "source": "completion",
