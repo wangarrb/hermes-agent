@@ -69,6 +69,32 @@ def test_validator_ignores_repository_path_tokens_in_codex_command(
     )
 
 
+def test_validator_accepts_advisory_title_mismatch_when_live_backend_matches(
+    tmp_path, monkeypatch,
+):
+    calls = []
+    panes = [{
+        "id": 3,
+        "title": "designer-hermes",
+        "is_plugin": False,
+        "exited": False,
+        "terminal_command": (
+            "bash -lc cd /home/wyr/code/SeqScale-designer && "
+            "HERMES_KANBAN_BOARD=seqscale "
+            "/home/wyr/.hermes/hermes-agent-repo/local/bin/hermes-kanban-continue -p designer"
+        ),
+    }]
+    monkeypatch.setattr(
+        bl.subprocess, "run",
+        lambda *a, **kw: _run_stub(panes=panes, calls=calls, args=a[0], **kw),
+    )
+
+    assert bl._zellij_validate_pane(
+        session="s", pane_id="3", expected_pane_prefix="hermes-kanban",
+        log_path=tmp_path / "inject.log",
+    )
+
+
 @pytest.mark.parametrize(
     ("title", "expected"),
     [

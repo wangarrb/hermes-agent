@@ -529,22 +529,28 @@ def _zellij_validate_pane(
             title_valid = expected_pane_prefix is None or _zellij_pane_title_matches(
                 str(pane.get("title", "")), expected_pane_prefix,
             )
-            if not title_valid:
-                continue
             if expected_pane_prefix is not None:
                 command = str(pane.get("terminal_command") or pane.get("pane_command") or "").casefold()
-                if command and "<defunct>" not in command and "conda" not in command:
-                    prefix_tokens = expected_pane_prefix.casefold().split("-")
-                    role = prefix_tokens[0]
-                    backend = {"codex": "codex", "hermes": "hermes", "claude": "claude", "codewhale": "codewhale", "deepseek": "deepseek", "reasonix": "reasonix"}.get(role, prefix_tokens[-1])
-                    if role == "implementer" and "deepseek" in prefix_tokens:
-                        backend = "deepseek"
-                    if role == "implementer" and "reasonix" in prefix_tokens:
-                        backend = "reasonix"
-                    backend_tokens = {backend}
-                    if backend == "deepseek":
-                        backend_tokens.add("codewhale")
-                    command_backends = _zellij_command_backend_tokens(command)
+                prefix_tokens = expected_pane_prefix.casefold().split("-")
+                role = prefix_tokens[0]
+                backend = {"codex": "codex", "hermes": "hermes", "claude": "claude", "codewhale": "codewhale", "deepseek": "deepseek", "reasonix": "reasonix"}.get(role, prefix_tokens[-1])
+                backend_tokens = {backend}
+                if backend == "deepseek":
+                    backend_tokens.add("codewhale")
+                command_backends = _zellij_command_backend_tokens(command)
+                if not title_valid:
+                    # The title is presentation state and may be overwritten by
+                    # a TUI/OSC sequence.  Treat it as advisory when a live
+                    # command proves the expected backend; never write to an
+                    # ambiguous or defunct pane without that proof.
+                    if not command or "<defunct>" in command or not (backend_tokens & command_backends):
+                        continue
+                    log_line(
+                        log_path,
+                        f"event=title_mismatch_advisory pane={pane_id!r} "
+                        f"expected={expected_pane_prefix!r} observed={pane.get('title', '')!r}",
+                    )
+                elif command and "<defunct>" not in command and "conda" not in command:
                     if not (backend_tokens & command_backends):
                         continue
             return True
