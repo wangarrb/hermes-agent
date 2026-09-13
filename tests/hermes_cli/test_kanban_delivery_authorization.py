@@ -199,6 +199,39 @@ def test_legal_delivery_chain_binds_authorization_and_never_merges(delivery_env)
     assert auth_event.payload["authorization"] == expected_tuple
 
 
+def test_completion_closes_frozen_prepared_delivery(delivery_env):
+    with kb.connect() as conn:
+        task, _worktree, _reservation, frozen, _delivered = _deliver(
+            conn, delivery_env, label="prepared-completion"
+        )
+        # Reproduce the interactive-listener race: the worktree was frozen,
+        # but the running->delivered event was lost before owner completion.
+        conn.execute(
+            "UPDATE tasks SET delivery_state = 'prepared' WHERE id = ?",
+            (task.id,),
+        )
+        assert kb.complete_task(
+            conn,
+            task.id,
+            result="frozen handback",
+            summary="frozen prepared delivery",
+            metadata={
+                "task_type": "code",
+                "independent_review_outcome": "TIMEOUT",
+                "independent_review_note": "lifecycle regression test",
+            },
+        )
+        current = kb.get_task(conn, task.id)
+        assert current.delivery_state == "delivered"
+        assert current.delivery.delivery_sha == frozen["delivery_commit"]
+        events = kb.list_events(conn, task.id)
+        assert any(
+            event.kind == "delivery_delivered"
+            and event.payload.get("source") == "completion"
+            for event in events
+        )
+
+
 def test_illegal_transition_fails_closed_with_durable_event(delivery_env):
     delivery = _delivery_module()
     with kb.connect() as conn:

@@ -6647,6 +6647,54 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # Interactive owner handbacks can complete a task after the listener
+        # has already frozen its worktree, while the delivery transition
+        # notification was lost or never emitted.  A frozen prepared delivery
+        # is safe to publish at completion: its commit/tree identity is already
+        # immutable and verified by ``freeze_task_delivery``.  Do not promote
+        # an unfrozen record; normal execution still follows
+        # prepared -> running -> delivered.
+        current_task = get_task(conn, task_id)
+        prepared_delivery = current_task.delivery if current_task else None
+        contract = (
+            prepared_delivery.workspace_contract
+            if prepared_delivery is not None
+            else {}
+        )
+        if (
+            prepared_delivery is not None
+            and prepared_delivery.state == "prepared"
+            and prepared_delivery.generation == int(current_task.generation)
+            and contract.get("frozen") is True
+            and prepared_delivery.delivery_sha
+            and prepared_delivery.delivery_tree
+        ):
+            delivered = prepared_delivery.with_state("delivered")
+            conn.execute(
+                "UPDATE tasks SET delivery_state = 'delivered', delivery_json = ? "
+                "WHERE id = ? AND generation = ? AND delivery_state = 'prepared'",
+                (
+                    delivery.dumps_delivery(delivered),
+                    task_id,
+                    current_task.generation,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "delivery_delivered",
+                {
+                    "from_state": "prepared",
+                    "to_state": "delivered",
+                    "actor": "complete",
+                    "source": "completion",
+                    "generation": current_task.generation,
+                    "reservation_id": prepared_delivery.reservation_id,
+                    "delivery_sha": prepared_delivery.delivery_sha,
+                    "delivery_tree": prepared_delivery.delivery_tree,
+                },
+                run_id=current_task.current_run_id,
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
