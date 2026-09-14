@@ -22,6 +22,7 @@ _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 _MUSE_SHORT_STOP_MAX_CHARS = 120
+_MUSE_SHORT_STOP_MAX_ATTEMPTS = 4
 _MUSE_TEXT_TOOL_CALL_MARKERS = (
     "<atem:function_calls",
     "<atem:invoke",
@@ -29,6 +30,7 @@ _MUSE_TEXT_TOOL_CALL_MARKERS = (
     "<function_call>",
 )
 _WATCHER_TASK_RE = re.compile(r"\[任务\s+(t_[A-Za-z0-9_-]+)\b")
+_MUSE_DEFAULT_TOOL_PROSE_RE = re.compile(r"\bdefault\.(?:\*|[a-z_][a-z0-9_-]*)")
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -175,7 +177,7 @@ def build_muse_short_stop_nudge(
     assistant_content: str | None,
     messages: Iterable[dict] | None = None,
     attempts: int = 0,
-    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    max_attempts: int = _MUSE_SHORT_STOP_MAX_ATTEMPTS,
 ) -> Optional[str]:
     """Re-prompt Muse when it emits a degenerate non-terminal Kanban final.
 
@@ -201,6 +203,11 @@ def build_muse_short_stop_nudge(
         return None
     lowered_content = content.lower()
     is_text_tool_call = any(marker in lowered_content for marker in _MUSE_TEXT_TOOL_CALL_MARKERS)
+    if not is_text_tool_call and _MUSE_DEFAULT_TOOL_PROSE_RE.search(lowered_content):
+        is_text_tool_call = any(
+            term in lowered_content
+            for term in ("tool", "工具", "namespace", "命名", "调用", "通道", "xml")
+        )
     if not is_text_tool_call and len(content) > _MUSE_SHORT_STOP_MAX_CHARS:
         return None
     if attempts >= max_attempts:

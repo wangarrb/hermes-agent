@@ -106,7 +106,7 @@ def test_muse_short_stop_nudge_is_bounded_and_ignores_non_muse():
         finish_reason="stop",
         assistant_content="short",
         messages=messages,
-        attempts=2,
+        attempts=4,
     ) is None
     assert build_muse_short_stop_nudge(
         model="glm-5.3-flash",
@@ -144,6 +144,25 @@ def test_muse_textual_tool_call_leak_is_reprompted():
 
     assert nudge is not None
     assert "structured function call" in nudge
+
+
+def test_muse_default_tool_namespace_prose_is_reprompted():
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+    ]
+    nudge = build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content=(
+            "未完成：继续取证。有效工具命名仍为 default.*，按既有通道继续取证。"
+        ),
+        messages=messages,
+        attempts=2,
+    )
+
+    assert nudge is not None
+    assert "bare tool names" in nudge
 
 
 def test_muse_short_stop_nudge_stops_after_terminal_board_tool():

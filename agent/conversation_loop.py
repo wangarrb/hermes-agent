@@ -6914,13 +6914,13 @@ def run_conversation(
                     })
                     agent._session_messages = messages
                     logger.warning(
-                        "Muse short-stop recovery nudge issued (attempt %d/2) task=%s",
+                        "Muse short-stop recovery nudge issued (attempt %d/4) task=%s",
                         agent._muse_short_stop_retries,
                         os.environ.get("HERMES_KANBAN_TASK", ""),
                     )
                     agent._emit_status(
                         "⚠️ Muse returned a non-terminal response — "
-                        f"nudging to continue ({agent._muse_short_stop_retries}/2)"
+                        f"nudging to continue ({agent._muse_short_stop_retries}/4)"
                     )
                     final_response = None
                     continue
