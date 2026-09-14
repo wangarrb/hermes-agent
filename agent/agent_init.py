@@ -643,13 +643,16 @@ def init_agent(
         # AWS Bedrock — auto-detect from provider name or base URL
         # (bedrock-runtime.<region>.amazonaws.com).
         agent.api_mode = "bedrock_converse"
-    elif agent.provider in {"nous", "nous-portal", "nousresearch"}:
-        # Portal is dual-wire: anthropic/* → Messages, everything else →
-        # chat_completions. Callers that already pass api_mode win above;
-        # this covers direct AIAgent construction without a resolved runtime.
-        from hermes_cli.providers import nous_api_mode
+    elif agent.provider in {"opencode-go", "opencode-zen"}:
+        # OpenCode Go/Zen are dual-wire providers: the correct transport is
+        # model-specific (e.g. Muse Spark → Responses, MiniMax/Qwen →
+        # Anthropic Messages, GLM/Kimi/DeepSeek → Chat Completions).  The
+        # runtime/model-switch paths already use this resolver; apply the same
+        # rule during initial AIAgent construction so a profile config cannot
+        # strand the first turn on the provider's default chat wire.
+        from hermes_cli.models import opencode_model_api_mode
 
-        agent.api_mode = nous_api_mode(agent.model)
+        agent.api_mode = opencode_model_api_mode(agent.provider, agent.model)
     else:
         agent.api_mode = "chat_completions"
 

@@ -34,7 +34,6 @@ def _agent(provider, model, base_url, api_mode=None):
     [
         ("opencode-go", "glm-5", "https://opencode.ai/zen/go/v1", None),  # chat_completions
         ("opencode-go", "gpt-5.6-luna", "https://opencode.ai/zen/go/v1", None),  # codex_responses
-        ("opencode-go", "minimax-m2.7", "https://opencode.ai/zen/go/v1", "anthropic_messages"),
         ("opencode-free", "laguna-s-2.1-free", "https://opencode.ai/zen/v1", None),
         ("custom", "glm-5", "https://opencode.ai/zen/go/v1", None),  # URL-only detection
     ],
@@ -47,6 +46,23 @@ def test_main_turn_sends_stable_session_header_on_every_transport(provider, mode
 
     other = _agent("openrouter", "anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1")
     assert "x-opencode-session" not in (build_api_kwargs(other, _MSGS).get("extra_headers") or {})
+
+
+@pytest.mark.parametrize(
+    "model, expected_api_mode",
+    [
+        ("muse-spark-1.3-contributor", "codex_responses"),
+        ("muse-spark-1.2-contributor", "codex_responses"),
+        ("glm-5.3-flash", "chat_completions"),
+    ],
+)
+def test_model_specific_api_mode_is_applied_during_agent_init(model, expected_api_mode):
+    agent = _agent(
+        "opencode-go",
+        model,
+        "https://opencode.ai/zen/go/v1",
+    )
+    assert agent.api_mode == expected_api_mode
 
 
 def test_auxiliary_calls_share_the_main_turn_session_key():
