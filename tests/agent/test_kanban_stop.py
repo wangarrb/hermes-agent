@@ -6,6 +6,7 @@ import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
+    build_muse_short_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
 )
@@ -72,6 +73,76 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_muse_short_stop_nudge_targets_watcher_task():
+    messages = [
+        {
+            "role": "user",
+            "content": "请读取任务文件并执行。[任务 t_abc123: bounded work] [by watcher]",
+        },
+    ]
+    nudge = build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="shit fuck damn",
+        messages=messages,
+    )
+
+    assert nudge is not None
+    assert "t_abc123" in nudge
+    assert "read_file" in nudge
+    assert "default." in nudge
+
+
+def test_muse_short_stop_nudge_is_bounded_and_ignores_non_muse():
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+    ]
+    assert build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="short",
+        messages=messages,
+        attempts=2,
+    ) is None
+    assert build_muse_short_stop_nudge(
+        model="glm-5.3-flash",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="short",
+        messages=messages,
+    ) is None
+    assert build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="x" * 121,
+        messages=messages,
+    ) is None
+
+
+def test_muse_short_stop_nudge_stops_after_terminal_board_tool():
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [{
+                "id": "1",
+                "function": {"name": "kanban_complete", "arguments": "{}"},
+            }],
+        },
+    ]
+    assert build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="short",
+        messages=messages,
+    ) is None
 
 
 

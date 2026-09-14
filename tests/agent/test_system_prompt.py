@@ -185,6 +185,18 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
 
 
+def test_muse_gets_tool_use_and_execution_guidance():
+    agent = _make_agent(
+        model="muse-spark-1.3-contributor",
+        valid_tool_names=["read_file"],
+        _tool_use_enforcement="auto",
+    )
+    stable = _stable_prompt(agent)
+
+    assert "# Tool-use enforcement" in stable
+    assert "# Execution discipline" in stable
+
+
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 

@@ -6877,6 +6877,57 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
+                # Muse Spark can end a long agentic turn with a tiny unrelated
+                # text fragment while a watcher-injected Kanban task is still
+                # running.  Keep the recovery narrow and bounded: only the
+                # OpenCode Go Muse family, only a watcher task, and only before
+                # a terminal Kanban tool has been called.  This prevents
+                # accepting fragments such as "shit fuck damn" as a task final
+                # without changing ordinary short user-facing answers.
+                try:
+                    from agent.kanban_stop import build_muse_short_stop_nudge
+
+                    _muse_short_nudge = build_muse_short_stop_nudge(
+                        model=getattr(agent, "model", None),
+                        provider=getattr(agent, "provider", None),
+                        finish_reason=finish_reason,
+                        assistant_content=final_response,
+                        messages=messages,
+                        attempts=getattr(agent, "_muse_short_stop_retries", 0),
+                    )
+                except Exception:
+                    logger.debug("Muse short-stop check failed", exc_info=True)
+                    _muse_short_nudge = None
+
+                if _muse_short_nudge:
+                    agent._muse_short_stop_retries = (
+                        getattr(agent, "_muse_short_stop_retries", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "muse_short_stop_retry"
+                    final_msg["_muse_short_stop_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _muse_short_nudge,
+                        "_muse_short_stop_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.warning(
+                        "Muse short-stop recovery nudge issued (attempt %d/2) task=%s",
+                        agent._muse_short_stop_retries,
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                    )
+                    agent._emit_status(
+                        "⚠️ Muse returned a short non-terminal fragment — "
+                        f"nudging to continue ({agent._muse_short_stop_retries}/2)"
+                    )
+                    final_response = None
+                    continue
+
+                # Reset after a normal/long final so a later watcher task gets
+                # its own bounded recovery budget.
+                agent._muse_short_stop_retries = 0
+
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
                 # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
@@ -6948,6 +6999,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_muse_short_stop_synthetic")
                     )
                 ):
                     messages.pop()

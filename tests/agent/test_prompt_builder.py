@@ -864,6 +864,9 @@ class TestBuildSkillsSystemPromptConditional:
 
 
 class TestToolUseEnforcementGuidance:
+    def test_muse_is_in_the_model_enforcement_catalog(self):
+        assert "muse" in TOOL_USE_ENFORCEMENT_MODELS
+
     def test_guidance_mentions_tool_calls(self):
         assert "tool call" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
 

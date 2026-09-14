@@ -192,3 +192,21 @@ class TestDroppedToolCallRecovery:
             "ephemeral scaffolding so they are never persisted."
         )
 
+    def test_muse_short_stop_scaffolding_is_ephemeral(self):
+        from run_agent import _is_ephemeral_scaffolding
+
+        assert _is_ephemeral_scaffolding(
+            {
+                "role": "assistant",
+                "content": "short fragment",
+                "_muse_short_stop_synthetic": True,
+            }
+        )
+        assert _is_ephemeral_scaffolding(
+            {
+                "role": "user",
+                "content": "continue",
+                "_muse_short_stop_synthetic": True,
+            }
+        )
+

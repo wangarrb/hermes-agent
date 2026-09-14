@@ -14,12 +14,15 @@ loop continues instead of exiting.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Iterable, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+_MUSE_SHORT_STOP_MAX_CHARS = 120
+_WATCHER_TASK_RE = re.compile(r"\[任务\s+(t_[A-Za-z0-9_-]+)\b")
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -101,8 +104,120 @@ def build_kanban_stop_nudge(
     )
 
 
+def _message_text(value: Any) -> str:
+    """Return a bounded plain-text view of a user message payload."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return str(value or "")
+
+
+def _latest_watcher_task(messages: Iterable[dict] | None) -> tuple[int, str] | None:
+    """Return the latest watcher-injected task marker and its message index."""
+    if not isinstance(messages, list):
+        return None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _message_text(message.get("content"))
+        if "[by watcher]" not in text:
+            continue
+        match = _WATCHER_TASK_RE.search(text)
+        if match:
+            return index, match.group(1)
+        env_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        if env_task:
+            return index, env_task
+    return None
+
+
+def _task_segment_called_terminal(
+    messages: Iterable[dict] | None,
+    start_index: int,
+) -> bool:
+    """Check terminal Kanban calls after the latest watcher task marker."""
+    if not isinstance(messages, list):
+        return False
+    for message in messages[start_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            if any(
+                _tool_call_name(call) in _TERMINAL_KANBAN_TOOLS
+                for call in message.get("tool_calls") or []
+            ):
+                return True
+        elif message.get("role") == "tool":
+            if str(message.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
+                return True
+    return False
+
+
+def build_muse_short_stop_nudge(
+    *,
+    model: str | None,
+    provider: str | None,
+    finish_reason: str | None,
+    assistant_content: str | None,
+    messages: Iterable[dict] | None = None,
+    attempts: int = 0,
+    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+) -> Optional[str]:
+    """Re-prompt Muse when it emits a short non-terminal Kanban final.
+
+    Muse Spark can return a tiny unrelated text fragment with
+    ``finish_reason=stop`` in long agentic sessions.  This guard is deliberately
+    narrow: it only applies to OpenCode Go Muse models, only to a watcher-marked
+    Kanban task, and only before that task has called a terminal board tool.
+    The bounded retry prevents a model/provider failure from becoming an
+    infinite loop, while avoiding acceptance of a random fragment as the task
+    result.
+    """
+    if str(provider or "").strip().lower() != "opencode-go":
+        return None
+    model_id = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if not model_id.startswith("muse-spark-"):
+        return None
+    if str(finish_reason or "").strip().lower() != "stop":
+        return None
+    content = str(assistant_content or "").strip()
+    if not content or len(content) > _MUSE_SHORT_STOP_MAX_CHARS:
+        return None
+    if attempts >= max_attempts:
+        return None
+
+    marker = _latest_watcher_task(messages)
+    if marker is None:
+        return None
+    start_index, task_id = marker
+    if _task_segment_called_terminal(messages, start_index):
+        return None
+
+    return (
+        "[System: Muse Spark returned a short non-terminal fragment while the "
+        f"Hermes Kanban task `{task_id}` is still running. This is not a final "
+        "answer. Continue the task now.\n\n"
+        "Do not repeat status text, do not use a `default.` namespace, and do not "
+        "describe what you would do. Use the exact bare tool names from the "
+        "provided tool list (for example `read_file`), execute the remaining "
+        "work, verify it, and finish with `kanban_complete(...)` or "
+        "`kanban_block(reason=...)` only when the task is actually terminal.\n\n"
+        "This is a bounded recovery attempt; make real progress in the next "
+        "response."
+    )
+
+
 __all__ = [
     "build_kanban_stop_nudge",
+    "build_muse_short_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
 ]
