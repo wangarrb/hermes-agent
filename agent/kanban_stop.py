@@ -22,6 +22,12 @@ _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 _MUSE_SHORT_STOP_MAX_CHARS = 120
+_MUSE_TEXT_TOOL_CALL_MARKERS = (
+    "<atem:function_calls",
+    "<atem:invoke",
+    "<tool_call>",
+    "<function_call>",
+)
 _WATCHER_TASK_RE = re.compile(r"\[任务\s+(t_[A-Za-z0-9_-]+)\b")
 
 
@@ -171,15 +177,17 @@ def build_muse_short_stop_nudge(
     attempts: int = 0,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
 ) -> Optional[str]:
-    """Re-prompt Muse when it emits a short non-terminal Kanban final.
+    """Re-prompt Muse when it emits a degenerate non-terminal Kanban final.
 
     Muse Spark can return a tiny unrelated text fragment with
-    ``finish_reason=stop`` in long agentic sessions.  This guard is deliberately
-    narrow: it only applies to OpenCode Go Muse models, only to a watcher-marked
-    Kanban task, and only before that task has called a terminal board tool.
-    The bounded retry prevents a model/provider failure from becoming an
-    infinite loop, while avoiding acceptance of a random fragment as the task
-    result.
+    ``finish_reason=stop`` in long agentic sessions, or leak an XML/tool-call
+    wrapper such as ``<atem:invoke name="default.terminal">`` as prose instead
+    of issuing a structured Hermes tool call. This guard is deliberately narrow:
+    it only applies to OpenCode Go Muse models, only to a watcher-marked Kanban
+    task, and only before that task has called a terminal board tool. The bounded
+    retry prevents a model/provider failure from becoming an infinite loop,
+    while avoiding acceptance of a random fragment or leaked tool syntax as the
+    task result.
     """
     if str(provider or "").strip().lower() != "opencode-go":
         return None
@@ -189,7 +197,11 @@ def build_muse_short_stop_nudge(
     if str(finish_reason or "").strip().lower() != "stop":
         return None
     content = str(assistant_content or "").strip()
-    if not content or len(content) > _MUSE_SHORT_STOP_MAX_CHARS:
+    if not content:
+        return None
+    lowered_content = content.lower()
+    is_text_tool_call = any(marker in lowered_content for marker in _MUSE_TEXT_TOOL_CALL_MARKERS)
+    if not is_text_tool_call and len(content) > _MUSE_SHORT_STOP_MAX_CHARS:
         return None
     if attempts >= max_attempts:
         return None
@@ -202,13 +214,14 @@ def build_muse_short_stop_nudge(
         return None
 
     return (
-        "[System: Muse Spark returned a short non-terminal fragment while the "
+        "[System: Muse Spark returned a non-terminal response while the "
         f"Hermes Kanban task `{task_id}` is still running. This is not a final "
         "answer. Continue the task now.\n\n"
-        "Do not repeat status text, do not use a `default.` namespace, and do not "
-        "describe what you would do. Use the exact bare tool names from the "
-        "provided tool list (for example `read_file`), execute the remaining "
-        "work, verify it, and finish with `kanban_complete(...)` or "
+        "Do not repeat status text, do not emit XML/Harmony tool-call prose, do "
+        "not use a `default.` namespace, and do not describe what you would do. "
+        "Use the exact bare tool names from the provided tool list (for example "
+        "`read_file`) as a structured function call, execute the remaining work, "
+        "verify it, and finish with `kanban_complete(...)` or "
         "`kanban_block(reason=...)` only when the task is actually terminal.\n\n"
         "This is a bounded recovery attempt; make real progress in the next "
         "response."

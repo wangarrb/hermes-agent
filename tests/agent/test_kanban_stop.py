@@ -124,6 +124,28 @@ def test_muse_short_stop_nudge_is_bounded_and_ignores_non_muse():
     ) is None
 
 
+def test_muse_textual_tool_call_leak_is_reprompted():
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+    ]
+    nudge = build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content=(
+            '<atem:function_calls>\n'
+            '<atem:invoke name="default.terminal">\n'
+            'echo "still working"\n'
+            '</atem:invoke>\n'
+            '</atem:function_calls>'
+        ),
+        messages=messages,
+    )
+
+    assert nudge is not None
+    assert "structured function call" in nudge
+
+
 def test_muse_short_stop_nudge_stops_after_terminal_board_tool():
     messages = [
         {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},

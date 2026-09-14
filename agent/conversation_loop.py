@@ -6878,12 +6878,13 @@ def run_conversation(
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
                 # Muse Spark can end a long agentic turn with a tiny unrelated
-                # text fragment while a watcher-injected Kanban task is still
-                # running.  Keep the recovery narrow and bounded: only the
-                # OpenCode Go Muse family, only a watcher task, and only before
-                # a terminal Kanban tool has been called.  This prevents
-                # accepting fragments such as "shit fuck damn" as a task final
-                # without changing ordinary short user-facing answers.
+                # text fragment, or leak XML/tool-call prose such as
+                # ``<atem:invoke name="default.terminal">`` while a
+                # watcher-injected Kanban task is still running. Keep the
+                # recovery narrow and bounded: only the OpenCode Go Muse family,
+                # only a watcher task, and only before a terminal Kanban tool has
+                # been called. This prevents accepting fragments or leaked tool
+                # syntax as a task final without changing ordinary answers.
                 try:
                     from agent.kanban_stop import build_muse_short_stop_nudge
 
@@ -6918,7 +6919,7 @@ def run_conversation(
                         os.environ.get("HERMES_KANBAN_TASK", ""),
                     )
                     agent._emit_status(
-                        "⚠️ Muse returned a short non-terminal fragment — "
+                        "⚠️ Muse returned a non-terminal response — "
                         f"nudging to continue ({agent._muse_short_stop_retries}/2)"
                     )
                     final_response = None
