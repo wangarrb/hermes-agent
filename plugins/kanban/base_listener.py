@@ -3059,6 +3059,20 @@ class BaseInteractiveListener:
                     _reload_ack_written = True  # Only write once
 
                 if active_task:
+                    # TUIs may reset the pane title after the initial task
+                    # injection (for example via an OSC title update).  Keep
+                    # the task identity visible throughout an active claim;
+                    # this is display-only and does not touch task state.
+                    try:
+                        self._sync_pane_title_to_running_claim(
+                            conn=conn,
+                            assignees=claim_assignees(args),
+                            session=zellij_session,
+                            pane_id=str(zellij_pane_id),
+                            log_path=log_path,
+                        )
+                    except Exception as exc:
+                        log_line(log_path, f"active title sync skipped: {exc}")
                     try:
                         (
                             status,

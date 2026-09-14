@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -168,3 +169,26 @@ def test_get_pane_title_skips_plugin_and_exited_panes(
     )
     assert bl._zellij_get_pane_title(session="s", pane_id="4") is None
     assert bl._zellij_get_pane_title(session="s", pane_id="99") is None
+
+
+def test_watcher_syncs_title_while_own_claim_is_active() -> None:
+    """A TUI may reset the title after injection; active loops must restore it."""
+    tree = ast.parse(Path(bl.__file__).read_text(encoding="utf-8"))
+    watcher = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "watcher_main"
+    )
+    active_branch = next(
+        node for node in ast.walk(watcher)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "active_task"
+    )
+    calls = [
+        node
+        for node in ast.walk(active_branch)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_sync_pane_title_to_running_claim"
+    ]
+    assert calls, "active claim loop must continuously restore task-id pane title"
