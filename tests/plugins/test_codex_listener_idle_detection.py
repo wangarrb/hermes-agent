@@ -150,10 +150,9 @@ def test_codex_post_inject_returns_confirmed_on_live_busy_transition(
     assert len(enters) == 1
 
 
-def test_codex_post_inject_accepts_transport_when_composer_clears_before_busy(
+def test_codex_post_inject_keeps_empty_composer_without_application_ack_unknown(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    """A fast submit can clear the composer before the busy row is rendered."""
     listener = codex.CodexInteractiveListener()
     monkeypatch.setattr(time, "sleep", lambda _: None)
     monkeypatch.setattr(
@@ -161,6 +160,36 @@ def test_codex_post_inject_accepts_transport_when_composer_clears_before_busy(
         lambda **_: "›\n  reviewer · Context 20% used\n",
     )
     monkeypatch.setattr(codex, "zellij_submit_enter", lambda **_: True)
+
+    assert listener.on_post_inject(
+        _args(), zellij_session="kanban-test", zellij_pane_id="2",
+        log_path=tmp_path / "listener.log",
+        injected_marker="marker", pre_write_composer="",
+    ) == "unknown"
+
+
+def test_codex_post_inject_accepts_exact_application_ack(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = codex.CodexInteractiveListener()
+    listener._submit_cursor = object()
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        codex,
+        "zellij_dump_screen",
+        lambda **_: "›\n  reviewer · Context 20% used\n",
+    )
+    monkeypatch.setattr(codex, "zellij_submit_enter", lambda **_: True)
+    monkeypatch.setattr(
+        codex,
+        "codex_submit_ack",
+        lambda *args, **kwargs: codex.SubmitAck(
+            state="accepted",
+            thread_id="thread-1",
+            turn_id="turn-new",
+            message_id="message-new",
+        ),
+    )
 
     assert listener.on_post_inject(
         _args(), zellij_session="kanban-test", zellij_pane_id="2",
