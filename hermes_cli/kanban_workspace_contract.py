@@ -106,14 +106,6 @@ def render_branch_template(
     return validate_branch_name(rendered)
 
 
-def _repository_from_worktree(path: Path) -> Path:
-    result = _run_git(path, "worktree", "list", "--porcelain")
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            return Path(line.removeprefix("worktree ")).expanduser().resolve()
-    raise WorkspaceContractError(f"cannot resolve repository for worktree {path}")
-
-
 def resolve_workspace_contract(task: Any, workspace: Path | str) -> dict[str, Any]:
     """Validate a linked worktree and return its immutable task identity."""
     raw_path = Path(workspace).expanduser()
@@ -164,7 +156,11 @@ def resolve_workspace_contract(task: Any, workspace: Path | str) -> dict[str, An
         "version": CONTRACT_VERSION,
         "valid": True,
         "mismatches": [],
-        "repository": str(_repository_from_worktree(path)),
+        # ``--git-common-dir`` already identifies the shared repository.  For
+        # a normal linked worktree it is <primary-worktree>/.git, so its parent
+        # is the repository root.  Avoid ``git worktree list``: it scans every
+        # linked worktree and can block for minutes under unrelated I/O load.
+        "repository": str(common_dir.parent),
         "worktree": str(path),
         "common_dir": str(common_dir),
         "base_commit": resolved_base,
@@ -382,7 +378,7 @@ def _linked_worktree_identity(worktree: Path | str) -> tuple[Path, Path, Path]:
     ).resolve(strict=False)
     if git_dir == common_dir:
         raise WorkspaceContractError(f"path is not a linked worktree: {path}")
-    return path, _repository_from_worktree(path), common_dir
+    return path, common_dir.parent, common_dir
 
 
 def _require_clean(worktree: Path) -> None:

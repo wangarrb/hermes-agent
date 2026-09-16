@@ -154,6 +154,24 @@ def test_resolved_contract_is_shared_by_task_show_json_and_worker_context(
     assert json.dumps(contract, ensure_ascii=False, sort_keys=True) in context
 
 
+def test_contract_resolver_does_not_scan_global_worktree_inventory(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo, workspace, task = _materialize_contract_task(tmp_path)
+    contracts = _contracts()
+    original = contracts._run_git
+
+    def necessary_git_only(path, *args, **kwargs):
+        assert args[:2] != ("worktree", "list")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(contracts, "_run_git", necessary_git_only)
+    contract = contracts.resolve_workspace_contract(task, workspace)
+
+    assert contract["repository"] == str(repo.resolve())
+    assert contract["common_dir"] == str((repo / ".git").resolve())
+
+
 def test_contract_resolver_fails_closed_for_dirty_branch_and_base_mismatch(
     kanban_home, tmp_path,
 ):
@@ -181,7 +199,7 @@ def test_contract_resolver_fails_closed_for_dirty_branch_and_base_mismatch(
         contracts.resolve_workspace_contract(bad_base, workspace)
 
 
-def test_contract_resolver_rejects_reachable_base_that_is_not_head_ancestor(
+def test_contract_resolver_allows_reachable_base_that_is_not_head_ancestor(
     kanban_home, tmp_path,
 ):
     repo, workspace, task = _materialize_contract_task(tmp_path)
@@ -194,8 +212,8 @@ def test_contract_resolver_rejects_reachable_base_that_is_not_head_ancestor(
 
     assert _git(workspace, "rev-parse", "HEAD") != newer_main
     non_ancestor_base = replace(task, base_commit=newer_main)
-    with pytest.raises(contracts.WorkspaceContractError, match="not an ancestor"):
-        contracts.resolve_workspace_contract(non_ancestor_base, workspace)
+    contract = contracts.resolve_workspace_contract(non_ancestor_base, workspace)
+    assert contract["base_commit"] == newer_main
 
 
 def test_rework_generation_does_not_invalidate_workspace_contract(
