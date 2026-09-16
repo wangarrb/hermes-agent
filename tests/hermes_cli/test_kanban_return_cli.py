@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -50,6 +51,34 @@ def test_return_for_rework_and_control_ack_round_trip(kanban_home):
     with kb.connect() as conn:
         assert kb.get_task(conn, parent).status == "ready"
         assert kb.get_task(conn, parent).rework_hold is False
+
+
+def test_control_send_cli_enqueues_idempotent_review_checkpoint(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="module", assignee="planner")
+        claimed = kb.claim_task(conn, task_id, claimer="planner-pane")
+        assert claimed is not None and claimed.current_run_id is not None
+        comment_id = kb.add_comment(conn, task_id, "planner", "checkpoint v4")
+
+    command = (
+        f"control-send {task_id} --run-id {claimed.current_run_id} "
+        f"--generation {claimed.generation} --target-profile reviewer "
+        f"--kind review_checkpoint --comment-id {comment_id} "
+        "--dedupe-key checkpoint:v4 --json"
+    )
+    first = json.loads(kc.run_slash(command))
+    replay = json.loads(kc.run_slash(command))
+
+    assert first == replay
+    assert first["task_id"] == task_id
+    assert first["kind"] == "review_checkpoint"
+    assert first["status"] == "pending"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.generation == claimed.generation
+        assert task.current_run_id == claimed.current_run_id
 
 
 def test_cli_uses_env_generation_fence(kanban_home, monkeypatch):

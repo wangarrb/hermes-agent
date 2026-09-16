@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import sys
+import hashlib
 from argparse import Namespace
 from pathlib import Path
 
@@ -11,6 +12,76 @@ import pytest
 from hermes_cli import kanban_db as kb
 from plugins.kanban import base_listener as bl
 from plugins.kanban.codex_listener import codex_kanban_interactive as codex
+
+
+def _canonical_json(value: dict) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+
+
+def _write_current_contract(
+    root: Path, task_id: str, *, generation: int = 1, version: int = 1,
+) -> str:
+    record = {
+        "schema_version": "seqscale-module-contract-v1",
+        "version": version,
+        "contract": {"task_id": task_id, "generation": generation},
+    }
+    content = _canonical_json(record)
+    digest = hashlib.sha256(content).hexdigest()
+    relative = f"contracts/v{version:03d}.json"
+    (root / "contracts").mkdir(parents=True, exist_ok=True)
+    (root / relative).write_bytes(content)
+    (root / "current-contract.json").write_bytes(
+        _canonical_json(
+            {
+                "schema_version": "seqscale-current-contract-v1",
+                "version": version,
+                "sha256": digest,
+                "path": relative,
+            }
+        )
+    )
+    return digest
+
+
+def _write_workflow_state(
+    common_dir: Path,
+    task_id: str,
+    *,
+    contract_sha: str,
+    version: int,
+    phase: str = "resume_pending",
+    write_record: bool = True,
+) -> None:
+    root = common_dir / "seqscale-workflow" / "tasks" / task_id
+    root.mkdir(parents=True, exist_ok=True)
+    state = {
+        "schema_version": "seqscale-workflow-state-v1",
+        "version": version,
+        "task_id": task_id,
+        "generation": 1,
+        "workflow_phase": phase,
+        "next_actor": "reviewer" if phase == "review_checkpoint" else "planner",
+        "contract_sha256": contract_sha,
+    }
+    content = _canonical_json(state)
+    digest = hashlib.sha256(content).hexdigest()
+    relative = f"workflow-state/v{version:03d}.json"
+    if write_record:
+        (root / "workflow-state").mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(content)
+    (root / "workflow-state.json").write_bytes(
+        _canonical_json(
+            {
+                "schema_version": "seqscale-workflow-state-pointer-v1",
+                "version": version,
+                "sha256": digest,
+                "path": relative,
+            }
+        )
+    )
 
 
 class _Listener(bl.BaseInteractiveListener):
@@ -260,6 +331,211 @@ def test_application_ack_ledger_prevents_duplicate_user_message_on_run_retry(
         "default", task_id, 1, "contract-abc", "task", 0,
     )
     assert len(injections) == 1
+
+
+def test_retry_reuses_handoff_but_new_workflow_resume_reinjects(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "artifacts"
+    common_dir = tmp_path / "common"
+    args = _task_args(workspace)
+    listener._init_from_args(args)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "on_claim_post_confirm", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **_: True)
+    injections: list[str] = []
+    monkeypatch.setattr(
+        bl,
+        "zellij_inject",
+        lambda **kwargs: injections.append(kwargs["text"]) or True,
+    )
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        contract_sha = _write_current_contract(artifacts, task_id)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+
+        def claim() -> tuple[int, str]:
+            claimed, run_id = listener.claim_and_inject_one(
+                args, log_path=tmp_path / "watch.log", conn=conn,
+            )
+            assert claimed == task_id and run_id is not None
+            handoff_id = listener._active_handoff_id
+            assert handoff_id is not None
+            return run_id, handoff_id
+
+        def retry_ready(reason: str) -> None:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            assert bl._reclaim_task_without_signaling_worker(
+                conn,
+                task_id,
+                reason=reason,
+                expected_run_id=task.current_run_id,
+                expected_generation=task.generation,
+                expected_claim_lock=task.claim_lock,
+            )
+            listener._clear_active_claim_identity()
+
+        run_1, initial_handoff = claim()
+        retry_ready("transport retry")
+        run_2, retry_handoff = claim()
+        retry_ready("legal resume")
+        _write_workflow_state(
+            common_dir,
+            task_id,
+            contract_sha=contract_sha,
+            version=1,
+        )
+        run_3, resume_handoff = claim()
+        retry_ready("resume transport retry")
+        run_4, resume_retry_handoff = claim()
+
+    assert len({run_1, run_2, run_3, run_4}) == 4
+    assert retry_handoff == initial_handoff
+    assert resume_handoff != initial_handoff
+    assert resume_retry_handoff == resume_handoff
+    assert len(injections) == 2
+    resume_record = listener._read_handoff_record(resume_handoff)
+    assert resume_record is not None
+    assert resume_record["handoff_kind"] == "resume_pending"
+    assert resume_record["sequence"] == 1
+    assert resume_record["contract_sha"] == contract_sha
+
+
+def test_current_contract_version_update_creates_new_logical_handoff(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "artifacts"
+    common_dir = tmp_path / "common"
+    args = _task_args(workspace)
+    listener._init_from_args(args)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "on_claim_post_confirm", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **_: True)
+    injections: list[str] = []
+    monkeypatch.setattr(
+        bl,
+        "zellij_inject",
+        lambda **kwargs: injections.append(kwargs["text"]) or True,
+    )
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+        "contract_sha256: stale-initial-body-hash\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        sha_v1 = _write_current_contract(artifacts, task_id, version=1)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        claimed, _run_1 = listener.claim_and_inject_one(
+            args, log_path=tmp_path / "watch.log", conn=conn,
+        )
+        assert claimed == task_id
+        handoff_v1 = listener._active_handoff_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert bl._reclaim_task_without_signaling_worker(
+            conn,
+            task_id,
+            reason="contract update",
+            expected_run_id=task.current_run_id,
+            expected_generation=task.generation,
+            expected_claim_lock=task.claim_lock,
+        )
+        listener._clear_active_claim_identity()
+        sha_v2 = _write_current_contract(artifacts, task_id, version=2)
+        claimed, _run_2 = listener.claim_and_inject_one(
+            args, log_path=tmp_path / "watch.log", conn=conn,
+        )
+        assert claimed == task_id
+        handoff_v2 = listener._active_handoff_id
+
+    assert sha_v2 != sha_v1
+    assert handoff_v2 != handoff_v1
+    assert len(injections) == 2
+    record = listener._read_handoff_record(handoff_v2)
+    assert record is not None and record["contract_sha"] == sha_v2
+
+
+def test_handoff_identity_fails_closed_on_missing_contract_pointer(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "missing-artifacts"
+    common_dir = tmp_path / "common"
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        with pytest.raises(bl.HandoffIdentityError, match="current contract"):
+            listener._resolve_handoff_identity(task)
+
+
+@pytest.mark.parametrize("write_record", [False, True])
+def test_handoff_identity_fails_closed_on_invalid_workflow_pointer(
+    kanban_home, tmp_path, monkeypatch, write_record,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "artifacts"
+    common_dir = tmp_path / "common"
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        contract_sha = _write_current_contract(artifacts, task_id)
+        _write_workflow_state(
+            common_dir,
+            task_id,
+            contract_sha=(contract_sha if not write_record else "0" * 64),
+            version=1,
+            write_record=write_record,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        expected = "workflow-state record" if not write_record else "contract SHA"
+        with pytest.raises(bl.HandoffIdentityError, match=expected):
+            listener._resolve_handoff_identity(task)
 
 
 def test_codex_retry_recovers_ack_after_crash_before_ledger_accept(

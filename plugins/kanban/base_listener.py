@@ -217,6 +217,17 @@ class PendingDelivery:
     first_observed_at: float
 
 
+class HandoffIdentityError(ValueError):
+    """A declared contract/workflow pointer cannot be verified."""
+
+
+@dataclass(frozen=True)
+class LogicalHandoffIdentity:
+    contract_sha: str
+    handoff_kind: str
+    sequence: int
+
+
 def _task_status(conn: Any, task_id: str) -> tuple[str | None, int | None]:
     row = conn.execute(
         "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
@@ -1477,32 +1488,214 @@ class BaseInteractiveListener:
         os.replace(temporary, path)
 
     @staticmethod
-    def _task_contract_sha(task: Any) -> str:
+    def _task_body_field(task: Any, field: str) -> str | None:
         body = str(getattr(task, "body", None) or "")
+        try:
+            parsed = json.loads(body)
+        except (TypeError, ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get(field) is not None:
+            value = str(parsed[field]).strip()
+            return value or None
         match = re.search(
-            r"(?im)^\s*contract_sha(?:256)?\s*[:=]\s*['\"]?([^\s'\"]+)",
+            rf"(?im)^\s*{re.escape(field)}\s*[:=]\s*['\"]?([^\s'\"]+)",
             body,
         )
-        return match.group(1) if match else ""
+        return match.group(1) if match else None
 
-    def _prepare_task_handoff(self, task: Any, run_id: int) -> dict[str, Any]:
-        contract_sha = self._task_contract_sha(task)
+    @staticmethod
+    def _read_identity_json(path: Path, label: str) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, RecursionError) as exc:
+            raise HandoffIdentityError(f"invalid {label}: {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise HandoffIdentityError(f"{label} must be a JSON object: {path}")
+        return value
+
+    @staticmethod
+    def _git_common_dir(workspace: Path) -> Path | None:
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = result.stdout.strip()
+        return Path(value).resolve(strict=False) if value else None
+
+    def _current_contract_sha(self, task: Any, conn: Any | None = None) -> str:
+        artifact_namespace = self._task_body_field(task, "artifact_namespace")
+        contract_ref = self._task_body_field(task, "contract_ref")
+        if artifact_namespace is None and conn is not None:
+            try:
+                task_delivery = task.delivery
+                reservation = (
+                    kb.get_scope_reservation(conn, task_delivery.reservation_id)
+                    if task_delivery is not None
+                    else None
+                )
+            except Exception:
+                reservation = None
+            if reservation is not None and reservation.artifact_namespace:
+                artifact_namespace = reservation.artifact_namespace
+                contract_ref = contract_ref or "current-contract.json"
+        if artifact_namespace is None and contract_ref is None:
+            return (
+                self._task_body_field(task, "contract_sha256")
+                or self._task_body_field(task, "contract_sha")
+                or ""
+            )
+        if artifact_namespace is None or contract_ref is None:
+            raise HandoffIdentityError(
+                "versioned current contract requires artifact_namespace and contract_ref"
+            )
+        root = Path(artifact_namespace).expanduser()
+        if not root.is_absolute():
+            raise HandoffIdentityError("artifact_namespace must be absolute")
+        relative = Path(contract_ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise HandoffIdentityError("contract_ref must be a safe relative path")
+        pointer_path = (root / relative).resolve(strict=False)
+        try:
+            pointer_path.relative_to(root.resolve(strict=False))
+        except ValueError as exc:
+            raise HandoffIdentityError("contract_ref escapes artifact_namespace") from exc
+        pointer = self._read_identity_json(pointer_path, "current contract pointer")
+        version = pointer.get("version")
+        expected_path = (
+            f"contracts/v{version:03d}.json"
+            if isinstance(version, int) and not isinstance(version, bool)
+            else None
+        )
+        digest = str(pointer.get("sha256") or "")
+        if (
+            pointer.get("schema_version") != "seqscale-current-contract-v1"
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or pointer.get("path") != expected_path
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise HandoffIdentityError("current contract pointer identity mismatch")
+        record_path = root / expected_path
+        try:
+            content = record_path.read_bytes()
+        except OSError as exc:
+            raise HandoffIdentityError(
+                f"invalid current contract record: {record_path}: {exc}"
+            ) from exc
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise HandoffIdentityError("current contract record hash mismatch")
+        record = self._read_identity_json(record_path, "current contract record")
+        contract = record.get("contract")
+        if (
+            record.get("schema_version") != "seqscale-module-contract-v1"
+            or record.get("version") != version
+            or not isinstance(contract, dict)
+            or contract.get("task_id") != task.id
+            or contract.get("generation") != task.generation
+        ):
+            raise HandoffIdentityError("current contract record task identity mismatch")
+        return digest
+
+    def _resolve_handoff_identity(
+        self, task: Any, conn: Any | None = None,
+    ) -> LogicalHandoffIdentity:
+        contract_sha = self._current_contract_sha(task, conn)
+        workspace = Path(task.workspace_path or self._workspace).expanduser().resolve(
+            strict=False
+        )
+        common_dir = self._git_common_dir(workspace)
+        if common_dir is None:
+            return LogicalHandoffIdentity(contract_sha, "task", 0)
+        root = (
+            common_dir
+            / "seqscale-workflow"
+            / "tasks"
+            / task.id
+        )
+        pointer_path = root / "workflow-state.json"
+        if not pointer_path.exists():
+            return LogicalHandoffIdentity(contract_sha, "task", 0)
+        pointer = self._read_identity_json(pointer_path, "workflow-state pointer")
+        version = pointer.get("version")
+        expected_path = (
+            f"workflow-state/v{version:03d}.json"
+            if isinstance(version, int) and not isinstance(version, bool)
+            else None
+        )
+        digest = str(pointer.get("sha256") or "")
+        if (
+            pointer.get("schema_version")
+            != "seqscale-workflow-state-pointer-v1"
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or pointer.get("path") != expected_path
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise HandoffIdentityError("workflow-state pointer identity mismatch")
+        record_path = root / expected_path
+        try:
+            content = record_path.read_bytes()
+        except OSError as exc:
+            raise HandoffIdentityError(
+                f"invalid workflow-state record: {record_path}: {exc}"
+            ) from exc
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise HandoffIdentityError("workflow-state record hash mismatch")
+        state = self._read_identity_json(record_path, "workflow-state record")
+        phase = state.get("workflow_phase")
+        next_actor = state.get("next_actor")
+        if (
+            state.get("schema_version") != "seqscale-workflow-state-v1"
+            or state.get("version") != version
+            or state.get("task_id") != task.id
+            or state.get("generation") != task.generation
+            or not isinstance(phase, str)
+            or not phase.strip()
+            or not isinstance(next_actor, str)
+            or not next_actor.strip()
+        ):
+            raise HandoffIdentityError("workflow-state record identity mismatch")
+        if state.get("contract_sha256") != contract_sha:
+            raise HandoffIdentityError(
+                "workflow-state contract SHA differs from current contract"
+            )
+        return LogicalHandoffIdentity(contract_sha, phase.strip(), version)
+
+    def _prepare_task_handoff(
+        self, task: Any, run_id: int, conn: Any | None = None,
+    ) -> dict[str, Any]:
+        identity = self._resolve_handoff_identity(task, conn)
         handoff_id = stable_handoff_id(
             self._board,
             task.id,
             task.generation,
-            contract_sha,
-            "task",
-            0,
+            identity.contract_sha,
+            identity.handoff_kind,
+            identity.sequence,
         )
         record = self._read_handoff_record(handoff_id) or {
             "handoff_id": handoff_id,
             "board": self._board,
             "task_id": task.id,
             "generation": task.generation,
-            "contract_sha": contract_sha,
-            "handoff_kind": "task",
-            "sequence": 0,
+            "contract_sha": identity.contract_sha,
+            "handoff_kind": identity.handoff_kind,
+            "sequence": identity.sequence,
             "state": "prepared",
             "run_ids": [],
         }
@@ -2397,6 +2590,21 @@ class BaseInteractiveListener:
         return path
 
     def _control_prompt(self, control: kb.ControlMessage) -> str:
+        if control.kind == "review_checkpoint":
+            comment = (
+                f" durable comment {control.comment_id}"
+                if control.comment_id is not None
+                else " the durable task comments"
+            )
+            return (
+                f"[REVIEW CHECKPOINT {control.id}] Task {control.task_id} run "
+                f"{control.run_id} generation {control.generation} requests a "
+                f"bounded review checkpoint. Read{comment}; review without "
+                "claiming the task or changing its generation/status. Record "
+                "the decision through the project checkpoint workflow, then "
+                f"acknowledge with `hermes kanban --board {self._board} "
+                f"control-ack {control.id}`."
+            )
         return (
             f"[SYSTEM CONTROL {control.id}] Task {control.task_id} run "
             f"{control.run_id} generation {control.generation} is SUPERSEDED "
@@ -2407,6 +2615,10 @@ class BaseInteractiveListener:
             f"with `hermes kanban "
             f"--board {self._board} control-ack {control.id}`."
         )
+
+    def _control_pane_label(self, control: kb.ControlMessage) -> str:
+        marker = "REVIEW" if control.kind == "review_checkpoint" else "PAUSE"
+        return f"{self.agent_slug}-kanban [{marker} {control.task_id}]"
 
     def _control_safe_boundary(
         self, args: argparse.Namespace, log_path: Path,
@@ -2461,7 +2673,7 @@ class BaseInteractiveListener:
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
-                name=f"{self.agent_slug}-kanban [PAUSE {control.task_id}]",
+                name=self._control_pane_label(control),
                 log_path=log_path,
             )
             return True
@@ -2471,7 +2683,7 @@ class BaseInteractiveListener:
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
-                name=f"{self.agent_slug}-kanban [PAUSE {control.task_id}]",
+                name=self._control_pane_label(control),
                 log_path=log_path,
             )
             return True
@@ -2485,9 +2697,16 @@ class BaseInteractiveListener:
             return False
         if leased.status == "delivered":
             self._active_control_id = leased.id
+            zellij_rename_pane(
+                session=session,
+                pane_id=pane_id,
+                name=self._control_pane_label(leased),
+                log_path=log_path,
+            )
             return True
 
-        self._mark_prompt_superseded(leased, conn=conn)
+        if leased.kind == "pause_for_rework":
+            self._mark_prompt_superseded(leased, conn=conn)
         prompt = tag_injected_text(
             self._control_prompt(leased), source_profile="watcher",
         )
@@ -2560,7 +2779,7 @@ class BaseInteractiveListener:
         zellij_rename_pane(
             session=session,
             pane_id=pane_id,
-            name=f"{self.agent_slug}-kanban [PAUSE {leased.task_id}]",
+            name=self._control_pane_label(leased),
             log_path=log_path,
         )
         log_line(
@@ -2883,7 +3102,9 @@ class BaseInteractiveListener:
                 or prompt_claim.claim_lock != claim_lock
             ):
                 raise RuntimeError("stale claim after writing task prompt")
-            handoff_record = self._prepare_task_handoff(claimed, claim_run_id)
+            handoff_record = self._prepare_task_handoff(
+                claimed, claim_run_id, conn,
+            )
             prompt_path = self._stable_handoff_prompt(
                 prompt_path,
                 str(handoff_record["handoff_id"]),

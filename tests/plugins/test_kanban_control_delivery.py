@@ -227,6 +227,58 @@ def test_idle_pane_receives_control_once_and_blocks_claim_until_ack(
     assert "SUPERSEDED" in prompt.read_text(encoding="utf-8")
 
 
+def test_review_checkpoint_control_uses_review_title_without_superseding_prompt(
+    kanban_home, tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    args = _listener_args(workspace)
+    listener = _listener(workspace)
+    injected: list[str] = []
+    titles: list[str] = []
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **kwargs: "ready>")
+    monkeypatch.setattr(
+        bl, "zellij_inject", lambda **kwargs: injected.append(kwargs["text"]) or True
+    )
+    monkeypatch.setattr(
+        bl, "zellij_rename_pane", lambda **kwargs: titles.append(kwargs["name"]) or True
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="module", assignee="planner")
+        claimed = kb.claim_task(conn, task_id, claimer="planner-pane")
+        assert claimed is not None and claimed.current_run_id is not None
+        prompt = bl.write_task_prompt(
+            agent_name="Dummy", agent_slug="dummy", board="default",
+            profile="reviewer", task_id=task_id, task_assignee="planner",
+            task_title="module", context="current contract", workspace=workspace,
+            run_id=claimed.current_run_id, generation=claimed.generation,
+        )
+        original = prompt.read_text(encoding="utf-8")
+        comment_id = kb.add_comment(conn, task_id, "planner", "checkpoint v2")
+        control = kb.enqueue_control_message(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            claimed.generation,
+            "reviewer",
+            "review_checkpoint",
+            comment_id,
+            "checkpoint:v2",
+        )
+        assert listener.pump_control_messages(
+            args, conn, workspace / "listener.log",
+        )
+        delivered = kb.list_control_messages(conn)[0]
+
+    assert delivered.id == control.id and delivered.status == "delivered"
+    assert len(injected) == 1
+    assert f"[REVIEW CHECKPOINT {control.id}]" in injected[0]
+    assert f"control-ack {control.id}" in injected[0]
+    assert titles[-1] == f"dummy-kanban [REVIEW {task_id}]"
+    assert prompt.read_text(encoding="utf-8") == original
+
+
 def test_control_supersedes_prompt_under_resolved_task_workspace(
     kanban_home, tmp_path, monkeypatch,
 ):

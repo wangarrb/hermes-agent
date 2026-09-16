@@ -256,6 +256,7 @@ def codex_submit_ack(
         return unknown
 
     expected = _normalized_message(marker)
+    matched_pending = False
     pending_message_id: str | None = None
     for line in appended.splitlines():
         try:
@@ -266,15 +267,17 @@ def codex_submit_ack(
         if user_message is not None:
             text, turn_id, message_id = user_message
             if _normalized_message(text) != expected:
+                matched_pending = False
                 pending_message_id = None
                 continue
             if turn_id:
                 return SubmitAck(
                     "accepted", before_cursor.thread_id, turn_id, message_id
                 )
+            matched_pending = True
             pending_message_id = message_id
             continue
-        if pending_message_id is None or not isinstance(record, dict):
+        if not matched_pending or not isinstance(record, dict):
             continue
         payload = record.get("payload")
         if not isinstance(payload, dict):
