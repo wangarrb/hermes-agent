@@ -442,6 +442,31 @@ def test_current_contract_uses_prepared_reservation_for_task_id_placeholder(
     assert listener._current_contract_sha(task, object()) == contract_sha
 
 
+def test_legacy_prepared_reservation_does_not_require_current_contract_pointer(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    artifacts = tmp_path / "legacy-artifacts"
+    artifacts.mkdir()
+    task = Namespace(
+        id="t_legacy",
+        generation=1,
+        body=(
+            "task_class: MODULE\n"
+            "artifact_namespace: generated /home/example/artifacts/<task_id>\n"
+        ),
+        delivery=Namespace(reservation_id=8),
+    )
+    reservation = Namespace(artifact_namespace=str(artifacts))
+    monkeypatch.setattr(
+        bl.kb,
+        "get_scope_reservation",
+        lambda _conn, reservation_id: reservation if reservation_id == 8 else None,
+    )
+
+    assert listener._current_contract_sha(task, object()) == ""
+
+
 def test_deterministic_handoff_identity_failure_blocks_instead_of_reclaim_loop(
     kanban_home, tmp_path, monkeypatch,
 ):
