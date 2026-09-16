@@ -417,6 +417,67 @@ def test_retry_reuses_handoff_but_new_workflow_resume_reinjects(
     assert resume_record["contract_sha"] == contract_sha
 
 
+def test_current_contract_uses_prepared_reservation_for_task_id_placeholder(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    artifacts = tmp_path / "artifacts" / "t_real"
+    contract_sha = _write_current_contract(artifacts, "t_real")
+    task = Namespace(
+        id="t_real",
+        generation=1,
+        body=(
+            "artifact_namespace: /home/example/artifacts/<actual_task_id>\n"
+            "task_class: MODULE\n"
+        ),
+        delivery=Namespace(reservation_id=7),
+    )
+    reservation = Namespace(artifact_namespace=str(artifacts))
+    monkeypatch.setattr(
+        bl.kb,
+        "get_scope_reservation",
+        lambda _conn, reservation_id: reservation if reservation_id == 7 else None,
+    )
+
+    assert listener._current_contract_sha(task, object()) == contract_sha
+
+
+def test_deterministic_handoff_identity_failure_blocks_instead_of_reclaim_loop(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    args = _task_args(workspace)
+    listener._init_from_args(args)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *a, **k: True)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="broken identity",
+            body=(
+                f"artifact_namespace: {tmp_path / 'missing-artifacts'}\n"
+                "contract_ref: current-contract.json\n"
+            ),
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+
+        claimed, run_id = listener.claim_and_inject_one(
+            args, log_path=tmp_path / "watch.log", conn=conn,
+        )
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert claimed is None and run_id is None
+    assert task is not None and task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert any("deterministic handoff identity failure" in item.body for item in comments)
+
+
 def test_current_contract_version_update_creates_new_logical_handoff(
     kanban_home, tmp_path, monkeypatch,
 ):
