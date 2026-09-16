@@ -1659,17 +1659,29 @@ class BaseInteractiveListener:
         state = self._read_identity_json(record_path, "workflow-state record")
         phase = state.get("workflow_phase")
         next_actor = state.get("next_actor")
+        state_generation = state.get("generation")
         if (
             state.get("schema_version") != "seqscale-workflow-state-v1"
             or state.get("version") != version
             or state.get("task_id") != task.id
-            or state.get("generation") != task.generation
+            or not isinstance(state_generation, int)
+            or isinstance(state_generation, bool)
+            or state_generation < 1
             or not isinstance(phase, str)
             or not phase.strip()
             or not isinstance(next_actor, str)
             or not next_actor.strip()
         ):
             raise HandoffIdentityError("workflow-state record identity mismatch")
+        if state_generation < task.generation:
+            # Generation is the workflow epoch. Return-for-rework preserves
+            # the prior pointer as history until the new generation publishes
+            # its own epoch; history must not block the initial new handoff.
+            return LogicalHandoffIdentity(contract_sha, "task", 0)
+        if state_generation > task.generation:
+            raise HandoffIdentityError(
+                "workflow-state generation is newer than current task"
+            )
         if state.get("contract_sha256") != contract_sha:
             raise HandoffIdentityError(
                 "workflow-state contract SHA differs from current contract"

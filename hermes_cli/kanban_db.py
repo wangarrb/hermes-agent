@@ -4679,18 +4679,23 @@ def lease_control_message(
             (now,),
         )
         existing = conn.execute(
-            "SELECT id FROM task_control_messages "
-            "WHERE status IN ('delivering', 'delivered') AND delivery_owner = ? "
-            "ORDER BY id LIMIT 1",
+            "SELECT c.id FROM task_control_messages c "
+            "JOIN tasks t ON t.id = c.task_id "
+            "WHERE c.status IN ('delivering', 'delivered') "
+            "AND c.delivery_owner = ? "
+            "AND (c.kind != 'review_checkpoint' OR c.generation = t.generation) "
+            "ORDER BY c.id LIMIT 1",
             (receiver,),
         ).fetchone()
         if existing:
             selected_id = int(existing["id"])
         else:
             row = conn.execute(
-                "SELECT id FROM task_control_messages "
-                f"WHERE status = 'pending' AND target_profile IN ({placeholders}) "
-                "ORDER BY id LIMIT 1",
+                "SELECT c.id FROM task_control_messages c "
+                "JOIN tasks t ON t.id = c.task_id "
+                f"WHERE c.status = 'pending' AND c.target_profile IN ({placeholders}) "
+                "AND (c.kind != 'review_checkpoint' OR c.generation = t.generation) "
+                "ORDER BY c.id LIMIT 1",
                 tuple(canonical),
             ).fetchone()
             if row:
@@ -4725,10 +4730,12 @@ def peek_control_message(
         return None
     placeholders = ",".join("?" for _ in canonical)
     row = conn.execute(
-        "SELECT * FROM task_control_messages WHERE "
-        "((status IN ('delivering', 'delivered') AND delivery_owner = ?) "
-        f"OR (status = 'pending' AND target_profile IN ({placeholders}))) "
-        "ORDER BY CASE WHEN delivery_owner = ? THEN 0 ELSE 1 END, id LIMIT 1",
+        "SELECT c.* FROM task_control_messages c "
+        "JOIN tasks t ON t.id = c.task_id WHERE "
+        "(c.kind != 'review_checkpoint' OR c.generation = t.generation) AND "
+        "((c.status IN ('delivering', 'delivered') AND c.delivery_owner = ?) "
+        f"OR (c.status = 'pending' AND c.target_profile IN ({placeholders}))) "
+        "ORDER BY CASE WHEN c.delivery_owner = ? THEN 0 ELSE 1 END, c.id LIMIT 1",
         (receiver, *canonical, receiver),
     ).fetchone()
     return ControlMessage.from_row(row) if row else None

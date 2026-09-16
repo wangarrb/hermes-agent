@@ -53,6 +53,7 @@ def _write_workflow_state(
     contract_sha: str,
     version: int,
     phase: str = "resume_pending",
+    generation: int = 1,
     write_record: bool = True,
 ) -> None:
     root = common_dir / "seqscale-workflow" / "tasks" / task_id
@@ -61,7 +62,7 @@ def _write_workflow_state(
         "schema_version": "seqscale-workflow-state-v1",
         "version": version,
         "task_id": task_id,
-        "generation": 1,
+        "generation": generation,
         "workflow_phase": phase,
         "next_actor": "reviewer" if phase == "review_checkpoint" else "planner",
         "contract_sha256": contract_sha,
@@ -535,6 +536,179 @@ def test_handoff_identity_fails_closed_on_invalid_workflow_pointer(
         assert task is not None
         expected = "workflow-state record" if not write_record else "contract SHA"
         with pytest.raises(bl.HandoffIdentityError, match=expected):
+            listener._resolve_handoff_identity(task)
+
+
+def test_old_workflow_epoch_is_ignored_for_new_generation_identity(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "artifacts"
+    common_dir = tmp_path / "common"
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute(
+            "UPDATE tasks SET generation = 2 WHERE id = ?",
+            (task_id,),
+        )
+        current_sha = _write_current_contract(
+            artifacts, task_id, generation=2, version=2,
+        )
+        _write_workflow_state(
+            common_dir,
+            task_id,
+            contract_sha="1" * 64,
+            version=4,
+            generation=1,
+            phase="resume_pending",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+
+        identity = listener._resolve_handoff_identity(task)
+
+    assert identity == bl.LogicalHandoffIdentity(
+        contract_sha=current_sha,
+        handoff_kind="task",
+        sequence=0,
+    )
+
+
+def test_new_generation_initial_handoff_retries_dedupe_then_epoch_reinjects(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "artifacts"
+    common_dir = tmp_path / "common"
+    args = _task_args(workspace)
+    listener._init_from_args(args)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "on_claim_post_confirm", lambda *a, **k: True)
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "❯")
+    monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **_: True)
+    injections: list[str] = []
+    monkeypatch.setattr(
+        bl,
+        "zellij_inject",
+        lambda **kwargs: injections.append(kwargs["text"]) or True,
+    )
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute(
+            "UPDATE tasks SET generation = 2, status = 'ready' WHERE id = ?",
+            (task_id,),
+        )
+        current_sha = _write_current_contract(
+            artifacts, task_id, generation=2, version=2,
+        )
+        _write_workflow_state(
+            common_dir,
+            task_id,
+            contract_sha="1" * 64,
+            version=4,
+            generation=1,
+        )
+
+        def claim() -> str:
+            claimed, run_id = listener.claim_and_inject_one(
+                args, log_path=tmp_path / "watch.log", conn=conn,
+            )
+            assert claimed == task_id and run_id is not None
+            assert listener._active_handoff_id is not None
+            return listener._active_handoff_id
+
+        def retry_ready(reason: str) -> None:
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            assert bl._reclaim_task_without_signaling_worker(
+                conn,
+                task_id,
+                reason=reason,
+                expected_run_id=task.current_run_id,
+                expected_generation=task.generation,
+                expected_claim_lock=task.claim_lock,
+            )
+            listener._clear_active_claim_identity()
+
+        initial = claim()
+        retry_ready("g2 initial retry")
+        initial_retry = claim()
+        retry_ready("initialize g2 workflow epoch")
+        _write_workflow_state(
+            common_dir,
+            task_id,
+            contract_sha=current_sha,
+            version=1,
+            generation=2,
+        )
+        resumed = claim()
+        retry_ready("g2 resume retry")
+        resumed_retry = claim()
+
+    assert initial_retry == initial
+    assert resumed != initial
+    assert resumed_retry == resumed
+    assert len(injections) == 2
+    record = listener._read_handoff_record(resumed)
+    assert record is not None
+    assert record["generation"] == 2
+    assert record["handoff_kind"] == "resume_pending"
+    assert record["sequence"] == 1
+    assert record["contract_sha"] == current_sha
+
+
+def test_same_generation_workflow_contract_mismatch_still_fails_closed(
+    kanban_home, tmp_path, monkeypatch,
+):
+    listener = _TaskListener("transport_accepted")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = tmp_path / "artifacts"
+    common_dir = tmp_path / "common"
+    monkeypatch.setattr(listener, "_git_common_dir", lambda _workspace: common_dir)
+    body = (
+        f"artifact_namespace: {artifacts}\n"
+        "contract_ref: current-contract.json\n"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="task", body=body, assignee="reviewer",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute("UPDATE tasks SET generation = 2 WHERE id = ?", (task_id,))
+        _write_current_contract(artifacts, task_id, generation=2, version=2)
+        _write_workflow_state(
+            common_dir,
+            task_id,
+            contract_sha="0" * 64,
+            version=1,
+            generation=2,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+
+        with pytest.raises(bl.HandoffIdentityError, match="contract SHA"):
             listener._resolve_handoff_identity(task)
 
 
