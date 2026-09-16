@@ -193,6 +193,20 @@ def _git(path: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _is_ancestor(path: Path, ancestor: str, descendant: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(path), "merge-base", "--is-ancestor", ancestor, descendant],
+        capture_output=True,
+        text=True,
+        timeout=_git_timeout(),
+        check=False,
+    )
+    if result.returncode in {0, 1}:
+        return result.returncode == 0
+    detail = (result.stderr or result.stdout or "git merge-base failed").strip()
+    raise DeliveryAuthorizationError(detail)
+
+
 def repository_for_record(record: DeliveryRecord) -> Path:
     repository = Path(str(record.workspace_contract.get("repository") or ""))
     if not repository.is_absolute() or not repository.is_dir():
@@ -305,9 +319,15 @@ def integration_mismatches(
         target_ref, target_sha = current_target_identity(task, record)
         if authorization.get("target_ref") != target_ref:
             mismatches.append("target_ref")
-        if authorization.get("target_sha") != target_sha:
-            mismatches.append("target_sha")
         repository = repository_for_record(record)
+        authorized_target = str(authorization.get("target_sha") or "")
+        if authorization.get("target_sha") != target_sha and not (
+            authorized_target
+            and record.delivery_sha
+            and _is_ancestor(repository, authorized_target, target_sha)
+            and _is_ancestor(repository, record.delivery_sha, target_sha)
+        ):
+            mismatches.append("target_sha")
         branch = str(record.workspace_contract.get("branch") or "")
         delivery_sha = _git(
             repository, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}",

@@ -199,6 +199,25 @@ def test_legal_delivery_chain_binds_authorization_and_never_merges(delivery_env)
     assert auth_event.payload["authorization"] == expected_tuple
 
 
+def test_integration_accepts_authorized_target_advanced_by_delivery_merge(delivery_env):
+    with kb.connect() as conn:
+        task, _worktree, reservation, frozen, _accepted, _authorized = _authorize(
+            conn, delivery_env, label="real-merge"
+        )
+        _git(
+            delivery_env["repo"],
+            "merge", "--no-ff", frozen["delivery_commit"],
+            "-m", "integrate authorized delivery",
+        )
+        integrated = kb.integrate_task_delivery(
+            conn, task.id, integrator="integrator-pane",
+        )
+        persisted_reservation = kb.get_scope_reservation(conn, reservation.id)
+
+    assert integrated.state == "integrated"
+    assert persisted_reservation.status == "integrated"
+
+
 def test_completion_closes_frozen_prepared_delivery(delivery_env):
     with kb.connect() as conn:
         task, _worktree, _reservation, frozen, _delivered = _deliver(
