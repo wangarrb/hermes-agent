@@ -1538,7 +1538,7 @@ class BaseInteractiveListener:
     def _current_contract_sha(self, task: Any, conn: Any | None = None) -> str:
         artifact_namespace = self._task_body_field(task, "artifact_namespace")
         contract_ref = self._task_body_field(task, "contract_ref")
-        if artifact_namespace is None and conn is not None:
+        if conn is not None:
             try:
                 task_delivery = task.delivery
                 reservation = (
@@ -1549,6 +1549,10 @@ class BaseInteractiveListener:
             except Exception:
                 reservation = None
             if reservation is not None and reservation.artifact_namespace:
+                # The prepared delivery reservation is the runtime authority.
+                # Task bodies may retain a human-facing <actual_task_id>
+                # placeholder because the real id does not exist at authoring
+                # time; do not let that display field override frozen state.
                 artifact_namespace = reservation.artifact_namespace
                 contract_ref = contract_ref or "current-contract.json"
         if artifact_namespace is None and contract_ref is None:
@@ -3130,12 +3134,17 @@ class BaseInteractiveListener:
             # needs_input instead of reclaiming into the retry storm.
             from hermes_cli.kanban_workspace_contract import WorkspaceContractError
 
-            if isinstance(exc, WorkspaceContractError):
+            if isinstance(exc, (WorkspaceContractError, HandoffIdentityError)):
+                failure_kind = (
+                    "workspace-contract"
+                    if isinstance(exc, WorkspaceContractError)
+                    else "handoff identity"
+                )
                 contract_note = (
                     f"{self.agent_slug}-listener could not claim {claimed.id}: "
-                    f"deterministic workspace-contract failure "
+                    f"deterministic {failure_kind} failure "
                     f"({type(exc).__name__}: {exc}). The task record needs a "
-                    f"publisher fix (base_commit/branch/workspace) before it can "
+                    f"publisher fix before it can "
                     f"run; blocked as needs_input to stop the claim loop. "
                     f"Fix the record then unblock."
                 )
@@ -3161,7 +3170,7 @@ class BaseInteractiveListener:
                     )
                 log_line(
                     log_path,
-                    f"task {claimed.id} deterministic workspace-contract failure; "
+                    f"task {claimed.id} deterministic {failure_kind} failure; "
                     f"commented + blocked needs_input (publisher must fix record); "
                     f"{type(exc).__name__}: {exc}",
                 )
