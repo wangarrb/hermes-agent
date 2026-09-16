@@ -1554,8 +1554,10 @@ class BaseInteractiveListener:
                 # placeholder because the real id does not exist at authoring
                 # time; do not let that display field override frozen state.
                 artifact_namespace = reservation.artifact_namespace
-                contract_ref = contract_ref or "current-contract.json"
-        if artifact_namespace is None and contract_ref is None:
+                pointer = Path(artifact_namespace) / "current-contract.json"
+                if contract_ref is None and pointer.is_file():
+                    contract_ref = "current-contract.json"
+        if contract_ref is None:
             return (
                 self._task_body_field(task, "contract_sha256")
                 or self._task_body_field(task, "contract_sha")
