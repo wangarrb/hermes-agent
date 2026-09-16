@@ -26,6 +26,7 @@ LF inserts a newline in the input buffer but does NOT submit.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +151,81 @@ def _pid_alive(pid: int | None) -> bool:
         return Path(f"/proc/{pid}").exists()
     except OSError:
         return False
+
+
+def _has_bound_child_process(pid: int | None) -> bool:
+    """Return whether a live descendant is bound beneath ``pid``."""
+    if not pid:
+        return False
+    pending = [int(pid)]
+    visited: set[int] = set()
+    while pending:
+        parent = pending.pop()
+        if parent in visited:
+            continue
+        visited.add(parent)
+        try:
+            raw = Path(
+                f"/proc/{parent}/task/{parent}/children"
+            ).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for token in raw.split():
+            try:
+                child = int(token)
+            except ValueError:
+                continue
+            if _pid_alive(child):
+                return True
+            pending.append(child)
+    return False
+
+
+def stable_handoff_id(
+    board: str,
+    task_id: str,
+    generation: int,
+    contract_sha: str,
+    handoff_kind: str,
+    sequence: int,
+) -> str:
+    """Return the logical command identity, deliberately excluding run ID."""
+    identity = [
+        str(board),
+        str(task_id),
+        int(generation),
+        str(contract_sha),
+        str(handoff_kind),
+        int(sequence),
+    ]
+    encoded = json.dumps(
+        identity, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class PendingDelivery:
+    task_id: str
+    run_id: int
+    generation: int
+    claim_lock: str
+    marker: str
+    pre_write_composer: str | None
+    correlation: str
+    handoff_id: str
+    first_observed_at: float
+
+
+class HandoffIdentityError(ValueError):
+    """A declared contract/workflow pointer cannot be verified."""
+
+
+@dataclass(frozen=True)
+class LogicalHandoffIdentity:
+    contract_sha: str
+    handoff_kind: str
+    sequence: int
 
 
 def _task_status(conn: Any, task_id: str) -> tuple[str | None, int | None]:
@@ -1185,7 +1262,12 @@ class BaseInteractiveListener:
             return "unknown"
 
         state = str(result or "").strip().lower()
-        if state in {"confirmed", "known_unsubmitted", "unknown"}:
+        if state in {
+            "confirmed",
+            "transport_accepted",
+            "known_unsubmitted",
+            "unknown",
+        }:
             return state
 
         if not self.semantic_delivery_required:
@@ -1263,6 +1345,12 @@ class BaseInteractiveListener:
         if not zellij_session or not zellij_pane_id:
             return
 
+        pending_state = self._observe_pending_delivery(
+            args, conn, task_id, log_path,
+        )
+        if pending_state == "known_unsubmitted":
+            return
+
         screen = zellij_dump_screen(session=zellij_session, pane_id=zellij_pane_id, log_path=log_path)
         if not screen:
             return
@@ -1271,6 +1359,7 @@ class BaseInteractiveListener:
         if not self.pane_is_idle(screen):
             # Pane is busy (agent recovered) — reset retry state so next error
             # cycle starts fresh
+            self._false_running_observations.pop(task_id, None)
             self._api_retry_count = 0
             self._api_retry_first_at = None
             self._api_retry_kind = None
@@ -1282,6 +1371,34 @@ class BaseInteractiveListener:
             session=zellij_session, pane_id=zellij_pane_id, screen=screen,
             task_id=task_id, log_path=log_path,
         ):
+            return
+        task = kb.get_task(conn, task_id)
+        workspace = (
+            Path(task.workspace_path).expanduser().resolve(strict=False)
+            if task is not None and task.workspace_path
+            else self._workspace
+        )
+        if task is not None and self._is_false_running(
+            conn, task, pane_idle=True, workspace=workspace,
+        ):
+            reclaimed = _reclaim_task_without_signaling_worker(
+                conn,
+                task_id,
+                reason=(
+                    "interactive false-running: pane idle and no task, "
+                    "worktree, or progress-ledger change for 300s"
+                ),
+                expected_run_id=task.current_run_id,
+                expected_generation=task.generation,
+                expected_claim_lock=task.claim_lock,
+            )
+            log_line(
+                log_path,
+                f"event=false_running_reclaim task_id={task_id} "
+                f"reclaimed={reclaimed}",
+            )
+            if reclaimed:
+                self._clear_active_claim_identity()
             return
         self._handle_idle_task_followup(args, conn, task_id, log_path)
 
@@ -1336,6 +1453,520 @@ class BaseInteractiveListener:
         self._goal_check_watermark_comment: dict[str, int] = {}
         self._goal_check_suspended: set[str] = set()
         self._stable_composer_cache: dict[tuple[str, str], tuple[str, float]] = {}
+        self._active_handoff_id: str | None = None
+        self._pending_delivery: PendingDelivery | None = None
+        self._active_pane_session: str | None = None
+        self._active_pane_id: str | None = None
+        self._false_running_observations: dict[str, tuple[float, tuple[Any, ...]]] = {}
+
+    def _handoff_ledger_dir(self) -> Path:
+        return kb.board_dir(self._board) / "listener-handoffs"
+
+    def _handoff_record_path(self, handoff_id: str) -> Path:
+        return self._handoff_ledger_dir() / f"{handoff_id}.json"
+
+    def _read_handoff_record(self, handoff_id: str) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(
+                self._handoff_record_path(handoff_id).read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError, RecursionError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_handoff_record(
+        self, handoff_id: str, record: dict[str, Any],
+    ) -> None:
+        directory = self._handoff_ledger_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = self._handoff_record_path(handoff_id)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _task_body_field(task: Any, field: str) -> str | None:
+        body = str(getattr(task, "body", None) or "")
+        try:
+            parsed = json.loads(body)
+        except (TypeError, ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get(field) is not None:
+            value = str(parsed[field]).strip()
+            return value or None
+        match = re.search(
+            rf"(?im)^\s*{re.escape(field)}\s*[:=]\s*['\"]?([^\s'\"]+)",
+            body,
+        )
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _read_identity_json(path: Path, label: str) -> dict[str, Any]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, RecursionError) as exc:
+            raise HandoffIdentityError(f"invalid {label}: {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise HandoffIdentityError(f"{label} must be a JSON object: {path}")
+        return value
+
+    @staticmethod
+    def _git_common_dir(workspace: Path) -> Path | None:
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = result.stdout.strip()
+        return Path(value).resolve(strict=False) if value else None
+
+    def _current_contract_sha(self, task: Any, conn: Any | None = None) -> str:
+        artifact_namespace = self._task_body_field(task, "artifact_namespace")
+        contract_ref = self._task_body_field(task, "contract_ref")
+        if artifact_namespace is None and conn is not None:
+            try:
+                task_delivery = task.delivery
+                reservation = (
+                    kb.get_scope_reservation(conn, task_delivery.reservation_id)
+                    if task_delivery is not None
+                    else None
+                )
+            except Exception:
+                reservation = None
+            if reservation is not None and reservation.artifact_namespace:
+                artifact_namespace = reservation.artifact_namespace
+                contract_ref = contract_ref or "current-contract.json"
+        if artifact_namespace is None and contract_ref is None:
+            return (
+                self._task_body_field(task, "contract_sha256")
+                or self._task_body_field(task, "contract_sha")
+                or ""
+            )
+        if artifact_namespace is None or contract_ref is None:
+            raise HandoffIdentityError(
+                "versioned current contract requires artifact_namespace and contract_ref"
+            )
+        root = Path(artifact_namespace).expanduser()
+        if not root.is_absolute():
+            raise HandoffIdentityError("artifact_namespace must be absolute")
+        relative = Path(contract_ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise HandoffIdentityError("contract_ref must be a safe relative path")
+        pointer_path = (root / relative).resolve(strict=False)
+        try:
+            pointer_path.relative_to(root.resolve(strict=False))
+        except ValueError as exc:
+            raise HandoffIdentityError("contract_ref escapes artifact_namespace") from exc
+        pointer = self._read_identity_json(pointer_path, "current contract pointer")
+        version = pointer.get("version")
+        expected_path = (
+            f"contracts/v{version:03d}.json"
+            if isinstance(version, int) and not isinstance(version, bool)
+            else None
+        )
+        digest = str(pointer.get("sha256") or "")
+        if (
+            pointer.get("schema_version") != "seqscale-current-contract-v1"
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or pointer.get("path") != expected_path
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise HandoffIdentityError("current contract pointer identity mismatch")
+        record_path = root / expected_path
+        try:
+            content = record_path.read_bytes()
+        except OSError as exc:
+            raise HandoffIdentityError(
+                f"invalid current contract record: {record_path}: {exc}"
+            ) from exc
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise HandoffIdentityError("current contract record hash mismatch")
+        record = self._read_identity_json(record_path, "current contract record")
+        contract = record.get("contract")
+        if (
+            record.get("schema_version") != "seqscale-module-contract-v1"
+            or record.get("version") != version
+            or not isinstance(contract, dict)
+            or contract.get("task_id") != task.id
+            or contract.get("generation") != task.generation
+        ):
+            raise HandoffIdentityError("current contract record task identity mismatch")
+        return digest
+
+    def _resolve_handoff_identity(
+        self, task: Any, conn: Any | None = None,
+    ) -> LogicalHandoffIdentity:
+        contract_sha = self._current_contract_sha(task, conn)
+        workspace = Path(task.workspace_path or self._workspace).expanduser().resolve(
+            strict=False
+        )
+        common_dir = self._git_common_dir(workspace)
+        if common_dir is None:
+            return LogicalHandoffIdentity(contract_sha, "task", 0)
+        root = (
+            common_dir
+            / "seqscale-workflow"
+            / "tasks"
+            / task.id
+        )
+        pointer_path = root / "workflow-state.json"
+        if not pointer_path.exists():
+            return LogicalHandoffIdentity(contract_sha, "task", 0)
+        pointer = self._read_identity_json(pointer_path, "workflow-state pointer")
+        version = pointer.get("version")
+        expected_path = (
+            f"workflow-state/v{version:03d}.json"
+            if isinstance(version, int) and not isinstance(version, bool)
+            else None
+        )
+        digest = str(pointer.get("sha256") or "")
+        if (
+            pointer.get("schema_version")
+            != "seqscale-workflow-state-pointer-v1"
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or pointer.get("path") != expected_path
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise HandoffIdentityError("workflow-state pointer identity mismatch")
+        record_path = root / expected_path
+        try:
+            content = record_path.read_bytes()
+        except OSError as exc:
+            raise HandoffIdentityError(
+                f"invalid workflow-state record: {record_path}: {exc}"
+            ) from exc
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise HandoffIdentityError("workflow-state record hash mismatch")
+        state = self._read_identity_json(record_path, "workflow-state record")
+        phase = state.get("workflow_phase")
+        next_actor = state.get("next_actor")
+        state_generation = state.get("generation")
+        if (
+            state.get("schema_version") != "seqscale-workflow-state-v1"
+            or state.get("version") != version
+            or state.get("task_id") != task.id
+            or not isinstance(state_generation, int)
+            or isinstance(state_generation, bool)
+            or state_generation < 1
+            or not isinstance(phase, str)
+            or not phase.strip()
+            or not isinstance(next_actor, str)
+            or not next_actor.strip()
+        ):
+            raise HandoffIdentityError("workflow-state record identity mismatch")
+        if state_generation < task.generation:
+            # Generation is the workflow epoch. Return-for-rework preserves
+            # the prior pointer as history until the new generation publishes
+            # its own epoch; history must not block the initial new handoff.
+            return LogicalHandoffIdentity(contract_sha, "task", 0)
+        if state_generation > task.generation:
+            raise HandoffIdentityError(
+                "workflow-state generation is newer than current task"
+            )
+        if state.get("contract_sha256") != contract_sha:
+            raise HandoffIdentityError(
+                "workflow-state contract SHA differs from current contract"
+            )
+        return LogicalHandoffIdentity(contract_sha, phase.strip(), version)
+
+    def _prepare_task_handoff(
+        self, task: Any, run_id: int, conn: Any | None = None,
+    ) -> dict[str, Any]:
+        identity = self._resolve_handoff_identity(task, conn)
+        handoff_id = stable_handoff_id(
+            self._board,
+            task.id,
+            task.generation,
+            identity.contract_sha,
+            identity.handoff_kind,
+            identity.sequence,
+        )
+        record = self._read_handoff_record(handoff_id) or {
+            "handoff_id": handoff_id,
+            "board": self._board,
+            "task_id": task.id,
+            "generation": task.generation,
+            "contract_sha": identity.contract_sha,
+            "handoff_kind": identity.handoff_kind,
+            "sequence": identity.sequence,
+            "state": "prepared",
+            "run_ids": [],
+        }
+        run_ids = [int(value) for value in record.get("run_ids", [])]
+        if int(run_id) not in run_ids:
+            run_ids.append(int(run_id))
+        record["run_ids"] = run_ids
+        record["last_run_id"] = int(run_id)
+        self._write_handoff_record(handoff_id, record)
+        self._active_handoff_id = handoff_id
+        self._restore_handoff_transport_metadata(record.get("transport"))
+        return record
+
+    def _mark_active_handoff_state(self, state: str) -> None:
+        handoff_id = self._active_handoff_id
+        if not handoff_id:
+            return
+        record = self._read_handoff_record(handoff_id)
+        if record is None:
+            return
+        record["state"] = state
+        record["updated_at"] = int(time.time())
+        transport = self._handoff_transport_metadata()
+        if transport is not None:
+            record["transport"] = transport
+        self._write_handoff_record(handoff_id, record)
+
+    def _bind_active_handoff_payload(self, payload: str) -> str:
+        """Freeze one exact user message for every logical handoff."""
+        handoff_id = self._active_handoff_id
+        if not handoff_id:
+            return payload
+        record = self._read_handoff_record(handoff_id)
+        if record is None:
+            return payload
+        frozen = record.get("payload")
+        if isinstance(frozen, str) and frozen:
+            return frozen
+        record["payload"] = payload
+        self._write_handoff_record(handoff_id, record)
+        return payload
+
+    @staticmethod
+    def _stable_handoff_prompt(prompt_path: Path, handoff_id: str) -> Path:
+        """Publish the latest run fence behind one stable logical path."""
+        stable_path = prompt_path.with_name(f"handoff-{handoff_id}.md")
+        temporary = stable_path.with_name(
+            f".{stable_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_bytes(prompt_path.read_bytes())
+        os.replace(temporary, stable_path)
+        return stable_path
+
+    def _handoff_transport_metadata(self) -> dict[str, Any] | None:
+        """Optional backend cursor persisted before the terminal write."""
+        return None
+
+    def _restore_handoff_transport_metadata(self, metadata: object) -> None:
+        """Restore a backend cursor after a listener/run restart."""
+        del metadata
+
+    def _existing_transport_ack(self, marker: str) -> bool:
+        """Return whether a persisted backend cursor already proves ACK."""
+        del marker
+        return False
+
+    def _set_active_pane_title(
+        self,
+        *,
+        session: str,
+        pane_id: str,
+        task_id: str,
+        review: bool = False,
+    ) -> None:
+        self._active_pane_session = str(session)
+        self._active_pane_id = str(pane_id)
+        name = (
+            f"{self.pane_label()} [REVIEW {task_id}]"
+            if review
+            else self.pane_label(task_id=task_id)
+        )
+        zellij_rename_pane(
+            session=str(session),
+            pane_id=str(pane_id),
+            name=name,
+            log_path=self._log_path,
+        )
+
+    def _progress_ledger_path(self, task_id: str) -> Path:
+        return kb.board_dir(self._board) / "listener-progress" / f"{task_id}.json"
+
+    def record_task_progress(self, task_id: str, progress: object) -> Path:
+        path = self._progress_ledger_path(task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(
+                {"updated_at": time.time(), "progress": progress},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+        return path
+
+    @staticmethod
+    def _workspace_progress_signature(workspace: Path) -> str:
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "diff",
+                    "--no-ext-diff",
+                    "--binary",
+                    "HEAD",
+                    "--",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "unavailable"
+        digest = hashlib.sha256()
+        digest.update(result.stdout)
+        digest.update(b"\0")
+        digest.update(status.stdout)
+        return digest.hexdigest()
+
+    def _progress_signature(
+        self, conn: Any, task: Any, workspace: Path,
+    ) -> tuple[Any, ...]:
+        event = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ? "
+            "AND kind NOT IN ('heartbeat', 'claim_extended')",
+            (task.id,),
+        ).fetchone()
+        comment = conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+        progress_path = self._progress_ledger_path(task.id)
+        try:
+            progress_digest = hashlib.sha256(progress_path.read_bytes()).hexdigest()
+        except OSError:
+            progress_digest = "missing"
+        return (
+            int(event[0]) if event and event[0] is not None else 0,
+            int(comment[0]) if comment and comment[0] is not None else 0,
+            self._workspace_progress_signature(workspace),
+            progress_digest,
+        )
+
+    def _is_false_running(
+        self,
+        conn: Any,
+        task: Any,
+        *,
+        pane_idle: bool,
+        workspace: Path,
+    ) -> bool:
+        now = time.time()
+        signature = self._progress_signature(conn, task, workspace)
+        protected = not pane_idle or _has_bound_child_process(task.worker_pid)
+        previous = self._false_running_observations.get(task.id)
+        if protected or previous is None or previous[1] != signature:
+            self._false_running_observations[task.id] = (now, signature)
+            return False
+        return now - previous[0] >= 300.0
+
+    def _observe_pending_delivery(
+        self,
+        args: argparse.Namespace,
+        conn: Any,
+        task_id: str,
+        log_path: Path,
+    ) -> str | None:
+        pending = self._pending_delivery
+        if pending is None or pending.task_id != task_id:
+            return None
+        task = kb.get_task(conn, task_id)
+        if (
+            task is None
+            or task.status != "running"
+            or task.current_run_id != pending.run_id
+            or task.generation != pending.generation
+            or task.claim_lock != pending.claim_lock
+        ):
+            self._pending_delivery = None
+            return None
+        state = self._post_injection_contract(
+            args,
+            zellij_session=str(getattr(args, "zellij_session", "")),
+            zellij_pane_id=str(getattr(args, "zellij_pane_id", "")),
+            log_path=log_path,
+            injected_marker=pending.marker,
+            pre_write_composer=pending.pre_write_composer,
+            correlation=pending.correlation,
+            run_id=pending.run_id,
+            generation=pending.generation,
+            task_id=pending.task_id,
+        )
+        if state in {"confirmed", "transport_accepted"}:
+            self._mark_active_handoff_state("accepted")
+            self._pending_delivery = None
+            self._log_delivery_event(
+                log_path,
+                state=(
+                    "confirmed" if state == "confirmed" else "transport_accepted"
+                ),
+                correlation_kind="task",
+                correlation_id=task_id,
+                task_id=task_id,
+                run_id=pending.run_id,
+                generation=pending.generation,
+                pane_id=str(getattr(args, "zellij_pane_id", "")),
+            )
+            return state
+        if state == "known_unsubmitted":
+            reclaimed = _reclaim_task_without_signaling_worker(
+                conn,
+                task_id,
+                reason=f"{self.agent_slug}-interactive delivery known_unsubmitted",
+                expected_run_id=pending.run_id,
+                expected_generation=pending.generation,
+                expected_claim_lock=pending.claim_lock,
+            )
+            self._log_delivery_event(
+                log_path,
+                state="requeued",
+                correlation_kind="task",
+                correlation_id=task_id,
+                task_id=task_id,
+                run_id=pending.run_id,
+                generation=pending.generation,
+                pane_id=str(getattr(args, "zellij_pane_id", "")),
+                reclaimed=reclaimed,
+            )
+            if reclaimed:
+                self._clear_active_claim_identity()
+            return state
+        return "unknown"
 
     # An idle prompt is a safe input boundary, but brief idle flashes occur
     # between tool calls.  Require a stable idle interval before injecting.
@@ -1651,10 +2282,23 @@ class BaseInteractiveListener:
         self._active_claim_lock = task.claim_lock
 
     def _clear_active_claim_identity(self) -> None:
+        pane_session = self._active_pane_session
+        pane_id = self._active_pane_id
+        if pane_session and pane_id:
+            zellij_rename_pane(
+                session=pane_session,
+                pane_id=pane_id,
+                name=self.pane_label(),
+                log_path=self._log_path,
+            )
         self._active_task_id = None
         self._active_run_id = None
         self._active_generation = None
         self._active_claim_lock = None
+        self._active_handoff_id = None
+        self._pending_delivery = None
+        self._active_pane_session = None
+        self._active_pane_id = None
         self._api_retry_count = 0
         self._api_retry_first_at = None
         self._api_retry_kind = None
@@ -1958,6 +2602,21 @@ class BaseInteractiveListener:
         return path
 
     def _control_prompt(self, control: kb.ControlMessage) -> str:
+        if control.kind == "review_checkpoint":
+            comment = (
+                f" durable comment {control.comment_id}"
+                if control.comment_id is not None
+                else " the durable task comments"
+            )
+            return (
+                f"[REVIEW CHECKPOINT {control.id}] Task {control.task_id} run "
+                f"{control.run_id} generation {control.generation} requests a "
+                f"bounded review checkpoint. Read{comment}; review without "
+                "claiming the task or changing its generation/status. Record "
+                "the decision through the project checkpoint workflow, then "
+                f"acknowledge with `hermes kanban --board {self._board} "
+                f"control-ack {control.id}`."
+            )
         return (
             f"[SYSTEM CONTROL {control.id}] Task {control.task_id} run "
             f"{control.run_id} generation {control.generation} is SUPERSEDED "
@@ -1968,6 +2627,10 @@ class BaseInteractiveListener:
             f"with `hermes kanban "
             f"--board {self._board} control-ack {control.id}`."
         )
+
+    def _control_pane_label(self, control: kb.ControlMessage) -> str:
+        marker = "REVIEW" if control.kind == "review_checkpoint" else "PAUSE"
+        return f"{self.agent_slug}-kanban [{marker} {control.task_id}]"
 
     def _control_safe_boundary(
         self, args: argparse.Namespace, log_path: Path,
@@ -2022,7 +2685,7 @@ class BaseInteractiveListener:
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
-                name=f"{self.agent_slug}-kanban [PAUSE {control.task_id}]",
+                name=self._control_pane_label(control),
                 log_path=log_path,
             )
             return True
@@ -2032,7 +2695,7 @@ class BaseInteractiveListener:
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
-                name=f"{self.agent_slug}-kanban [PAUSE {control.task_id}]",
+                name=self._control_pane_label(control),
                 log_path=log_path,
             )
             return True
@@ -2046,9 +2709,16 @@ class BaseInteractiveListener:
             return False
         if leased.status == "delivered":
             self._active_control_id = leased.id
+            zellij_rename_pane(
+                session=session,
+                pane_id=pane_id,
+                name=self._control_pane_label(leased),
+                log_path=log_path,
+            )
             return True
 
-        self._mark_prompt_superseded(leased, conn=conn)
+        if leased.kind == "pause_for_rework":
+            self._mark_prompt_superseded(leased, conn=conn)
         prompt = tag_injected_text(
             self._control_prompt(leased), source_profile="watcher",
         )
@@ -2121,7 +2791,7 @@ class BaseInteractiveListener:
         zellij_rename_pane(
             session=session,
             pane_id=pane_id,
-            name=f"{self.agent_slug}-kanban [PAUSE {leased.task_id}]",
+            name=self._control_pane_label(leased),
             log_path=log_path,
         )
         log_line(
@@ -2320,6 +2990,11 @@ class BaseInteractiveListener:
             claim_generation = claimed.generation
             claim_lock = claimed.claim_lock
             self._remember_active_claim(claimed)
+            self._set_active_pane_title(
+                session=str(getattr(args, "zellij_session", "")),
+                pane_id=str(getattr(args, "zellij_pane_id", "")),
+                task_id=claimed.id,
+            )
         except Exception as exc:
             log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
             return None, None
@@ -2341,6 +3016,7 @@ class BaseInteractiveListener:
                 expected_generation=claim_generation,
                 expected_claim_lock=claim_lock,
             )
+            self._clear_active_claim_identity()
             return None, None
 
         claim_fence = {
@@ -2438,6 +3114,13 @@ class BaseInteractiveListener:
                 or prompt_claim.claim_lock != claim_lock
             ):
                 raise RuntimeError("stale claim after writing task prompt")
+            handoff_record = self._prepare_task_handoff(
+                claimed, claim_run_id, conn,
+            )
+            prompt_path = self._stable_handoff_prompt(
+                prompt_path,
+                str(handoff_record["handoff_id"]),
+            )
         except Exception as exc:
             # A deterministic workspace-contract failure (bad base_commit,
             # branch mismatch, missing worktree) will NEVER clear on its own:
@@ -2500,6 +3183,14 @@ class BaseInteractiveListener:
             self._clear_active_claim_identity()
             return None, None
 
+        if handoff_record.get("state") == "accepted":
+            log_line(
+                log_path,
+                f"event=delivery_reused task_id={claimed.id} "
+                f"run_id={claim_run_id} handoff_id={self._active_handoff_id}",
+            )
+            return claimed.id, claim_run_id
+
         # Post-claim idle confirmation
         if not self.on_claim_post_confirm(args, log_path):
             log_line(log_path, f"idle confirmation failed; aborting injection for {claimed.id}")
@@ -2523,6 +3214,7 @@ class BaseInteractiveListener:
         inject_str = tag_injected_text(
             inject_str, source_profile="watcher",
         )
+        inject_str = self._bind_active_handoff_payload(inject_str)
 
         zellij_session = getattr(args, "zellij_session", "")
         zellij_pane_id = getattr(args, "zellij_pane_id", "")
@@ -2531,6 +3223,17 @@ class BaseInteractiveListener:
             session=str(zellij_session), pane_id=str(zellij_pane_id),
             log_path=log_path,
         )
+        self._mark_active_handoff_state("prepared")
+        if self._existing_transport_ack(
+            self._delivery_marker(inject_str, correlation)
+        ):
+            self._mark_active_handoff_state("accepted")
+            log_line(
+                log_path,
+                f"event=delivery_recovered task_id={claimed.id} "
+                f"run_id={claim_run_id} handoff_id={self._active_handoff_id}",
+            )
+            return claimed.id, claim_run_id
 
         ok = zellij_inject(
             session=zellij_session, pane_id=str(zellij_pane_id),
@@ -2578,7 +3281,42 @@ class BaseInteractiveListener:
             run_id=claim_run_id, generation=claim_generation,
             task_id=claimed.id,
         )
-        if state not in {"confirmed", "transport_accepted"}:
+        if state == "unknown":
+            handoff_id = self._active_handoff_id or ""
+            self._pending_delivery = PendingDelivery(
+                task_id=claimed.id,
+                run_id=claim_run_id,
+                generation=claim_generation,
+                claim_lock=claim_lock,
+                marker=self._delivery_marker(inject_str, correlation),
+                pre_write_composer=pre_write_composer,
+                correlation=correlation,
+                handoff_id=handoff_id,
+                first_observed_at=time.time(),
+            )
+            self._mark_active_handoff_state("pending")
+            self._log_delivery_event(
+                log_path,
+                state="pending",
+                correlation_kind="task",
+                correlation_id=claimed.id,
+                task_id=claimed.id,
+                run_id=claim_run_id,
+                generation=claim_generation,
+                pane_id=str(zellij_pane_id),
+            )
+            try:
+                kb.heartbeat_worker(
+                    conn,
+                    claimed.id,
+                    note="transport_pending",
+                    **claim_fence,
+                )
+            except Exception as exc:
+                log_line(log_path, f"transport_pending heartbeat failed: {exc}")
+            return claimed.id, claim_run_id
+
+        if state == "known_unsubmitted":
             reclaimed = _reclaim_task_without_signaling_worker(
                 conn, claimed.id,
                 reason=(
@@ -2586,9 +3324,8 @@ class BaseInteractiveListener:
                 ),
                 **claim_fence,
             )
-            event = "delivery_requeued" if state == "known_unsubmitted" else "delivery_unknown"
             self._log_delivery_event(
-                log_path, state=event.removeprefix("delivery_"),
+                log_path, state="requeued",
                 correlation_kind="task", correlation_id=claimed.id,
                 task_id=claimed.id, run_id=claim_run_id,
                 generation=claim_generation, pane_id=str(zellij_pane_id),
@@ -2603,6 +3340,11 @@ class BaseInteractiveListener:
                 )
             self._clear_active_claim_identity()
             return None, None
+
+        if state not in {"confirmed", "transport_accepted"}:
+            raise RuntimeError(f"invalid delivery state: {state}")
+
+        self._mark_active_handoff_state("accepted")
 
         self._log_delivery_event(
             log_path,
@@ -2634,11 +3376,6 @@ class BaseInteractiveListener:
         except Exception as exc:
             log_line(log_path, f"post-inject DB op failed (non-fatal): {exc}")
 
-        zellij_rename_pane(
-            session=zellij_session, pane_id=str(zellij_pane_id),
-            name=self.pane_label(task_id=claimed.id),
-            log_path=log_path,
-        )
         log_line(log_path, f"claimed+injected {claimed.id}: {claimed.title} prompt={prompt_path}")
         return claimed.id, claim_run_id
 
@@ -3118,13 +3855,18 @@ class BaseInteractiveListener:
                                     expected_generation=active_generation,
                                     expected_claim_lock=active_claim_lock,
                                 )
-                                worker_heartbeat_ok = claim_heartbeat_ok and kb.heartbeat_worker(
-                                    conn, active_task,
-                                    note=f"{self.agent_slug}-interactive waiting for complete/block from {self.agent_name} TUI",
-                                    expected_run_id=active_run_id,
-                                    expected_generation=active_generation,
-                                    expected_claim_lock=active_claim_lock,
-                                )
+                                if self._pending_delivery is not None:
+                                    # Pending transport is liveness, not worker
+                                    # progress. Renew only this exact claim fence.
+                                    worker_heartbeat_ok = claim_heartbeat_ok
+                                else:
+                                    worker_heartbeat_ok = claim_heartbeat_ok and kb.heartbeat_worker(
+                                        conn, active_task,
+                                        note=f"{self.agent_slug}-interactive waiting for complete/block from {self.agent_name} TUI",
+                                        expected_run_id=active_run_id,
+                                        expected_generation=active_generation,
+                                        expected_claim_lock=active_claim_lock,
+                                    )
                             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                                 consecutive_db_errors += 1
                                 log_line(log_path, f"DB error on heartbeat: {exc}")

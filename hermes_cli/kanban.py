@@ -619,6 +619,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_control_ack.add_argument("control_id", type=int)
     p_control_ack.add_argument("--receiver", default=None)
 
+    p_control_send = sub.add_parser(
+        "control-send",
+        help="Idempotently enqueue a non-mutating review checkpoint control",
+    )
+    p_control_send.add_argument("task_id")
+    p_control_send.add_argument("--run-id", required=True, type=int)
+    p_control_send.add_argument("--generation", required=True, type=int)
+    p_control_send.add_argument("--target-profile", required=True)
+    p_control_send.add_argument(
+        "--kind", required=True, choices=["review_checkpoint"],
+    )
+    p_control_send.add_argument("--comment-id", type=int, default=None)
+    p_control_send.add_argument("--dedupe-key", required=True)
+    p_control_send.add_argument("--return-task-id", default=None)
+    p_control_send.add_argument("--json", action="store_true")
+
     # --- diagnostics (board-wide health) ---
     p_diag = sub.add_parser(
         "diagnostics",
@@ -1183,6 +1199,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "return-for-rework": _cmd_return_for_rework,
+            "control-send": _cmd_control_send,
             "control-ack": _cmd_control_ack,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1253,6 +1270,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "assign",
     "reclaim",
     "reassign",
+    "control-send",
     "link",
     "unlink",
     "claim",
@@ -2206,6 +2224,36 @@ def _cmd_return_for_rework(args: argparse.Namespace) -> int:
         )
     controls = ", ".join(f"control={cid}" for cid in result.control_ids)
     print(f"Returned {args.task_id} for rework at generation {result.generation}" + (f"; {controls}" if controls else ""))
+    return 0
+
+
+def _control_to_dict(control: kb.ControlMessage) -> dict[str, Any]:
+    return {
+        name: getattr(control, name)
+        for name in control.__dataclass_fields__
+    }
+
+
+def _cmd_control_send(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        control = kb.enqueue_control_message(
+            conn,
+            args.task_id,
+            args.run_id,
+            args.generation,
+            args.target_profile,
+            args.kind,
+            args.comment_id,
+            args.dedupe_key,
+            return_task_id=args.return_task_id,
+        )
+    if args.json:
+        print(json.dumps(_control_to_dict(control), ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Enqueued control {control.id} kind={control.kind} "
+            f"task={control.task_id} target={control.target_profile}"
+        )
     return 0
 
 

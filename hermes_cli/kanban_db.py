@@ -4530,6 +4530,130 @@ def list_control_messages(
     return [ControlMessage.from_row(row) for row in conn.execute(query, params)]
 
 
+def enqueue_control_message(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    generation: int,
+    target_profile: str,
+    kind: str,
+    comment_id: Optional[int],
+    dedupe_key: str,
+    return_task_id: Optional[str] = None,
+) -> ControlMessage:
+    """Idempotently enqueue a non-mutating interactive-listener control.
+
+    This public surface is intentionally bounded to review checkpoints.
+    Rework pause controls remain owned by :func:`return_task_for_rework`,
+    which also manages generation invalidation and control holds.
+    """
+    task_id = str(task_id or "").strip()
+    return_task_id = str(return_task_id or task_id).strip()
+    target_profile = _canonical_assignee(target_profile)
+    kind = str(kind or "").strip()
+    dedupe_key = str(dedupe_key or "").strip()
+    if not task_id or not return_task_id:
+        raise ValueError("control task_id and return_task_id are required")
+    if kind != "review_checkpoint":
+        raise ValueError("public control kind must be review_checkpoint")
+    if not target_profile:
+        raise ValueError("control target_profile is required")
+    if not dedupe_key or any(char in dedupe_key for char in "\r\n"):
+        raise ValueError("control dedupe_key must be a nonempty single line")
+    if int(run_id) < 1 or int(generation) < 1:
+        raise ValueError("control run_id and generation must be positive")
+
+    task = get_task(conn, task_id)
+    if task is None or task.status == "archived":
+        raise ValueError(f"unknown or archived task {task_id}")
+    if task.generation != int(generation):
+        raise ValueError(
+            f"control generation mismatch: task={task.generation} "
+            f"requested={generation}"
+        )
+    if get_task(conn, return_task_id) is None:
+        raise ValueError(f"unknown return task {return_task_id}")
+    run = conn.execute(
+        "SELECT task_id, generation FROM task_runs WHERE id = ?",
+        (int(run_id),),
+    ).fetchone()
+    if (
+        run is None
+        or run["task_id"] != task_id
+        or int(run["generation"]) != int(generation)
+    ):
+        raise ValueError("control run does not match task/generation")
+    if comment_id is not None:
+        comment = conn.execute(
+            "SELECT task_id FROM task_comments WHERE id = ?",
+            (int(comment_id),),
+        ).fetchone()
+        if comment is None or comment["task_id"] != task_id:
+            raise ValueError("control comment does not belong to task")
+
+    now = int(time.time())
+    identity = (
+        task_id,
+        return_task_id,
+        int(run_id),
+        int(generation),
+        target_profile,
+        kind,
+        int(comment_id) if comment_id is not None else None,
+    )
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM task_control_messages WHERE dedupe_key = ?",
+            (dedupe_key,),
+        ).fetchone()
+        if existing is not None:
+            actual = (
+                existing["task_id"],
+                existing["return_task_id"],
+                int(existing["run_id"]),
+                int(existing["generation"]),
+                existing["target_profile"],
+                existing["kind"],
+                (
+                    int(existing["comment_id"])
+                    if existing["comment_id"] is not None
+                    else None
+                ),
+            )
+            if actual != identity:
+                raise ValueError("control dedupe_key already binds different identity")
+            return ControlMessage.from_row(existing)
+        cursor = conn.execute(
+            """
+            INSERT INTO task_control_messages (
+                task_id, return_task_id, run_id, generation,
+                target_profile, kind, comment_id, status,
+                dedupe_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (*identity, dedupe_key, now),
+        )
+        control_id = int(cursor.lastrowid or 0)
+        _append_event(
+            conn,
+            task_id,
+            "control_enqueued",
+            {
+                "control_id": control_id,
+                "kind": kind,
+                "target_profile": target_profile,
+                "dedupe_key": dedupe_key,
+            },
+            run_id=int(run_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM task_control_messages WHERE id = ?",
+            (control_id,),
+        ).fetchone()
+    assert row is not None
+    return ControlMessage.from_row(row)
+
+
 def lease_control_message(
     conn: sqlite3.Connection,
     *,
@@ -4555,18 +4679,23 @@ def lease_control_message(
             (now,),
         )
         existing = conn.execute(
-            "SELECT id FROM task_control_messages "
-            "WHERE status IN ('delivering', 'delivered') AND delivery_owner = ? "
-            "ORDER BY id LIMIT 1",
+            "SELECT c.id FROM task_control_messages c "
+            "JOIN tasks t ON t.id = c.task_id "
+            "WHERE c.status IN ('delivering', 'delivered') "
+            "AND c.delivery_owner = ? "
+            "AND (c.kind != 'review_checkpoint' OR c.generation = t.generation) "
+            "ORDER BY c.id LIMIT 1",
             (receiver,),
         ).fetchone()
         if existing:
             selected_id = int(existing["id"])
         else:
             row = conn.execute(
-                "SELECT id FROM task_control_messages "
-                f"WHERE status = 'pending' AND target_profile IN ({placeholders}) "
-                "ORDER BY id LIMIT 1",
+                "SELECT c.id FROM task_control_messages c "
+                "JOIN tasks t ON t.id = c.task_id "
+                f"WHERE c.status = 'pending' AND c.target_profile IN ({placeholders}) "
+                "AND (c.kind != 'review_checkpoint' OR c.generation = t.generation) "
+                "ORDER BY c.id LIMIT 1",
                 tuple(canonical),
             ).fetchone()
             if row:
@@ -4601,10 +4730,12 @@ def peek_control_message(
         return None
     placeholders = ",".join("?" for _ in canonical)
     row = conn.execute(
-        "SELECT * FROM task_control_messages WHERE "
-        "((status IN ('delivering', 'delivered') AND delivery_owner = ?) "
-        f"OR (status = 'pending' AND target_profile IN ({placeholders}))) "
-        "ORDER BY CASE WHEN delivery_owner = ? THEN 0 ELSE 1 END, id LIMIT 1",
+        "SELECT c.* FROM task_control_messages c "
+        "JOIN tasks t ON t.id = c.task_id WHERE "
+        "(c.kind != 'review_checkpoint' OR c.generation = t.generation) AND "
+        "((c.status IN ('delivering', 'delivered') AND c.delivery_owner = ?) "
+        f"OR (c.status = 'pending' AND c.target_profile IN ({placeholders}))) "
+        "ORDER BY CASE WHEN c.delivery_owner = ? THEN 0 ELSE 1 END, c.id LIMIT 1",
         (receiver, *canonical, receiver),
     ).fetchone()
     return ControlMessage.from_row(row) if row else None

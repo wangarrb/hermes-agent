@@ -40,7 +40,22 @@ from base_listener import (  # noqa: E402
     _pane_can_accept_new_kanban_task,
     _tail_nonempty_lines,
 )
-from session_scope import latest_codex_thread  # noqa: E402
+from session_scope import (  # noqa: E402
+    CodexRolloutCursor,
+    SubmitAck,
+    codex_rollout_cursor,
+    codex_submit_ack,
+    latest_codex_thread,
+)
+
+
+LISTENER_CAPABILITIES = {
+    "version": 3,
+    "application_submit_ack": True,
+    "transport_unknown_non_destructive": True,
+    "stable_handoff_id": True,
+    "task_title_lifecycle": True,
+}
 
 
 class CodexInteractiveListener(BaseInteractiveListener):
@@ -56,6 +71,7 @@ class CodexInteractiveListener(BaseInteractiveListener):
     busy_markers: tuple[str, ...] = ("• thinking", "• working", "• running", "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     queued_input_markers: tuple[str, ...] = ()
     semantic_delivery_required = True
+    capabilities = LISTENER_CAPABILITIES
 
     # ── Abstract method implementations ──
 
@@ -185,6 +201,65 @@ class CodexInteractiveListener(BaseInteractiveListener):
             )
         return bool(screen and self.pane_is_idle(screen) and not self.composer_input_text(screen))
 
+    def _pre_write_composer(
+        self, *, session: str, pane_id: str, log_path: Path,
+    ) -> str | None:
+        if getattr(self, "_submit_cursor_handoff_id", None) != getattr(
+            self, "_active_handoff_id", None
+        ):
+            codex_home = Path(
+                os.environ.get("CODEX_HOME") or Path.home() / ".codex"
+            )
+            self._submit_cursor = codex_rollout_cursor(codex_home, self._workspace)
+            self._submit_cursor_handoff_id = getattr(
+                self, "_active_handoff_id", None
+            )
+        return super()._pre_write_composer(
+            session=session,
+            pane_id=pane_id,
+            log_path=log_path,
+        )
+
+    def _handoff_transport_metadata(self) -> dict[str, object] | None:
+        cursor = getattr(self, "_submit_cursor", None)
+        if not isinstance(cursor, CodexRolloutCursor):
+            return None
+        return {
+            "kind": "codex_rollout_cursor",
+            "thread_id": cursor.thread_id,
+            "rollout_path": str(cursor.rollout_path),
+            "byte_offset": cursor.byte_offset,
+        }
+
+    def _restore_handoff_transport_metadata(self, metadata: object) -> None:
+        if not isinstance(metadata, dict):
+            return
+        if metadata.get("kind") != "codex_rollout_cursor":
+            return
+        try:
+            cursor = CodexRolloutCursor(
+                thread_id=str(metadata["thread_id"]),
+                rollout_path=Path(str(metadata["rollout_path"])),
+                byte_offset=int(metadata["byte_offset"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        self._submit_cursor = cursor
+        self._submit_cursor_handoff_id = getattr(self, "_active_handoff_id", None)
+
+    def _existing_transport_ack(self, marker: str) -> bool:
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        ack = codex_submit_ack(
+            codex_home,
+            self._workspace,
+            getattr(self, "_submit_cursor", None),
+            marker,
+        )
+        if ack.state != "accepted":
+            return False
+        self._last_submit_ack = ack
+        return True
+
     # ── Override on_claim_pre_check: check last 5 lines, not just last line ──
     # Codex TUI layout puts the "›" prompt above the bottom status bar (model
     # name, workspace path).  The base class only checks the very last
@@ -288,6 +363,17 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 return True
             return False
 
+        def _application_ack() -> SubmitAck:
+            codex_home = Path(
+                os.environ.get("CODEX_HOME") or Path.home() / ".codex"
+            )
+            return codex_submit_ack(
+                codex_home,
+                self._workspace,
+                getattr(self, "_submit_cursor", None),
+                marker,
+            )
+
         for attempt in range(1, self._POST_INJECT_MAX_RETRIES + 1):
             time.sleep(self._POST_INJECT_CONFIRM_S)
             screen = zellij_dump_screen(
@@ -313,21 +399,18 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 continue
             if saw_marker:
                 return "confirmed"
-            # The submit path can complete before Codex renders a busy marker.
-            # When the composer was empty before injection and is empty now,
-            # transport has accepted the submitted command even though semantic
-            # work has not appeared in the viewport yet.  Returning
-            # transport_accepted prevents a false delivery_unknown reclaim;
-            # the caller still distinguishes this from semantic confirmation.
-            if pre_write_composer == "" and self.pane_is_idle(screen):
+            ack = _application_ack()
+            if ack.state == "accepted":
+                self._last_submit_ack = ack
                 log_line(
                     log_path,
-                    "codex post-inject: composer empty after successful submit; "
-                    "accepting transport without semantic confirmation",
+                    "codex post-inject: application ACK "
+                    f"thread={ack.thread_id} turn={ack.turn_id} "
+                    f"message={ack.message_id}",
                 )
                 return "transport_accepted"
-            # Non-empty unrelated composer or a screen without a supported
-            # composer is inconclusive; never scan transcript tail for marker.
+            # An empty composer alone is not an acknowledgement: the terminal
+            # write and Enter may both succeed without Codex queuing a turn.
             return "unknown"
         return "known_unsubmitted" if saw_marker else "unknown"
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -7,6 +8,12 @@ import pytest
 
 from plugins.kanban.codex_listener.codex_kanban_interactive import (
     CodexInteractiveListener,
+    LISTENER_CAPABILITIES,
+)
+from plugins.kanban.session_scope import (
+    CodexRolloutCursor,
+    codex_rollout_cursor,
+    codex_submit_ack,
 )
 
 
@@ -273,3 +280,254 @@ def test_codex_listener_does_not_resume_unrelated_rollout(
 
     assert not listener.has_saved_sessions(seqscale)
     assert listener.build_tui_cmd(seqscale, continue_session=False)[0] == "codex"
+
+
+def test_codex_submit_ack_reads_exact_user_message_after_saved_cursor(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    workspace = tmp_path / "SeqScale"
+    workspace.mkdir()
+    rollout = codex_home / "sessions" / "rollout.jsonl"
+    rollout.parent.mkdir()
+    marker = "execute handoff [task t_1] [by watcher]"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": marker,
+                    "turn_id": "turn-old",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(codex_home / "state_5.sqlite") as conn:
+        conn.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                rollout_path TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO threads(id, cwd, rollout_path, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("thread-1", str(workspace), str(rollout), 1),
+        )
+
+    before_cursor = codex_rollout_cursor(codex_home, workspace)
+    assert before_cursor is not None
+    with rollout.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": f"prefix {marker}",
+                        "turn_id": "turn-nearby",
+                    },
+                }
+            )
+            + "\n"
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "execute   handoff\n[task t_1] [by watcher]",
+                        "turn_id": "turn-new",
+                        "message_id": "message-new",
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    ack = codex_submit_ack(codex_home, workspace, before_cursor, marker)
+
+    assert ack.state == "accepted"
+    assert ack.thread_id == "thread-1"
+    assert ack.turn_id == "turn-new"
+    assert ack.message_id == "message-new"
+
+
+def test_codex_submit_ack_does_not_scan_before_cursor(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    workspace = tmp_path / "SeqScale"
+    workspace.mkdir()
+    rollout = codex_home / "rollout.jsonl"
+    marker = "handoff-marker"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": marker,
+                    "turn_id": "turn-old",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(codex_home / "state_5.sqlite") as conn:
+        conn.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                rollout_path TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO threads(id, cwd, rollout_path, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("thread-1", str(workspace), str(rollout), 1),
+        )
+
+    before_cursor = codex_rollout_cursor(codex_home, workspace)
+    assert before_cursor is not None
+
+    assert codex_submit_ack(
+        codex_home, workspace, before_cursor, marker
+    ).state == "unknown"
+
+
+def test_codex_submit_ack_associates_idless_user_message_with_later_turn(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    workspace = tmp_path / "SeqScale"
+    workspace.mkdir()
+    rollout = codex_home / "rollout.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    with sqlite3.connect(codex_home / "state_5.sqlite") as conn:
+        conn.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                rollout_path TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO threads(id, cwd, rollout_path, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("thread-1", str(workspace), str(rollout), 1),
+        )
+    marker = "handoff without message identifiers"
+    before_cursor = codex_rollout_cursor(codex_home, workspace)
+    assert before_cursor is not None
+    with rollout.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": marker},
+                }
+            )
+            + "\n"
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "type": "turn_context",
+                    "payload": {"turn_id": "turn-new"},
+                }
+            )
+            + "\n"
+        )
+
+    ack = codex_submit_ack(codex_home, workspace, before_cursor, marker)
+
+    assert ack.state == "accepted"
+    assert ack.thread_id == "thread-1"
+    assert ack.turn_id == "turn-new"
+    assert ack.message_id is None
+
+
+def test_codex_submit_ack_rejects_cursor_from_different_current_thread(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    workspace = tmp_path / "SeqScale"
+    workspace.mkdir()
+    rollout_old = codex_home / "rollout-old.jsonl"
+    rollout_new = codex_home / "rollout-new.jsonl"
+    rollout_old.write_text("", encoding="utf-8")
+    rollout_new.write_text("", encoding="utf-8")
+    with sqlite3.connect(codex_home / "state_5.sqlite") as conn:
+        conn.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                rollout_path TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO threads(id, cwd, rollout_path, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                ("thread-old", str(workspace), str(rollout_old), 1),
+                ("thread-new", str(workspace), str(rollout_new), 2),
+            ],
+        )
+    before_cursor = CodexRolloutCursor(
+        thread_id="thread-old",
+        rollout_path=rollout_old,
+        byte_offset=0,
+    )
+    with rollout_old.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "wrong thread marker",
+                        "turn_id": "turn-old-thread",
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    assert codex_submit_ack(
+        codex_home, workspace, before_cursor, "wrong thread marker"
+    ).state == "unknown"
+
+
+def test_codex_listener_capabilities_advertise_continuity_v3() -> None:
+    assert LISTENER_CAPABILITIES == {
+        "version": 3,
+        "application_submit_ack": True,
+        "transport_unknown_non_destructive": True,
+        "stable_handoff_id": True,
+        "task_title_lifecycle": True,
+    }

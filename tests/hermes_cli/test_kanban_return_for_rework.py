@@ -115,6 +115,132 @@ def test_release_control_lease_makes_pause_available_to_another_receiver(kanban_
     assert acked
 
 
+def test_review_checkpoint_control_enqueue_is_idempotent_and_state_neutral(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="module", assignee="planner")
+        claimed = kb.claim_task(conn, task_id, claimer="planner-pane")
+        assert claimed is not None and claimed.current_run_id is not None
+        comment_id = kb.add_comment(
+            conn,
+            task_id,
+            "planner",
+            "WORKFLOW_STATE review_checkpoint version=3",
+        )
+        before = kb.get_task(conn, task_id)
+
+        first = kb.enqueue_control_message(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            claimed.generation,
+            "reviewer",
+            "review_checkpoint",
+            comment_id,
+            "checkpoint:t_module:v3",
+        )
+        replay = kb.enqueue_control_message(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            claimed.generation,
+            "reviewer",
+            "review_checkpoint",
+            comment_id,
+            "checkpoint:t_module:v3",
+        )
+        after = kb.get_task(conn, task_id)
+
+        assert first.id == replay.id
+        assert first.kind == "review_checkpoint"
+        assert first.return_task_id == task_id
+        assert first.status == "pending"
+        assert kb.list_control_messages(conn) == [first]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_control_holds WHERE control_id = ?",
+            (first.id,),
+        ).fetchone()[0] == 0
+        assert (after.status, after.generation, after.assignee, after.current_run_id) == (
+            before.status,
+            before.generation,
+            before.assignee,
+            before.current_run_id,
+        )
+
+        leased = kb.lease_control_message(
+            conn, profiles=["reviewer"], receiver="review-pane",
+        )
+        assert leased is not None and leased.id == first.id
+        assert kb.mark_control_delivered(conn, leased.id, receiver="review-pane")
+        assert kb.ack_control_message(conn, leased.id, receiver="reviewer")
+
+
+def test_review_checkpoint_control_rejects_dedupe_collision(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="module", assignee="planner")
+        claimed = kb.claim_task(conn, task_id, claimer="planner-pane")
+        assert claimed is not None and claimed.current_run_id is not None
+        comment_id = kb.add_comment(conn, task_id, "planner", "checkpoint v1")
+        kb.enqueue_control_message(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            claimed.generation,
+            "reviewer",
+            "review_checkpoint",
+            comment_id,
+            "checkpoint:stable-key",
+        )
+        with pytest.raises(ValueError, match="dedupe"):
+            kb.enqueue_control_message(
+                conn,
+                task_id,
+                claimed.current_run_id,
+                claimed.generation,
+                "critic",
+                "review_checkpoint",
+                comment_id,
+                "checkpoint:stable-key",
+            )
+
+
+def test_old_generation_review_control_is_not_leased_after_rollover(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="module", assignee="planner")
+        claimed = kb.claim_task(conn, task_id, claimer="planner-pane")
+        assert claimed is not None and claimed.current_run_id is not None
+        comment_id = kb.add_comment(conn, task_id, "planner", "g1 checkpoint")
+        control = kb.enqueue_control_message(
+            conn,
+            task_id,
+            claimed.current_run_id,
+            claimed.generation,
+            "reviewer",
+            "review_checkpoint",
+            comment_id,
+            "checkpoint:g1",
+        )
+        conn.execute(
+            "UPDATE tasks SET generation = 2, status = 'ready', "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+
+        assert kb.peek_control_message(
+            conn, profiles=["reviewer"], receiver="review-pane",
+        ) is None
+        assert kb.lease_control_message(
+            conn, profiles=["reviewer"], receiver="review-pane",
+        ) is None
+        historical = kb.list_control_messages(conn, task_id=task_id)
+
+    assert [item.id for item in historical] == [control.id]
+    assert historical[0].status == "pending"
+
+
 def test_rework_hold_drains_only_after_every_control_ack(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="root")
