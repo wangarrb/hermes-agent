@@ -41,6 +41,7 @@ from base_listener import (  # noqa: E402
     _tail_nonempty_lines,
 )
 from session_scope import (  # noqa: E402
+    CodexRolloutCursor,
     SubmitAck,
     codex_rollout_cursor,
     codex_submit_ack,
@@ -203,13 +204,61 @@ class CodexInteractiveListener(BaseInteractiveListener):
     def _pre_write_composer(
         self, *, session: str, pane_id: str, log_path: Path,
     ) -> str | None:
-        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        self._submit_cursor = codex_rollout_cursor(codex_home, self._workspace)
+        if getattr(self, "_submit_cursor_handoff_id", None) != getattr(
+            self, "_active_handoff_id", None
+        ):
+            codex_home = Path(
+                os.environ.get("CODEX_HOME") or Path.home() / ".codex"
+            )
+            self._submit_cursor = codex_rollout_cursor(codex_home, self._workspace)
+            self._submit_cursor_handoff_id = getattr(
+                self, "_active_handoff_id", None
+            )
         return super()._pre_write_composer(
             session=session,
             pane_id=pane_id,
             log_path=log_path,
         )
+
+    def _handoff_transport_metadata(self) -> dict[str, object] | None:
+        cursor = getattr(self, "_submit_cursor", None)
+        if not isinstance(cursor, CodexRolloutCursor):
+            return None
+        return {
+            "kind": "codex_rollout_cursor",
+            "thread_id": cursor.thread_id,
+            "rollout_path": str(cursor.rollout_path),
+            "byte_offset": cursor.byte_offset,
+        }
+
+    def _restore_handoff_transport_metadata(self, metadata: object) -> None:
+        if not isinstance(metadata, dict):
+            return
+        if metadata.get("kind") != "codex_rollout_cursor":
+            return
+        try:
+            cursor = CodexRolloutCursor(
+                thread_id=str(metadata["thread_id"]),
+                rollout_path=Path(str(metadata["rollout_path"])),
+                byte_offset=int(metadata["byte_offset"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+        self._submit_cursor = cursor
+        self._submit_cursor_handoff_id = getattr(self, "_active_handoff_id", None)
+
+    def _existing_transport_ack(self, marker: str) -> bool:
+        codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        ack = codex_submit_ack(
+            codex_home,
+            self._workspace,
+            getattr(self, "_submit_cursor", None),
+            marker,
+        )
+        if ack.state != "accepted":
+            return False
+        self._last_submit_ack = ack
+        return True
 
     # ── Override on_claim_pre_check: check last 5 lines, not just last line ──
     # Codex TUI layout puts the "›" prompt above the bottom status bar (model
