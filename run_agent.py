@@ -251,6 +251,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # Muse short-stop recovery pair: a short non-terminal fragment and the
+    # synthetic continuation nudge are only loop scaffolding.
+    "_muse_short_stop_synthetic",
 )
 
 
