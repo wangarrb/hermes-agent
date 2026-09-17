@@ -603,19 +603,36 @@ def _chat_messages_to_responses_input(
                         items.append(replay_item)
                         replayed_message_items += 1
 
+                # The Responses API requires a following item after each
+                # reasoning item (otherwise: missing_following_item error).
+                # A ``function_call`` already satisfies that requirement, so
+                # inventing a blank assistant carrier between the two corrupts
+                # the replayed turn shape: reasoning models on the Responses
+                # wire (Muse Spark, #103483) re-read the malformed row once per
+                # tool round and can then end the turn on a degenerate final.
+                # Emit a follower only when nothing else will follow, and keep
+                # it non-empty because strict Responses-compatible providers
+                # reject content="" with HTTP 400 (#75202).
+                pending_tool_items = False
+                _pending_tool_calls = msg.get("tool_calls")
+                if isinstance(_pending_tool_calls, list):
+                    for _tc in _pending_tool_calls:
+                        if not isinstance(_tc, dict):
+                            continue
+                        _fn = _tc.get("function", {})
+                        _fn_name = _fn.get("name") if isinstance(_fn, dict) else None
+                        if isinstance(_fn_name, str) and _fn_name.strip():
+                            pending_tool_items = True
+                            break
+
                 if replayed_message_items > 0:
                     pass
                 elif content_parts:
                     items.append({"role": "assistant", "content": content_parts})
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
-                elif has_codex_reasoning:
-                    # The Responses API requires a following item after each
-                    # reasoning item (otherwise: missing_following_item error).
-                    # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
-                    items.append({"role": "assistant", "content": ""})
+                elif has_codex_reasoning and not pending_tool_items:
+                    items.append({"role": "assistant", "content": " "})
 
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
