@@ -61,7 +61,15 @@ _REASONING_BLOCK_PATTERNS = tuple(
 )
 
 _TOOL_CALL_BLOCK_PATTERNS = tuple(
-    re.compile(rf"<{name}\b[^>]*>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    # Namespace prefixes are tolerated (`<atem:function_calls>`): the open and
+    # close tags must agree on being prefixed or bare, and the prefix itself is
+    # any dotted/dashed identifier. Muse Spark on the Responses wire serializes
+    # its native tool call onto the text channel with a namespace prefix, so an
+    # unprefixed-only pattern leaked the whole block as the turn's final answer.
+    re.compile(
+        rf"<(?:[\w.-]+:)?{name}\b[^>]*>.*?</(?:[\w.-]+:)?{name}>",
+        re.DOTALL | re.IGNORECASE,
+    )
     for name in _TOOL_CALL_TAG_NAMES
 )
 
@@ -86,7 +94,7 @@ _ORPHAN_REASONING_TAG_PATTERN = re.compile(
 )
 
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
-    rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*',
+    rf'</(?:(?:[\w.-]+:)?(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function))>\s*',
     re.IGNORECASE,
 )
 

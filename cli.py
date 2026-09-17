@@ -284,11 +284,14 @@ def _strip_reasoning_tags(text: str) -> str:
             cleaned,
             flags=re.IGNORECASE,
         )
-    # Tool-call XML blocks (openclaw/openclaw#67318).
+    # Tool-call XML blocks (openclaw/openclaw#67318). Namespace prefixes are
+    # tolerated (`<atem:function_calls>…</atem:function_calls>`) so a model that
+    # serializes its native tool call onto the text channel with a prefix does
+    # not leak the block as the visible answer.
     for tc_tag in ("tool_call", "tool_calls", "tool_result",
                    "function_call", "function_calls"):
         cleaned = re.sub(
-            rf"<{tc_tag}\b[^>]*>.*?</{tc_tag}>\s*",
+            rf"<(?:[\w.-]+:)?{tc_tag}\b[^>]*>.*?</(?:[\w.-]+:)?{tc_tag}>\s*",
             "",
             cleaned,
             flags=re.DOTALL | re.IGNORECASE,
@@ -302,9 +305,9 @@ def _strip_reasoning_tags(text: str) -> str:
         cleaned,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    # Stray tool-call close tags.
+    # Stray tool-call close tags (namespace-prefixed closers included).
     cleaned = re.sub(
-        r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*',
+        r'</(?:(?:[\w.-]+:)?(?:tool_call|tool_calls|tool_result|function_call|function_calls|function))>\s*',
         '',
         cleaned,
         flags=re.IGNORECASE,
