@@ -24,6 +24,7 @@ from typing import Any
 
 DEFAULT_API = "http://127.0.0.1:8888"
 DEFAULT_BANK = "hermes"
+DEFAULT_REQUEST_TIMEOUT = 120.0
 DEFAULT_CARDS_ROOT = Path.home() / ".hermes" / "hindsight" / "offline_reflect" / "v2_cards"
 DEFAULT_REPAIR_SIDECAR_ROOT = Path.home() / ".hermes" / "hindsight" / "review_repair" / "approved"
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -84,7 +85,21 @@ def clean_json_text(text: str) -> str:
     return CONTROL_CHARS.sub("", text or "")
 
 
-def http_json(url: str, payload: dict[str, Any], timeout: int = 45) -> Any:
+def positive_request_timeout(value: str | float) -> float:
+    """Validate per-request seconds, not the total layered-recall wall budget."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("request timeout must be a positive finite number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("request timeout must be a positive finite number")
+    return timeout
+
+
+def http_json(
+    url: str, payload: dict[str, Any], timeout: float = DEFAULT_REQUEST_TIMEOUT,
+) -> Any:
+    timeout = positive_request_timeout(timeout)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -146,7 +161,11 @@ def has_measurement_signal(text: str) -> bool:
     return any(w in t for w in MEASUREMENT_WORDS) or "%" in t
 
 
-def recall(api: str, bank: str, query: str, limit: int, *, include_observations: bool = True) -> list[dict[str, Any]]:
+def recall(
+    api: str, bank: str, query: str, limit: int, *,
+    include_observations: bool = True,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+) -> list[dict[str, Any]]:
     # V2 default: include observation units explicitly. Hindsight's API default
     # only searches world/experience, so direct canonical observations would be
     # invisible without this types list. Eval baselines may disable this to
@@ -155,7 +174,10 @@ def recall(api: str, bank: str, query: str, limit: int, *, include_observations:
     if include_observations:
         types.insert(0, "observation")
     payload = {"query": query, "limit": limit, "types": types}
-    data = http_json(f"{api}/v1/default/banks/{bank}/memories/recall", payload)
+    data = http_json(
+        f"{api}/v1/default/banks/{bank}/memories/recall", payload,
+        timeout=request_timeout,
+    )
     return data.get("results") or []
 
 
@@ -539,11 +561,18 @@ def layered_recall(
     local_sidecar_limit: int | None = None,
     repair_sidecar_root: str | Path | None = None,
     repair_sidecar_limit: int | None = None,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
 ) -> list[dict[str, Any]]:
+    request_timeout = positive_request_timeout(request_timeout)
+    recall_options: dict[str, Any] = {"include_observations": include_observations}
+    # Preserve the default call shape for existing recall substitutes. Native
+    # recall and http_json share the same default; overrides are always forwarded.
+    if request_timeout != DEFAULT_REQUEST_TIMEOUT:
+        recall_options["request_timeout"] = request_timeout
     merged: dict[str, dict[str, Any]] = {}
     for vi, q in enumerate(query_variants(query, mode)):
         try:
-            results = recall(api, bank, q, raw_limit, include_observations=include_observations)
+            results = recall(api, bank, q, raw_limit, **recall_options)
         except Exception as e:
             results = [{"error": repr(e), "query": q}]
         for rank, r in enumerate(results, 1):
@@ -642,6 +671,10 @@ def main() -> None:
     ap.add_argument("--mode", choices=["high-level", "evidence", "mixed"], default="mixed")
     ap.add_argument("--api", default=DEFAULT_API)
     ap.add_argument("--bank", default=DEFAULT_BANK)
+    ap.add_argument(
+        "--request-timeout", type=positive_request_timeout, default=DEFAULT_REQUEST_TIMEOUT,
+        help="Seconds per HTTP request (default: 120); serial query variants need a longer outer wall timeout",
+    )
     ap.add_argument("--raw-limit", type=int, default=40, help="Results to fetch per query variant before local rerank")
     ap.add_argument("--limit", type=int, default=10, help="Final result count")
     ap.add_argument("--cards-root", default=str(DEFAULT_CARDS_ROOT), help="Local v2 canonical cards root; used by default when the directory exists")
@@ -671,6 +704,7 @@ def main() -> None:
         local_sidecar_limit=args.local_sidecar_limit,
         repair_sidecar_root=repair_sidecar_root,
         repair_sidecar_limit=args.repair_sidecar_limit,
+        request_timeout=args.request_timeout,
     )
     if args.json:
         print(json.dumps({"query": query, "mode": args.mode, "results": results}, ensure_ascii=False, indent=2))
