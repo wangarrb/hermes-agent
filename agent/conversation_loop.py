@@ -6873,6 +6873,11 @@ def run_conversation(
                     truncated_response_parts = []
                     length_continue_retries = 0
                 
+                # Keep the pre-strip text for the Muse stop-guard below: the
+                # stripper removes text-channel tool-call XML, and a turn whose
+                # whole final was such a block would otherwise reach the guard as
+                # an empty string and slip past it.
+                _muse_raw_final = final_response
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
@@ -6893,6 +6898,7 @@ def run_conversation(
                         provider=getattr(agent, "provider", None),
                         finish_reason=finish_reason,
                         assistant_content=final_response,
+                        raw_content=_muse_raw_final,
                         messages=messages,
                         attempts=getattr(agent, "_muse_short_stop_retries", 0),
                     )

@@ -178,6 +178,7 @@ def build_muse_short_stop_nudge(
     messages: Iterable[dict] | None = None,
     attempts: int = 0,
     max_attempts: int = _MUSE_SHORT_STOP_MAX_ATTEMPTS,
+    raw_content: str | None = None,
 ) -> Optional[str]:
     """Re-prompt Muse when it emits a degenerate non-terminal Kanban final.
 
@@ -190,6 +191,13 @@ def build_muse_short_stop_nudge(
     retry prevents a model/provider failure from becoming an infinite loop,
     while avoiding acceptance of a random fragment or leaked tool syntax as the
     task result.
+
+    ``raw_content`` is the assistant text *before* text-channel stripping. The
+    conversation loop strips tool-call XML from the visible final before calling
+    this guard, so a turn whose entire final was such a block arrives here as an
+    empty ``assistant_content``. Consulting the pre-strip text only in that case
+    keeps the guard firing on the leak it exists to catch, without letting a
+    legitimate answer that merely quotes XML be mistaken for a leak.
     """
     if str(provider or "").strip().lower() != "opencode-go":
         return None
@@ -199,6 +207,8 @@ def build_muse_short_stop_nudge(
     if str(finish_reason or "").strip().lower() != "stop":
         return None
     content = str(assistant_content or "").strip()
+    if not content:
+        content = str(raw_content or "").strip()
     if not content:
         return None
     lowered_content = content.lower()

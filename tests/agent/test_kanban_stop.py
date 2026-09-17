@@ -190,6 +190,97 @@ def test_muse_short_stop_nudge_stops_after_terminal_board_tool():
 
 
 
+def test_muse_nudge_survives_pre_strip_losing_the_xml():
+    """The stripper must not blind this guard.
+
+    ``conversation_loop`` strips text-channel tool-call XML from the visible
+    final before calling the guard, so a turn whose entire final was a leaked
+    ``<atem:function_calls>`` block arrives as an empty ``assistant_content``.
+    Without ``raw_content`` the guard would go silent on exactly the leak it
+    exists to catch, and the turn would fall through to the generic
+    (session-scoped, one-shot) empty-response path instead.
+    """
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+    ]
+    leaked = (
+        '<atem:function_calls>\n'
+        '<atem:invoke name="default.terminal">\n'
+        'echo "still working"\n'
+        '</atem:invoke>\n'
+        '</atem:function_calls>'
+    )
+
+    # What the loop actually hands over after stripping: empty visible text,
+    # with the pre-strip original alongside it.
+    nudge = build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="",
+        raw_content=leaked,
+        messages=messages,
+    )
+
+    assert nudge is not None, "guard went silent on a leaked tool call"
+    assert "structured function call" in nudge
+
+
+def test_muse_nudge_still_ignores_an_empty_final_with_no_leak():
+    """An empty final with no tool-call leak keeps the old behaviour.
+
+    A genuinely empty response must stay with the generic empty-response path;
+    this guard must not claim it.
+    """
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+    ]
+    assert build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="",
+        raw_content="",
+        messages=messages,
+    ) is None
+
+
+def test_muse_nudge_unchanged_on_the_nonempty_path():
+    """``raw_content`` must not widen detection beyond the empty case.
+
+    When the visible final is non-empty the guard sees exactly what it saw
+    before this change: a long answer with no tool-call syntax is left alone,
+    while a short fragment is still treated as degenerate.
+    """
+    messages = [
+        {"role": "user", "content": "[任务 t_abc123: work] [by watcher]"},
+    ]
+    long_answer = (
+        "The task is complete. I refactored the replay adapter, added regression "
+        "tests for the reasoning follower, and verified the full suite passes. "
+        "See the diff above for the exact changes."
+    )
+    assert len(long_answer) > 120
+    assert build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content=long_answer,
+        raw_content=long_answer,
+        messages=messages,
+    ) is None
+
+    # Degenerate short final still caught (pre-existing path).
+    assert build_muse_short_stop_nudge(
+        model="muse-spark-1.3-contributor",
+        provider="opencode-go",
+        finish_reason="stop",
+        assistant_content="пар",
+        raw_content="пар",
+        messages=messages,
+    ) is not None
+
+
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
 # nudge fires first (up to 2 attempts), and if the worker still exits
