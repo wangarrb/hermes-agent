@@ -254,6 +254,11 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # Muse short-stop recovery pair: a short non-terminal fragment and the
     # synthetic continuation nudge are only loop scaffolding.
     "_muse_short_stop_synthetic",
+    # degenerate-final re-prompt pair: the collapsed assistant turn and the
+    # "resume the task" nudge exist only to drive the bounded retry.
+    # Persisting them would replay the internal retry instruction as
+    # user-authored context on resume.
+    "_degenerate_final_nudge",
 )
 
 

@@ -6988,10 +6988,94 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # ── Degenerate-final recovery ─────────────────────────
+                # A text stop whose whole visible answer is a fragment, or a
+                # progress note announcing work it never did, after real tool
+                # work is a provider-side collapse rather than an answer: the
+                # loop accepts it, the turn reports completed, and an unattended
+                # job silently abandons the task. Reported on the Responses wire
+                # with muse-spark, where the tool work always executes correctly
+                # and only the final text collapses. Bounded to two re-prompts
+                # per turn because the two arms compose in practice — a fragment
+                # retry can come back as a stall note. Gated on the turn having
+                # actually run tool work, so a terse answer from a chat-only
+                # turn is left alone. See agent/degenerate_final.py.
+                try:
+                    from agent.degenerate_final import (
+                        DEGENERATE_FINAL_MAX_NUDGES,
+                        DEGENERATE_FINAL_MIN_TOOL_RESULTS,
+                        build_degenerate_final_nudge,
+                        degenerate_final_arm,
+                        degenerate_final_guard_mode,
+                        tool_results_since_last_user,
+                    )
+                    from run_agent import _EPHEMERAL_SCAFFOLDING_FLAGS
+
+                    _degenerate_arm = ""
+                    if (
+                        finish_reason == "stop"
+                        and bool(getattr(agent, "_stall_guards", True))
+                        and degenerate_final_guard_mode(agent) != "off"
+                        and not assistant_message.tool_calls
+                        and getattr(agent, "_degenerate_final_nudges", 0)
+                        < DEGENERATE_FINAL_MAX_NUDGES
+                        and tool_results_since_last_user(
+                            messages, _EPHEMERAL_SCAFFOLDING_FLAGS
+                        )
+                        >= DEGENERATE_FINAL_MIN_TOOL_RESULTS
+                    ):
+                        _degenerate_arm = degenerate_final_arm(final_response) or ""
+                except Exception:
+                    logger.debug("degenerate-final check failed", exc_info=True)
+                    _degenerate_arm = ""
+
+                if _degenerate_arm:
+                    agent._degenerate_final_nudges = (
+                        getattr(agent, "_degenerate_final_nudges", 0) + 1
+                    )
+                    logger.warning(
+                        "Degenerate final (%s): text stop ended the turn with a "
+                        "%d-char non-answer after %d tool result(s) — "
+                        "re-prompting %d/%d (model=%s provider=%s api_mode=%s): %r",
+                        _degenerate_arm,
+                        len(final_response or ""),
+                        tool_results_since_last_user(
+                            messages, _EPHEMERAL_SCAFFOLDING_FLAGS
+                        ),
+                        agent._degenerate_final_nudges,
+                        DEGENERATE_FINAL_MAX_NUDGES,
+                        agent.model,
+                        agent.provider,
+                        getattr(agent, "api_mode", ""),
+                        (final_response or "")[:40],
+                    )
+                    agent._emit_status(
+                        "↻ Model ended the turn without an answer — "
+                        "re-prompting to finish"
+                    )
+                    # Both halves of the re-prompt pair are ephemeral
+                    # scaffolding (mirrors the dropped-tool-call nudge pattern):
+                    # the collapsed assistant turn exists only to keep role
+                    # alternation valid for the nudge, and the nudge exists only
+                    # to drive the retry. Flag both so the persistence layer
+                    # never writes them to the durable transcript and the pop
+                    # below can strip an unanswered tail pair.
+                    final_msg["_degenerate_final_nudge"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": build_degenerate_final_nudge(_degenerate_arm),
+                        "_degenerate_final_nudge": True,
+                    })
+                    agent._session_messages = messages
+                    final_response = None
+                    continue
+
                 # Reached finalization without the dropped-tool-call mismatch —
                 # a genuine turn end. Clear the consecutive-stall budget so the
                 # next turn starts fresh.
                 agent._dropped_toolcall_retries = 0
+                agent._degenerate_final_nudges = 0
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
@@ -7007,6 +7091,7 @@ def run_conversation(
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
                         or messages[-1].get("_muse_short_stop_synthetic")
+                        or messages[-1].get("_degenerate_final_nudge")
                     )
                 ):
                     messages.pop()
