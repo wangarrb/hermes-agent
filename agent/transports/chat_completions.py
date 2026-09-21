@@ -257,6 +257,13 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — strict providers reject this
                 or "api_content" in msg  # persist-what-you-send sidecar
+                # ``name`` on a tool result is the OpenAI-spec optional field that
+                # some gateways reject outright (Console Go / opencode-go:
+                # 'messages[N]: "name" is not supported by this endpoint'). It is
+                # listed on its own because a message whose ONLY offending key is
+                # ``name`` must still arm the sanitizer — otherwise the early
+                # ``return messages`` above hands the field to the wire untouched.
+                or (msg.get("role") == "tool" and "name" in msg)
             ):
                 needs_sanitize = True
                 break
@@ -308,6 +315,15 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
+
+            # ``name`` is schema-valid on user/assistant messages, so the removal
+            # is role-qualified: only tool results carry it illegally.
+            # ``make_tool_result_message()`` writes it alongside the internal
+            # ``tool_name``; strict gateways reject it with
+            # ``'messages[N]: "name" is not supported by this endpoint'``.
+            if msg.get("role") == "tool" and "name" in msg:
+                out_msg = mutable_msg()
+                out_msg.pop("name", None)
 
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).

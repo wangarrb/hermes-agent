@@ -731,3 +731,95 @@ class TestPromptCacheKeyCapability:
         assert first == second
         assert first != key("cron_job_2026-07-15T10:05:00Z", instructions="You are different.")
         assert first != key("cron_job_2026-07-15T10:05:00Z", tool_name="search")
+
+
+class TestToolResultNameStrip:
+    """``name`` on a tool result must not reach the wire.
+
+    ``make_tool_result_message()`` stamps tool results with BOTH the OpenAI-spec
+    ``name`` and Hermes' internal ``tool_name``. Only ``tool_name`` used to be
+    stripped, so ``name`` leaked — and the OpenCode Go relay's upstream (Console
+    Go) rejects it outright with a hard, non-retryable
+
+        HTTP 400: messages[N]: "name" is not supported by this endpoint
+
+    which fails every tool-using conversation on that provider from the first
+    tool round onward. Permissive providers ignore the unknown key, which is why
+    this went unnoticed.
+
+    The removal is role-qualified: ``name`` IS schema-valid on user/assistant
+    messages, so only tool results may lose it.
+    """
+
+    def _real_tool_result(self, name="terminal"):
+        """Build the message via its actual producer, not a hand-made dict."""
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        return make_tool_result_message(name, "a.txt\nb.txt", "call_1")
+
+    def test_producer_actually_sets_this_field(self):
+        """Guard: if the producer stops writing ``name``, these tests are moot."""
+        msg = self._real_tool_result()
+        assert msg.get("name") == "terminal"
+        assert msg.get("tool_name") == "terminal"
+
+    def test_name_is_stripped_from_tool_results(self, transport):
+        msgs = [
+            {"role": "user", "content": "list files"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            self._real_tool_result(),
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.3-flash")
+
+        tool_msg = [m for m in result if m.get("role") == "tool"][0]
+        assert "name" not in tool_msg, tool_msg
+        assert "tool_name" not in tool_msg, tool_msg
+        # The payload fields a tool result legitimately needs survive.
+        assert tool_msg["tool_call_id"] == "call_1"
+        assert "a.txt" in tool_msg["content"]
+        # Original list untouched (deepcopy-on-demand contract).
+        assert msgs[2]["name"] == "terminal"
+
+    def test_name_alone_still_arms_the_sanitizer(self, transport):
+        """A tool row whose ONLY offending key is ``name`` must not early-return.
+
+        The sanitizer bails out by identity when no message trips its trigger
+        set; before this fix ``name`` was not in that set, so a tool row carrying
+        just ``name`` (the shape ``conversation_loop`` writes on its
+        invalid-tool-name paths) reached the wire completely untouched.
+        """
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "name": "terminal", "tool_call_id": "call_1",
+             "content": "out"},
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.3-flash")
+
+        assert result is not msgs, "sanitizer bailed out; name would leak"
+        assert "name" not in result[1], result[1]
+
+    def test_name_is_preserved_on_user_and_assistant(self, transport):
+        """``name`` is schema-valid there, so the strip must stay role-qualified."""
+        msgs = [
+            {"role": "user", "name": "alice", "content": "hi"},
+            {"role": "assistant", "name": "hermes", "content": "hello",
+             "tool_name": "terminal"},  # unrelated cleanup still runs
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.3-flash")
+
+        assert result[0]["name"] == "alice"
+        assert result[1]["name"] == "hermes"
+        assert "tool_name" not in result[1]
+
+    def test_clean_history_still_returned_by_identity(self, transport):
+        """No regression to the no-copy fast path for already-clean payloads."""
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "out"},
+        ]
+        assert transport.convert_messages(msgs) is msgs
