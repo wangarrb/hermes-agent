@@ -36,13 +36,23 @@ owner_workspace_common_dir() {
 }
 
 owner_workspace_is_linked_to() {
-    local primary="$1" target="$2" primary_common target_common
+    local primary="$1" target="$2" primary_common target_common target_gitdir linked_target
     primary_common="$(owner_workspace_common_dir "$primary")" || return 1
     target_common="$(owner_workspace_common_dir "$target")" || return 1
     [[ "$primary_common" == "$target_common" ]] || return 1
-    git -C "$primary" worktree list --porcelain |
-        awk '/^worktree / {sub(/^worktree /, ""); print}' |
-        grep -Fxq "$target"
+
+    # Do not enumerate every worktree in the repository here. Large experiment
+    # repos can have hundreds of historical worktree-admin entries, and
+    # `git worktree list --porcelain` resolves each one before returning. The
+    # target's own .git file plus its admin gitdir provide the same identity
+    # check in O(1): target -> admin entry -> target, under primary's common dir.
+    target_gitdir="$(git -C "$target" rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 1
+    target_gitdir="$(readlink -f "$target_gitdir")" || return 1
+    [[ -f "$target_gitdir/gitdir" ]] || return 1
+    [[ "$(readlink -f "$target_gitdir/../..")" == "$primary_common" ]] || return 1
+    linked_target="$(sed -n '1p' "$target_gitdir/gitdir")"
+    [[ -n "$linked_target" ]] || return 1
+    [[ "$(readlink -f "$linked_target")" == "$(readlink -f "$target/.git")" ]]
 }
 
 owner_workspace_print_contract() {
