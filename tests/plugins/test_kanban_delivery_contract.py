@@ -20,6 +20,23 @@ def _canonical_json(value: dict) -> bytes:
     ).encode()
 
 
+def test_handoff_ack_is_not_reused_after_owner_pane_changes() -> None:
+    record = {
+        "delivery_target": {
+            "profile": "designer",
+            "session": "kanban-seqscale",
+            "pane_id": "3",
+        },
+    }
+
+    assert bl.BaseInteractiveListener._handoff_target_matches(
+        record, profile="designer", session="kanban-seqscale", pane_id="3",
+    )
+    assert not bl.BaseInteractiveListener._handoff_target_matches(
+        record, profile="implementer", session="kanban-seqscale", pane_id="1",
+    )
+
+
 def _write_current_contract(
     root: Path, task_id: str, *, generation: int = 1, version: int = 1,
 ) -> str:

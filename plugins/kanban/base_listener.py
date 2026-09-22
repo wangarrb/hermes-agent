@@ -1757,6 +1757,32 @@ class BaseInteractiveListener:
         return payload
 
     @staticmethod
+    def _handoff_target_matches(
+        record: dict[str, Any], *, profile: str, session: str, pane_id: str,
+    ) -> bool:
+        """Only reuse a transport ACK on the same visible target."""
+        target = record.get("delivery_target")
+        return isinstance(target, dict) and target == {
+            "profile": profile,
+            "session": session,
+            "pane_id": pane_id,
+        }
+
+    def _record_handoff_target(
+        self, record: dict[str, Any], *, profile: str, session: str,
+        pane_id: str,
+    ) -> None:
+        """Persist the pane/profile that received the frozen handoff."""
+        record["delivery_target"] = {
+            "profile": profile,
+            "session": session,
+            "pane_id": pane_id,
+        }
+        handoff_id = self._active_handoff_id
+        if handoff_id:
+            self._write_handoff_record(handoff_id, record)
+
+    @staticmethod
     def _stable_handoff_prompt(prompt_path: Path, handoff_id: str) -> Path:
         """Publish the latest run fence behind one stable logical path."""
         stable_path = prompt_path.with_name(f"handoff-{handoff_id}.md")
@@ -3194,13 +3220,39 @@ class BaseInteractiveListener:
             self._clear_active_claim_identity()
             return None, None
 
-        if handoff_record.get("state") == "accepted":
+        zellij_session = str(getattr(args, "zellij_session", ""))
+        zellij_pane_id = str(getattr(args, "zellij_pane_id", ""))
+        if (
+            handoff_record.get("state") == "accepted"
+            and self._handoff_target_matches(
+                handoff_record,
+                profile=pane_profile,
+                session=zellij_session,
+                pane_id=zellij_pane_id,
+            )
+        ):
             log_line(
                 log_path,
                 f"event=delivery_reused task_id={claimed.id} "
                 f"run_id={claim_run_id} handoff_id={self._active_handoff_id}",
             )
             return claimed.id, claim_run_id
+
+        if handoff_record.get("state") == "accepted":
+            # The logical handoff is valid, but its previous ACK belongs to a
+            # different visible owner pane (or predates target recording).
+            # Re-inject the same frozen payload on this target.
+            log_line(
+                log_path,
+                f"event=delivery_retarget task_id={claimed.id} "
+                f"run_id={claim_run_id} handoff_id={self._active_handoff_id} "
+                f"profile={pane_profile} pane={zellij_pane_id}",
+            )
+            handoff_record["state"] = "prepared"
+            self._record_handoff_target(
+                handoff_record, profile=pane_profile,
+                session=zellij_session, pane_id=zellij_pane_id,
+            )
 
         # Post-claim idle confirmation
         if not self.on_claim_post_confirm(args, log_path):
@@ -3227,8 +3279,6 @@ class BaseInteractiveListener:
         )
         inject_str = self._bind_active_handoff_payload(inject_str)
 
-        zellij_session = getattr(args, "zellij_session", "")
-        zellij_pane_id = getattr(args, "zellij_pane_id", "")
         correlation = f"task:{claimed.id}:run:{claim_run_id}:generation:{claim_generation}"
         pre_write_composer = self._pre_write_composer(
             session=str(zellij_session), pane_id=str(zellij_pane_id),
@@ -3356,6 +3406,11 @@ class BaseInteractiveListener:
             raise RuntimeError(f"invalid delivery state: {state}")
 
         self._mark_active_handoff_state("accepted")
+        handoff_record["state"] = "accepted"
+        self._record_handoff_target(
+            handoff_record, profile=pane_profile,
+            session=str(zellij_session), pane_id=str(zellij_pane_id),
+        )
 
         self._log_delivery_event(
             log_path,
