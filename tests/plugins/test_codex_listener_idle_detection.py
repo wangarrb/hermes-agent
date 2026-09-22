@@ -45,6 +45,18 @@ def test_codex_composer_parser_treats_default_placeholder_as_empty() -> None:
     ) is None
 
 
+def test_codex_idle_detection_accepts_concatenated_empty_placeholder() -> None:
+    listener = codex.CodexInteractiveListener()
+    screen = (
+        "previous transcript\n"
+        "成。› Ask Codex to do anything\n"
+        "gpt-5.6-luna xhigh · main · Context 20% used\n"
+    )
+
+    assert listener.pane_is_idle(screen)
+    assert listener.composer_input_text(screen) is None
+
+
 def test_codex_claim_precheck_rejects_nonempty_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:

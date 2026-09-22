@@ -136,7 +136,16 @@ class CodexInteractiveListener(BaseInteractiveListener):
         # The prompt may be bare, followed by role/status text, or share a
         # row with the status bar.  Only a prompt glyph at the start of a
         # current line counts; transcript prose containing › is ignored.
-        return any(re.match(r"^\s*›(?:\s|$)", line) for line in tail_lines)
+        if any(re.match(r"^\s*›(?:\s|$)", line) for line in tail_lines):
+            return True
+        # Zellij can concatenate the previous transcript line with the empty
+        # composer/status footer (e.g. ``成。› Ask Codex to do anything``).
+        # Treat only the known empty placeholder as idle; arbitrary inline
+        # prompt text may still be a user draft and must remain fail-closed.
+        return any(
+            "› ask codex to do anything" in line.casefold()
+            for line in tail_lines
+        )
 
     _COMPOSER_PROMPT_RE = re.compile(r"^\s*›(?:\s?(.*))?$")
     _EMPTY_COMPOSER_PLACEHOLDERS = frozenset({
@@ -155,6 +164,11 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 first_text = (match.group(1) or "").strip()
                 break
         if prompt_index is None:
+            if any(
+                "› ask codex to do anything" in line.casefold()
+                for line in lines[-5:]
+            ):
+                return None
             return None
 
         # Strip an inline role/status suffix while preserving composer text,
