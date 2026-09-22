@@ -57,6 +57,17 @@ def test_codex_idle_detection_accepts_concatenated_empty_placeholder() -> None:
     assert listener.composer_input_text(screen) is None
 
 
+def test_codex_idle_detection_accepts_truncated_placeholder_with_status() -> None:
+    listener = codex.CodexInteractiveListener()
+    screen = (
+        "transcript\n"
+        "› Ask Codex to do anythi  gpt-5.6-luna xhigh · m…\n"
+    )
+
+    assert listener.pane_is_idle(screen)
+    assert listener.composer_input_text(screen) is None
+
+
 def test_codex_claim_precheck_rejects_nonempty_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:

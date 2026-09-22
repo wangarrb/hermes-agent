@@ -144,6 +144,7 @@ class CodexInteractiveListener(BaseInteractiveListener):
         # prompt text may still be a user draft and must remain fail-closed.
         return any(
             "› ask codex to do anything" in line.casefold()
+            or "› ask codex to do anythi" in line.casefold()
             for line in tail_lines
         )
 
@@ -151,6 +152,22 @@ class CodexInteractiveListener(BaseInteractiveListener):
     _EMPTY_COMPOSER_PLACEHOLDERS = frozenset({
         "ask codex to do anything",
     })
+    # Zellij can truncate the placeholder before the model/status footer,
+    # e.g. ``› Ask Codex to do anythi  gpt-5.6-luna xhigh · m…``.
+    _TRUNCATED_EMPTY_COMPOSER_PREFIXES = (
+        "ask codex to do anythi",
+    )
+
+    @classmethod
+    def _is_empty_composer_placeholder(cls, payload: str) -> bool:
+        normalized = " ".join(payload.split()).casefold()
+        return (
+            normalized in cls._EMPTY_COMPOSER_PLACEHOLDERS
+            or any(
+                normalized.startswith(prefix)
+                for prefix in cls._TRUNCATED_EMPTY_COMPOSER_PREFIXES
+            )
+        )
 
     def composer_input_text(self, screen: str) -> str | None:
         """Extract the current Codex composer buffer, excluding its status bar."""
@@ -166,6 +183,7 @@ class CodexInteractiveListener(BaseInteractiveListener):
         if prompt_index is None:
             if any(
                 "› ask codex to do anything" in line.casefold()
+                or "› ask codex to do anythi" in line.casefold()
                 for line in lines[-5:]
             ):
                 return None
@@ -192,7 +210,7 @@ class CodexInteractiveListener(BaseInteractiveListener):
                 break
             parts.append(stripped)
         payload = "\n".join(parts).strip()
-        if payload.casefold() in self._EMPTY_COMPOSER_PLACEHOLDERS:
+        if self._is_empty_composer_placeholder(payload):
             return None
         return payload or None
 
