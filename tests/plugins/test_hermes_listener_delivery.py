@@ -25,6 +25,18 @@ def test_hermes_composer_parser_distinguishes_empty_from_unknown() -> None:
     assert listener.composer_input_text("transcript only\n") is None
 
 
+def test_hermes_accepts_default_codex_placeholder_with_status_footer() -> None:
+    listener = hermes.HermesInteractiveListener()
+    screen = (
+        "› Ask Codex to do anything\n\n"
+        "gpt-5.6-luna xhigh · main · Context 83% used · weekly…\n"
+    )
+
+    assert listener._last_non_decorative_line(screen) == "› Ask Codex to do anything"
+    assert listener._is_truly_idle_line("› Ask Codex to do anything")
+    assert listener.composer_input_text(screen) == ""
+
+
 def test_hermes_claim_precheck_rejects_nonempty_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:

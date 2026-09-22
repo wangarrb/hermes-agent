@@ -110,6 +110,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
         r"^\s*(?:(?:coordinator|planner|implementer|critic|reviewer|designer)\s+)?"
         r"[›❯](?:\s?(.*))?$"
     )
+    _EMPTY_COMPOSER_PLACEHOLDER = "Ask Codex to do anything"
 
     def composer_input_text(self, screen: str) -> str | None:
         """Return the current Hermes composer text.
@@ -137,6 +138,8 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if "msg=interrupt" in lines[prompt_index].lower():
             return None
 
+        if first_text == self._EMPTY_COMPOSER_PLACEHOLDER:
+            first_text = ""
         parts = [first_text] if first_text else []
         for line in lines[prompt_index + 1 :]:
             stripped = line.strip()
@@ -145,6 +148,8 @@ class HermesInteractiveListener(BaseInteractiveListener):
             if self._DECORATIVE_LINE_RE.match(stripped):
                 break
             lowered = stripped.lower()
+            if self._is_ignored_status_line(stripped):
+                break
             if lowered.startswith("⚕") or "context" in lowered and "│" in stripped:
                 break
             if stripped.startswith(("└", "┌", "╭", "╰")) and any(
@@ -392,6 +397,13 @@ class HermesInteractiveListener(BaseInteractiveListener):
     # the marker is present but the pane is NOT idle.  We must NOT
     # inject into a pane where the user is composing input.
     _DECORATIVE_LINE_RE = re.compile(r'^[─═│┃┤├┬┴┼┌┐└┘╭╰╮╯╚╝─┄┈╶╨╺╻╼╽╾╿┣┡┢┥┙┛┝┟┠┞]+$')
+    _STATUS_LINE_RE = re.compile(
+        r'^(?:'
+        r'⚠.*|⚕.*|'
+        r'(?:gpt|glm|claude|deepseek|qwen|o\d)[^·]*·.*(?:context|weekly|main|tokens|capabilities).*'
+        r')$',
+        re.IGNORECASE,
+    )
 
     # Only a bare prompt is idle. The command-hint placeholder contains a
     # prompt symbol too, but cli.py renders it only while ``_agent_running`` is
@@ -403,16 +415,26 @@ class HermesInteractiveListener(BaseInteractiveListener):
         r'^(?:(?:coordinator|planner|implementer|critic|reviewer|designer)\s*)?'
         r'[›❯]\s*$'
     )
+    _PLACEHOLDER_IDLE_RE = re.compile(r'^[›❯]\s*Ask Codex to do anything\s*$')
 
     def _is_truly_idle_line(self, line: str) -> bool:
         """Return True only for a known idle prompt/status rendering."""
-        return bool(self._IDLE_ONLY_RE.match(line.strip()))
+        stripped = line.strip()
+        return bool(self._IDLE_ONLY_RE.match(stripped) or self._PLACEHOLDER_IDLE_RE.match(stripped))
+
+    def _is_ignored_status_line(self, line: str) -> bool:
+        """Ignore Hermes' model/status footer when finding the live composer."""
+        return bool(self._STATUS_LINE_RE.match(line.strip()))
 
     def _last_non_decorative_line(self, screen: str) -> str:
         """Return the final meaningful pane line, ignoring Hermes borders."""
         for line in reversed(screen.splitlines()):
             stripped = line.strip()
-            if stripped and not self._DECORATIVE_LINE_RE.match(stripped):
+            if (
+                stripped
+                and not self._DECORATIVE_LINE_RE.match(stripped)
+                and not self._is_ignored_status_line(stripped)
+            ):
                 return stripped
         return ""
 
