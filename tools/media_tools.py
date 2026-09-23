@@ -18,7 +18,9 @@ import httpx
 
 from hermes_constants import display_hermes_home, get_hermes_dir
 from tools.registry import registry, tool_error
-from tools.transcription_tools import MAX_FILE_SIZE, SUPPORTED_FORMATS, _find_ffmpeg_binary, transcribe_audio
+from tools.transcription_common import MAX_FILE_SIZE, SUPPORTED_FORMATS
+from tools.transcription_audio import _find_ffmpeg_binary
+from tools.transcription_tools import transcribe_audio
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
