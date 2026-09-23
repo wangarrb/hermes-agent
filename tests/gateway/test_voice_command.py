@@ -52,7 +52,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.platforms.base import SessionSource
+from gateway.platforms.event import MessageEvent, MessageType
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +309,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -336,7 +337,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -632,6 +633,44 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "channel"
 
     @pytest.mark.asyncio
+    async def test_input_reroutes_speaker_without_changing_transport_owner(self, runner, monkeypatch):
+        from gateway.config import Platform
+        from gateway.profile_routing import parse_profile_routes
+
+        runner.config = SimpleNamespace(
+            multiplex_profiles=True,
+            profile_routes=parse_profile_routes([
+                {"name": "second", "platform": "discord", "bot_profile": "team-bot",
+                 "user_id": "222", "profile": "second"},
+            ]),
+        )
+        monkeypatch.setattr(
+            "gateway.run._multiplex_profile_homes",
+            lambda _config: [("team-bot", None), ("first", None), ("second", None)],
+        )
+        mock_adapter = AsyncMock()
+        mock_adapter._owner_profile = "team-bot"
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {111: SessionSource(
+            platform=Platform.DISCORD, chat_id="123", chat_type="channel",
+            user_id="111", profile="first",
+        ).to_dict()}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters = {}
+        runner._profile_adapters = {
+            "team-bot": {Platform.DISCORD: mock_adapter},
+            "second": {},
+        }
+
+        await runner._handle_voice_channel_input(111, 222, "Hello from VC", adapter=mock_adapter)
+
+        source = mock_adapter.handle_message.call_args[0][0].source
+        assert (source.user_id, source.profile) == ("222", "second")
+        assert runner._transport_owner(source) == (mock_adapter, "team-bot")
+
+    @pytest.mark.asyncio
     async def test_input_resolves_channel_prompt(self, runner):
         """Voice input must carry the bound text channel's channel_prompt (#50149)."""
         from gateway.config import Platform
@@ -765,6 +804,49 @@ class TestDiscordVoiceChannelMethods:
 
         assert events == ["flush", "stop", "process", "disconnect"]
         adapter._is_allowed_user.assert_called_once_with("42", guild=adapter._client.get_guild(111), is_dm=False)
+
+
+    @pytest.mark.asyncio
+    async def test_disconnect_leaves_voice_before_cancelling_bot_task(self):
+        """Voice must be torn down while the gateway websocket is still alive.
+
+        VoiceClient.disconnect() sends a voice state update over the main gateway
+        connection and waits for the voice socket to close.  The bot task is the
+        loop running that connection, so cancelling it first strands the
+        handshake and the disconnect blocks until the caller's shutdown timeout.
+        """
+        adapter = self._make_adapter()
+        events = []
+
+        async def cancel_liveness_task():
+            events.append("cancel_liveness_task")
+
+        async def cancel_bot_task():
+            events.append("cancel_bot_task")
+
+        async def leave_voice_channel(guild_id):
+            events.append(f"leave_voice_channel:{guild_id}")
+
+        async def close():
+            events.append("close_client")
+
+        adapter._cancel_liveness_task = cancel_liveness_task
+        adapter._cancel_bot_task = cancel_bot_task
+        adapter.leave_voice_channel = leave_voice_channel
+        adapter._client.close = close
+        adapter._voice_clients[111] = MagicMock()
+        adapter._ready_event = MagicMock()
+        adapter._post_connect_task = None
+        adapter._missed_message_backfill_task = None
+
+        await adapter.disconnect()
+
+        assert events == [
+            "cancel_liveness_task",
+            "leave_voice_channel:111",
+            "cancel_bot_task",
+            "close_client",
+        ]
 
 
     @pytest.mark.asyncio
@@ -1011,7 +1093,7 @@ class TestStreamTtsToSpeaker:
 
     def test_none_sentinel_flushes_buffer(self):
         """None sentinel causes remaining buffer to be spoken."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1029,7 +1111,7 @@ class TestStreamTtsToSpeaker:
 
     def test_stop_event_aborts_early(self):
         """Setting stop_event causes early exit."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1045,7 +1127,7 @@ class TestStreamTtsToSpeaker:
 
     def test_done_event_set_on_exception(self):
         """tts_done_event is set even when an exception occurs."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1712,7 +1794,8 @@ class TestVoiceTTSPlayback:
 
     def _call_should_reply(self, runner, voice_mode, msg_type, response="Hello",
                            agent_msgs=None, already_sent=False):
-        from gateway.platforms.base import MessageEvent, SessionSource
+        from gateway.platforms.base import SessionSource
+        from gateway.platforms.event import MessageEvent
         from gateway.config import Platform
         runner._voice_mode["discord:ch1"] = voice_mode
         source = SessionSource(
@@ -1728,20 +1811,20 @@ class TestVoiceTTSPlayback:
 
     def test_voice_input_runner_skips(self):
         """Streaming OFF + voice input: runner skips — base adapter handles."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.VOICE, already_sent=False) is False
 
     def test_text_input_voice_all_runner_fires(self):
         """Streaming OFF + text input + voice_mode=all: runner generates TTS."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.TEXT, already_sent=False) is True
 
 
     def test_error_response_no_tts(self):
         """Error response: no TTS regardless of voice_mode."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.TEXT, response="Error: boom") is False
 
@@ -1751,7 +1834,7 @@ class TestVoiceTTSPlayback:
 
     def test_streaming_on_agent_tts_dedup(self):
         """Streaming ON + agent called TTS: runner skips (dedup still works)."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         agent_msgs = [{"role": "assistant", "tool_calls": [
             {"id": "1", "type": "function", "function": {"name": "text_to_speech", "arguments": "{}"}}
@@ -1875,7 +1958,7 @@ class TestStreamTtsTempfileFallback:
         import wave
         import tools.tts_tool as tts_mod
         import tools.voice_mode as vm
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
 
         # Fake registry streamer so resolve_streaming_provider yields chunked
         # PCM regardless of which real providers are configured in the env.
