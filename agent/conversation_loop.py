@@ -7007,6 +7007,7 @@ def run_conversation(
                         build_degenerate_final_nudge,
                         degenerate_final_arm,
                         degenerate_final_guard_mode,
+                        last_real_user_message,
                         tool_results_since_last_user,
                     )
                     from run_agent import _EPHEMERAL_SCAFFOLDING_FLAGS
@@ -7024,7 +7025,10 @@ def run_conversation(
                         )
                         >= DEGENERATE_FINAL_MIN_TOOL_RESULTS
                     ):
-                        _degenerate_arm = degenerate_final_arm(final_response) or ""
+                        _degenerate_arm = degenerate_final_arm(
+                            final_response,
+                            last_real_user_message(messages, _EPHEMERAL_SCAFFOLDING_FLAGS),
+                        ) or ""
                 except Exception:
                     logger.debug("degenerate-final check failed", exc_info=True)
                     _degenerate_arm = ""

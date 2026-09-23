@@ -1,10 +1,10 @@
 """Degenerate-final guard: a text stop whose whole answer is not an answer.
 
 Ported from upstream #111472, adapted for this fork (see
-``agent/degenerate_final.py`` docstring for the two deliberate deviations):
-the ``auto`` scope stays on the reported collapse family, and the wrong-script
-arm exempts the conversation's own script so terse Chinese answers are not
-mistaken for collapses.
+``agent/degenerate_final.py`` docstring): the predicate is now upstream's
+released ``looks_like_degenerate_final`` (v2026.9.21), the ``auto`` scope is on
+for every route, and the one remaining deviation exempts the conversation's own
+script so terse Chinese answers are not mistaken for collapses.
 
 The predicate tests are direct. The loop-integration behaviour is asserted
 through the same policy functions the loop calls, with the loop's gate
@@ -42,10 +42,50 @@ class _Agent:
 # ── Fragment arm ──────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("fragment", ["пар", "กระทบ", "σ", "더보기", "OUCH H ι", "더보기 보기"])
+@pytest.mark.parametrize("fragment", ["пар", "กระทบ", "σ", "더보기", "더보기 보기"])
 def test_reported_collapse_fragments_match(fragment):
     """The shapes from the upstream report must be caught."""
     assert looks_like_degenerate_final(fragment) is True
+
+
+@pytest.mark.parametrize("text", ["OUCH H ι", "the", "ing", "éclair"])
+def test_ascii_bearing_fragments_are_knowingly_not_covered(text):
+    """Upstream's rule: any ASCII alphanumeric character means a real answer.
+
+    That is what keeps ``SQLite``, ``report.csv`` and ``42`` from being
+    re-prompted, and it knowingly leaves Latin-script/mixed fragments uncovered —
+    catching those needs a dictionary or perplexity signal, not a shape rule.
+    """
+    assert looks_like_degenerate_final(text) is False
+
+
+@pytest.mark.parametrize("answer", ["42", "SQLite", "report.csv", ":8080", "€12.50", "Done.", "already done."])
+def test_upstream_protected_terse_answers_never_match(answer):
+    """Regression: the hand-written predicate flagged every one of these."""
+    assert looks_like_degenerate_final(answer) is False
+
+
+@pytest.mark.parametrize("text", [":8080", ":) ", "(a)", "$5", "#123", "-1"])
+def test_leading_punctuation_only_flags_a_following_letter(text):
+    assert looks_like_degenerate_final(text) is False
+
+
+def test_mid_punctuation_opener_is_a_fragment():
+    """Upstream's leading-punctuation arm: ``?warming up``."""
+    assert looks_like_degenerate_final("?warming up") is True
+    assert looks_like_degenerate_final("?warming up", "hi") is True
+
+
+@pytest.mark.parametrize("text", ["₽🔧", "✅", "123", "..."])
+def test_letterless_finals_are_never_collapses(text):
+    """Excluded so a ``✅`` answer after tool work is not re-prompted."""
+    assert looks_like_degenerate_final(text) is False
+
+
+def test_reply_in_the_users_own_script_is_an_answer():
+    """Upstream's user-script comparison: ``да`` to a Russian prompt is an answer."""
+    assert looks_like_degenerate_final("да", "готово?") is False
+    assert looks_like_degenerate_final("да", "what is this?") is True
 
 
 @pytest.mark.parametrize("answer", ["done", "ok", "fixed", "complete", "pass", "ack", "got it"])
@@ -83,9 +123,10 @@ def test_empty_and_whitespace_never_match():
     assert looks_like_degenerate_final(None) is False
 
 
-def test_foreign_script_still_flagged_inside_punctuation():
-    """Exempting CJK must not exempt the reported wrong-script class."""
-    assert looks_like_degenerate_final("пар!") is True
+def test_terminal_punctuation_makes_it_a_finished_sentence():
+    """Upstream: a sentence terminator means an answer, even on a foreign word."""
+    assert looks_like_degenerate_final("пар!") is False
+    assert looks_like_degenerate_final("пар") is True
 
 
 # ── Mid-task stall arm ────────────────────────────────────────────────
@@ -119,13 +160,14 @@ def test_stall_arm_has_its_own_length_ceiling():
 
 
 def test_arm_classification_prefers_fragment():
-    """Order matters: the fragment arm is evaluated first, so a short stall note
-    inside its char ceiling classifies as a fragment. That matches upstream, and
-    both arms produce a re-prompt, so only the nudge wording differs."""
+    """Order matters: the fragment arm is evaluated first.
+
+    Upstream's fragment rule needs a *wrong-script* word, so a short ASCII
+    stall-shaped note is no longer a fragment — the stall arm owns it at any
+    length.  Both arms produce a re-prompt; only the nudge wording differs.
+    """
     assert degenerate_final_arm("пар") == "fragment"
-    # <= 24 chars → fragment arm wins.
-    assert degenerate_final_arm("analysis in progress") == "fragment"
-    # Above the fragment ceiling → the stall arm owns it.
+    assert degenerate_final_arm("analysis in progress") == "mid-task stall note"
     assert (
         degenerate_final_arm("technical check in progress, pulling the term definitions")
         == "mid-task stall note"
@@ -189,24 +231,22 @@ def test_tool_evidence_threshold_is_met_by_two_results():
 # ── Scope ─────────────────────────────────────────────────────────────
 
 
-def test_auto_is_on_for_the_reported_family():
+def test_auto_is_on_for_every_route():
+    """Scope is deliberately wider than upstream's ``codex_responses``-only auto.
+
+    The collapse was measured on this install across ``opencode-go``/muse,
+    ``openai-codex``/gpt-5.6-* and ``cch``/deepseek-flash alike, so the fence is
+    the model's behaviour, not the transport.
+    """
     assert degenerate_final_guard_mode(
         _Agent(model="muse-spark-1.3-contributor", provider="opencode-go")
     ) == "all"
-
-
-def test_auto_is_off_for_the_daily_driver():
-    """Deviation 1: upstream would enable this for every codex_responses route.
-
-    On this install that includes openai-codex/gpt-5.6-luna and cch, so the
-    default scope is deliberately narrower than upstream.
-    """
     assert degenerate_final_guard_mode(
         _Agent(model="gpt-5.6-luna", provider="openai-codex")
-    ) == "off"
+    ) == "all"
     assert degenerate_final_guard_mode(
         _Agent(model="deepseek-flash", provider="cch")
-    ) == "off"
+    ) == "all"
 
 
 def test_explicit_override_wins_both_directions():
@@ -278,8 +318,17 @@ def test_chat_only_turn_is_untouched():
     ) is False
 
 
-def test_out_of_scope_model_is_untouched():
-    assert _loop_would_fire(_Agent(model="gpt-5.6-luna"), text="пар") is False
+def test_every_model_is_in_scope_by_default():
+    """Widened beyond upstream's ``codex_responses``-only auto — see the docstring."""
+    assert _loop_would_fire(_Agent(model="gpt-5.6-luna"), text="пар") is True
+    assert _loop_would_fire(_Agent(model="deepseek-flash"), text="пар") is True
+
+
+def test_explicitly_disabled_guard_is_untouched():
+    assert _loop_would_fire(_Agent(_degenerate_final_guard=False), text="пар") is False
+    assert _loop_would_fire(
+        _Agent(model="gpt-5.6-luna", _degenerate_final_guard=["deepseek"]), text="пар"
+    ) is False
 
 
 def test_tool_calls_present_is_untouched():
@@ -467,9 +516,19 @@ def test_fragment_after_tool_work_is_re_prompted_in_the_real_loop():
         _teardown(srv, home, prev)
 
 
-def test_out_of_scope_model_is_not_re_prompted():
-    """Control: the same script under a non-collapsing model is untouched."""
-    agent, srv, home, prev = _make_agent("gpt-5.6-luna")
+def test_disabled_guard_does_not_re_prompt():
+    """Control: the same script with the guard explicitly off is untouched.
+
+    This used to run under ``gpt-5.6-luna`` as an "out of scope model" control.
+    That was vacuous: the mock serves chat-completions only, so the luna route
+    failed at the API layer ("Codex Responses stream did not emit a terminal
+    response") and no nudge could appear for reasons unrelated to the guard.
+    Disabling the guard on the same model/route the firing test uses is a real
+    control — it proves the nudge comes from the guard and not from something
+    else in the loop.
+    """
+    agent, srv, home, prev = _make_agent("muse-spark-1.3-contributor")
+    agent._degenerate_final_guard = False
     try:
         _MockHandler.response_queue.extend(TWO_TOOLS_THEN_FRAGMENT)
         agent.run_conversation(
