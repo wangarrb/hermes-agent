@@ -42,7 +42,7 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
-from agent.think_scrubber import StreamingThinkScrubber
+from agent.think_scrubber import StreamingThinkScrubber, StreamingToolCallScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -960,6 +960,13 @@ def init_agent(
     # erased delta1, so downstream state machines never learned a
     # block was open and leaked delta2 as content).
     agent._stream_think_scrubber = StreamingThinkScrubber()
+    # Stateful scrubber for text-channel tool-call XML split across stream
+    # deltas.  Muse Spark (Responses wire) serializes its native tool call onto
+    # the *text* channel as `<atem:function_calls>…</atem:function_calls>` while
+    # the parsed `function_call` item executes normally, so the markup reached
+    # the pane verbatim: the reasoning scrubber has no concept of a tool-call
+    # tag, and _strip_think_blocks only runs on completed text.
+    agent._stream_toolcall_scrubber = StreamingToolCallScrubber()
     # Visible assistant text already delivered through live token callbacks
     # during the current model response. Used to avoid re-sending the same
     # commentary when the provider later returns it as a completed interim

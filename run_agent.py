@@ -5864,27 +5864,32 @@ class AIAgent:
         """Reset tracking for text delivered during the current model response."""
         # Flush any benign partial-tag tail held by the think scrubber
         # first (#17924): an innocent '<' at the end of the stream that
-        # turned out not to be a tag prefix should reach the UI.  Then
-        # flush the context scrubber.  Order matters — the think
-        # scrubber's output feeds into the context scrubber's state.
+        # turned out not to be a tag prefix should reach the UI.  Then the
+        # tool-call XML scrubber, and finally the context scrubber.  Order
+        # matters — each scrubber's output feeds into the next one's state.
         think_scrubber = getattr(self, "_stream_think_scrubber", None)
-        if think_scrubber is not None:
-            think_tail = think_scrubber.flush()
-            if think_tail:
+        toolcall_scrubber = getattr(self, "_stream_toolcall_scrubber", None)
+        if think_scrubber is not None or toolcall_scrubber is not None:
+            tail = think_scrubber.flush() if think_scrubber is not None else ""
+            if tail and toolcall_scrubber is not None:
+                tail = toolcall_scrubber.feed(tail)
+            if toolcall_scrubber is not None:
+                tail += toolcall_scrubber.flush()
+            if tail:
                 # Route the tail through the context scrubber too so a
                 # memory-context span straddling the final boundary is
                 # still caught.
                 ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
                 if ctx_scrubber is not None:
-                    think_tail = ctx_scrubber.feed(think_tail)
-                if think_tail:
+                    tail = ctx_scrubber.feed(tail)
+                if tail:
                     callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
                     for cb in callbacks:
                         try:
-                            cb(think_tail)
+                            cb(tail)
                         except Exception:
                             pass
-                    self._record_streamed_assistant_text(think_tail)
+                    self._record_streamed_assistant_text(tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
@@ -5900,6 +5905,44 @@ class AIAgent:
                         pass
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
+
+    def _scrub_tool_call_stream_text(self, text: str) -> str:
+        """Drop text-channel tool-call XML from streamed text.
+
+        Deliberately does NOT strip reasoning tags: the tool-call-suppressed
+        forward in ``agent.chat_completion_helpers`` hands text to the stream
+        callback precisely so the CLI can still extract reasoning tags from it,
+        and that consumer needs them intact.
+        """
+        if not text:
+            return text
+        scrubber = getattr(self, "_stream_toolcall_scrubber", None)
+        if scrubber is None:
+            return text
+        return scrubber.feed(text)
+
+    def _forward_suppressed_stream_text(self, text: str) -> None:
+        """Forward tool-call-suppressed content to the display callback.
+
+        While tool calls are accumulating, regular content streaming is
+        suppressed so chatty pre-tool prose is not shown — but the suppressed
+        text is still forwarded, because reasoning tags embedded in it must reach
+        the reasoning display rather than appearing as a confusing post-response
+        fallback.  That forward bypasses ``_fire_stream_delta``, so it has to
+        scrub text-channel tool-call XML itself; otherwise the markup reaches the
+        pane while the tool call is still being accumulated.
+        """
+        callback = getattr(self, "stream_delta_callback", None)
+        if callback is None:
+            return
+        visible = self._scrub_tool_call_stream_text(text)
+        if not visible:
+            return
+        try:
+            callback(visible)
+            self._record_streamed_assistant_text(visible)
+        except Exception:
+            pass
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -6201,6 +6244,12 @@ class AIAgent:
             else:
                 # Defensive: legacy callers without the scrubber attribute.
                 text = self._strip_think_blocks(text or "")
+            # Then suppress text-channel tool-call XML (`<atem:function_calls>…`).
+            # The tool call itself arrives as a parsed `function_call` item, so
+            # dropping the markup keeps the pane readable without affecting
+            # execution; without this the raw XML was streamed verbatim.
+            if text:
+                text = self._scrub_tool_call_stream_text(text)
             # Then feed through the stateful context scrubber so memory-context
             # spans split across chunks cannot leak to the UI (#5719).
             scrubber = getattr(self, "_stream_context_scrubber", None)
