@@ -51,6 +51,16 @@ class TestIsLikelyBinary:
         sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
+    def test_trailing_replacement_char_from_utf8_boundary_is_ignored(self, ops):
+        """A terminal-decoder U+FFFD at the sample boundary is truncation, not binary data."""
+        sample = "a" * 999 + "\ufffd"
+        assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
+
+    def test_interior_replacement_char_still_marks_binary(self, ops):
+        """An interior U+FFFD still indicates undecodable source bytes."""
+        sample = "a" * 500 + "\ufffd" + "a" * 499
+        assert ops._is_likely_binary("file.xyz", content_sample=sample) is True
+
 
 # =========================================================================
 # _check_lint edge cases

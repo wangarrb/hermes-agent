@@ -908,11 +908,20 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            sample = content_sample[:1000]
+            # Sampling artifact: `head -c 1000` can cut a UTF-8 multibyte
+            # character in half at the byte boundary; the shell's
+            # errors="replace" decode then appends exactly one U+FFFD at the
+            # END of the sample. That is truncation, not corruption — strip a
+            # single trailing U+FFFD before judging (interior U+FFFD still
+            # means genuine bad bytes / mojibake).
+            if sample.endswith("\ufffd"):
+                sample = sample[:-1]
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     
