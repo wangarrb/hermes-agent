@@ -6,7 +6,10 @@ from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
 
 
 def _snapshot(conn, task_id):
-    row = conn.execute("SELECT current_run_id, status, completion_contract FROM tasks WHERE id=?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT current_run_id, status, completion_contract, generation "
+        "FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
     return tuple(row) if row else None
 
 
@@ -14,7 +17,7 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
-    run_id, status, contract = snapshot
+    run_id, status, contract, generation = snapshot
     if not contract or contract == "local-only":
         return None
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
@@ -27,7 +30,7 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
             if _snapshot(conn, task_id) != snapshot:
                 return False
             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr)
+        snapshot = (run_id, status, published_pr, generation)
         contract = published_pr
     return snapshot, collect_acceptance(contract, published_pr)
 

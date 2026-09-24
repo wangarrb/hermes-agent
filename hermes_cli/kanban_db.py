@@ -2950,6 +2950,7 @@ def complete_task(
     task_before = get_task(conn, task_id)
     if task_before is None:
         return False
+    completion_generation = int(task_before.generation)
     try:
         validated_review = independent_review.validate_completion(task_before, metadata)
         metadata = dict(validated_review) if validated_review is not None else None
@@ -3000,8 +3001,9 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
-                """
-        params: tuple = (result, now, task_id)
+                   AND generation = ?
+                 """
+        params: tuple = (result, now, task_id, completion_generation)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))

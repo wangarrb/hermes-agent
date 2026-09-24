@@ -129,6 +129,35 @@ def test_explicit_review_timeout_requires_note(kanban_home, tmp_path):
             )
 
 
+def test_completion_refuses_generation_change_after_review_validation(kanban_home, tmp_path, monkeypatch):
+    with kb.connect() as conn:
+        task_id = _create_implementer_task(conn, tmp_path)
+        original_gate = kb._gate_empty_completion
+
+        def gate_then_rework(connection, task_id, *, result, summary):
+            original_gate(connection, task_id, result=result, summary=summary)
+            connection.execute(
+                "UPDATE tasks SET generation = generation + 1 WHERE id = ?",
+                (task_id,),
+            )
+
+        monkeypatch.setattr(kb, "_gate_empty_completion", gate_then_rework)
+        assert not kb.complete_task(
+            conn,
+            task_id,
+            summary="stale generation completion",
+            metadata={
+                "task_type": "code",
+                "independent_review_outcome": "TIMEOUT",
+                "independent_review_note": "review timed out",
+            },
+        )
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "ready"
+        assert current.generation == 2
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     [
