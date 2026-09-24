@@ -197,7 +197,7 @@ def test_missing_review_blocks_implementer_but_not_designer(kanban_home, tmp_pat
             workspace_kind="worktree", workspace_path=str(tmp_path / "designer-wt"),
             base_commit="a" * 40, branch_name="designer/test",
         )
-        assert kb.complete_task(conn, designer_id, metadata={"task_type": "code"})
+        assert kb.complete_task(conn, designer_id, summary="design delivered", metadata={"task_type": "code"})
 
 
 @pytest.mark.parametrize("task_type", ["plan", "research", "readonly"])
@@ -207,6 +207,7 @@ def test_explicit_non_delivery_opt_out_is_allowed(kanban_home, tmp_path, task_ty
         assert kb.complete_task(
             conn,
             task_id,
+            summary="non-delivery work complete",
             metadata={
                 "task_type": task_type,
                 "independent_review_required": False,

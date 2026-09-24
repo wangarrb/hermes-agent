@@ -1277,7 +1277,8 @@ def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
-    branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
+    branch_name: Optional[str] = None, base_commit: Optional[str] = None,
+    target_branch: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
@@ -1335,6 +1336,13 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    base_commit = str(base_commit or "").strip() or None
+    target_branch = str(target_branch or "").strip() or None
+    if (base_commit or target_branch) and workspace_kind != "worktree":
+        raise ValueError("base_commit and target_branch are only valid for worktree workspaces")
+    if target_branch:
+        target_branch = workspace_contract.validate_branch_name(target_branch)
+    branch_template = branch_name
 
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
@@ -1351,6 +1359,13 @@ def create_task(
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
+            if result_subscriber:
+                with write_txn(conn, allow_nested=True):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO kanban_result_subscriptions "
+                        "(task_id, target_profile, created_at, active) VALUES (?, ?, ?, 1)",
+                        (row["id"], _canonical_assignee(result_subscriber), int(time.time())),
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -1365,6 +1380,11 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        resolved_branch_name = (
+            workspace_contract.render_branch_template(
+                branch_template, task_id=task_id, generation=1, assignee=assignee,
+            ) if branch_template else None
+        )
         try:
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
@@ -1375,25 +1395,32 @@ def create_task(
                 if project_obj is not None and workspace_kind == "worktree":
                     if project_repo and not workspace_path:
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
-                    if not branch_name:
-                        branch_name = _project_branch_name(project_obj, task_id, title)
+                    if not resolved_branch_name:
+                        resolved_branch_name = _project_branch_name(project_obj, task_id, title)
+                # A declared immutable base/target needs a branch BEFORE the
+                # dispatcher persists the worktree path (which validates the
+                # contract). Use the same fallback name dispatch used to mint.
+                if not resolved_branch_name and workspace_kind == "worktree" and (base_commit or target_branch):
+                    resolved_branch_name = f"wt/{task_id}"
 
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, base_commit, target_branch,
+                        project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        resolved_branch_name, base_commit, target_branch,
+                        project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
@@ -1414,7 +1441,9 @@ def create_task(
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
-                        "branch_name": branch_name,
+                        "branch_name": resolved_branch_name,
+                        "base_commit": base_commit,
+                        "target_branch": target_branch,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -2336,6 +2365,7 @@ def claim_task(
     expected_run_id: Optional[int] = None,
     expected_generation: Optional[int] = None,
     expected_claim_lock: Optional[str] = None,
+    require_reservation: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2368,6 +2398,49 @@ def claim_task(
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
+        # This guard is derived from the persisted delivery, not caller opt-in:
+        # dispatcher and interactive listeners call claim_task without extra
+        # flags. Ordinary cards still claim without a reservation.
+        delivery_row = conn.execute(
+            "SELECT delivery_state FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        prepared_delivery = bool(
+            delivery_row and delivery_row["delivery_state"] in {"prepared", "running"}
+        )
+        require_reservation = require_reservation or prepared_delivery
+        if require_reservation:
+            bound_record = None
+            if prepared_delivery:
+                current = get_task(conn, task_id)
+                bound_record = current.delivery if current else None
+                if (current is None or bound_record is None
+                        or bound_record.task_id != task_id
+                        or bound_record.generation != current.generation
+                        or bound_record.base_commit != current.base_commit):
+                    _append_event(
+                        conn, task_id, "claim_rejected",
+                        {"reason": "prepared_delivery_identity_missing"},
+                    )
+                    return None
+            # A different reservation on the same task/base cannot stand in
+            # for the one cryptographically bound to the prepared delivery.
+            reservation_clause = " AND r.id = ?" if bound_record else ""
+            reservation_params = (
+                (task_id, bound_record.reservation_id) if bound_record else (task_id,)
+            )
+            active = conn.execute(
+                "SELECT 1 FROM tasks t JOIN task_scope_reservations r "
+                "ON r.task_id = t.id AND r.generation = t.generation "
+                "AND r.base_commit = t.base_commit AND r.status = 'active' "
+                "WHERE t.id = ?" + reservation_clause + " LIMIT 1",
+                reservation_params,
+            ).fetchone()
+            if active is None:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "active_write_reservation_required"},
+                )
+                return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
@@ -2375,6 +2448,29 @@ def claim_task(
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
+        if require_reservation:
+            writable_task = get_task(conn, task_id)
+            record = writable_task.delivery if writable_task else None
+            if (writable_task is not None and record is not None
+                    and record.state == "prepared"
+                    and record.generation == writable_task.generation):
+                running_record = record.with_state("running")
+                if conn.execute(
+                    "UPDATE tasks SET delivery_state = 'running', delivery_json = ? "
+                    "WHERE id = ? AND generation = ? AND delivery_state = 'prepared'",
+                    (delivery.dumps_delivery(running_record), task_id, writable_task.generation),
+                ).rowcount != 1:
+                    raise delivery.DeliveryError("prepared delivery changed during claim")
+                _append_event(
+                    conn, task_id, "delivery_running",
+                    {
+                        "from_state": "prepared", "to_state": "running",
+                        "actor": lock, "source": "claim",
+                        "generation": writable_task.generation,
+                        "reservation_id": record.reservation_id,
+                    },
+                    run_id=run_id,
+                )
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
@@ -2846,6 +2942,25 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # Preserve the fork's implementer review contract while retaining the
+    # upstream completion/claim fences below. This checks the actual review
+    # artifact, or an explicit TIMEOUT with a nonempty explanation; it never
+    # treats a caller's bare 'PASS' text as a review receipt.
+    from hermes_cli import kanban_independent_review as independent_review
+    task_before = get_task(conn, task_id)
+    if task_before is None:
+        return False
+    try:
+        validated_review = independent_review.validate_completion(task_before, metadata)
+        metadata = dict(validated_review) if validated_review is not None else None
+    except independent_review.IndependentReviewError as exc:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_independent_review",
+                {"generation": task_before.generation, "reason": str(exc)},
+                run_id=task_before.current_run_id,
+            )
+        raise
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2892,6 +3007,46 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        # A worker may complete after its worktree was frozen but the
+        # running->delivered notification was lost. Promote only a verifiably
+        # frozen record of this same generation; an unfrozen handoff stays
+        # prepared and cannot become publishable by completing the card.
+        current_task = get_task(conn, task_id)
+        prepared = current_task.delivery if current_task else None
+        # freeze_task_delivery persists the frozen contract on the TASK; the
+        # prepared record still carries its pre-freeze snapshot when the
+        # delivered transition was lost.
+        contract = current_task.workspace_contract if current_task else None
+        if (current_task is not None and prepared is not None
+                and prepared.state in {"prepared", "running"}
+                and contract is not None and contract.get("frozen") is True):
+            if (prepared.task_id != task_id or prepared.generation != current_task.generation
+                    or prepared.base_commit != contract.get("base_commit")):
+                raise delivery.DeliveryError("frozen delivery record identity mismatch")
+            delivery.validate_frozen_contract(current_task, contract)
+            frozen_sha = str(contract["delivery_commit"])
+            frozen_tree = str(contract["delivery_tree"])
+            delivered = prepared.with_state(
+                "delivered", workspace_contract=dict(contract),
+                delivery_sha=frozen_sha, delivery_tree=frozen_tree,
+            )
+            if conn.execute(
+                "UPDATE tasks SET delivery_state = 'delivered', delivery_json = ? "
+                "WHERE id = ? AND generation = ? AND delivery_state = ?",
+                (delivery.dumps_delivery(delivered), task_id, current_task.generation, prepared.state),
+            ).rowcount != 1:
+                raise delivery.DeliveryError("frozen delivery changed during completion")
+            _append_event(
+                conn, task_id, "delivery_delivered",
+                {
+                    "from_state": prepared.state, "to_state": "delivered",
+                    "actor": "complete", "source": "completion",
+                    "generation": current_task.generation,
+                    "reservation_id": prepared.reservation_id,
+                    "delivery_sha": frozen_sha, "delivery_tree": frozen_tree,
+                },
+                run_id=current_task.current_run_id,
+            )
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -4033,7 +4188,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in (
+        "task_comments", "task_events", "task_runs", "kanban_notify_subs",
+        "kanban_result_queue", "kanban_result_subscriptions",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
@@ -4165,6 +4323,10 @@ def _ctx_header(lines: list[str], task: Task) -> None:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.workspace_contract is not None:
+        lines.append(
+            "Workspace contract: " + workspace_contract.dumps_contract(task.workspace_contract)
+        )
     lines.append("")
     if task.body and task.body.strip():
         lines.append("## Body")

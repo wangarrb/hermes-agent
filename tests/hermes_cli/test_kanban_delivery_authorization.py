@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -251,6 +252,54 @@ def test_completion_closes_frozen_prepared_delivery(delivery_env):
         )
 
 
+def test_completion_repairs_actual_frozen_prepared_delivery(delivery_env):
+    with kb.connect() as conn:
+        task, worktree, _reservation, _prepared = _prepare(
+            conn, delivery_env, label="lost-delivery-transition"
+        )
+        assert task is not None
+        artifact = worktree / "result.txt"
+        artifact.write_text("result\n", encoding="utf-8")
+        _git(worktree, "add", artifact.name)
+        _git(worktree, "commit", "-m", "freeze result")
+        frozen = kb.freeze_task_delivery(conn, task.id)
+        assert kb.get_task(conn, task.id).delivery_state == "prepared"
+
+        assert kb.complete_task(
+            conn, task.id, summary="frozen result",
+            metadata={"independent_review_outcome": "TIMEOUT",
+                      "independent_review_note": "review attempt timed out; frozen result handback"},
+        )
+        current = kb.get_task(conn, task.id)
+        assert current is not None and current.delivery is not None
+        assert current.delivery_state == "delivered"
+        assert current.delivery.delivery_sha == frozen["delivery_commit"]
+        assert current.delivery.delivery_tree == frozen["delivery_tree"]
+
+
+def test_completion_rejects_moved_head_after_frozen_prepared_delivery(delivery_env):
+    with kb.connect() as conn:
+        task, worktree, _reservation, _prepared = _prepare(
+            conn, delivery_env, label="moved-frozen-head"
+        )
+        assert task is not None
+        kb.freeze_task_delivery(conn, task.id)
+        (worktree / "after.txt").write_text("later\n", encoding="utf-8")
+        _git(worktree, "add", "after.txt")
+        _git(worktree, "commit", "-m", "move head")
+
+        with pytest.raises(_delivery_module().DeliveryError, match="commit/tree identity mismatch"):
+            kb.complete_task(
+                conn, task.id, summary="must reject",
+                metadata={"independent_review_outcome": "TIMEOUT",
+                          "independent_review_note": "review attempt timed out; reject moved HEAD"},
+            )
+        current = kb.get_task(conn, task.id)
+        assert current is not None
+        assert current.status == "ready"
+        assert current.delivery_state == "prepared"
+
+
 def test_completion_closes_prepared_record_using_frozen_contract(delivery_env):
     with kb.connect() as conn:
         task, _worktree, _reservation, frozen, _delivered = _deliver(
@@ -344,6 +393,55 @@ def test_writable_claim_advances_prepared_delivery_to_running(delivery_env):
     assert claimed is not None
     assert running.state == "running"
     assert running.generation == claimed.generation
+
+
+def test_prepared_claim_requires_reservation_without_caller_opt_in(delivery_env):
+    with kb.connect() as conn:
+        task, _worktree, reservation, _prepared = _prepare(conn, delivery_env, "claim-denied")
+        assert task is not None
+        conn.execute(
+            "UPDATE task_scope_reservations SET status = 'released' WHERE id = ?",
+            (reservation.id,),
+        )
+        assert kb.claim_task(conn, task.id, claimer="dispatcher") is None
+        current = kb.get_task(conn, task.id)
+        assert current is not None and current.status == "ready"
+        assert current.delivery_state == "prepared"
+        assert any(
+            event.kind == "claim_rejected"
+            and (event.payload or {}).get("reason") == "active_write_reservation_required"
+            for event in kb.list_events(conn, task.id)
+        )
+
+
+def test_prepared_claim_rejects_replacement_reservation(delivery_env):
+    with kb.connect() as conn:
+        task, _worktree, original, _prepared = _prepare(conn, delivery_env, "claim-replacement")
+        assert task is not None
+        conn.execute(
+            "UPDATE task_scope_reservations SET status = 'released' WHERE id = ?",
+            (original.id,),
+        )
+        replacement = kb.reserve_task_scopes(
+            conn, task.id,
+            write_set=("src/unrelated.py",),
+            artifact_namespace=f"/tmp/hermes-delivery/{task.id}/replacement",
+            expected_generation=task.generation,
+            expected_base_commit=delivery_env["base"],
+        )
+        assert replacement.id != original.id
+        assert kb.claim_task(conn, task.id, claimer="dispatcher") is None
+        current = kb.get_task(conn, task.id)
+        assert current is not None and current.status == "ready"
+        assert current.delivery_state == "prepared"
+
+
+def test_prepared_claim_advances_delivery_without_caller_opt_in(delivery_env):
+    with kb.connect() as conn:
+        task, _worktree, _reservation, _prepared = _prepare(conn, delivery_env, "claim-allowed")
+        assert task is not None
+        claimed = kb.claim_task(conn, task.id, claimer="dispatcher")
+        assert claimed is not None and claimed.delivery_state == "running"
 
 
 def test_delivered_rejects_forged_workspace_identity(delivery_env):
@@ -571,6 +669,7 @@ def test_legacy_board_migrates_delivery_columns(delivery_env):
 def test_cli_delivery_operations_and_show_json(delivery_env):
     with kb.connect() as conn:
         task, worktree = _create_task(conn, delivery_env, "cli")
+        assert task is not None
 
     prepared = json.loads(kc.run_slash(
         f"prepare {task.id} --source-branch main "
@@ -597,7 +696,7 @@ def test_cli_delivery_operations_and_show_json(delivery_env):
     shown = json.loads(kc.run_slash(f"show {task.id} --json"))
     assert shown["delivery"]["state"] == "authorized"
     assert shown["delivery"]["authorization"] == authorized["authorization"]
-    assert "delivery: authorized" in kc.run_slash(f"show {task.id}")
+    assert re.search(r"delivery:\s+authorized", kc.run_slash(f"show {task.id}"))
 
     integrated = json.loads(kc.run_slash(
         f"integrate {task.id} --integrator integrator-pane --json"

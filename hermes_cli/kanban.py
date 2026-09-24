@@ -211,8 +211,41 @@ def _profile_author() -> str:
         return "user"
 
 
+def _resolve_result_subscriber(args: argparse.Namespace) -> Optional[str]:
+    """Route cross-profile task results back to their publisher unless opted out."""
+    from hermes_cli.profiles import normalize_profile_name
+
+    explicit = str(getattr(args, "notify_profile", None) or "").strip()
+    if explicit:
+        return normalize_profile_name(explicit)
+    origin = str(
+        getattr(args, "origin_profile", None)
+        or os.environ.get("HERMES_KANBAN_ORIGIN_PROFILE")
+        or os.environ.get("HERMES_KANBAN_PROFILE")
+        or os.environ.get("HERMES_PROFILE")
+        or ""
+    ).strip()
+    notify_origin = getattr(args, "notify_origin", None)
+    if notify_origin is False:
+        return None
+    if notify_origin is True:
+        if not origin:
+            raise ValueError("--notify-origin requires an origin profile")
+        return normalize_profile_name(origin)
+    if os.environ.get("HERMES_KANBAN_RESULT_NOTIFICATIONS", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    } or not origin:
+        return None
+    assignee = str(getattr(args, "assignee", None) or "").strip()
+    if not assignee:
+        return None
+    origin_profile = normalize_profile_name(origin)
+    return origin_profile if origin_profile != normalize_profile_name(assignee) else None
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
-    "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
+    "init", "create", "swarm", "prepare", "freeze", "accept", "authorize",
+    "integrate", "abandon", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
@@ -358,6 +391,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: {exc}", 2)
     if branch_name and ws_kind != "worktree":
         return _err("kanban: --branch is only valid with --workspace worktree", 2)
+    if (getattr(args, "base_commit", None) or getattr(args, "target_branch", None)) and ws_kind != "worktree":
+        return _err("kanban: --base-commit and --target-branch require --workspace worktree", 2)
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -366,11 +401,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    try:
+        result_subscriber = _resolve_result_subscriber(args)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
+            base_commit=getattr(args, "base_commit", None),
+            target_branch=getattr(args, "target_branch", None),
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
@@ -380,6 +421,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            result_subscriber=result_subscriber,
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
@@ -500,6 +542,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if want_json:
         _print_json({
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
+            "delivery": task.delivery.to_dict() if task.delivery else None,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
@@ -517,6 +560,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     field("workspace", f"{task.workspace_kind}" + (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         field("branch", task.branch_name)
+    if task.delivery_state:
+        field("delivery", task.delivery_state)
     if task.skills:
         field("skills", ", ".join(task.skills))
     if task.model_override:
@@ -573,6 +618,87 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+    return 0
+
+
+def _print_delivery(record, *, as_json: bool) -> None:
+    if as_json:
+        _print_json(record.to_dict())
+    else:
+        print(f"Delivery {record.task_id}: {record.state}")
+
+
+def _cmd_prepare_delivery(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            raise ValueError(f"no such task: {args.task_id}")
+        source_branch = args.source_branch or task.target_branch
+        if not source_branch:
+            raise ValueError("--source-branch is required when task has no target branch")
+        contract = kb.prepare_task_worktree(
+            conn, task.id, source_branch=source_branch, upstream=args.upstream,
+        )
+        reservation = kb.reserve_task_scopes(
+            conn, task.id, write_set=args.write_set,
+            artifact_namespace=args.artifact_namespace,
+            expected_generation=task.generation,
+            expected_base_commit=contract["base_commit"],
+        )
+        record = kb.prepare_task_delivery(
+            conn, task.id, workspace_contract=contract,
+            reservation_id=reservation.id,
+            actor=args.actor or _profile_author(), source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_freeze_delivery(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        contract = kb.freeze_task_delivery(conn, args.task_id)
+        record = kb.mark_task_delivered(
+            conn, args.task_id, workspace_contract=contract,
+            actor=args.actor or _profile_author(), source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_accept_delivery(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        record = kb.accept_task_delivery(
+            conn, args.task_id, actor=args.actor or _profile_author(), source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_authorize_delivery(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        record = kb.authorize_task_delivery(
+            conn, args.task_id, integrator=args.integrator,
+            actor=args.actor, source=args.source,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_integrate_delivery(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        record = kb.integrate_task_delivery(
+            conn, args.task_id, integrator=args.integrator,
+        )
+    _print_delivery(record, as_json=args.json)
+    return 0
+
+
+def _cmd_abandon_delivery(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        record = kb.abandon_task_delivery(
+            conn, args.task_id, actor=args.actor or _profile_author(), reason=args.reason,
+        )
+    _print_delivery(record, as_json=args.json)
     return 0
 
 
@@ -740,7 +866,11 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        before_claim = kb.get_task(conn, args.task_id)
+        task = kb.claim_task(
+            conn, args.task_id, ttl_seconds=args.ttl,
+            require_reservation=bool(before_claim and before_claim.delivery_state == "prepared"),
+        )
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
@@ -1326,6 +1456,9 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "prepare": _cmd_prepare_delivery, "freeze": _cmd_freeze_delivery,
+    "accept": _cmd_accept_delivery, "authorize": _cmd_authorize_delivery,
+    "integrate": _cmd_integrate_delivery, "abandon": _cmd_abandon_delivery,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,

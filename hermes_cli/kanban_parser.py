@@ -158,6 +158,8 @@ _SPECS = [
              help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
                   "an explicit 'scratch' also opts out of a project-scoped board's project)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
+        _arg("--base-commit", help="Immutable base commit for a worktree task"),
+        _arg("--target-branch", help="Integration target branch for a worktree task"),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "
                   "worktree under the project's primary repo with a "
@@ -174,6 +176,12 @@ _SPECS = [
                   "30m, 2h, 1d). When exceeded, the dispatcher SIGTERMs (then "
                   "SIGKILLs) the worker and re-queues the task."),
         _arg("--created-by", default="user", help="Author name recorded on the task (default: user)"),
+        _arg("--origin-profile", help="Publishing profile (overrides HERMES_KANBAN_ORIGIN_PROFILE)"),
+        _arg("--notify-profile", help="Explicit profile to notify of an actionable result"),
+        _arg("--notify-origin", action="store_true", default=None,
+             help="Notify the origin profile even for same-profile work"),
+        _arg("--no-notify-origin", action="store_false", dest="notify_origin",
+             help="Do not implicitly notify the origin profile"),
         _arg("--skill", action="append", default=[], dest="skills",
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
@@ -236,6 +244,30 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
+    _cmd("prepare", [
+        _TASK_ID, _arg("--source-branch"), _arg("--upstream", default="origin"),
+        _arg("--write-set", action="append", required=True),
+        _arg("--artifact-namespace", required=True),
+        _arg("--actor"), _arg("--source", default="workflow"), _json_flag(),
+    ], help="Prepare delivery workspace and scopes"),
+    _cmd("freeze", [
+        _TASK_ID, _arg("--actor"), _arg("--source", default="worker"), _json_flag(),
+    ], help="Freeze a running delivery"),
+    _cmd("accept", [
+        _TASK_ID, _arg("--actor"), _arg("--source", default="review"), _json_flag(),
+    ], help="Accept a delivered revision"),
+    _cmd("authorize", [
+        _TASK_ID, _arg("--integrator", required=True),
+        _arg("--actor", required=True, help="Self-reported actor label (not verified user identity)"),
+        _arg("--source", required=True, choices=("interactive", "manual", "user")),
+        _json_flag(),
+    ], help="Record self-reported delivery authorization (not human identity proof)"),
+    _cmd("integrate", [
+        _TASK_ID, _arg("--integrator", required=True), _json_flag(),
+    ], help="Record authorized integration"),
+    _cmd("abandon", [
+        _TASK_ID, _arg("--actor"), _arg("--reason", required=True), _json_flag(),
+    ], help="Abandon a delivery generation"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
     _cmd("set-model", [

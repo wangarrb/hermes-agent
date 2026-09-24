@@ -154,6 +154,25 @@ def test_resolved_contract_is_shared_by_task_show_json_and_worker_context(
     assert json.dumps(contract, ensure_ascii=False, sort_keys=True) in context
 
 
+def test_declared_base_without_branch_persists_dispatch_fallback(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    base_commit = _init_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="untemplated worktree", assignee="implementer",
+            workspace_kind="worktree", workspace_path=str(repo),
+            base_commit=base_commit, target_branch="main",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.branch_name == f"wt/{task_id}"
+        workspace = kb.resolve_workspace(task)
+        assert kb.set_workspace_path(conn, task_id, workspace)
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.workspace_contract is not None
+        assert current.workspace_contract["valid"] is True
+
+
 def test_contract_resolver_does_not_scan_global_worktree_inventory(
     kanban_home, tmp_path, monkeypatch,
 ):

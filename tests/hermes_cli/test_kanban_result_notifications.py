@@ -148,6 +148,20 @@ def test_cli_explicit_origin_overrides_environment(
         assert _subscriptions(conn, task_id) == ["coordinator"]
 
 
+def test_cli_parses_result_notification_flags(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_ORIGIN_PROFILE", "planner")
+    assert "Created" in kanban_cli.run_slash(
+        "create 'manual notify' --assignee planner --notify-origin"
+    )
+    assert "Created" in kanban_cli.run_slash(
+        "create 'no implicit notify' --assignee reviewer --no-notify-origin"
+    )
+    with kb.connect() as conn:
+        by_title = {task.title: task.id for task in kb.list_tasks(conn)}
+        assert _subscriptions(conn, by_title["manual notify"]) == ["planner"]
+        assert _subscriptions(conn, by_title["no implicit notify"]) == []
+
+
 def test_cli_uses_existing_listener_profile_env_as_origin_fallback(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -218,6 +232,9 @@ def test_actionable_task_events_enqueue_once_without_terminal_io(
         assert [(row["task_id"], row["event_kind"]) for row in _queue_rows(conn)] == [
             (completed, "completed"),
             (blocked, "blocked"),
+            # The fork's actionable-event policy includes dependency blocks;
+            # subscribers must see why a child cannot make progress.
+            (dependency, "blocked"),
             (gave_up, "gave_up"),
         ]
 
@@ -256,8 +273,8 @@ def test_fifo_lease_stops_at_unexpired_foreign_head_and_reclaims_expired(
         second = kb.create_task(
             conn, title="second", assignee="reviewer", result_subscriber="planner"
         )
-        assert kb.complete_task(conn, first)
-        assert kb.complete_task(conn, second)
+        assert kb.complete_task(conn, first, summary="first result")
+        assert kb.complete_task(conn, second, summary="second result")
 
         leased = kb.lease_result_notifications(
             conn,
@@ -308,7 +325,7 @@ def test_result_wait_state_excludes_current_task_but_reports_queue(
         assert state.watched_task_ids == [watched]
         assert state.queue_ids == []
 
-        assert kb.complete_task(conn, watched)
+        assert kb.complete_task(conn, watched, summary="watched result")
         state = kb.result_wait_state(conn, "planner", exclude_task_id=current)
         assert state.watched_task_ids == []
         assert len(state.queue_ids) == 1
@@ -321,7 +338,7 @@ def test_hard_delete_removes_result_subscription_and_queue_rows(
         task_id = kb.create_task(
             conn, title="delete", assignee="reviewer", result_subscriber="planner"
         )
-        assert kb.complete_task(conn, task_id)
+        assert kb.complete_task(conn, task_id, summary="task result")
         assert kb.delete_task(conn, task_id)
         assert conn.execute(
             "SELECT 1 FROM kanban_result_subscriptions WHERE task_id = ?", (task_id,)

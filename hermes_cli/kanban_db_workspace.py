@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import contextlib
 
 from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli import kanban_workspace_contract as workspace_contract
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -596,21 +597,37 @@ def set_workspace_path(
     expected_generation: Optional[int] = None,
     expected_claim_lock: Optional[str] = None,
 ) -> bool:
-    # Legacy worker callers pass a lease fence. Upstream's write path already
-    # serializes the column update; reject an obviously stale task before
-    # touching it, while preserving the old three-argument API.
-    if expected_generation is not None or expected_claim_lock is not None:
-        row = conn.execute(
-            "SELECT generation, claim_lock FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if row is None:
-            return False
-        if expected_generation is not None and int(row["generation"] or 1) != int(expected_generation):
-            return False
-        if expected_claim_lock is not None and (row["claim_lock"] or "") != expected_claim_lock:
-            return False
-    _set_task_column(conn, task_id, "workspace_path", str(path))
-    return True
+    """Persist the path and worktree identity under the optional claim fence."""
+    task = _kb.get_task(conn, task_id)
+    if task is None:
+        return False
+    contract_json = task.workspace_contract_json
+    canonical_base = task.base_commit
+    if task.workspace_kind == "worktree" and (
+        task.base_commit or task.target_branch or task.workspace_contract_json
+    ):
+        contract = workspace_contract.validate_or_resolve_contract(task, path)
+        contract_json = workspace_contract.dumps_contract(contract)
+        canonical_base = contract["base_commit"]
+    predicates: list[str] = []
+    params: list[object] = [str(path), contract_json, canonical_base, task_id]
+    if expected_run_id is not None:
+        predicates.append("current_run_id = ?")
+        params.append(int(expected_run_id))
+    if expected_generation is not None:
+        predicates.append("generation = ?")
+        params.append(int(expected_generation))
+    if expected_claim_lock is not None:
+        predicates.append("claim_lock IS ?")
+        params.append(str(expected_claim_lock))
+    where = "".join(f" AND {predicate}" for predicate in predicates)
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET workspace_path = ?, workspace_contract_json = ?, "
+            "base_commit = ? WHERE id = ?" + where,
+            params,
+        )
+    return cur.rowcount == 1
 
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
