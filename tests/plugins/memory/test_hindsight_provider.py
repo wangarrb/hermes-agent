@@ -500,6 +500,12 @@ class TestToolHandlers:
         assert result["result"] == "Memory stored successfully."
         assert provider._client.aretain_batch.call_args.kwargs["retain_async"] is False
 
+    def test_retain_timeout_reports_unknown_outcome_without_retry_advice(self, provider, monkeypatch):
+        monkeypatch.setattr(provider, "_retain_batch", MagicMock(side_effect=TimeoutError()))
+        result = provider.handle_tool_call("hindsight_retain", {"content": "test"})
+        assert "status unknown" in result
+        assert "do not retry blindly" in result
+
     def test_retain_defaults_item_timestamp_when_no_occurred_at(self, provider, monkeypatch):
         event_time = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
         monkeypatch.setattr("plugins.memory.hindsight._hermes_now", lambda: event_time)

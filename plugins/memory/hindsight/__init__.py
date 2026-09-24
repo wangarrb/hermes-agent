@@ -1156,6 +1156,11 @@ class HindsightMemoryProvider(MemoryProvider):
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)
+            if isinstance(e, TimeoutError):
+                detail = f"timed out after {self._timeout}s"
+                if tool_name == "hindsight_retain":
+                    detail += "; write status unknown, do not retry blindly"
+                return tool_error(f"{failure}: {detail}")
             return tool_error(f"{failure}: {e}")
 
     # -- session lifecycle -------------------------------------------------------
