@@ -3475,7 +3475,7 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
         },
     )
     monkeypatch.setattr("run_agent.AIAgent", fake_agent)
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda _platform: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     agent = server._make_agent("sid", "session-key")
@@ -3496,7 +3496,7 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
         _fallback_chain=chain,
     )
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda _platform: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     kwargs = server._background_agent_kwargs(agent, "task-id")
@@ -3520,7 +3520,7 @@ def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
             ],
         },
     )
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda _platform: ["file"])
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
     kwargs = server._background_agent_kwargs(agent, "task-id")
@@ -4230,12 +4230,9 @@ def test_finalized_origin_ui_session_falls_back_to_live_continuation(monkeypatch
 def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
     """A negative truncate_before_user_ordinal must be rejected, not honoured.
 
-    The handler validates the upper bound (`ordinal >= len(user_indices)`) but a
-    negative ordinal would otherwise slip through and hit Python negative
-    indexing: `user_indices[-1]` selects the LAST user turn, truncating history
-    to everything before it and persisting that loss via replace_messages — an
-    unrecoverable overwrite of the session DB. Reject it on the safe 4018 path
-    and leave the in-memory history and the DB untouched.
+    Negative ordinals must not use Python's negative indexing to target the
+    last user turn. With explicit rewind consent, a stale ordinal still
+    fails closed on 4018 without rewriting the active transcript or DB.
     """
     replaced = []
 
@@ -4269,6 +4266,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
                     "session_id": "trunc-sid",
                     "text": "next",
                     "truncate_before_user_ordinal": -1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -4282,11 +4280,11 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
 
 
 def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
-    """Stale truncate_before_user_ordinal=0 must not wipe a non-empty transcript.
+    """Neither stale truncation nor rewind without wipe consent may erase history.
 
-    Desktop desync can attach ordinal 0 to an ordinary fresh submit. That cuts
-    at the first user message (history[:0] == []) and replace_messages() would
-    DELETE every durable row. Refuse unless confirm_empty_truncate is set.
+    Ordinal 0 cuts at the first user message (history[:0] == []) and a
+    destructive replace would erase the active transcript. The first gate
+    requires rewind consent; this test covers the additional empty-cut gate.
     """
     replaced = []
 
@@ -4295,10 +4293,10 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
             replaced.append((key, list(messages)))
 
     history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "ok"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "done"},
+        {"_row_id": 101, "role": "user", "content": "first"},
+        {"_row_id": 102, "role": "assistant", "content": "ok"},
+        {"_row_id": 103, "role": "user", "content": "second"},
+        {"_row_id": 104, "role": "assistant", "content": "done"},
     ]
     server._sessions["empty-trunc-sid"] = _session(history=list(history))
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
@@ -4310,7 +4308,23 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
     )
 
     try:
-        # Missing confirm → refuse.
+        stale = server.handle_request(
+            {
+                "id": "stale",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "empty-trunc-sid",
+                    "text": "fresh typed message",
+                    "truncate_before_row_id": 101,
+                    "truncate_before_user_ordinal": 0,
+                },
+            }
+        )
+        assert stale["error"]["code"] == 4029
+        assert replaced == []
+        assert server._sessions["empty-trunc-sid"]["history"] == history
+
+        # Rewind consent alone is insufficient for an empty cut.
         resp = server.handle_request(
             {
                 "id": "1",
@@ -4318,7 +4332,9 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                 "params": {
                     "session_id": "empty-trunc-sid",
                     "text": "fresh typed message",
+                    "truncate_before_row_id": 101,
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -4333,7 +4349,9 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                     "params": {
                         "session_id": "empty-trunc-sid",
                         "text": "fresh typed message",
+                        "truncate_before_row_id": 101,
                         "truncate_before_user_ordinal": 0,
+                        "confirm_truncate": True,
                         "confirm_empty_truncate": falsey,
                     },
                 }
@@ -4369,21 +4387,23 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, daemon=None, **_thread_options):
             self._target = target
 
         def start(self):
             self._target()
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, *, active_only=False,
+                             archive_dropped=False, reject_active_turn_lease=False):
+            assert active_only and archive_dropped and reject_active_turn_lease
             replaced.append((key, list(messages)))
 
     history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "ok"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "done"},
+        {"_row_id": 101, "role": "user", "content": "first"},
+        {"_row_id": 102, "role": "assistant", "content": "ok"},
+        {"_row_id": 103, "role": "user", "content": "second"},
+        {"_row_id": 104, "role": "assistant", "content": "done"},
     ]
     server._sessions["confirm-empty-sid"] = _session(
         agent=_Agent(), history=list(history)
@@ -4403,7 +4423,9 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
                 "params": {
                     "session_id": "confirm-empty-sid",
                     "text": "first",
+                    "truncate_before_row_id": 101,
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                     "confirm_empty_truncate": True,
                 },
             }
@@ -9198,7 +9220,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, daemon=None, **_thread_options):
             self._target = target
 
         def start(self):
@@ -9216,7 +9238,12 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
+        def replace_messages(self, session_id, messages, *, active_only=False,
+                             archive_dropped=False, reject_active_turn_lease=False):
+            assert active_only and archive_dropped and reject_active_turn_lease
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -9236,6 +9263,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
                     "session_id": "sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -9272,7 +9300,12 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
     server._sessions["trunc-fail-sid"] = sess
 
     class _FailDb:
-        def replace_messages(self, session_id, messages):
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
+        def replace_messages(self, session_id, messages, *, active_only=False,
+                             archive_dropped=False, reject_active_turn_lease=False):
+            assert active_only and archive_dropped and reject_active_turn_lease
             raise OSError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
@@ -9292,6 +9325,7 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
                     "session_id": "trunc-fail-sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -9318,10 +9352,8 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
 def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
     """truncate_before_user_ordinal must count only real user turns.
 
-    display_kind timeline rows (model_switch, async_delegation_complete, …)
-    are role=user but no client counts them as user turns. Without the
-    filter, a trailing marker shifts the ordinal so the wrong message is
-    targeted for truncation.
+    A trailing display_kind marker has role=user but is not a user turn.
+    Ordinal 2 must be stale, not a request to truncate at that marker.
     """
 
     seen = {}
@@ -9340,7 +9372,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
             }
 
     class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, daemon=None, **_thread_options):
             self._target = target
 
         def start(self):
@@ -9363,7 +9395,12 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
+        def replace_messages(self, session_id, messages, *, active_only=False,
+                             archive_dropped=False, reject_active_turn_lease=False):
+            assert active_only and archive_dropped and reject_active_turn_lease
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -9375,8 +9412,23 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
 
-        # ordinal=1 means "truncate before the 2nd-from-last real user turn"
-        # which is "first". The display_kind marker must NOT shift the ordinal.
+        stale = server.handle_request(
+            {
+                "id": "stale",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "not sent",
+                    "truncate_before_user_ordinal": 2,
+                    "confirm_truncate": True,
+                },
+            }
+        )
+        assert stale["error"]["code"] == 4018
+        assert stub_db.replaced == []
+        assert server._sessions["sid"]["history"] == original_history
+
+        # The real second user turn is still addressable at ordinal 1.
         resp = server.handle_request(
             {
                 "id": "1",
@@ -9385,16 +9437,13 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
                     "session_id": "sid",
                     "text": "edited first",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
-        # With display_kind filter: user_indices = [0, 2] (indices of "first" and "second").
-        # ordinal=1 → user_indices[1] = 2, truncated = history[:2] = [first, first reply].
-        # Without the filter: user_indices = [0, 2, 4] (includes the marker),
-        # ordinal=1 → user_indices[1] = 2, same result by luck — but ordinal=0
-        # would truncate to history[:0] vs history[:0], and higher ordinals shift.
+        # user_indices = [0, 2], so ordinal 1 cuts before the second turn.
         assert seen["history"] == original_history[:2], (
             f"Expected truncation to first 2 messages, got {seen['history']}"
         )
@@ -12661,22 +12710,21 @@ def test_browser_manage_status_falls_back_to_config_cdp_url(monkeypatch):
 
 
 def test_browser_manage_status_does_not_call_get_cdp_override(monkeypatch):
-    """Regression guard for Copilot's "status must not block" review:
-    status must NOT route through `_get_cdp_override`, which performs a
-    `/json/version` HTTP probe with a multi-second timeout."""
+    """Status must not enter the CDP HTTP probe used by browser tools."""
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
 
-    fake = types.SimpleNamespace(
-        _get_cdp_override=lambda: pytest.fail(  # noqa: PT015 — fail loudly if called
-            "_get_cdp_override must not run on /browser status (network I/O)"
-        )
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+    with patch(
+        "tools.browser_tool_cdp._get_cdp_override",
+        side_effect=lambda: pytest.fail("browser status must not probe CDP"),
+    ), patch(
+        "hermes_cli.browser_connect.is_browser_debug_ready",
+        side_effect=lambda *_a, **_kw: pytest.fail("browser status must not probe CDP"),
+    ):
         resp = server.handle_request(
             {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
         )
 
-    assert resp["result"]["connected"] is True
+    assert resp["result"] == {"connected": True, "url": "http://127.0.0.1:9222"}
 
 
 def test_browser_manage_connect_sets_env_and_cleans_twice(monkeypatch):
@@ -12694,8 +12742,10 @@ def test_browser_manage_connect_sets_env_and_cleans_twice(monkeypatch):
         cleanup_all_browsers=_cleanup_all,
         _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
     )
-    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
-        _stub_urlopen(monkeypatch, ok=True)
+    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}), patch(
+        "hermes_cli.browser_connect.is_browser_debug_ready",
+        side_effect=lambda url, timeout=1.0: url == "http://127.0.0.1:9222",
+    ):
         resp = server.handle_request(
             {
                 "id": "1",
@@ -12716,12 +12766,19 @@ def test_browser_manage_connect_sets_env_and_cleans_twice(monkeypatch):
 
 def test_browser_manage_connect_defaults_to_loopback(monkeypatch):
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    probed = []
+
+    def ready(url, timeout=1.0):
+        probed.append(url)
+        return url == "http://127.0.0.1:9222"
+
     fake = types.SimpleNamespace(
         cleanup_all_browsers=lambda: None,
         _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
     )
-    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
-        urls = _stub_urlopen_capture(monkeypatch, ok=True)
+    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}), patch(
+        "hermes_cli.browser_connect.is_browser_debug_ready", side_effect=ready,
+    ):
         resp = server.handle_request(
             {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
         )
@@ -12731,7 +12788,7 @@ def test_browser_manage_connect_defaults_to_loopback(monkeypatch):
     assert resp["result"]["messages"] == [
         "Chromium-family browser is already listening at http://127.0.0.1:9222"
     ]
-    assert urls[0] == "http://127.0.0.1:9222/json/version"
+    assert probed[0] == "http://127.0.0.1:9222"
 
 
 def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
@@ -12841,8 +12898,10 @@ def test_browser_manage_connect_handles_null_url(monkeypatch):
         cleanup_all_browsers=lambda: None,
         _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
     )
-    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
-        _stub_urlopen(monkeypatch, ok=True)
+    with patch.dict(sys.modules, {"tools.browser_tool_lifecycle": fake}), patch(
+        "hermes_cli.browser_connect.is_browser_debug_ready",
+        side_effect=lambda url, timeout=1.0: url == "http://127.0.0.1:9222",
+    ):
         resp = server.handle_request(
             {
                 "id": "1",
@@ -13439,7 +13498,7 @@ def _setup_make_agent_mocks(monkeypatch, cfg):
     monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "off")
     monkeypatch.setattr(server, "_load_reasoning_config", lambda model="": None)
     monkeypatch.setattr(server, "_load_service_tier", lambda: None)
-    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda _platform: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_agent_cbs", lambda sid: {})
 
@@ -15437,7 +15496,7 @@ class TestResolveRuntimeWithFallback:
             fake_resolve,
         )
         monkeypatch.setattr("run_agent.AIAgent", fake_agent)
-        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda _platform: ["file"])
         monkeypatch.setattr(server, "_get_db", lambda: None)
 
         agent = server._make_agent(
