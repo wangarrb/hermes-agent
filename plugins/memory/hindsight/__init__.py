@@ -1107,11 +1107,21 @@ class HindsightMemoryProvider(MemoryProvider):
         content, context = args["content"], args.get("context")
         item = self._build_retain_kwargs(content, context=context, tags=args.get("tags"),
                                          occurred_at=args.get("occurred_at"))
+        # Explicit tool writes should not hold the agent turn while extraction and
+        # PostgreSQL indexing finish. The pinned 0.6.1 client has no caller-supplied
+        # operation_id; report submission separately from verified completion.
         logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                      self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id)
-        logger.debug("Tool hindsight_retain: success")
-        return "Memory stored successfully."
+        response = self._retain_batch(item, bank_id=self._bank_id, retain_async=self._retain_async)
+        if getattr(response, "success", True) is False:
+            raise RuntimeError("Hindsight did not accept the retain operation")
+        if not self._retain_async:
+            logger.debug("Tool hindsight_retain: synchronous success")
+            return "Memory stored successfully."
+        operation_id = getattr(response, "operation_id", None)
+        logger.debug("Tool hindsight_retain: queued operation_id=%s", operation_id)
+        result = "Memory queued for storage; completion not yet verified."
+        return f"{result} operation_id={operation_id}" if operation_id else result
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]

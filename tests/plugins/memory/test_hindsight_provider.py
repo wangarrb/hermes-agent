@@ -469,19 +469,36 @@ class TestPostSetup:
 
 
 class TestToolHandlers:
-    def test_retain_success(self, provider):
+    def test_retain_queues_async_operation_with_pinned_client_signature(self, provider):
+        async def pinned_client_retain(*, bank_id, items, retain_async):
+            assert bank_id == "test-bank"
+            assert len(items) == 1
+            assert retain_async is True
+            return SimpleNamespace(success=True, operation_id="server-operation")
+
+        provider._client.aretain_batch.side_effect = pinned_client_retain
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"].startswith("Memory queued for storage; completion not yet verified.")
+        assert "server-operation" in result["result"]
         provider._client.aretain_batch.assert_called_once()
         call_kwargs = provider._client.aretain_batch.call_args.kwargs
         assert call_kwargs["bank_id"] == "test-bank"
+        assert call_kwargs["retain_async"] is True
+        assert "operation_id" not in call_kwargs
         item = call_kwargs["items"][0]
         assert item["content"] == "user likes dark mode"
         # bank_id/retain_async are call-level args, never item keys.
         assert "bank_id" not in item
         assert "retain_async" not in item
+
+    def test_retain_honors_explicit_synchronous_config(self, provider_with_config):
+        provider = provider_with_config(retain_async=False)
+        provider._client = _make_mock_client()
+        result = json.loads(provider.handle_tool_call("hindsight_retain", {"content": "test"}))
+        assert result["result"] == "Memory stored successfully."
+        assert provider._client.aretain_batch.call_args.kwargs["retain_async"] is False
 
     def test_retain_defaults_item_timestamp_when_no_occurred_at(self, provider, monkeypatch):
         event_time = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -489,7 +506,7 @@ class TestToolHandlers:
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"].startswith("Memory queued for storage; completion not yet verified.")
         item = provider._client.aretain_batch.call_args.kwargs["items"][0]
         # Non-temporal retains still carry a defaulted event timestamp so the
         # server can resolve any relative time phrases (#93568).
@@ -500,7 +517,7 @@ class TestToolHandlers:
             "hindsight_retain",
             {"content": "user visited Paris", "occurred_at": "2026-03-03"},
         ))
-        assert result["result"] == "Memory stored successfully."
+        assert result["result"].startswith("Memory queued for storage; completion not yet verified.")
         item = provider._client.aretain_batch.call_args.kwargs["items"][0]
         assert item["timestamp"] == "2026-03-03"
 
