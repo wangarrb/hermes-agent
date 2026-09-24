@@ -100,6 +100,19 @@ def test_clone_channels_opt_in_keeps_the_source_channels(home):
     assert gm.build_migration_plan().blocked
 
 
+def test_explicitly_disabled_cloned_channel_does_not_warn_as_duplicate(home):
+    profile_dir = create_profile("twin", clone_config=True, no_alias=True, clone_channels=True)
+    config_path = profile_dir / "config.yaml"
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    cfg["platforms"]["telegram"]["enabled"] = False
+    cfg["platforms"]["discord"]["enabled"] = False
+    config_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    # Keep the credentials intact for CLI use, but neither adapter claims a bot.
+    assert _fingerprints(profile_dir).isdisjoint(_fingerprints(home))
+    assert shared_channel_credentials(profile_dir, home) == []
+
+
 def test_clone_all_drops_pairing_and_platform_state(home):
     (home / "platforms" / "pairing").mkdir(parents=True)
     (home / "platforms" / "pairing" / "telegram_approved.json").write_text("{}", encoding="utf-8")

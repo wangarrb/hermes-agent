@@ -470,6 +470,19 @@ def shared_channel_credentials(profile_dir: Path, source_dir: Path) -> List[str]
     mine_cfg = _config_platform_tokens(profile_dir / "config.yaml")
     theirs_cfg = _config_platform_tokens(source_dir / "config.yaml")
     shared.update(pid for pid, token in mine_cfg.items() if theirs_cfg.get(pid) == token)
+    if shared:
+        # A retained token is not an active bot claim when either profile explicitly
+        # disables that adapter. Match gateway_migrate._credential_claims rather than
+        # warning about a collision the multiplexer correctly ignores.
+        from hermes_cli.config import read_user_config_raw
+        mine_path, theirs_path = profile_dir / "config.yaml", source_dir / "config.yaml"
+        mine_raw = read_user_config_raw(mine_path) if mine_path.is_file() else {}
+        theirs_raw = read_user_config_raw(theirs_path) if theirs_path.is_file() else {}
+        shared = {
+            pid for pid in shared
+            if _explicit_enabled(mine_raw, pid) is not False
+            and _explicit_enabled(theirs_raw, pid) is not False
+        }
     return sorted(shared)
 
 
