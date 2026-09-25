@@ -630,8 +630,34 @@ def set_workspace_path(
     return cur.rowcount == 1
 
 
-def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
-    _set_task_column(conn, task_id, "branch_name", str(branch_name))
+def set_branch_name(
+    conn: sqlite3.Connection,
+    task_id: str,
+    branch_name: str,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist the actual branch under the optional claim fence."""
+    predicates: list[str] = []
+    params: list[object] = [str(branch_name), task_id]
+    if expected_run_id is not None:
+        predicates.append("current_run_id = ?")
+        params.append(int(expected_run_id))
+    if expected_generation is not None:
+        predicates.append("generation = ?")
+        params.append(int(expected_generation))
+    if expected_claim_lock is not None:
+        predicates.append("claim_lock IS ?")
+        params.append(str(expected_claim_lock))
+    where = "".join(f" AND {predicate}" for predicate in predicates)
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET branch_name = ? WHERE id = ?" + where,
+            params,
+        )
+    return cur.rowcount == 1
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
