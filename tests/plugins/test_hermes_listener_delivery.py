@@ -37,6 +37,16 @@ def test_hermes_accepts_default_codex_placeholder_with_status_footer() -> None:
     assert listener.composer_input_text(screen) == ""
 
 
+def test_hermes_accepts_rotating_composer_placeholder_with_status_footer() -> None:
+    listener = hermes.HermesInteractiveListener()
+    screen = (
+        "designer ❯ Research this topic and write me a brief\n\n"
+        "gpt-6-luna · main · Context 28% used · weekly…\n"
+    )
+
+    assert listener.composer_input_text(screen) == ""
+
+
 def test_hermes_claim_precheck_rejects_nonempty_composer_draft(
     tmp_path: Path, monkeypatch,
 ) -> None:

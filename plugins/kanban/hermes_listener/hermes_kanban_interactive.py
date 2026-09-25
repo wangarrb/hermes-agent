@@ -112,6 +112,23 @@ class HermesInteractiveListener(BaseInteractiveListener):
     )
     _EMPTY_COMPOSER_PLACEHOLDER = "Ask Codex to do anything"
 
+    @classmethod
+    def _is_empty_composer_placeholder(cls, text: str) -> bool:
+        """Recognize Hermes' rotating empty-composer tips as empty input.
+
+        The CLI rotates ``hermes_cli.tips.COMPOSER_PLACEHOLDERS`` in the prompt
+        line. Treating one of those tips as a draft makes the Kanban watcher
+        permanently skip ready tasks, so keep this parser coupled to the
+        canonical list while retaining the legacy Codex placeholder.
+        """
+        if text == cls._EMPTY_COMPOSER_PLACEHOLDER:
+            return True
+        try:
+            from hermes_cli.tips import COMPOSER_PLACEHOLDERS
+            return text in COMPOSER_PLACEHOLDERS
+        except Exception:
+            return False
+
     def composer_input_text(self, screen: str) -> str | None:
         """Return the current Hermes composer text.
 
@@ -138,7 +155,7 @@ class HermesInteractiveListener(BaseInteractiveListener):
         if "msg=interrupt" in lines[prompt_index].lower():
             return None
 
-        if first_text == self._EMPTY_COMPOSER_PLACEHOLDER:
+        if self._is_empty_composer_placeholder(first_text):
             first_text = ""
         parts = [first_text] if first_text else []
         for line in lines[prompt_index + 1 :]:
