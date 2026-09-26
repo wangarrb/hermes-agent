@@ -79,9 +79,18 @@ if [ ! -f "$WATCHER_SCRIPT" ]; then
     exec hermes "${HERMES_ARGS[@]}"
 fi
 
-# Build watcher command
+# Build watcher command.  Invoke the environment interpreter directly: the
+# conda-run wrapper can remain stuck in activate/plugin startup (or leave a
+# defunct wrapper) while the pane's Hermes process is healthy, so the
+# supervisor misclassifies the watcher as dead. Override only when a deployment
+# intentionally uses a different environment.
+WATCHER_PYTHON="${HERMES_KANBAN_PYTHON:-/home/wyr/miniconda/envs/egomotion4d/bin/python3}"
+if [ ! -x "$WATCHER_PYTHON" ]; then
+    echo "$log_prefix ERROR: watcher Python is not executable: $WATCHER_PYTHON" >&2
+    exit 1
+fi
 WATCHER_CMD=(
-    /home/wyr/miniconda/bin/conda run -n egomotion4d python3 "$WATCHER_SCRIPT"
+    "$WATCHER_PYTHON" "$WATCHER_SCRIPT"
     --watch-child
     --profile "${PROFILE:-implementer}"
     --board "${BOARD:-egomotion4d}"

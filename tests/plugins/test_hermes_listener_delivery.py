@@ -44,6 +44,7 @@ def test_hermes_accepts_rotating_composer_placeholder_with_status_footer() -> No
         "gpt-6-luna · main · Context 28% used · weekly…\n"
     )
 
+    assert listener._is_truly_idle_line("designer ❯ Research this topic and write me a brief")
     assert listener.composer_input_text(screen) == ""
 
 
@@ -59,6 +60,21 @@ def test_hermes_claim_precheck_rejects_nonempty_composer_draft(
     monkeypatch.setattr(time, "sleep", lambda _: None)
 
     assert not listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
+
+
+def test_hermes_claim_precheck_accepts_rotating_placeholder_with_command_hint(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    listener = hermes.HermesInteractiveListener()
+    monkeypatch.setattr(
+        hermes,
+        "zellij_dump_screen",
+        lambda **_: (
+            "designer ❯ Research this topic and write me a brief\n"
+            "☤ msg=interrupt · /queue · /bg · /steer\n"
+        ),
+    )
+    assert listener.on_claim_pre_check(_args(), tmp_path / "listener.log")
 
 
 def test_hermes_claim_precheck_fails_closed_for_unknown_composer(

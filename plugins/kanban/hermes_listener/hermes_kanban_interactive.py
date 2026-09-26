@@ -165,6 +165,8 @@ class HermesInteractiveListener(BaseInteractiveListener):
             if self._DECORATIVE_LINE_RE.match(stripped):
                 break
             lowered = stripped.lower()
+            if "msg=interrupt" in lowered:
+                break
             if self._is_ignored_status_line(stripped):
                 break
             if lowered.startswith("⚕") or "context" in lowered and "│" in stripped:
@@ -437,7 +439,13 @@ class HermesInteractiveListener(BaseInteractiveListener):
     def _is_truly_idle_line(self, line: str) -> bool:
         """Return True only for a known idle prompt/status rendering."""
         stripped = line.strip()
-        return bool(self._IDLE_ONLY_RE.match(stripped) or self._PLACEHOLDER_IDLE_RE.match(stripped))
+        if self._IDLE_ONLY_RE.match(stripped) or self._PLACEHOLDER_IDLE_RE.match(stripped):
+            return True
+        match = self._COMPOSER_PROMPT_RE.match(stripped)
+        return bool(
+            match
+            and self._is_empty_composer_placeholder((match.group(1) or "").strip())
+        )
 
     def _is_ignored_status_line(self, line: str) -> bool:
         """Ignore Hermes' model/status footer when finding the live composer."""
@@ -472,9 +480,12 @@ class HermesInteractiveListener(BaseInteractiveListener):
             if not screen:
                 return False
             last_line = self._last_non_decorative_line(screen)
-            # Strict idle check: prompt marker with NO user input after it
-            if not self._is_truly_idle_line(last_line):
-                log_line(log_path, f"on_claim_pre_check attempt {attempt+1}/2: last line NOT truly idle ({last_line[:80]})")
+            # The live Hermes UI may leave the ``msg=interrupt`` command-hint
+            # row below the composer while the agent is idle. Do not require
+            # that decorative row to be the prompt; parse the actual composer
+            # line and use the tail busy markers as the activity guard.
+            if not self.pane_is_idle(screen):
+                log_line(log_path, f"on_claim_pre_check attempt {attempt+1}/2: pane not idle ({last_line[:80]})")
                 return False
             # Also check busy markers in the tail — Hermes shows ❯ even
             # between turns while executing tools; busy markers (💻, msg=interrupt)
