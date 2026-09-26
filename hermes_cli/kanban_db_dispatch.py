@@ -613,6 +613,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -627,6 +629,12 @@ def heartbeat_worker(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params += (int(expected_run_id),)
+        if expected_generation is not None:
+            sql += " AND generation = ?"
+            params += (int(expected_generation),)
+        if expected_claim_lock is not None:
+            sql += " AND claim_lock = ?"
+            params += (str(expected_claim_lock),)
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False

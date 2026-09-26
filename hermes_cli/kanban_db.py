@@ -2564,14 +2564,28 @@ def goal_run_status(
 def heartbeat_claim(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_generation: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Extend a running claim; True if we still own it."""
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
+        predicates = ["id = ?", "status = 'running'", "claim_lock = ?"]
+        params: list[Any] = [task_id, lock]
+        if expected_run_id is not None:
+            predicates.append("current_run_id = ?")
+            params.append(int(expected_run_id))
+        if expected_generation is not None:
+            predicates.append("generation = ?")
+            params.append(int(expected_generation))
+        if expected_claim_lock is not None:
+            predicates.append("claim_lock = ?")
+            params.append(str(expected_claim_lock))
         cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
+            "UPDATE tasks SET claim_expires = ? WHERE " + " AND ".join(predicates),
+            [expires, *params],
         )
         if cur.rowcount != 1:
             return False
