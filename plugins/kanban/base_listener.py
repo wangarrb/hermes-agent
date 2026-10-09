@@ -1446,6 +1446,7 @@ class BaseInteractiveListener:
         self._idle_followup_task_id: str | None = None
         self._idle_followup_since: float | None = None
         self._idle_followup_sent: bool = False
+        self._reviewer_lifecycle_last_sent_at: dict[str, float] = {}
         self._goal_completion_last_sent_at: dict[str, float] = {}
         self._goal_result_wait_since: dict[str, float] = {}
         self._goals_waiting_on_results: set[str] = set()
@@ -2004,6 +2005,7 @@ class BaseInteractiveListener:
     # An idle prompt is a safe input boundary, but brief idle flashes occur
     # between tool calls.  Require a stable idle interval before injecting.
     IDLE_FOLLOWUP_GRACE_S: float = 15.0
+    REVIEWER_LIFECYCLE_INTERVAL_S: float = 600.0
     DAYTIME_GOAL_COMPLETION_INTERVAL_S: float = 2 * 60.0
     OVERNIGHT_GOAL_COMPLETION_INTERVAL_S: float = 30 * 60.0
     RESULT_WAIT_GOAL_INTERVAL_S: float = 120 * 60.0
@@ -2179,6 +2181,7 @@ class BaseInteractiveListener:
             log_line(log_path, f"idle followup task lookup failed for {task_id}: {exc}")
             return False
         if task is None or task.status != "running":
+            self._reviewer_lifecycle_last_sent_at.pop(task_id, None)
             self._reset_idle_followup()
             return False
 
@@ -2257,7 +2260,11 @@ class BaseInteractiveListener:
         if self._idle_followup_since is None:
             self._idle_followup_since = now
             return True
-        if self._idle_followup_sent:
+        if task.assignee == "reviewer":
+            last_sent_at = self._reviewer_lifecycle_last_sent_at.get(task_id)
+            if last_sent_at is not None and now - last_sent_at < self.REVIEWER_LIFECYCLE_INTERVAL_S:
+                return True
+        elif self._idle_followup_sent and not task.goal_mode:
             return True
         if now - self._idle_followup_since < self.IDLE_FOLLOWUP_GRACE_S:
             return True
@@ -2305,6 +2312,8 @@ class BaseInteractiveListener:
                 self._goal_result_wait_since[task_id] = now
             else:
                 self._goal_completion_last_sent_at[task_id] = now
+        if task.assignee == "reviewer":
+            self._reviewer_lifecycle_last_sent_at[task_id] = now
         self._idle_followup_sent = True
         return True
 

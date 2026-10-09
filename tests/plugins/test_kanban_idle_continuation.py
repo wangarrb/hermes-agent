@@ -95,6 +95,7 @@ def test_goal_task_gets_one_completion_check_per_idle_episode(
 ) -> None:
     task_id = _running_task(assignee="planner", goal_mode=True)
     listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
     now = [100.0]
     injected: list[str] = []
     monkeypatch.setattr(bl.time, "time", lambda: now[0])
@@ -122,6 +123,7 @@ def test_goal_completion_check_is_throttled_to_2_minutes_outside_1_to_9(
 ) -> None:
     task_id = _running_task(assignee="planner", goal_mode=True)
     listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
     now = [100.0]
     screen = ["planner ❯\n"]
     injected: list[str] = []
@@ -153,6 +155,7 @@ def test_goal_completion_check_is_throttled_to_30_minutes_from_1_to_9(
 ) -> None:
     task_id = _running_task(assignee="planner", goal_mode=True)
     listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
     now = [100.0]
     screen = ["planner ❯\n"]
     injected: list[str] = []
@@ -242,9 +245,14 @@ def test_goal_waiting_on_subscribed_task_uses_120_minute_insurance_interval(
             assignee="reviewer",
             result_subscriber="planner",
         )
+        assert kb.claim_task(conn, watched, claimer="reviewer-watcher") is not None
+        wait_state = kb.result_wait_state(conn, "planner", exclude_task_id=task_id)
+        assert (watched, "running") in wait_state.watched_tasks
     listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
     now = [100.0]
     injected: list[str] = []
+    monkeypatch.setattr(bl, "_result_notifications_enabled", lambda: True)
     monkeypatch.setattr(bl.time, "time", lambda: now[0])
     monkeypatch.setattr(bl.time, "sleep", lambda _: None)
     monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: "planner ❯\n")
@@ -277,7 +285,7 @@ def test_goal_timer_resets_after_last_queued_result_is_delivered(
             assignee="reviewer",
             result_subscriber="planner",
         )
-        assert kb.complete_task(conn, watched)
+        assert kb.complete_task(conn, watched, result="review checkpoint completed")
     listener = _Listener()
     now = [100.0]
     injected: list[str] = []
@@ -354,6 +362,38 @@ def test_idle_reviewer_gets_one_lifecycle_nudge(
         listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
 
     assert len([text for text in injected if "REVIEW_LIFECYCLE" in text]) == 1
+
+
+def test_idle_reviewer_lifecycle_is_throttled_to_600_seconds(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task_id = _running_task(assignee="reviewer", goal_mode=False)
+    listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
+    now = [100.0]
+    screen = ["reviewer ❯\n"]
+    injected: list[str] = []
+    monkeypatch.setattr(bl.time, "time", lambda: now[0])
+    monkeypatch.setattr(bl.time, "sleep", lambda _: None)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **_: screen[0])
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]))
+
+    with kb.connect() as conn:
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+        screen[0] = "working\n"
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        screen[0] = "reviewer ❯\n"
+        now[0] += listener.IDLE_FOLLOWUP_GRACE_S + 1
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+        assert len([text for text in injected if "REVIEW_LIFECYCLE" in text]) == 1
+
+        now[0] += listener.REVIEWER_LIFECYCLE_INTERVAL_S
+        listener.on_task_running_monitor(_args(), conn, task_id, tmp_path / "watch.log")
+
+    assert len([text for text in injected if "REVIEW_LIFECYCLE" in text]) == 2
 
 
 def test_hermes_strict_idle_path_also_checks_goal_completion(
@@ -572,6 +612,7 @@ def test_goal_completion_check_circuit_breaks_after_three_stalled_rounds(
 ) -> None:
     task_id = _running_task(assignee="planner", goal_mode=True)
     listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
     now = [100.0]
     screen = ["planner ❯\n"]
     injected: list[str] = []
@@ -607,6 +648,7 @@ def test_goal_check_circuit_breaker_resumes_after_real_progress(
 ) -> None:
     task_id = _running_task(assignee="planner", goal_mode=True)
     listener = _Listener()
+    monkeypatch.setattr(listener, "_is_false_running", lambda *args, **kwargs: False)
     now = [100.0]
     screen = ["planner ❯\n"]
     injected: list[str] = []
