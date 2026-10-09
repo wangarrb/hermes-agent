@@ -83,6 +83,9 @@ _WATCHER_KEY_FLAGS = (
     "--zellij-pane-id",
 )
 _SUPERVISOR_FALLBACK_ENV = "HERMES_KANBAN_SUPERVISOR_FALLBACK"
+# Preserve the crash-loop circuit breaker without turning intermittent failures
+# spread across days into a permanent per-role shutdown.
+RESTART_BUDGET_RESET_S = 30 * 60
 
 
 def _watcher_key(cmdline: list[str]) -> tuple[str, ...] | None:
@@ -285,12 +288,28 @@ def _watcher_identity_key(cmdline: list[str]) -> str:
     return ":".join(key)
 
 
+def _restart_count_after_stable_uptime(
+    restarts: int,
+    started_at_monotonic: float,
+    now_monotonic: float,
+    *,
+    stable_s: float = RESTART_BUDGET_RESET_S,
+) -> int:
+    """Reset a crash-loop budget only after one watcher survives the grace."""
+    if restarts > 0 and now_monotonic - started_at_monotonic >= stable_s:
+        return 0
+    return restarts
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Kanban watcher supervisor")
     parser.add_argument("--session", default="", help="Zellij session name (for logging only)")
     parser.add_argument("--board", default="", help="Board slug for scoping (filters discovery)")
     parser.add_argument("--poll-s", type=float, default=30.0, help="Poll interval in seconds")
-    parser.add_argument("--max-restarts", type=int, default=5, help="Max restarts per process before giving up")
+    parser.add_argument(
+        "--max-restarts", type=int, default=5,
+        help="Max crash-loop restarts before giving up (resets after stable uptime)",
+    )
     parser.add_argument("--restart-delay-s", type=float, default=5.0, help="Delay before restarting a crashed watcher")
     parser.add_argument("--log-dir", default="/home/wyr/.hermes/hermes-agent/kanban_logs/egomotion4d", help="Log directory")
     args = parser.parse_args(argv)
@@ -344,6 +363,33 @@ def main(argv: list[str] | None = None) -> int:
                     pid: cmdline for pid, cmdline in current.items()
                     if _matches_board_session(cmdline, args.board, args.session)
                 }
+
+            # ``max_restarts`` is a crash-loop breaker, not a lifetime quota.
+            # A watcher that survives the stable window earns a fresh budget.
+            now_monotonic = time.monotonic()
+            for pid, info in list(tracked.items()):
+                if pid not in current:
+                    continue
+                started_at = info.get("started_monotonic")
+                if not isinstance(started_at, (int, float)):
+                    info["started_monotonic"] = now_monotonic
+                    continue
+                identity = _watcher_identity_key(current[pid])
+                previous = restart_counts.get(identity, 0)
+                updated = _restart_count_after_stable_uptime(
+                    previous, float(started_at), now_monotonic,
+                )
+                if updated != previous:
+                    restart_counts[identity] = updated
+                    info["restarts"] = updated
+                    info["started_monotonic"] = now_monotonic
+                    key_parts = _watcher_key(current[pid])
+                    profile = key_parts[1] if key_parts else "?"
+                    log(
+                        f"  restart budget reset after stable watcher lifetime: "
+                        f"profile={profile} identity={identity} "
+                        f"stable_s={RESTART_BUDGET_RESET_S}",
+                    )
 
             # Find dead ones
             dead_pids = [pid for pid in tracked if pid not in current and not _process_alive(pid)]
@@ -414,7 +460,12 @@ def main(argv: list[str] | None = None) -> int:
                         env=env,
                         start_new_session=True,
                     )
-                    tracked[new_proc.pid] = {"cmdline": cmdline, "restarts": restart_counts[key], "env": env}
+                    tracked[new_proc.pid] = {
+                        "cmdline": cmdline,
+                        "restarts": restart_counts[key],
+                        "env": env,
+                        "started_monotonic": time.monotonic(),
+                    }
                     log(f"  restarted: pid={new_proc.pid} profile={profile} (attempt {restart_counts[key]}/{args.max_restarts})")
                 except OSError as exc:
                     log(f"  restart failed: profile={profile} error={exc}")
@@ -438,7 +489,12 @@ def main(argv: list[str] | None = None) -> int:
                         if arg == "--profile" and i + 1 < len(cmdline):
                             profile = cmdline[i + 1]
                             break
-                    tracked[pid] = {"cmdline": cmdline, "restarts": 0, "env": env}
+                    tracked[pid] = {
+                        "cmdline": cmdline,
+                        "restarts": restart_counts.get(_watcher_identity_key(cmdline), 0),
+                        "env": env,
+                        "started_monotonic": time.monotonic(),
+                    }
                     log(f"tracking: pid={pid} profile={profile}")
 
             parent_by_pid = {

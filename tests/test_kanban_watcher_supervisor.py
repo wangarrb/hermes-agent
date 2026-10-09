@@ -224,3 +224,18 @@ def test_launcher_replacement_during_restart_delay():
     current = {201: _cmd()}
     dead_cmdline = _cmd()
     assert supervisor._has_live_replacement(current, 101, dead_cmdline)
+
+
+def test_restart_budget_resets_only_after_a_stable_watcher_lifetime():
+    supervisor = _load_supervisor()
+    stable_s = supervisor.RESTART_BUDGET_RESET_S
+
+    assert supervisor._restart_count_after_stable_uptime(
+        5, 100.0, 100.0 + stable_s - 1.0,
+    ) == 5
+    assert supervisor._restart_count_after_stable_uptime(
+        5, 100.0, 100.0 + stable_s,
+    ) == 0
+    assert supervisor._restart_count_after_stable_uptime(
+        0, 100.0, 100.0 + stable_s * 2,
+    ) == 0
