@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from plugins.kanban import base_listener as bl
 
 
@@ -51,7 +52,7 @@ def _args() -> argparse.Namespace:
 
 def _enqueue_results(count: int = 2) -> list[str]:
     task_ids: list[str] = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for index in range(count):
             task_id = kb.create_task(
                 conn,
@@ -73,9 +74,10 @@ def test_busy_pane_keeps_result_queue_pending(
     listener = _Listener()
     injected: list[str] = []
     monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: False)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *_: False)
     monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]) or True)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert listener.pump_result_notifications(_args(), conn, tmp_path / "watch.log")
         row = conn.execute("SELECT status FROM kanban_result_queue").fetchone()
         assert row["status"] == "pending"
@@ -93,7 +95,7 @@ def test_safe_pane_injects_bounded_fifo_batch_and_marks_delivered(
     monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: True)
     monkeypatch.setattr(bl, "zellij_inject", lambda **kw: injected.append(kw["text"]) or True)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert listener.pump_result_notifications(_args(), conn, tmp_path / "watch.log")
         rows = conn.execute(
             "SELECT id, event_id, status FROM kanban_result_queue ORDER BY id"
@@ -118,7 +120,7 @@ def test_failed_injection_releases_result_lease(
     monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: True)
     monkeypatch.setattr(bl, "zellij_inject", lambda **_: False)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert listener.pump_result_notifications(_args(), conn, tmp_path / "watch.log")
         row = conn.execute(
             "SELECT status, lease_owner, lease_expires FROM kanban_result_queue"
@@ -138,7 +140,7 @@ def test_uncertain_post_injection_is_consumed_once(
     monkeypatch.setattr(bl, "zellij_submit", lambda **_: True)
     monkeypatch.setattr(listener, "_post_injection_contract", lambda *args, **kwargs: "unknown")
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert listener.pump_result_notifications(_args(), conn, tmp_path / "watch.log")
         row = conn.execute(
             "SELECT status, lease_owner, lease_expires FROM kanban_result_queue"
@@ -159,7 +161,59 @@ def test_disabled_result_delivery_leaves_queue_untouched(
         "wait_for_stable_composer_input",
         lambda **_: pytest.fail("disabled delivery must not inspect the pane"),
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert not listener.pump_result_notifications(_args(), conn, tmp_path / "watch.log")
         row = conn.execute("SELECT status FROM kanban_result_queue").fetchone()
         assert row["status"] == "pending"
+
+
+def test_pending_result_does_not_starve_a_claimable_pane(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enqueue_results(1)
+    listener = _Listener()
+    monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: False)
+    claim_checks: list[bool] = []
+    monkeypatch.setattr(
+        listener,
+        "on_claim_pre_check",
+        lambda args, log_path: claim_checks.append(True) or True,
+    )
+
+    with kbc.connect() as conn:
+        assert not listener.pump_result_notifications(
+            _args(), conn, tmp_path / "watch.log",
+        )
+        row = conn.execute("SELECT status FROM kanban_result_queue").fetchone()
+    assert row["status"] == "pending"
+    assert claim_checks == [True]
+
+
+def test_result_lease_owned_by_another_pane_does_not_starve_claimable_pane(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _enqueue_results(1)
+    listener = _Listener()
+    monkeypatch.setattr(listener, "wait_for_stable_composer_input", lambda **_: True)
+    monkeypatch.setattr(listener, "on_claim_pre_check", lambda *_: True)
+
+    with kbc.connect() as conn:
+        leased = kb.lease_result_notifications(
+            conn,
+            target_profile="planner",
+            lease_owner="another-pane:results",
+            limit=8,
+            lease_seconds=600,
+        )
+        assert len(leased) == 1
+        assert not listener.pump_result_notifications(
+            _args(), conn, tmp_path / "watch.log",
+        )
+        row = conn.execute(
+            "SELECT status, lease_owner FROM kanban_result_queue",
+        ).fetchone()
+    assert tuple(row) == ("leased", "another-pane:results")

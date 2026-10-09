@@ -48,6 +48,7 @@ if str(HERMES_REPO) not in sys.path:
     sys.path.insert(0, str(HERMES_REPO))
 
 from hermes_cli import kanban_db as kb  # noqa: E402
+from hermes_cli.kanban_db_connect import connect as connect_kanban_db  # noqa: E402
 from hermes_cli import kanban_listener_policy as listener_policy  # noqa: E402
 from hermes_cli import kanban_worker_runtime as worker_runtime  # noqa: E402
 
@@ -304,7 +305,7 @@ def _cleanup_active_claim(
         return
     claim_run_id = expected_run_id if expected_run_id is not None else run_id
     try:
-        with kb.connect(board=board) as conn:
+        with connect_kanban_db(board=board) as conn:
             status, _ = _task_status(conn, task_id)
             if status == "running":
                 reclaimed = kb.reclaim_task(
@@ -2713,7 +2714,26 @@ class BaseInteractiveListener:
             return False
 
         if control.status == "delivered":
-            self._active_control_id = control.id
+            if self._active_control_id != control.id:
+                self._active_control_id = control.id
+                age_s = max(
+                    0,
+                    int(time.time() - (control.delivered_at or control.created_at)),
+                )
+                ack_guidance = (
+                    "verify the superseded worker is stopped before control-ack"
+                    if control.kind == "pause_for_rework"
+                    else "complete the requested review checkpoint before control-ack"
+                )
+                log_line(
+                    log_path,
+                    f"control_ack_pending id={control.id} kind={control.kind} "
+                    f"task={control.task_id} run={control.run_id} "
+                    f"generation={control.generation} age_s={age_s}; "
+                    "new task claims remain held; "
+                    f"{ack_guidance}: `hermes kanban --board {self._board} "
+                    f"control-ack {control.id}`",
+                )
             zellij_rename_pane(
                 session=session,
                 pane_id=pane_id,
@@ -2828,18 +2848,51 @@ class BaseInteractiveListener:
         )
         log_line(
             log_path,
-            f"delivered control {leased.id} for {leased.task_id}; awaiting ACK",
+            f"delivered control {leased.id} for {leased.task_id}; awaiting ACK; "
+            "new task claims remain held until the requested control action is "
+            "complete and explicitly acknowledged",
+        )
+        return True
+
+    def _claim_can_proceed_after_result_deferral(
+        self,
+        args: argparse.Namespace,
+        log_path: Path,
+        *,
+        reason: str,
+    ) -> bool:
+        """Let the normal claim gate decide when result delivery cannot proceed.
+
+        Result callbacks stay durable, but a queue item that cannot currently be
+        delivered must not permanently outrank an otherwise-safe task claim. A
+        busy/unknown pane still fails closed through the same backend-specific
+        pre-check used by ``claim_and_inject_one``.
+        """
+        session = str(getattr(args, "zellij_session", "") or "")
+        pane_id = str(getattr(args, "zellij_pane_id", "") or "")
+        if (
+            self._active_task_id is not None
+            or not self.idle_markers
+            or not session
+            or not pane_id
+            or not self.on_claim_pre_check(args, log_path)
+        ):
+            return False
+        log_line(
+            log_path,
+            f"result notification deferred ({reason}); pane passes claim pre-check; "
+            "leaving queue durable and allowing task discovery",
         )
         return True
 
     def pump_result_notifications(
         self, args: argparse.Namespace, conn: Any, log_path: Path,
     ) -> bool:
-        """Deliver one durable FIFO batch, or hold normal injection while pending.
+        """Deliver a durable FIFO batch before discovery when it is actionable.
 
-        The task transition that created the queue item never waits for this
-        method. A busy or unavailable pane simply leaves the durable head in
-        place for a later watcher tick.
+        If delivery cannot proceed, leave the queue intact and let the backend's
+        normal claim pre-check decide whether the pane can accept a task. A busy,
+        unknown, or non-interactive pane remains fail-closed.
         """
         if not _result_notifications_enabled():
             return False
@@ -2861,7 +2914,11 @@ class BaseInteractiveListener:
             pane_id=pane_id,
             log_path=log_path,
         ):
-            return True
+            return not self._claim_can_proceed_after_result_deferral(
+                args,
+                log_path,
+                reason="pane did not reach stable notification input",
+            )
 
         receiver = f"{self._control_receiver(args)}:results"
         try:
@@ -2874,9 +2931,17 @@ class BaseInteractiveListener:
             )
         except (ValueError, sqlite3.DatabaseError) as exc:
             log_line(log_path, f"result queue lease failed: {exc}")
-            return True
+            return not self._claim_can_proceed_after_result_deferral(
+                args,
+                log_path,
+                reason="result notification could not be leased",
+            )
         if not items:
-            return True
+            return not self._claim_can_proceed_after_result_deferral(
+                args,
+                log_path,
+                reason="result queue is leased elsewhere or no longer claimable",
+            )
 
         parts: list[str] = []
         for item in items:
@@ -3004,7 +3069,7 @@ class BaseInteractiveListener:
         _owns_conn = conn is None
         if _owns_conn:
             try:
-                conn = kb.connect(board=board)
+                conn = connect_kanban_db(board=board)
             except Exception as exc:
                 log_line(log_path, f"claim DB error (non-fatal): {type(exc).__name__}: {exc}")
                 return None, None
@@ -3564,7 +3629,7 @@ class BaseInteractiveListener:
             task_state = None
             if handoff and handoff.task_id:
                 try:
-                    conn_check = kb.connect(board=board)
+                    conn_check = connect_kanban_db(board=board)
                     task_state = (
                         status,
                         current_run_id,
@@ -3800,7 +3865,7 @@ class BaseInteractiveListener:
 
             for attempt in range(3):
                 try:
-                    _conn = kb.connect(board=board)
+                    _conn = connect_kanban_db(board=board)
                     _conn_created_at = time.time()
                     consecutive_db_errors = 0
                     return _conn

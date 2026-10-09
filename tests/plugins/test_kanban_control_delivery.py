@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from plugins.kanban import base_listener as bl
 
 
@@ -72,7 +73,7 @@ def _listener(workspace: Path) -> DummyListener:
 
 
 def test_control_lease_is_exclusive_retryable_and_ack_idempotent(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _, control_id = _pending_pause(conn)
         first = kb.lease_control_message(
             conn, profiles=["reviewer"], receiver="pane-a", lease_seconds=30
@@ -98,7 +99,7 @@ def test_control_lease_is_exclusive_retryable_and_ack_idempotent(kanban_home):
 
 
 def test_expired_delivery_lease_is_adopted_after_restart(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _, control_id = _pending_pause(conn)
         assert kb.lease_control_message(
             conn, profiles=["reviewer"], receiver="dead-listener"
@@ -132,7 +133,7 @@ def test_busy_pane_keeps_control_pending(kanban_home, tmp_path, monkeypatch):
         bl, "zellij_rename_pane", lambda **kwargs: titles.append(kwargs["name"]) or True
     )
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _, control_id = _pending_pause(conn)
         assert listener.pump_control_messages(args, conn, workspace / "listener.log")
         message = kb.list_control_messages(conn)[0]
@@ -158,7 +159,7 @@ def test_unknown_pane_state_never_injects_control(
     )
     monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _pending_pause(conn)
         assert listener.pump_control_messages(args, conn, workspace / "listener.log")
         message = kb.list_control_messages(conn)[0]
@@ -182,7 +183,7 @@ def test_control_second_probe_failure_is_fail_closed(
     )
     monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _pending_pause(conn)
         assert listener.pump_control_messages(args, conn, workspace / "listener.log")
         message = kb.list_control_messages(conn)[0]
@@ -208,7 +209,7 @@ def test_idle_pane_receives_control_once_and_blocks_claim_until_ack(
         bl, "zellij_rename_pane", lambda **kwargs: titles.append(kwargs["name"]) or True
     )
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id, control_id = _pending_pause(conn)
         assert listener.pump_control_messages(args, conn, workspace / "listener.log")
         assert listener.pump_control_messages(args, conn, workspace / "listener.log")
@@ -244,7 +245,7 @@ def test_review_checkpoint_control_uses_review_title_without_superseding_prompt(
         bl, "zellij_rename_pane", lambda **kwargs: titles.append(kwargs["name"]) or True
     )
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="module", assignee="planner")
         claimed = kb.claim_task(conn, task_id, claimer="planner-pane")
         assert claimed is not None and claimed.current_run_id is not None
@@ -292,7 +293,7 @@ def test_control_supersedes_prompt_under_resolved_task_workspace(
     monkeypatch.setattr(bl, "zellij_inject", lambda **kwargs: True)
     monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn, title="review", assignee="reviewer",
             workspace_kind="dir", workspace_path=str(task_workspace),
@@ -331,7 +332,7 @@ def test_failed_listener_injection_releases_lease(kanban_home, tmp_path, monkeyp
     monkeypatch.setattr(bl, "zellij_dump_screen", lambda **kwargs: "ready>")
     monkeypatch.setattr(bl, "zellij_inject", lambda **kwargs: False)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _pending_pause(conn)
         assert listener.pump_control_messages(args, conn, workspace / "listener.log")
         message = kb.list_control_messages(conn)[0]
@@ -351,7 +352,7 @@ def test_shared_claim_path_delivers_control_before_claiming_another_task(
     monkeypatch.setattr(bl, "zellij_inject", lambda **kwargs: True)
     monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         _pending_pause(conn)
         waiting = kb.create_task(conn, title="next", assignee="reviewer")
         claimed, run_id = listener.claim_and_inject_one(
@@ -379,6 +380,33 @@ def test_codewhale_steering_dismiss_ignores_system_controls(monkeypatch, tmp_pat
         profile="reviewer",
         log_path=tmp_path / "listener.log",
     )
+
+
+def test_restarted_listener_surfaces_delivered_control_that_holds_claims(
+    kanban_home, tmp_path, monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    args = _listener_args(workspace)
+    first = _listener(workspace)
+    monkeypatch.setattr(bl, "zellij_dump_screen", lambda **kwargs: "ready>")
+    monkeypatch.setattr(bl, "zellij_inject", lambda **kwargs: True)
+    monkeypatch.setattr(bl, "zellij_rename_pane", lambda **kwargs: True)
+
+    with kbc.connect() as conn:
+        _task_id, control_id = _pending_pause(conn)
+        assert first.pump_control_messages(args, conn, workspace / "listener.log")
+        message = kb.list_control_messages(conn)[0]
+        assert message.status == "delivered"
+
+    restarted = _listener(workspace)
+    with kbc.connect() as conn:
+        assert restarted.pump_control_messages(args, conn, workspace / "listener.log")
+
+    log_text = (workspace / "listener.log").read_text(encoding="utf-8")
+    assert f"control_ack_pending id={control_id}" in log_text
+    assert "task claims remain held" in log_text
+    assert "verify the superseded worker is stopped" in log_text
 
 
 def test_task_prompt_contains_role_guidance_and_generation_fences(tmp_path):
