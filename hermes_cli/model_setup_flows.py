@@ -383,7 +383,17 @@ def _model_flow_openai_codex(config, current_model=""):
             from hermes_cli.auth import resolve_codex_runtime_credentials
             _codex_token = resolve_codex_runtime_credentials().get("api_key")
 
-    codex_models = get_codex_model_ids(access_token=_codex_token)
+    from hermes_cli.model_switch import _declared_model_ids
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    configured = providers.get("openai-codex") if isinstance(providers, dict) else None
+    configured_base_url = str(configured.get("base_url") or "").rstrip("/") if isinstance(configured, dict) else ""
+    native_codex_config = not configured_base_url or configured_base_url == DEFAULT_CODEX_BASE_URL.rstrip("/")
+    configured_models = (
+        _declared_model_ids(configured.get("models"))
+        if isinstance(configured, dict) and native_codex_config
+        else []
+    )
+    codex_models = list(dict.fromkeys([*configured_models, *get_codex_model_ids(access_token=_codex_token)]))
     selected = _prompt_model_selection(
         codex_models, current_model=current_model, confirm_provider="openai-codex",
         confirm_base_url=DEFAULT_CODEX_BASE_URL, confirm_api_key=_codex_token or "")

@@ -1596,7 +1596,15 @@ def _validate_switch(st: _Switch) -> Optional[ModelSwitchResult]:
     if not validate_as.lower().startswith("custom"):
         pdef = resolve_provider_full(validate_as, st.user_providers, st.custom_providers)
         if pdef is not None and pdef.source == "user-config":
-            validate_as = f"custom:{validate_as}"
+            from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+            native_codex_config = (
+                validate_as.lower() == "openai-codex"
+                and (not pdef.base_url or pdef.base_url.rstrip("/") == DEFAULT_CODEX_BASE_URL.rstrip("/"))
+            )
+            # A pinned Codex model list is still the built-in OAuth provider, not a custom
+            # endpoint with a GET /models route. Explicit non-Codex URLs remain custom.
+            if not native_codex_config:
+                validate_as = f"custom:{validate_as}"
     try:
         validation = validate_requested_model(
             st.new_model, validate_as, api_key=st.api_key, base_url=st.base_url,

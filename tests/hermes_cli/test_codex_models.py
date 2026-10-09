@@ -201,6 +201,34 @@ def test_model_command_prompts_to_reuse_or_reauthenticate_codex_session(monkeypa
     assert captured["force_new_login"] is True
 
 
+def test_model_command_includes_configured_codex_models_missing_from_live_catalog(monkeypatch):
+    from hermes_cli import model_setup_flows
+
+    captured = {}
+    monkeypatch.setattr(model_setup_flows, "_oauth_gate", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_codex_auth_status",
+        lambda: {"logged_in": True, "api_key": "codex-access-token"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.get_codex_model_ids",
+        lambda access_token=None: ["gpt-6-astra", "gpt-5.6-sol"],
+    )
+
+    def capture_models(model_ids, **kwargs):
+        captured["models"] = model_ids
+        return None
+
+    monkeypatch.setattr("hermes_cli.auth._prompt_model_selection", capture_models)
+    monkeypatch.setattr(model_setup_flows, "_activate_provider_model", lambda *args: None)
+
+    model_setup_flows._model_flow_openai_codex(
+        {"providers": {"openai-codex": {"models": ["gpt-6-sol", "gpt-6-luna"]}}}
+    )
+
+    assert captured["models"][:3] == ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"]
+
+
 # ── Tests for _normalize_model_for_provider ──────────────────────────
 
 
@@ -328,3 +356,87 @@ def test_catalog_requests_use_ungated_client_version(monkeypatch):
         parsed = urlparse(url)
         assert parsed.netloc == "chatgpt.com" and parsed.path == "/backend-api/codex/models"
         assert parse_qs(parsed.query)["client_version"] == ["0.0.0"]
+
+
+def test_pinned_codex_models_use_builtin_validation_in_model_switch():
+    """A models-only Codex config must not probe Codex as a custom /models endpoint."""
+    from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+    from hermes_cli.model_switch import _Switch, _validate_switch
+
+    st = _Switch(
+        raw_input="gpt-6-sol", current_provider="openai-codex", current_model="gpt-6-luna",
+        current_base_url=DEFAULT_CODEX_BASE_URL, current_api_key="test-token", is_global=False,
+        explicit_provider="", user_providers={"openai-codex": {"models": ["gpt-6-sol"]}},
+        custom_providers=[], new_model="gpt-6-sol", target_provider="openai-codex",
+        api_key="test-token", base_url=DEFAULT_CODEX_BASE_URL, api_mode="codex_responses",
+    )
+    seen = []
+
+    def validate(_model, provider, **_kwargs):
+        seen.append(provider)
+        if provider.startswith("custom"):
+            return {"accepted": False, "persist": False, "recognized": False,
+                    "message": "custom endpoint /models unavailable; gpt-6-sol was not saved"}
+        return {"accepted": True, "persist": True, "recognized": True, "message": None}
+
+    with patch("hermes_cli.models_validate.validate_requested_model", side_effect=validate):
+        assert _validate_switch(st) is None
+
+    assert seen == ["openai-codex"]
+    assert st.validation["message"] is None
+
+
+def test_custom_codex_proxy_keeps_custom_endpoint_validation():
+    from hermes_cli.auth import DEFAULT_CODEX_BASE_URL
+    from hermes_cli.model_switch import _Switch, _validate_switch
+
+    proxy_url = "https://codex-proxy.example/v1"
+    st = _Switch(
+        raw_input="gpt-6-sol", current_provider="openai-codex", current_model="gpt-6-luna",
+        current_base_url=proxy_url, current_api_key="test-token", is_global=False,
+        explicit_provider="", user_providers={"openai-codex": {
+            "base_url": proxy_url, "models": ["gpt-6-sol"]}},
+        custom_providers=[], new_model="gpt-6-sol", target_provider="openai-codex",
+        api_key="test-token", base_url=proxy_url, api_mode="codex_responses",
+    )
+    seen = []
+
+    def validate(_model, provider, **_kwargs):
+        seen.append(provider)
+        return {"accepted": True, "persist": True, "recognized": True, "message": None}
+
+    with patch("hermes_cli.models_validate.validate_requested_model", side_effect=validate):
+        assert _validate_switch(st) is None
+
+    assert seen == ["custom:openai-codex"]
+
+
+def test_native_codex_setup_does_not_list_custom_proxy_models(monkeypatch):
+    from hermes_cli import model_setup_flows
+
+    captured = {}
+    monkeypatch.setattr(model_setup_flows, "_oauth_gate", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_codex_auth_status",
+        lambda: {"logged_in": True, "api_key": "codex-access-token"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models.get_codex_model_ids",
+        lambda access_token=None: ["gpt-6-astra"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection",
+        lambda model_ids, **kwargs: captured.setdefault("models", model_ids),
+    )
+    monkeypatch.setattr(model_setup_flows, "_activate_provider_model", lambda *args: None)
+
+    model_setup_flows._model_flow_openai_codex({
+        "providers": {
+            "openai-codex": {
+                "base_url": "https://codex-proxy.example/v1",
+                "models": ["proxy-only-model"],
+            }
+        }
+    })
+
+    assert captured["models"] == ["gpt-6-astra"]
