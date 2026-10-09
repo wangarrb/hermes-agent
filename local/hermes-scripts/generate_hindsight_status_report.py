@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 WIKI_DIR = Path.home() / "wiki" / "auto-maintenance" / "reports"
-OFFLINE_ROOT = Path.home() / ".hermes" / "hindsight" / "offline_reflect"
+OFFLINE_ROOT = Path("/var/lib/hindsight-offline-reflect")
 V2_ROOT = OFFLINE_ROOT / "v2_rebuild"
 WEEKLY_ROOT = OFFLINE_ROOT / "weekly"
 ARCHIVE_DIR = Path.home() / "wiki" / "auto-maintenance" / "archive" / "status-reports"

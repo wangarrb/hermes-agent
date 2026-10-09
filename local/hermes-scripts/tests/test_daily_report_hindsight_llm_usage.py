@@ -72,10 +72,28 @@ def test_non_usage_lines_ignored():
     assert batch['batches'] == 0
 
 
+def test_usage_capture_status_marks_journal_gap_when_oneapi_has_requests():
+    mod = load_module()
+    status = mod.hindsight_usage_capture_status([], {'requests': 12})
+    assert status['status'] == 'gap'
+    assert status['journal_calls'] == 0
+    assert status['oneapi_requests'] == 12
+
+
+def test_usage_capture_status_marks_complete_when_journal_has_calls():
+    mod = load_module()
+    status = mod.hindsight_usage_capture_status(
+        [{'calls': 3, 'total_tokens': 100}], {'requests': 3}
+    )
+    assert status['status'] == 'complete'
+
+
 def test_oneapi_counts_filter_channel_type_and_window(tmp_path):
     mod = load_module()
     db = tmp_path / 'one-api.db'
     con = sqlite3.connect(db)
+    con.execute('CREATE TABLE channels (id INTEGER PRIMARY KEY, models TEXT)')
+    con.executemany('INSERT INTO channels VALUES (?,?)', [(5, 'auto_cheep_model'), (6, 'auto_cheep_model'), (7, 'auto_cheep_model'), (1, 'other')])
     con.execute(
         'CREATE TABLE logs (created_at INTEGER, channel_id INTEGER, type INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER)'
     )

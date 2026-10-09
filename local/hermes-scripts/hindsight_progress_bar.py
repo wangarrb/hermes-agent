@@ -16,7 +16,7 @@ from pathlib import Path
 
 HOME = Path.home()
 LOG_DIR = HOME / ".hermes" / "logs" / "hindsight-offline-reflect"
-OUT_DIR = HOME / ".hermes" / "hindsight" / "offline_reflect"
+OUT_DIR = Path("/var/lib/hindsight-offline-reflect")
 DAILY_DIR = OUT_DIR / "daily"
 WEEKLY_DIR = OUT_DIR / "weekly"
 PG_INSTANCE = HOME / ".hindsight-docker" / "instances" / "hindsight" / "instance.json"

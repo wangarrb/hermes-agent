@@ -47,6 +47,7 @@ from typing import Any
 
 DEFAULT_SAMPLE_SIZE = 5
 DEFAULT_MAX_DAILY_REVIEWS = 5
+DEFAULT_MAX_AGE_DAYS = 14
 DEFAULT_MANIFEST_DIR = "/home/wyr/.hermes/hindsight/session_ingest/manifests"
 DEFAULT_REVIEW_DIR = "/home/wyr/.hermes/hindsight/review_repair"
 # Domain/task keywords that indicate real work content (any language).
@@ -60,6 +61,34 @@ NOISE_SIGNAL_RE = re.compile(
     r"(^(hi|hello|你好|test|ping)\b|转发成功|esc to|继续|go on)",
     re.IGNORECASE,
 )
+HOUSEKEEPING_TOPICS = {"memory-management", "native-consolidation"}
+
+
+def is_actionable_manual_record(record: dict[str, Any]) -> bool:
+    """Reject records whose only topics describe memory-pipeline housekeeping."""
+    topics = {
+        str(tag).split(":", 1)[1]
+        for tag in (record.get("tags") or [])
+        if str(tag).startswith("topic:")
+    }
+    return not topics or bool(topics - HOUSEKEEPING_TOPICS)
+
+
+def is_recent_record(
+    record: dict[str, Any], *, now: datetime | None = None, max_age_days: int | None = DEFAULT_MAX_AGE_DAYS
+) -> bool:
+    if max_age_days is None or max_age_days < 0:
+        return True
+    now = now or datetime.now(timezone.utc)
+    event = str(record.get("event_date") or (record.get("metadata") or {}).get("started_at") or "")
+    try:
+        ts = datetime.fromisoformat(event.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_days = (now - ts.astimezone(timezone.utc)).total_seconds() / 86400.0
+        return 0 <= age_days <= max_age_days
+    except (TypeError, ValueError):
+        return False
 
 
 def load_records(manifest_path: Path) -> list[dict[str, Any]]:
@@ -143,14 +172,23 @@ def importance_score(record: dict[str, Any]) -> float:
 
 
 def sample_records(
-    records: list[dict[str, Any]], sample_size: int, reviewed: dict[str, Any]
+    records: list[dict[str, Any]],
+    sample_size: int,
+    reviewed: dict[str, Any],
+    *,
+    now: datetime | None = None,
+    max_age_days: int | None = DEFAULT_MAX_AGE_DAYS,
 ) -> list[dict[str, Any]]:
+    now = now or datetime.now(timezone.utc)
+
     pending = [
         r
         for r in records
         if (
             r.get("action") == "manual_review"
             and r.get("document_id") not in reviewed
+            and is_recent_record(r, now=now, max_age_days=max_age_days)
+            and is_actionable_manual_record(r)
             # Never sample/promote secret-flagged records: the promote path
             # would submit their full (unredacted) content to retain.
             and r.get("reason") != "secret_or_credential_material"
@@ -253,6 +291,8 @@ def main() -> int:
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
     parser.add_argument("--max-daily-reviews", type=int, default=DEFAULT_MAX_DAILY_REVIEWS,
                         help="hard cap on review-LLM calls per calendar day across all runs (default 5)")
+    parser.add_argument("--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS,
+                        help="only sample manual_review records this recent (default 14; negative disables)")
     parser.add_argument("--review-dir", default=DEFAULT_REVIEW_DIR)
     parser.add_argument("--output-dir", default=DEFAULT_MANIFEST_DIR)
     parser.add_argument("--execute", action="store_true", help="run LLM review and write curated manifest (default: report only)")
@@ -282,12 +322,14 @@ def main() -> int:
         if (
             r.get("action") == "manual_review"
             and r.get("document_id") not in reviewed
+            and is_recent_record(r, max_age_days=args.max_age_days)
+            and is_actionable_manual_record(r)
             # Never sample/promote secret-flagged records: the promote path
             # would submit their full (unredacted) content to retain.
             and r.get("reason") != "secret_or_credential_material"
         )
     )
-    sample = sample_records(records, args.sample_size, reviewed)
+    sample = sample_records(records, args.sample_size, reviewed, max_age_days=args.max_age_days)
     if not sample:
         print(f"manual_review pending={pending_count}; nothing new to sample")
         return 0

@@ -13,6 +13,7 @@ import shlex
 import sqlite3
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ os.environ['no_proxy'] = 'localhost,127.0.0.1'
 
 HERMES_HOME = Path("/home/wyr/.hermes")
 STATE_DB = HERMES_HOME / "state.db"
+ONEAPI_DB_PATH = Path.home() / ".local/share/one-api/data/one-api.db"
 PROFILE_DIR = HERMES_HOME / "profiles"
 PSQL = os.environ.get("HINDSIGHT_PSQL", "/home/wyr/.hindsight-docker/installation/18.1.0/bin/psql")
 HINDSIGHT_API = os.environ.get("HINDSIGHT_API", "http://127.0.0.1:8888")
@@ -642,8 +644,24 @@ def hindsight_logs_since(start: datetime, end: datetime) -> str:
         timeout=90,
     )
     if code != 0 and not out.strip():
-        return ""  # journalctl 不可用且无输出（无权限等），放弃
+        # Some native installs set SyslogIdentifier=hindsight but do not expose
+        # the unit selector consistently after restart. Retry by identifier.
+        code_tag, out_tag, _ = run(
+            f"journalctl -t hindsight --since {shlex.quote(since)} --until {shlex.quote(until)} -o cat 2>&1",
+            timeout=90,
+        )
+        if code_tag == 0 and out_tag.strip():
+            out = out_tag
+        else:
+            return ""  # journalctl 不可用且无输出（无权限等），放弃
     journal_text = out
+    if not journal_text.strip():
+        _, tagged, _ = run(
+            f"journalctl -t hindsight --since {shlex.quote(since)} --until {shlex.quote(until)} -o cat 2>&1",
+            timeout=90,
+        )
+        if tagged.strip():
+            journal_text = tagged
     # 2) 迁移期补齐：journal 首条日志时间 vs 窗口起点
     try:
         code2, first_line, _ = run(
@@ -729,35 +747,73 @@ def parse_hindsight_llm_logs(log_text: str) -> tuple[list[dict[str, int | float 
 def parse_oneapi_auto_cheep_counts(db_path: str, start: datetime, end: datetime) -> dict[str, int]:
     """从 One API 日志库副本统计 auto_cheep_model 的上游请求（全量口径交叉核对）。
 
-    渠道 3/4/5/6/7 = auto_cheep_model 专用渠道（zen-free / cch-bridge / cch-bridge-glm /
-    opencode-go-muse / opencode-go-mimo；3/4/5 已禁用但保留历史流量）。
+    动态发现 models 列表中精确包含 auto_cheep_model 的渠道，含禁用渠道历史流量。
+    这是这些渠道的全部消费，不应冒充仅 Hindsight 服务自身的调用数。
     created_at 为 unix 秒；type=2 为成功消费记录。覆盖 2026-09-13 服务端补丁前
     journal 未记录的快调用，可作"实际产生调用数"的上游实测。
     """
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        channel_ids = [row[0] for row in con.execute("SELECT id, models FROM channels")
+                       if "auto_cheep_model" in [m.strip() for m in (row[1] or "").split(",")]]
+        if not channel_ids:
+            return {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0}
+        placeholders = ",".join("?" for _ in channel_ids)
         row = con.execute(
             "SELECT count(*),"
             " COALESCE(SUM(prompt_tokens), 0),"
             " COALESCE(SUM(completion_tokens), 0)"
             " FROM logs"
             " WHERE created_at >= ? AND created_at < ?"
-            " AND channel_id IN (3, 4, 5, 6, 7) AND type = 2",
-            (int(start.timestamp()), int(end.timestamp())),
+            f" AND channel_id IN ({placeholders}) AND type = 2",
+            (int(start.timestamp()), int(end.timestamp()), *channel_ids),
         ).fetchone()
     finally:
         con.close()
     return {"requests": int(row[0]), "prompt_tokens": int(row[1]), "completion_tokens": int(row[2])}
 
 
+def hindsight_usage_capture_status(
+    llm_usage: list[dict[str, int | float | str]], oneapi: dict[str, int] | None
+) -> dict[str, int | str]:
+    """Classify whether the report has a usable Hindsight token source.
+
+    A healthy OneAPI request count with zero parsed journald calls is a logging
+    gap, not evidence of zero Hindsight usage.
+    """
+    journal_calls = sum(int(row.get("calls") or 0) for row in (llm_usage or []))
+    oneapi_requests = int((oneapi or {}).get("requests") or 0)
+    if journal_calls > 0:
+        status = "complete"
+    elif oneapi_requests > 0:
+        status = "gap"
+    else:
+        status = "unavailable"
+    return {
+        "status": status,
+        "journal_calls": journal_calls,
+        "oneapi_requests": oneapi_requests,
+    }
+
+
 def oneapi_auto_cheep_counts(start: datetime, end: datetime) -> dict[str, int] | None:
-    """把 One API 的日志库拷出容器后统计；容器/库不可用时返回 None（不影响主报表）。"""
+    """对本机挂载库做一致快照，包含 WAL；库不可用时不输出伪造的零值。"""
     try:
         with tempfile.TemporaryDirectory(prefix="oneapi-report-") as tmp_dir:
             db_path = os.path.join(tmp_dir, "one-api.db")
-            code, _out, _err = run(f"docker cp one-api:/data/one-api.db {shlex.quote(db_path)}", timeout=60)
-            if code != 0 or not os.path.exists(db_path):
-                return None
+            source = sqlite3.connect(f"file:{ONEAPI_DB_PATH}?mode=ro", uri=True, timeout=5)
+            destination = sqlite3.connect(db_path)
+            deadline = time.monotonic() + 30
+
+            def progress(_status: int, _remaining: int, _total: int) -> None:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("One API report snapshot exceeded 30 seconds")
+
+            try:
+                source.backup(destination, pages=128, sleep=0.01, progress=progress)
+            finally:
+                source.close()
+                destination.close()
             return parse_oneapi_auto_cheep_counts(db_path, start, end)
     except Exception:
         return None
@@ -841,8 +897,8 @@ def hindsight_db_stats(start: datetime, end: datetime) -> dict:
 
 
 def offline_output_counts(now: datetime) -> dict[str, str | int]:
-    v2_dir = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
-    rebuild_dir = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_rebuild"
+    v2_dir = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
+    rebuild_dir = Path("/var/lib/hindsight-offline-reflect") / "v2_rebuild"
     v2_manifest = v2_dir / "manifest.json"
     v2_latest = rebuild_dir / "latest.json"
 
@@ -1069,6 +1125,13 @@ def main() -> int:
     try:
         cmd = f"journalctl -u hindsight.service --since {shlex.quote(start.strftime('%Y-%m-%d %H:%M:%S'))} -o short-iso 2>&1"
         code, jout, _ = run(cmd, timeout=30)
+        if not jout.strip():
+            _, jout_tag, _ = run(
+                f"journalctl -t hindsight --since {shlex.quote(start.strftime('%Y-%m-%d %H:%M:%S'))} -o short-iso 2>&1",
+                timeout=30,
+            )
+            if jout_tag.strip():
+                jout = jout_tag
         first_line = (jout.strip().splitlines() or [""])[0]
         m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", first_line)
         if m:
@@ -1115,6 +1178,14 @@ def main() -> int:
     else:
         print("无 LLM 调用记录")
     oneapi = oneapi_auto_cheep_counts(start, end)
+    capture_status = hindsight_usage_capture_status(llm_usage, oneapi)
+    if capture_status["status"] == "gap":
+        print(
+            "⚠️ Hindsight 日志采集缺口：OneAPI 有请求，但 journald 未解析到 LLM 调用；"
+            "日报 token 数只能作为下界。"
+        )
+    elif capture_status["status"] == "unavailable":
+        print("⚠️ Hindsight token 无可用交叉来源（journal 与 OneAPI 均无记录）。")
     if oneapi and oneapi["requests"]:
         journal_total = sum(int(r["calls"]) for r in llm_usage)
         oneapi_line = f"上游实测（One API，auto_cheep 渠道全部请求）: {oneapi['requests']} 次"
