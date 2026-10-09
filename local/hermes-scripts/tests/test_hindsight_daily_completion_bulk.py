@@ -25,7 +25,7 @@ def args_for(output_dir: Path):
         output_dir=str(output_dir),
         max_input_chars=60000,
         llm_model="test-model",
-        llm_label="xunfei-coding",
+        llm_label="oneapi-auto-cheep",
         llm_base_url="http://127.0.0.1:3000/v1",
         no_response_format=False,
         emit_observations=True,
@@ -94,7 +94,53 @@ def test_bulk_daily_units_include_profile_qualified_session_ids(tmp_path, monkey
     assert [item.source_ids for item in result["2026-05-07"]] == [["f-profile"]]
 
 
-def test_completion_uses_exact_progress_key_and_live_artifact(tmp_path, monkeypatch):
+def test_bulk_and_single_day_partition_respect_explicit_event_date(tmp_path, monkeypatch):
+    module = load_module()
+    args = args_for(tmp_path)
+    fact = module.FactRecord(
+        "fact-1",
+        "hermes-session::session_20260330_source",
+        "body",
+        "world",
+        "2026-09-01T12:00:00+08:00",
+        "2026-09-01T12:00:01+08:00",
+        "hermes",
+    )
+    monkeypatch.setattr(module, "query_facts_for_days", lambda bank, days: [fact])
+
+    bulk = module.build_daily_fact_units_for_days(args, ["2026-03-30", "2026-09-01"])
+    single_old = module.build_daily_fact_units_for_days(args, ["2026-03-30"])
+    single_event = module.build_daily_fact_units_for_days(args, ["2026-09-01"])
+
+    assert bulk["2026-03-30"] == []
+    assert [u.source_ids for u in bulk["2026-09-01"]] == [["fact-1"]]
+    assert single_old["2026-03-30"] == []
+    assert [u.source_ids for u in single_event["2026-09-01"]] == [["fact-1"]]
+
+
+def test_bulk_and_single_day_partition_use_document_date_only_without_event_date(tmp_path, monkeypatch):
+    module = load_module()
+    args = args_for(tmp_path)
+    fact = module.FactRecord(
+        "fact-legacy",
+        "hermes-session::planner::20260330_source",
+        "body",
+        "world",
+        None,
+        None,
+        "hermes",
+    )
+    monkeypatch.setattr(module, "query_facts_for_days", lambda bank, days: [fact])
+
+    bulk = module.build_daily_fact_units_for_days(args, ["2026-03-30", "2026-09-01"])
+    single = module.build_daily_fact_units_for_days(args, ["2026-03-30"])
+
+    assert [u.source_ids for u in bulk["2026-03-30"]] == [["fact-legacy"]]
+    assert [u.source_ids for u in single["2026-03-30"]] == [["fact-legacy"]]
+    assert bulk["2026-09-01"] == []
+
+
+def test_completion_rejects_progress_only_without_current_sidecar(tmp_path, monkeypatch):
     module = load_module()
     expected = unit(module, "2026-05-07", "current content")
     monkeypatch.setattr(module, "build_daily_fact_units_for_days", lambda args, days: {"2026-05-07": [expected]})
@@ -117,12 +163,12 @@ def test_completion_uses_exact_progress_key_and_live_artifact(tmp_path, monkeypa
     monkeypatch.setattr(module, "DEFAULT_PROGRESS_FILE", progress_path)
 
     report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
-    assert report["details"]["2026-05-07"]["matched_units"] == 1
+    assert report["details"]["2026-05-07"]["matched_units"] == 0
+    assert report["missing_days"] == ["2026-05-07"]
 
     different_model_args = args_for(tmp_path)
     different_model_args.llm_model = "different-runtime-model"
-    report = module.daily_completion_report(different_model_args, ["2026-05-07"])
-    assert report["details"]["2026-05-07"]["matched_units"] == 1
+    assert report["details"]["2026-05-07"]["matched_units"] == 0
 
     output.unlink()
     report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
@@ -151,19 +197,26 @@ def test_completion_accepts_exact_json_hash_and_rejects_legacy_markdown(tmp_path
     assert report["missing_days"] == ["2026-05-07"]
 
     markdown = day_dir / "hermes__00__exact.md"
-    markdown.write_text("result", encoding="utf-8")
+    markdown.write_text(module.render_markdown(expected, {"executive_summary": ["result"]}, "", model="test-model"), encoding="utf-8")
     sidecar = day_dir / "hermes__00__exact.json"
     sidecar.write_text(
         json.dumps(
             {
+                "artifact_schema_version": module.DAILY_ARTIFACT_SCHEMA_VERSION,
                 "unit": {
                     "scope": "daily",
                     "period": "2026-05-07",
                     "topic": "hermes",
                     "index": 0,
+                    "source_count": expected.source_count,
                     "source_ids": ["fact-2026-05-07"],
+                    "date_range_start": expected.date_range_start,
+                    "date_range_end": expected.date_range_end,
                     "input_content_hash": module.short_hash(expected.content, 24),
                 },
+                "model": "test-model",
+                "llm_json": {"executive_summary": ["result"]},
+                "raw_text": "",
                 "markdown_path": str(markdown),
             }
         ),
@@ -173,11 +226,47 @@ def test_completion_accepts_exact_json_hash_and_rejects_legacy_markdown(tmp_path
     report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
     assert report["details"]["2026-05-07"]["matched_units"] == 1
 
+    valid_markdown = markdown.read_text(encoding="utf-8")
+    for old, new in (
+        ("period: 2026-05-07", "period: 2026-05-08"),
+        ("- fact-2026-05-07", "- wrong-source"),
+    ):
+        markdown.write_text(valid_markdown.replace(old, new, 1), encoding="utf-8")
+        report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
+        assert report["missing_days"] == ["2026-05-07"]
+    markdown.write_text(valid_markdown, encoding="utf-8")
+
     data = json.loads(sidecar.read_text(encoding="utf-8"))
     data["unit"]["input_content_hash"] = "stale"
     sidecar.write_text(json.dumps(data), encoding="utf-8")
     report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
     assert report["missing_days"] == ["2026-05-07"]
+
+
+def test_completion_manifest_freezes_unit_signatures_without_raw_text(tmp_path, monkeypatch):
+    module = load_module()
+    expected = unit(module, "2026-05-07", "current content")
+    args = args_for(tmp_path)
+    monkeypatch.setattr(
+        module,
+        "build_daily_fact_units_for_days",
+        lambda current_args, days: {"2026-05-07": [expected]},
+    )
+
+    units_by_day, completion = module.build_daily_completion_snapshot(args, ["2026-05-07"])
+    manifest = module.write_daily_completion_manifest(
+        tmp_path,
+        args,
+        ["2026-05-07"],
+        units_by_day,
+        completion,
+    )
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert data["schema_version"] == "daily-completion-manifest-v1"
+    assert data["units"]["2026-05-07"][0]["source_ids"] == ["fact-2026-05-07"]
+    assert data["units"]["2026-05-07"][0]["input_content_hash"] == module.short_hash(expected.content, 24)
+    assert "current content" not in manifest.read_text(encoding="utf-8")
 
 
 def test_completion_rejects_live_artifact_outside_exact_day_directory(tmp_path, monkeypatch):
@@ -252,6 +341,58 @@ def test_run_units_rebuilds_stale_cached_daily_artifact(tmp_path, monkeypatch):
     assert saved
 
 
+def test_run_units_rebuilds_legacy_sidecar_even_when_progress_markdown_is_live(tmp_path, monkeypatch):
+    module = load_module()
+    expected = unit(module, "2026-05-07", "current content")
+    args = args_for(tmp_path)
+    args.mode = "submit"
+    args.force_repost = False
+    args.concurrency = 1
+    args.min_concurrency = 1
+    args.rate_limit_backoff_seconds = 0
+    args.delay = 0
+    output_dir = tmp_path / "daily" / "2026-05-07"
+    output_dir.mkdir(parents=True)
+    legacy_md = output_dir / "hermes__00__legacy.md"
+    legacy_json = output_dir / "hermes__00__legacy.json"
+    legacy_md.write_text("scope: daily\nperiod: 2026-05-07\ntopic: hermes\n", encoding="utf-8")
+    legacy_json.write_text(
+        json.dumps({
+            "unit": {
+                "scope": "daily",
+                "period": "2026-05-07",
+                "topic": "hermes",
+                "index": 0,
+                "source_ids": ["fact-2026-05-07"],
+            },
+            "markdown_path": str(legacy_md),
+        }),
+        encoding="utf-8",
+    )
+    key = module.unit_progress_key(expected, args)
+    entry = module.progress_entry(expected, args, output_markdown=str(legacy_md))
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text(
+        json.dumps({
+            "processed_units_v2": {key: entry},
+            "processed_document_ids": [],
+            "processed_unit_keys": [],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "DEFAULT_PROGRESS_FILE", progress_path)
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "call_llm_for_unit",
+        lambda args, reflect_unit: (calls.append(reflect_unit) or ({"executive_summary": ["rebuilt"]}, "{}")),
+    )
+    monkeypatch.setattr(module, "post_to_hindsight", lambda *args, **kwargs: (True, None))
+
+    assert module.run_units(args, [expected]) == 0
+    assert calls == [expected]
+
+
 def test_run_units_rebuilds_daily_entry_when_exact_content_hash_changed(tmp_path, monkeypatch):
     module = load_module()
     cached = unit(module, "2026-05-07", "period: old fact")
@@ -291,3 +432,70 @@ def test_run_units_rebuilds_daily_entry_when_exact_content_hash_changed(tmp_path
 
     assert module.run_units(args, [current]) == 0
     assert calls == [current]
+
+
+def test_weekly_refuses_legacy_daily_gaps_when_backfill_is_not_explicit(tmp_path, monkeypatch):
+    module = load_module()
+    day = "2026-03-15"
+    expected = unit(module, day, "source facts")
+    monkeypatch.setattr(module, "retained_sqlite_days", lambda _bank: [day])
+    monkeypatch.setattr(module, "history_period_for", lambda _days: "all-history")
+    monkeypatch.setattr(module, "build_daily_completion_snapshot", lambda _args, days: (
+        {day: [expected]},
+        {"missing_days": [day], "details": {day: {"expected_units": 1, "missing_units": 1}}},
+    ))
+    monkeypatch.setattr(module, "write_daily_completion_manifest", lambda *_args: tmp_path / "completion.json")
+    run_calls = []
+    monkeypatch.setattr(module, "run_units", lambda *args: run_calls.append(args) or 0)
+    args = argparse.Namespace(
+        weekly_source="daily",
+        weekly_window="all-history",
+        output_dir=str(tmp_path),
+        bank="hermes",
+        backfill_missing_daily=False,
+        scope="weekly",
+        mode="submit",
+        date=day,
+        daily_source="facts",
+        group_by="topic",
+    )
+
+    try:
+        module.resolve_missing_daily_args(args)
+    except SystemExit as exc:
+        assert "backfill" in str(exc).lower() or "missing" in str(exc).lower()
+    else:
+        raise AssertionError("weekly must fail closed instead of processing or backfilling incomplete daily inputs")
+    assert run_calls == []
+
+
+def test_weekly_backfill_runs_only_after_explicit_opt_in(tmp_path, monkeypatch):
+    module = load_module()
+    day = "2026-03-15"
+    expected = unit(module, day, "source facts")
+    monkeypatch.setattr(module, "retained_sqlite_days", lambda _bank: [day])
+    monkeypatch.setattr(module, "history_period_for", lambda _days: "all-history")
+    monkeypatch.setattr(module, "build_daily_completion_snapshot", lambda _args, days: (
+        {day: [expected]},
+        {"missing_days": [day], "details": {day: {"expected_units": 1, "missing_units": 1}}},
+    ))
+    monkeypatch.setattr(module, "write_daily_completion_manifest", lambda *_args: tmp_path / "completion.json")
+    run_calls = []
+    monkeypatch.setattr(module, "run_units", lambda _args, units: run_calls.extend(units) or 0)
+    monkeypatch.setattr(module, "evaluate_daily_completion", lambda *_args: {"missing_days": []})
+    args = argparse.Namespace(
+        weekly_source="daily",
+        weekly_window="all-history",
+        output_dir=str(tmp_path),
+        bank="hermes",
+        backfill_missing_daily=True,
+        scope="weekly",
+        mode="submit",
+        date=day,
+        daily_source="facts",
+        group_by="topic",
+    )
+
+    module.resolve_missing_daily_args(args)
+
+    assert run_calls == [expected]

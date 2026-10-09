@@ -267,7 +267,7 @@ def status(log_fh) -> None:
 
 def weekly_budget_cmd(args: argparse.Namespace, week: str) -> list[str]:
     weekly_window = getattr(args, "weekly_window", "all-history")
-    no_backfill = getattr(args, "no_backfill_missing_daily", False)
+    backfill = bool(getattr(args, "backfill_missing_daily", False))
     cmd = [
         sys.executable,
         str(OFFLINE_REFLECT_SCRIPT),
@@ -282,7 +282,7 @@ def weekly_budget_cmd(args: argparse.Namespace, week: str) -> list[str]:
         "--weekly-group-by",
         "topic",
     ]
-    if not no_backfill:
+    if backfill:
         cmd.append("--backfill-missing-daily")
     cmd += [
         "--mode",
@@ -301,7 +301,7 @@ def weekly_budget_cmd(args: argparse.Namespace, week: str) -> list[str]:
 
 def weekly_submit_cmd(args: argparse.Namespace, week: str) -> list[str]:
     weekly_window = getattr(args, "weekly_window", "all-history")
-    no_backfill = getattr(args, "no_backfill_missing_daily", False)
+    backfill = bool(getattr(args, "backfill_missing_daily", False))
     cmd = [
         sys.executable,
         str(SCRIPT),
@@ -319,7 +319,7 @@ def weekly_submit_cmd(args: argparse.Namespace, week: str) -> list[str]:
         "--weekly-group-by",
         "topic",
     ]
-    if not no_backfill:
+    if backfill:
         cmd.append("--backfill-missing-daily")
     cmd += [
         "--mode",
@@ -462,8 +462,11 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=0, help="0 means no timeout")
     parser.add_argument("--weekly-budget-max-pending-units", type=int, default=200, help="Fail closed before paid LLM if regular weekly would process more pending units")
     parser.add_argument("--weekly-budget-max-pending-chars", type=int, default=10000000, help="Fail closed before paid LLM if regular weekly pending chars exceeds this")
-    parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly scope: all-history=full history with backfill (default); week=current ISO week only")
-    parser.add_argument("--no-backfill-missing-daily", action="store_true", help="Skip backfilling missing daily outputs before weekly")
+    parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly scope: all-history=full history; week=current ISO week only")
+    backfill_group = parser.add_mutually_exclusive_group()
+    backfill_group.add_argument("--backfill-missing-daily", dest="backfill_missing_daily", action="store_true", help="Explicitly authorize paid LLM backfill of incomplete daily units before weekly")
+    backfill_group.add_argument("--no-backfill-missing-daily", dest="backfill_missing_daily", action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(backfill_missing_daily=False)
     parser.add_argument("--dry-run-budget-only", action="store_true", help="For weekly/both: run read-only weekly budget check and skip paid LLM submit/V2 publish")
     parser.add_argument("--lock-timeout", type=int, default=21600, help="seconds to wait for pipeline lock")
     args = parser.parse_args()
@@ -497,6 +500,7 @@ def main() -> None:
             "poll": args.poll,
             "timeout": args.timeout,
             "dry_run_budget_only": bool(args.dry_run_budget_only),
+            "backfill_missing_daily": bool(args.backfill_missing_daily),
         }
         try:
             if should_run_daily(args):

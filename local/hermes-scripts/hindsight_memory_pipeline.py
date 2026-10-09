@@ -328,7 +328,6 @@ def weekly_reflect_step(args: argparse.Namespace) -> Step:
             "daily",
             "--weekly-group-by",
             "topic",
-            "--backfill-missing-daily",
             "--mode",
             "submit",
             "--prefilter",
@@ -351,7 +350,6 @@ def weekly_reflect_step(args: argparse.Namespace) -> Step:
             "daily",
             "--weekly-group-by",
             "topic",
-            "--backfill-missing-daily",
             "--mode",
             "dry-run",
             "--prefilter",
@@ -362,9 +360,11 @@ def weekly_reflect_step(args: argparse.Namespace) -> Step:
             "--budget-max-pending-chars",
             str(args.weekly_budget_max_pending_chars),
         ]
+    if bool(getattr(args, "backfill_missing_daily", False)):
+        cmd.append("--backfill-missing-daily")
     return Step(
         name="weekly_reflect",
-        description="Weekly/all-history high-dimensional integration from daily outputs; includes backfill-missing-daily gate.",
+        description="Weekly/all-history integration from complete daily outputs; missing daily units fail closed unless explicit backfill opt-in is set.",
         command=cmd,
         mutating=bool(args.execute),
         writes_local=True,
@@ -598,6 +598,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         args.output_root = DEFAULT_PROPOSAL_ROOT
     if getattr(args, "skip_daily", False) and args.mode != "full":
         raise SystemExit("--skip-daily is only valid with full mode")
+    if getattr(args, "backfill_missing_daily", False) and args.mode not in {"weekly", "full"}:
+        raise SystemExit("--backfill-missing-daily is only valid with weekly/full mode")
     if getattr(args, "native_consolidation_poll", None) is None:
         args.native_consolidation_poll = int(getattr(args, "poll", 60) or 60)
     require_confirm(args)
@@ -618,9 +620,10 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 name="native_consolidation_drain_after_daily",
                 description="Wait until Hindsight native source-fact consolidation is drained after daily/session ingestion, before V2 quality gates.",
             ))
-        # Full mode must finish weekly all-history backfill before any
-        # publish-capable V2 reduction. Daily-only mode still gates directly
-        # after its own native-consolidation drain.
+        # Full mode must finish weekly all-history integration before any
+        # publish-capable V2 reduction. Incomplete daily inputs fail closed by
+        # default; only the explicit --backfill-missing-daily opt-in may spend
+        # LLM calls to regenerate them.
         if args.mode == "daily":
             steps.append(v2_rebuild_step(args))
     if args.mode in {"weekly", "full"}:
@@ -662,6 +665,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "mode": args.mode,
         "history": args.history,
         "skip_daily": bool(getattr(args, "skip_daily", False)),
+        "backfill_missing_daily": bool(getattr(args, "backfill_missing_daily", False)),
         "execute": bool(args.execute),
         "config_path": str(cfg.get("config_path")),
         "api_url": str(cfg.get("api_url")),
@@ -839,6 +843,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--weekly-budget-max-pending-chars", type=int, default=500000)
     ap.add_argument("--include-wiki", action="store_true", help="For full mode, include long-cycle wiki candidate maintenance")
     ap.add_argument("--skip-daily", action="store_true", help="For full mode resume runs, skip session manifest/retain, daily reflect, and the daily V2 rebuild gate")
+    ap.add_argument("--backfill-missing-daily", action="store_true", help="Explicitly authorize paid LLM backfill of incomplete daily artifacts before weekly; default is fail closed without backfill")
     ap.add_argument("--no-switch-mode", action="store_true", default=True, help="Skip LLM provider switch_mode in retain/reflect wrappers; container is pre-configured via start-hindsight.sh (default: True)")
     ap.add_argument("--skip-repair-zone", action="store_true", help="For weekly/full, skip approved repair sidecar proposal sweep")
     ap.add_argument("--skip-proposal-review", action="store_true", help="For weekly/full, skip local proposal LLM/human review packet generation")

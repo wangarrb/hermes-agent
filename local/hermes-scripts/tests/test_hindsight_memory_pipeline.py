@@ -35,6 +35,7 @@ def ns(**kw):
         no_wait_native_consolidation=False,
         include_wiki=False,
         skip_daily=False,
+        backfill_missing_daily=False,
         skip_repair_zone=False,
         skip_proposal_review=False,
         execute_proposal_review_llm=False,
@@ -98,6 +99,7 @@ def test_full_history_plan_forces_retain_state_ignore_and_includes_weekly_wiki()
     assert '--ignore-submit-state' in retain['command']
     assert 'weekly_reflect' in names(plan)
     weekly = next(s for s in plan['steps'] if s['name'] == 'weekly_reflect')
+    assert '--backfill-missing-daily' not in weekly['command']
     bank_idx = weekly['command'].index('--bank')
     assert weekly['command'][bank_idx + 1] == 'hermes'
     assert 'wiki_auto_maintenance' in names(plan)
@@ -326,3 +328,27 @@ def test_restore_observations_off_fails_if_readback_is_inconsistent(monkeypatch)
         assert 'readback' in str(exc).lower()
     else:
         raise AssertionError('inconsistent bank settings must fail closed')
+
+
+def test_weekly_plan_does_not_backfill_legacy_daily_outputs_by_default():
+    mod = load_module()
+    plan = mod.build_plan(ns(mode='weekly'))
+    weekly = next(step for step in plan['steps'] if step['name'] == 'weekly_reflect')
+    assert '--backfill-missing-daily' not in weekly['command']
+
+
+def test_weekly_plan_backfills_only_with_explicit_opt_in():
+    mod = load_module()
+    plan = mod.build_plan(ns(mode='weekly', backfill_missing_daily=True))
+    weekly = next(step for step in plan['steps'] if step['name'] == 'weekly_reflect')
+    assert '--backfill-missing-daily' in weekly['command']
+
+
+def test_backfill_opt_in_is_rejected_for_daily_mode():
+    mod = load_module()
+    try:
+        mod.build_plan(ns(mode='daily', backfill_missing_daily=True))
+    except SystemExit as exc:
+        assert 'weekly/full' in str(exc)
+    else:
+        raise AssertionError('daily mode must not accept weekly backfill')

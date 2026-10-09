@@ -537,5 +537,5 @@ def test_daily_completion_report_detects_partial_existing_day(tmp_path, monkeypa
     assert report['done_days'] == []
     assert report['missing_days'] == ['2026-05-07']
     assert report['details']['2026-05-07']['expected_units'] == 2
-    assert report['details']['2026-05-07']['matched_units'] == 1
-    assert report['details']['2026-05-07']['missing_units'] == 1
+    assert report['details']['2026-05-07']['matched_units'] == 0
+    assert report['details']['2026-05-07']['missing_units'] == 2

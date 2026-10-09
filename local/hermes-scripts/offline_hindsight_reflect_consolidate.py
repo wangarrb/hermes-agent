@@ -22,6 +22,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -39,7 +40,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import import_sqlite_to_hindsight as sqlite_import  # noqa: E402
 
 DEFAULT_DB_PATH = HERMES_HOME / "state.db"
-DEFAULT_OUTPUT_DIR = HERMES_HOME / "hindsight" / "offline_reflect"
+DEFAULT_OUTPUT_DIR = Path("/var/lib/hindsight-offline-reflect")
 DEFAULT_PROGRESS_FILE = DEFAULT_OUTPUT_DIR / "offline_reflect_progress.json"
 DEFAULT_API = "http://127.0.0.1:8888"
 DEFAULT_BANK = "hermes"
@@ -53,6 +54,7 @@ MAX_RETRIES = 3
 PIPELINE_VERSION = "offline-reflect-cache-v2"
 PROMPT_VERSION = "offline-reflect-prompt-v2-20260507"
 SCHEMA_VERSION = "canonical-observations-v1"
+DAILY_ARTIFACT_SCHEMA_VERSION = "daily-artifact-v2"
 WEEKLY_INPUT_PROJECTION_VERSION = "weekly-markdown-no-duplicate-json-v1"
 
 
@@ -131,8 +133,22 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, obj: Any) -> None:
+    atomic_write_text(path, json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Commit one file atomically; incomplete temp files are never live artifacts."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def sql_quote(value: str) -> str:
@@ -342,9 +358,30 @@ def fact_document_like_clauses_for_days(days: list[str]) -> list[str]:
 
 
 def query_facts_for_days(bank: str, days: list[str]) -> list[FactRecord]:
+    # DESIGN: daily/weekly consolidation consumes only first-class facts
+    # (world/experience). Exclusions, in order:
+    #   1. fact_type='observation' — a DERIVED consolidation output (native
+    #      engine writes it with document_id=NULL); feeding it back into daily
+    #      is output-as-input recursion and amplifies scope/tag errors.
+    #   2. document_id 'hermes-offline-consolidation%' / 'hermes-offline-canonical%'
+    #      — our OWN daily/weekly outputs retained back as facts. Their
+    #      event_date is the RETAIN time, not the fact time, so the event_date
+    #      window would otherwise re-ingest e.g. 5837 weekly facts on 2026-08-08.
+    # Day selection uses event_date whenever it exists, which is the only
+    # column all fact types maintain (document_id embeds the SESSION start
+    # date, not the fact date).  Legacy document-id matching is retained only
+    # for rows with NULL event_date.  Without this guard, a fact selected by
+    # its legacy document date can be assigned to a different bucket when the
+    # caller requests all days instead of one day.
     if not days:
         return []
     like_clauses = fact_document_like_clauses_for_days(days)
+    day_clauses = []
+    for day in days:
+        compact_day = day.replace("-", "")
+        day_clauses.append(
+            f"(event_date >= {sql_quote(day)} AND event_date < ({sql_quote(day)}::timestamptz + interval '1 day'))"
+        )
     sql = f"""
 SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)
 FROM (
@@ -356,13 +393,40 @@ FROM (
          COALESCE(created_at::text, '') AS created_at
   FROM memory_units
   WHERE bank_id = {sql_quote(bank)}
-    AND ({' OR '.join(like_clauses)})
+  AND fact_type IN ('world', 'experience')
+  AND document_id NOT LIKE 'hermes-offline-consolidation%'
+  AND document_id NOT LIKE 'hermes-offline-canonical%'
+  AND (
+    (event_date IS NOT NULL AND ({' OR '.join(day_clauses)}))
+    OR
+    (event_date IS NULL AND ({' OR '.join(like_clauses)}))
+  )
     AND text IS NOT NULL
     AND length(text) > 0
   ORDER BY document_id, event_date NULLS LAST, created_at, id
 ) t;
 """
     rows = psql_json(sql)
+    # Capacity valve. LLM cost is driven by UNITS (build_fact_units splits by
+    # topic and max_input_chars), not by raw fact count. Measured on real data
+    # after the event_date bucketing fix: 2.3k facts -> 17 units, 5.0k -> 41,
+    # 10.9k -> 79. The old 1500-facts threshold was derived while the bucketing
+    # bug fragmented 5.2k facts into 329 units, so it now rejects legitimate
+    # high-volume session days. Only single-day callers are checked (weekly
+    # backfill queries all retained days in one call, which is legitimate).
+    MAX_FACTS_PER_DAY = 20000
+    if len(days) == 1 and len(rows) > MAX_FACTS_PER_DAY:
+        by_type: dict[str, int] = {}
+        by_ns: dict[str, int] = {}
+        for row in rows:
+            by_type[str(row.get("fact_type"))] = by_type.get(str(row.get("fact_type")), 0) + 1
+            ns = str(row.get("document_id") or "NULL").split(":")[0]
+            by_ns[ns] = by_ns.get(ns, 0) + 1
+        raise SystemExit(
+            f"query_facts_for_days: day {days[0]} has {len(rows)} facts, exceeding the "
+            f"safety cap {MAX_FACTS_PER_DAY} (types={by_type}, doc namespaces={by_ns}). "
+            "Rerun with an explicit narrowed window or raise the cap deliberately."
+        )
     facts: list[FactRecord] = []
     for row in rows:
         doc_id = row.get("document_id") or ""
@@ -810,7 +874,7 @@ def user_prompt_for(unit: ReflectUnit, *, emit_observations: bool = False, outpu
         "要求：\n"
         "1. 只保留长期稳定、有复用价值的信息；丢弃一次性进度、寒暄、重复日志。\n"
         "2. 合并重复观点；冲突信息要标明条件或不确定性。\n"
-        "3. 技术内容优先保留数值证据、文件路径、命令、配置名、版本、验证结果。\n"
+        "3. 技术内容优先保留数值证据、文件路径、命令、配置名、版本、验证结果；检索/benchmark 相关的专有名词、指标名、关键数值和用户偏好关键词必须原样保留，不能只改写成泛化同义句。\n"
         "4. 用户偏好和项目约定必须明确写出适用范围；发现 API key/token/密钥时只记录配置风险，不保留具体值。\n"
         "5. weekly/global consolidation 需要跨话题、跨历史周期整合；历史结论有更新时，以条件化表述刷新全局知识，不要只总结当前周。\n"
         "6. 输出严格 JSON，schema 形如：\n"
@@ -963,16 +1027,40 @@ def call_llm(
     }
     if response_format:
         payload["response_format"] = {"type": "json_object"}
+    # Reasoning models (e.g. opencode space-bunny-free) spend the whole
+    # max_tokens budget on reasoning_content and return an EMPTY content field
+    # (finish_reason=length). "low" keeps a small reasoning trace while leaving
+    # room for the actual answer; "none" is rejected upstream with HTTP 400.
+    # Set HINDSIGHT_OFFLINE_REASONING_EFFORT="" to disable this entirely.
+    _effort = os.environ.get("HINDSIGHT_OFFLINE_REASONING_EFFORT", "low").strip()
+    if _effort:
+        payload["reasoning_effort"] = _effort
 
     last_err = ""
+    # OpenCode Go free-tier endpoints route by session header; without it the
+    # API rejects with MissingSessionID even with a valid bearer key.
+    extra_headers: dict[str, str] = {}
+    if "opencode.ai" in base:
+        extra_headers["x-opencode-session"] = "hindsight-offline-reflect"
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = requests.post(
                 f"{base}/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", **extra_headers},
                 json=payload,
                 timeout=REQUEST_TIMEOUT,
             )
+            if resp.status_code == 400 and "response_format" in resp.text[:1000] and payload.get("response_format"):
+                # Some OpenAI-compatible backends (e.g. opencode zen) reject
+                # response_format; retry once without it — JSON is still
+                # elicited by the prompt itself.
+                payload.pop("response_format", None)
+                resp = requests.post(
+                    f"{base}/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", **extra_headers},
+                    json=payload,
+                    timeout=REQUEST_TIMEOUT,
+                )
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {resp.status_code}: {resp.text[:500]}"
                 if resp.status_code == 429 and raise_on_429:
@@ -1148,13 +1236,17 @@ def save_result(output_dir: Path, unit: ReflectUnit, obj: dict[str, Any] | None,
             "date_range_end": unit.date_range_end,
         },
         "model": model,
+        "artifact_schema_version": DAILY_ARTIFACT_SCHEMA_VERSION if unit.scope == "daily" else None,
         "llm_json": obj,
         "raw_text": raw_text,
         "markdown_path": str(md_path),
     }
-    save_json(json_path, data)
     md_path.parent.mkdir(parents=True, exist_ok=True)
-    md_path.write_text(markdown, encoding="utf-8")
+    # Markdown becomes visible first; JSON is the completion marker and is
+    # committed last. A killed process cannot leave a JSON sidecar that
+    # advertises a missing Markdown artifact.
+    atomic_write_text(md_path, markdown)
+    save_json(json_path, data)
     return ReflectResult(unit, obj, raw_text, markdown, doc_id, json_path, md_path)
 
 
@@ -1327,6 +1419,8 @@ def progress_entry(unit: ReflectUnit, args: argparse.Namespace, *, document_id: 
         "date_range_end": unit.date_range_end,
         "input_content_hash": short_hash(unit.content, 24),
     }
+    if unit.scope == "daily":
+        entry["artifact_schema_version"] = DAILY_ARTIFACT_SCHEMA_VERSION
     if document_id:
         entry["document_id"] = document_id
     if output_markdown:
@@ -1474,7 +1568,11 @@ def v2_progress_entry_is_reusable(output_dir: Path, unit: ReflectUnit, entry: An
     if not isinstance(entry, dict) or not progress_output_is_live(output_dir, unit, entry):
         return False
     if unit.scope == "daily":
-        return entry.get("input_content_hash") == short_hash(unit.content, 24)
+        return (
+            entry.get("input_content_hash") == short_hash(unit.content, 24)
+            and entry.get("artifact_schema_version") == DAILY_ARTIFACT_SCHEMA_VERSION
+            and daily_artifact_is_complete(output_dir, unit)
+        )
     return True
 
 
@@ -1655,7 +1753,16 @@ def build_daily_fact_units_for_days(args: argparse.Namespace, days: list[str]) -
     requested = set(days)
     facts_by_day: dict[str, list[FactRecord]] = {day: [] for day in days}
     for fact in query_facts_for_days(args.bank, days):
-        day, _topic = parse_doc_day_topic(fact.document_id)
+        # Bucket by the fact's own event_date whenever it exists.  The
+        # document_id fallback is only for legacy rows without event_date;
+        # never reinterpret an explicit event date through the session start
+        # date just because the requested window is narrower.
+        day: str | None = None
+        ev = getattr(fact, "event_date", None)
+        if ev:
+            day = str(ev)[:10]
+        else:
+            day, _topic = parse_doc_day_topic(fact.document_id)
         if day in requested:
             facts_by_day[day].append(fact)
 
@@ -1727,6 +1834,50 @@ def daily_output_completion_keys(output_dir: Path, day: str) -> set[tuple[str, i
     return keys
 
 
+def daily_markdown_matches_sidecar(data: dict[str, Any], markdown_path: Path) -> bool:
+    """Verify the Markdown is exactly the deterministic rendering of its sidecar."""
+    unit = data.get("unit")
+    if not isinstance(unit, dict):
+        return False
+    source_ids = unit.get("source_ids")
+    source_count = unit.get("source_count")
+    date_range_start = unit.get("date_range_start")
+    date_range_end = unit.get("date_range_end")
+    model = data.get("model")
+    raw_text = data.get("raw_text")
+    llm_json = data.get("llm_json")
+    if (
+        unit.get("scope") != "daily"
+        or not isinstance(unit.get("period"), str)
+        or not isinstance(unit.get("topic"), str)
+        or type(unit.get("index")) is not int
+        or not isinstance(source_ids, list)
+        or type(source_count) is not int
+        or not isinstance(date_range_start, str)
+        or not isinstance(date_range_end, str)
+        or not isinstance(model, str)
+        or not isinstance(raw_text, str)
+        or (llm_json is not None and not isinstance(llm_json, dict))
+    ):
+        return False
+    try:
+        expected_unit = ReflectUnit(
+            scope=unit["scope"],
+            period=unit["period"],
+            topic=unit["topic"],
+            index=unit["index"],
+            content="",
+            source_count=source_count,
+            source_ids=[str(value) for value in source_ids],
+            date_range_start=date_range_start,
+            date_range_end=date_range_end,
+        )
+        expected_markdown = render_markdown(expected_unit, llm_json, raw_text, model=model)
+        return markdown_path.read_text(encoding="utf-8") == expected_markdown
+    except (KeyError, OSError, UnicodeError, TypeError, ValueError):
+        return False
+
+
 def daily_json_completion_signatures(output_dir: Path, day: str) -> set[tuple[str, int, tuple[str, ...], str]]:
     signatures: set[tuple[str, int, tuple[str, ...], str]] = set()
     day_dir = output_dir / "daily" / day
@@ -1734,6 +1885,8 @@ def daily_json_completion_signatures(output_dir: Path, day: str) -> set[tuple[st
         data = load_json(path, {})
         unit = data.get("unit") if isinstance(data, dict) else None
         if not isinstance(unit, dict):
+            continue
+        if data.get("artifact_schema_version") != DAILY_ARTIFACT_SCHEMA_VERSION:
             continue
         if unit.get("scope") != "daily" or unit.get("period") != day:
             continue
@@ -1752,46 +1905,67 @@ def daily_json_completion_signatures(output_dir: Path, day: str) -> set[tuple[st
             or not content_hash
             or not markdown_path.is_file()
             or markdown_path.resolve() != expected_markdown.resolve()
+            or markdown_path.parent.resolve() != day_dir.resolve()
+            or not daily_markdown_matches_sidecar(data, markdown_path)
         ):
             continue
         signatures.add((topic, index, tuple(sorted(str(value) for value in source_ids)), content_hash))
     return signatures
 
 
-def daily_completion_report(args: argparse.Namespace, days: list[str]) -> dict[str, Any]:
-    """Validate that every expected daily unit has a matching markdown output.
+def daily_artifact_is_complete(output_dir: Path, unit: ReflectUnit) -> bool:
+    """Return whether one daily unit has a complete current JSON/Markdown pair."""
+    if unit.scope != "daily":
+        return False
+    day_dir = output_dir / "daily" / unit.period
+    pattern = f"{safe_filename(unit.topic)}__{unit.index:02d}__*.json"
+    expected_source_ids = tuple(sorted(str(value) for value in unit.source_ids))
+    expected_hash = short_hash(unit.content, 24)
+    for json_path in day_dir.glob(pattern):
+        data = load_json(json_path, {})
+        if not isinstance(data, dict) or data.get("artifact_schema_version") != DAILY_ARTIFACT_SCHEMA_VERSION:
+            continue
+        sidecar = data.get("unit")
+        if not isinstance(sidecar, dict):
+            continue
+        try:
+            sidecar_index = int(sidecar.get("index", -1))
+        except (TypeError, ValueError):
+            continue
+        if (
+            sidecar.get("scope") != "daily"
+            or sidecar.get("period") != unit.period
+            or sidecar.get("topic") != unit.topic
+            or sidecar_index != unit.index
+            or tuple(sorted(str(value) for value in (sidecar.get("source_ids") or []))) != expected_source_ids
+            or sidecar.get("input_content_hash") != expected_hash
+        ):
+            continue
+        markdown_path = Path(str(data.get("markdown_path") or "")).expanduser()
+        try:
+            if not markdown_path.is_file() or markdown_path.resolve() != json_path.with_suffix(".md").resolve():
+                continue
+            if markdown_path.parent.resolve() != day_dir.resolve():
+                continue
+            if not daily_markdown_matches_sidecar(data, markdown_path):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        return True
+    return False
 
-    A day with only one existing markdown is not necessarily complete: a daily
-    run can be split into multiple topic/chunk units.  Weekly all-history must
-    fail closed when a day is missing any expected unit, otherwise it can reduce
-    an incomplete daily set and then cache the wrong weekly result.
-    """
-    output_dir = Path(args.output_dir)
+
+def evaluate_daily_completion(output_dir: Path, units_by_day: dict[str, list[ReflectUnit]]) -> dict[str, Any]:
+    """Evaluate one frozen unit snapshot without querying Hindsight again."""
+    output_dir = Path(output_dir)
     done_days: list[str] = []
     missing_days: list[str] = []
     details: dict[str, dict[str, Any]] = {}
-    units_by_day = build_daily_fact_units_for_days(args, days)
-    progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
-    entries_v2 = processed_units_v2(progress)
-    progress_index = daily_progress_index(entries_v2)
-    for day in days:
+    for day in units_by_day:
         units = units_by_day.get(day, [])
         expected = {unit_completion_signature(unit) for unit in units}
         observed = daily_json_completion_signatures(output_dir, day)
         matched = expected & observed
-        for unit in units:
-            signature = unit_completion_signature(unit)
-            if signature in matched:
-                continue
-            candidates = progress_index.get(daily_progress_lookup_key(unit), [])
-            for entry in candidates:
-                entry_content_hash = entry.get("input_content_hash")
-                content_matches = entry_content_hash == signature[-1] or (
-                    not entry_content_hash and legacy_daily_progress_is_unambiguous(unit)
-                )
-                if content_matches and progress_output_is_live(output_dir, unit, entry):
-                    matched.add(signature)
-                    break
         missing = expected - matched
         details[day] = {
             "expected_units": len(expected),
@@ -1806,6 +1980,58 @@ def daily_completion_report(args: argparse.Namespace, days: list[str]) -> dict[s
     return {"done_days": done_days, "missing_days": missing_days, "details": details}
 
 
+def build_daily_completion_snapshot(
+    args: argparse.Namespace,
+    days: list[str],
+) -> tuple[dict[str, list[ReflectUnit]], dict[str, Any]]:
+    """Build expected units once and evaluate them against current artifacts."""
+    units_by_day = build_daily_fact_units_for_days(args, days)
+    return units_by_day, evaluate_daily_completion(Path(args.output_dir), units_by_day)
+
+
+def daily_completion_report(args: argparse.Namespace, days: list[str]) -> dict[str, Any]:
+    """Validate every expected daily unit using a single query snapshot."""
+    _units_by_day, report = build_daily_completion_snapshot(args, days)
+    return report
+
+
+def write_daily_completion_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    days: list[str],
+    units_by_day: dict[str, list[ReflectUnit]],
+    completion: dict[str, Any],
+) -> Path:
+    """Persist hashes/source IDs for an auditable, raw-text-free repair run."""
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = output_dir / "completion_manifests" / f"{run_id}-daily-completion.json"
+    payload = {
+        "schema_version": "daily-completion-manifest-v1",
+        "generated_at": datetime.now().isoformat(),
+        "bank": args.bank,
+        "days": list(days),
+        "pipeline_version": PIPELINE_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "artifact_schema_version": DAILY_ARTIFACT_SCHEMA_VERSION,
+        "units": {
+            day: [
+                {
+                    "topic": unit.topic,
+                    "index": unit.index,
+                    "source_ids": sorted(str(value) for value in unit.source_ids),
+                    "input_content_hash": short_hash(unit.content, 24),
+                }
+                for unit in units_by_day.get(day, [])
+            ]
+            for day in days
+        },
+        "missing_before": list(completion.get("missing_days") or []),
+        "details_before": completion.get("details") or {},
+    }
+    save_json(path, payload)
+    return path
+
+
 def existing_daily_periods(output_dir: Path, days: list[str]) -> set[str]:
     done: set[str] = set()
     for day in days:
@@ -1816,37 +2042,41 @@ def existing_daily_periods(output_dir: Path, days: list[str]) -> set[str]:
 
 
 def resolve_missing_daily_args(args: argparse.Namespace) -> None:
-    """When weekly uses daily outputs, optionally backfill missing daily periods.
-
-    This keeps weekly semantics stable: weekly normally integrates daily outputs,
-    not raw/facts directly. Backfill is explicit and processes each missing day
-    from processed facts.
-    """
-    if not getattr(args, "backfill_missing_daily", False):
-        return
+    """Validate weekly daily inputs; backfill only after an explicit opt-in."""
     if args.weekly_source != "daily":
         return
     weekly_window = getattr(args, "weekly_window", "all-history")
     output_dir = Path(args.output_dir)
     if weekly_window == "all-history":
-        period = history_period_for(retained_sqlite_days(args.bank) or existing_daily_output_days(output_dir))
-        days = retained_sqlite_days(args.bank)
+        days = retained_sqlite_days(args.bank) or existing_daily_output_days(output_dir)
+        period = history_period_for(days)
     else:
         y, w, period = parse_week(args.week)
         start, end, _ = week_bounds(y, w)
         days = iter_dates_between(start.date(), end.date())
-    completion = daily_completion_report(args, days)
+    units_by_day, completion = build_daily_completion_snapshot(args, days)
     missing = list(completion["missing_days"])
     missing_details = {day: completion["details"].get(day, {}) for day in missing}
+    if missing:
+        manifest_path = write_daily_completion_manifest(output_dir, args, days, units_by_day, completion)
+        print(f"Daily completion manifest: {manifest_path}")
     if not missing:
         print(f"Weekly {period}: all {len(days)} daily outputs already exist and match expected units.")
         setattr(args, "_budget_missing_daily", [])
         setattr(args, "_budget_missing_daily_details", {})
         setattr(args, "_backfill_units", [])
         return
-    print(f"Weekly {period}: backfilling missing/incomplete daily outputs before weekly: {', '.join(missing)}")
+
     setattr(args, "_budget_missing_daily", missing)
     setattr(args, "_budget_missing_daily_details", missing_details)
+    if not getattr(args, "backfill_missing_daily", False):
+        raise SystemExit(
+            "Weekly blocked: daily inputs are missing or fail sidecar/Markdown integrity checks "
+            f"for {len(missing)} retained date(s): {', '.join(missing)}. "
+            "No LLM backfill was run. Use --backfill-missing-daily only after explicitly authorizing the cost."
+        )
+
+    print(f"Weekly {period}: backfilling missing/incomplete daily outputs before weekly: {', '.join(missing)}")
     original_scope = args.scope
     original_date = args.date
     original_daily_source = args.daily_source
@@ -1858,7 +2088,7 @@ def resolve_missing_daily_args(args: argparse.Namespace) -> None:
         args.group_by = "topic"
         for day in missing:
             args.date = day
-            units, *_ = build_daily_for_args(args)
+            units = list(units_by_day.get(day, []))
             print_units(units)
             if args.mode == "dry-run":
                 backfill_units.extend(units)
@@ -1867,7 +2097,10 @@ def resolve_missing_daily_args(args: argparse.Namespace) -> None:
             if code != 0:
                 raise SystemExit(code)
         if args.mode != "dry-run":
-            remaining = daily_completion_report(args, missing)["missing_days"]
+            remaining = evaluate_daily_completion(
+                output_dir,
+                {day: units_by_day.get(day, []) for day in missing},
+            )["missing_days"]
             if remaining:
                 raise RuntimeError(f"daily backfill completed but artifacts are still missing: {', '.join(remaining)}")
     finally:
@@ -1888,7 +2121,7 @@ def main() -> None:
     parser.add_argument("--weekly-source", choices=["daily", "facts", "raw"], default="daily", help="weekly 默认跨话题+跨历史周期整合 daily consolidation 结果；facts=直接整合 processed facts；raw 仅诊断，成本高")
     parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly 默认 all-history，刷新整个 Hindsight 高层知识；week 仅整合 --week 指定 ISO 周")
     parser.add_argument("--weekly-group-by", choices=["all", "topic"], default="topic", help="V2 默认 topic：先做 topic history reduce；global canonical cards 由 v2 reducer 再统一生成。all 仅用于诊断或兼容旧 cross-topic chunk")
-    parser.add_argument("--backfill-missing-daily", action="store_true", help="weekly-source=daily 时，先对缺失 daily 输出的 retained 日期做 processed-facts daily consolidation，再执行 weekly/global")
+    parser.add_argument("--backfill-missing-daily", action="store_true", help="weekly-source=daily 时显式授权对缺失日执行 processed-facts daily LLM 回补；默认 fail-closed，不产生回补费用")
     parser.add_argument("--mode", choices=["dry-run", "submit"], default="dry-run")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--api", default=DEFAULT_API)
