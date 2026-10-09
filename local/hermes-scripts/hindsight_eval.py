@@ -32,7 +32,7 @@ if "127.0.0.1" not in _no_proxy and "localhost" not in _no_proxy:
     _os.environ["NO_PROXY"] = _os.environ["no_proxy"]
 DEFAULT_BENCH = HERMES_HOME / "hindsight" / "eval" / "benchmark_queries.jsonl"
 DEFAULT_OUT = HERMES_HOME / "hindsight" / "eval" / "runs"
-DEFAULT_CARDS_ROOT = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
+DEFAULT_CARDS_ROOT = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
 DEFAULT_API = "http://127.0.0.1:8888"
 DEFAULT_BANK = "hermes"
 LAYERED_PATH = HERMES_HOME / "scripts" / "hindsight_recall_layered.py"

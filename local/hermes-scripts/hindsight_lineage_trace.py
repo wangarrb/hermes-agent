@@ -26,7 +26,7 @@ from hindsight_native_client import DEFAULT_API, HindsightNativeClient
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
 DEFAULT_STATE_DB = HERMES_HOME / "state.db"
-DEFAULT_OFFLINE_ROOT = HERMES_HOME / "hindsight" / "offline_reflect"
+DEFAULT_OFFLINE_ROOT = Path("/var/lib/hindsight-offline-reflect")
 DEFAULT_CARDS_ROOT = DEFAULT_OFFLINE_ROOT / "v2_cards"
 DEFAULT_OUTPUT_DIR = DEFAULT_OFFLINE_ROOT / "lineage_traces"
 

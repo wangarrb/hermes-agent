@@ -26,8 +26,8 @@ import hindsight_conflict_core as core
 
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
-DEFAULT_AUDIT_JSON = HERMES_HOME / "hindsight" / "offline_reflect" / "conflict_audit" / "latest.json"
-DEFAULT_OUTPUT_DIR = HERMES_HOME / "hindsight" / "offline_reflect" / "repair_proposals"
+DEFAULT_AUDIT_JSON = Path("/var/lib/hindsight-offline-reflect") / "conflict_audit" / "latest.json"
+DEFAULT_OUTPUT_DIR = Path("/var/lib/hindsight-offline-reflect") / "repair_proposals"
 
 
 def load_json(path: Path) -> dict[str, Any]:

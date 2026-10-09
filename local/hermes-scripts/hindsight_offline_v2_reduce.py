@@ -25,7 +25,7 @@ from typing import Any
 
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
-DEFAULT_OFFLINE_ROOT = HERMES_HOME / "hindsight" / "offline_reflect"
+DEFAULT_OFFLINE_ROOT = Path("/var/lib/hindsight-offline-reflect")
 DEFAULT_OUTPUT_ROOT = DEFAULT_OFFLINE_ROOT / "v2_cards"
 DEFAULT_ALIAS_MAP = DEFAULT_OFFLINE_ROOT / "v2_aliases.json"
 ACTIVE_CANON_TO_ALIASES: dict[str, list[str]] = {}
@@ -118,6 +118,12 @@ def active_offline_json_files(root: Path, *, include_backups: bool = False) -> l
     for f in glob.glob(str(root / "**" / "*.json"), recursive=True):
         p = Path(f)
         if not include_backups and is_bad_output_backup(p):
+            continue
+        relative = p.relative_to(root)
+        # Rebuild reports are generated outputs, not daily/weekly source facts.
+        # Excluding their directory also prevents an interrupted/corrupt report
+        # from making the next reducer run fail its source-JSON parse gate.
+        if relative.parts and relative.parts[0] == "v2_rebuild":
             continue
         if p.name in {"offline_reflect_progress.json"}:
             continue
@@ -651,7 +657,7 @@ def write_cards(cards: list[dict[str, Any]], output_root: Path, *, observations:
     return written
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description="Generic local reducer for Offline Hindsight v2 canonical cards")
     ap.add_argument("--offline-root", default=str(DEFAULT_OFFLINE_ROOT))
     ap.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
@@ -687,7 +693,14 @@ def main() -> None:
         "writes": [],
         "safety": "No LLM calls. No Hindsight writes. Local files only when --mode local.",
     }
-    if args.mode == "local":
+    parse_errors = stats.get("parse_errors")
+    local_write_allowed = type(parse_errors) is int and parse_errors == 0
+    if args.mode == "local" and not local_write_allowed:
+        report["write_blocked_reason"] = (
+            "local writes require stats.parse_errors to be the integer 0; "
+            f"got {parse_errors!r}"
+        )
+    elif args.mode == "local":
         written = write_cards(cards, output_root, observations=observations)
         report["writes"] = [str(p) for p in written]
     if args.json:
@@ -697,6 +710,8 @@ def main() -> None:
         print(f"mode={args.mode} scope={args.scope}")
         print(f"input_files={stats.get('input_files')} collected_observations={len(observations)} cards={len(cards)}")
         print(f"topics={list((stats.get('topics') or {}).keys())[:12]}")
+        if report.get("write_blocked_reason"):
+            print(f"write_blocked={report['write_blocked_reason']}")
         for c in report["cards"][:20]:
             print(f"  [{c['scope']}] {c['topic']}: observations={c['observation_count']} id={c['card_id']}")
         if report["writes"]:
@@ -704,7 +719,8 @@ def main() -> None:
             for p in report["writes"][:20]:
                 print(f"  {p}")
         print(report["safety"])
+    return 2 if args.mode == "local" and not local_write_allowed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

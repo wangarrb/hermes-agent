@@ -197,9 +197,17 @@ def _call_hindsight_llm(
             }
             if response_format:
                 payload["response_format"] = {"type": "json_object"}
+            headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
+            # opencode-go endpoints require a session header (MissingSessionID 400
+            # otherwise, observed 2026-09-30). Any stable session id works; value is
+            # not validated by the gateway, it is used for request routing.
+            if "opencode.ai" in (cfg.get("base_url") or ""):
+                headers["x-opencode-session"] = os.environ.get(
+                    "OPENCODE_SESSION_ID", "hermes-offline-pipeline"
+                )
             resp = _requests.post(
                 f"{cfg['base_url']}/chat/completions",
-                headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"},
+                headers=headers,
                 json=payload,
                 timeout=300,
             )
@@ -3248,6 +3256,12 @@ def main() -> int:
             "HINDSIGHT_SESSION_PROFILE_MODE": "all",
             "HERMES_ACCEPT_HOOKS": "1",
             "PYTHONUNBUFFERED": "1",
+            # The pipeline has up to three native-consolidation drain steps that
+            # run after retain. Restoring enable_observations at the end of each
+            # wrapper invocation would make the following drain wait forever on a
+            # disabled consolidation, so the pipeline's final restore_observations_off
+            # step owns the restore instead.
+            "HINDSIGHT_DEFER_OBSERVATIONS_RESTORE": "1",
         }
         # Propagate explicit --llm-* overrides into the pipeline subprocess so
         # hindsight_memory_pipeline.py / hindsight_minimax_import.py use them too.
@@ -3257,14 +3271,24 @@ def main() -> int:
             env["HINDSIGHT_OFFLINE_LLM_BASE_URL"] = _LLM_OVERRIDES["base_url"]
         if _LLM_OVERRIDES.get("api_key"):
             env["HINDSIGHT_OFFLINE_LLM_API_KEY"] = _LLM_OVERRIDES["api_key"]
+        # The custom profile resolves its key by ENV NAME
+        # (HINDSIGHT_OFFLINE_LLM_API_KEY_ENV -> api_key_envs), so the name the
+        # caller passed via --llm-api-key-env must be propagated too. Without
+        # this, the setdefault below points every override at ONEAPI_API_KEY and
+        # a non-oneapi endpoint (e.g. opencode.ai) fails with 401.
+        if _args.llm_api_key_env:
+            env["HINDSIGHT_OFFLINE_LLM_API_KEY_ENV"] = _args.llm_api_key_env
         if _LLM_OVERRIDES.get("provider"):
             env["HINDSIGHT_OFFLINE_HINDSIGHT_PROVIDER"] = _LLM_OVERRIDES["provider"]
         if _LLM_OVERRIDES.get("model") or _LLM_OVERRIDES.get("base_url"):
             env["HINDSIGHT_OFFLINE_LLM_PROFILE"] = "custom"
             # custom profile needs a full set; default to the local oneapi
             # gateway + ONEAPI key when the user only overrode the model name.
+            # A caller-supplied --llm-api-key-env must win over the ONEAPI
+            # fallback, otherwise non-oneapi endpoints get the wrong bearer.
             env.setdefault("HINDSIGHT_OFFLINE_LLM_BASE_URL", "http://127.0.0.1:3000/v1")
-            env.setdefault("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV", "ONEAPI_API_KEY")
+            if not env.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV"):
+                env["HINDSIGHT_OFFLINE_LLM_API_KEY_ENV"] = "ONEAPI_API_KEY"
             env.setdefault("HINDSIGHT_OFFLINE_HINDSIGHT_PROVIDER", "openai")
         proc = subprocess.run(
             [

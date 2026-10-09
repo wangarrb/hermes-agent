@@ -6,7 +6,7 @@ import sys
 import types
 from pathlib import Path
 
-ROOT = Path('/home/wyr/.hermes/scripts')
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module(name):
@@ -190,6 +190,24 @@ def test_api_contamination_case_not_dropped_when_memory_text_has_hit():
     assert cases[0]['evidence']['contamination_hits'][0]['name'] == 'raw_stack_trace'
 
 
+def test_fact_outlier_audit_uses_aggregate_threshold_and_severity():
+    audit = load_module('hindsight_conflict_audit')
+
+    class FakeClient:
+        def iter_memories(self, types=None, max_items=None):
+            yield {'document_id': 'doc-p1', 'text': '[CONTEXT COMPACTION] leaked'}
+            yield {'document_id': 'doc-p1', 'text': 'ordinary fact'}
+            yield {'document_id': 'doc-p2', 'text': 'PENDING_BREAKDOWN'}
+            yield {'document_id': 'doc-p2', 'text': 'ordinary fact'}
+            yield {'document_id': 'doc-below-threshold', 'text': '[CONTEXT COMPACTION] leaked'}
+
+    cases = audit.fact_outlier_cases('hermes', client=FakeClient(), threshold=2)
+    by_document = {case['target']['document_id']: case for case in cases}
+    assert set(by_document) == {'doc-p1', 'doc-p2'}
+    assert by_document['doc-p1']['severity'] == 'P1'
+    assert by_document['doc-p2']['severity'] == 'P2'
+
+
 def test_gate_proposal_uses_detailed_observations_index(tmp_path):
     gate = load_module('hindsight_offline_v2_gate')
     cards_root = tmp_path / 'cards'
@@ -297,14 +315,14 @@ def test_paid_llm_env_caps_retries_and_uses_long_rate_limit_backoff(monkeypatch)
     assert env['HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES'] == '2'
     assert env['HINDSIGHT_API_CONSOLIDATION_LLM_MAX_RETRIES'] == '1'
     assert env['HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS'] == '1'
-    assert env['HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_JOB'] == '60'
-    assert env['HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND'] == '60'
+    assert env['HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_JOB'] == '64'
+    assert env['HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND'] == '64'
     assert env['HINDSIGHT_API_CONSOLIDATION_RECALL_BUDGET'] == 'low'
-    assert env['HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE'] == '20'
-    assert env['HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE'] == '20'
+    assert env['HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE'] == '64'
+    assert env['HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE'] == '8'
     assert env['HINDSIGHT_API_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS'] == '4096'
-    assert env['HINDSIGHT_API_WORKER_MAX_SLOTS'] == '5'
-    assert env['HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS'] == '1'
+    assert env['HINDSIGHT_API_WORKER_MAX_SLOTS'] == '6'
+    assert env['HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS'] == '2'
 
 
 def test_minimax_import_defaults_to_pinned_hindsight_v061_image(monkeypatch):
@@ -560,3 +578,27 @@ def test_rebuild_publish_requires_explicit_confirm_even_if_gates_skipped(monkeyp
         rebuild.main()
     assert exc.value.code == 2
     assert not calls
+
+
+def test_reducer_ignores_its_own_v2_rebuild_report_json(tmp_path):
+    module_name = 'hindsight_offline_v2_reduce_regression'
+    spec = importlib.util.spec_from_file_location(module_name, ROOT / 'hindsight_offline_v2_reduce.py')
+    assert spec is not None and spec.loader is not None
+    reducer = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = reducer
+    spec.loader.exec_module(reducer)
+
+    root = tmp_path / 'offline'
+    daily = root / 'daily' / '2026-10-07'
+    daily.mkdir(parents=True)
+    source = daily / 'hermes.json'
+    source.write_text(json.dumps({'llm_json': {}, 'unit': {'topic': 'hermes'}}), encoding='utf-8')
+    rebuild = root / 'v2_rebuild'
+    rebuild.mkdir()
+    (rebuild / 'v2-rebuild-interrupted.json').write_text('{"incomplete":', encoding='utf-8')
+
+    observations, stats = reducer.collect_observations(root)
+
+    assert stats['input_files'] == 1
+    assert stats['parse_errors'] == 0
+    assert observations == []

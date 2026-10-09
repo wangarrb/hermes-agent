@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path('/home/wyr/.hermes/scripts')
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module(name):
@@ -58,7 +58,7 @@ def test_get_llm_profile_config_beats_env_and_dotenv_profile_values(tmp_path, mo
     )
     monkeypatch.setenv('HERMES_HOME', str(hermes_home))
     monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(config_path))
-    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'xunfei-coding')
+    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'oneapi-auto-cheep')
 
     mod = load_module('hindsight_minimax_import')
 
@@ -80,12 +80,12 @@ def test_get_llm_profile_missing_config_uses_static_default_not_env_profile(tmp_
 
     mod = load_module('hindsight_minimax_import')
 
-    assert mod.get_llm_profile()['label'] == 'xunfei-coding'
+    assert mod.get_llm_profile()['label'] == 'oneapi-auto-cheep'
 
 
-def test_xunfei_profile_model_comes_only_from_dotenv(tmp_path, monkeypatch):
+def test_oneapi_auto_cheep_profile_model_can_be_overridden_by_dotenv(tmp_path, monkeypatch):
     config_path = tmp_path / 'pipeline_config.json'
-    config_path.write_text(json.dumps({'llm_profile': 'xunfei-coding'}), encoding='utf-8')
+    config_path.write_text(json.dumps({'llm_profile': 'oneapi-auto-cheep'}), encoding='utf-8')
     hermes_home = tmp_path / 'hermes'
     hermes_home.mkdir()
     (hermes_home / '.env').write_text(
@@ -101,8 +101,25 @@ def test_xunfei_profile_model_comes_only_from_dotenv(tmp_path, monkeypatch):
     mod = load_module('hindsight_minimax_import')
     profile = mod.get_llm_profile()
 
-    assert 'model' not in mod.BUILTIN_LLM_PROFILES['xunfei-coding']
+    assert mod.BUILTIN_LLM_PROFILES['oneapi-auto-cheep']['model'] == 'auto_cheep_model'
     assert profile['model'] == 'dotenv-model'
+
+
+def test_legacy_xunfei_coding_profile_alias_resolves_to_oneapi_auto_cheep(tmp_path, monkeypatch):
+    hermes_home = tmp_path / 'hermes'
+    hermes_home.mkdir()
+    (hermes_home / '.env').write_text('ONEAPI_API_KEY=test-key\n', encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(tmp_path / 'missing.json'))
+    monkeypatch.delenv('HINDSIGHT_OFFLINE_LLM_PROFILE', raising=False)
+    monkeypatch.delenv('HINDSIGHT_OFFLINE_LLM_MODEL', raising=False)
+
+    mod = load_module('hindsight_minimax_import')
+    profile = mod.get_llm_profile('xunfei-coding')
+
+    assert profile['label'] == 'oneapi-auto-cheep'
+    assert profile['model'] == 'auto_cheep_model'
+    assert profile['base_url'] == 'http://127.0.0.1:3000/v1'
 
 
 def test_get_llm_profile_explicit_argument_and_env_model_override_config(tmp_path, monkeypatch):
@@ -113,7 +130,7 @@ def test_get_llm_profile_explicit_argument_and_env_model_override_config(tmp_pat
     (hermes_home / '.env').write_text('BAILIAN_API_KEY=test-key\n', encoding='utf-8')
     monkeypatch.setenv('HERMES_HOME', str(hermes_home))
     monkeypatch.setenv('HINDSIGHT_PIPELINE_CONFIG', str(config_path))
-    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'xunfei-coding')
+    monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_PROFILE', 'oneapi-auto-cheep')
     monkeypatch.setenv('HINDSIGHT_OFFLINE_LLM_MODEL', 'explicit-model')
 
     mod = load_module('hindsight_minimax_import')

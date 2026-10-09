@@ -49,6 +49,7 @@ def ns(**kw):
         execute=False,
         confirm=None,
         output_root=Path('/tmp/out'),
+        manual_review_enabled=False,
     )
     defaults.update(kw)
     return Namespace(**defaults)
@@ -80,6 +81,15 @@ def test_daily_plan_defaults_to_incremental_session_and_no_write():
     assert daily['command'][bank_idx + 1] == 'hermes'
 
 
+def test_daily_plan_does_not_auto_submit_manual_review_backlog():
+    mod = load_module()
+    plan = mod.build_plan(ns(mode='daily', execute=True, confirm='run-hindsight-pipeline'))
+    review = next(s for s in plan['steps'] if s['name'] == 'manual_review_sampling')
+    assert '--execute' not in review['command']
+    assert '--submit' not in review['command']
+
+
+
 def test_full_history_plan_forces_retain_state_ignore_and_includes_weekly_wiki():
     mod = load_module()
     plan = mod.build_plan(ns(mode='full', history='all', include_wiki=True))
@@ -92,6 +102,10 @@ def test_full_history_plan_forces_retain_state_ignore_and_includes_weekly_wiki()
     assert weekly['command'][bank_idx + 1] == 'hermes'
     assert 'wiki_auto_maintenance' in names(plan)
     assert 'conflict_audit' in names(plan)
+    step_names = names(plan)
+    assert step_names.count('v2_rebuild_gate') == 1
+    assert step_names.index('weekly_reflect') < step_names.index('v2_rebuild_gate')
+    assert step_names.index('native_consolidation_drain_after_weekly') < step_names.index('v2_rebuild_gate')
 
 
 def test_session_profile_mode_can_be_overridden_for_manifest_build():
@@ -204,3 +218,111 @@ def test_custom_bank_propagates_to_retain_and_reflect_steps():
     for step in (retain, daily, weekly):
         idx = step['command'].index('--bank')
         assert step['command'][idx + 1] == 'hermes_custom'
+
+
+def test_preflight_plan_does_not_include_observation_restore():
+    mod = load_module()
+    plan = mod.build_plan(ns(mode='preflight'))
+    assert names(plan) == ['preflight']
+    assert not plan['production_writes_possible']
+
+
+def test_pipeline_env_defers_wrapper_restore_and_uses_configured_api(monkeypatch):
+    mod = load_module()
+    monkeypatch.setattr(mod, 'get_cfg', lambda _args: {'api_url': 'http://hindsight.test:8888'})
+    monkeypatch.setattr(mod, 'consolidation_tuning', lambda _cfg: {
+        'consolidation_batch_size': 4,
+        'consolidation_llm_batch_size': 8,
+        'max_memories_per_round': 64,
+        'parallel_batches': 1,
+        'recall_budget': 8,
+        'source_facts_max_tokens': 1000,
+        'source_facts_max_tokens_per_observation': 500,
+    })
+    env = mod.pipeline_env(ns(mode='daily', execute=True))
+    assert env['HINDSIGHT_DEFER_OBSERVATIONS_RESTORE'] == '1'
+    assert env['HINDSIGHT_API_URL'] == 'http://hindsight.test:8888'
+    preflight_env = mod.pipeline_env(ns(mode='preflight', execute=False))
+    assert preflight_env.get('HINDSIGHT_DEFER_OBSERVATIONS_RESTORE') != '1'
+
+
+def test_execute_plan_restores_observations_after_later_step_failure(monkeypatch):
+    mod = load_module()
+    args = ns(mode='daily', execute=True, confirm='run-hindsight-pipeline')
+    monkeypatch.setattr(mod, 'bank_observations_state', lambda *_args: (False, False))
+    calls = []
+
+    def fake_run_command(cmd, env=None):
+        calls.append(list(cmd))
+        if cmd == ['daily']:
+            raise SystemExit(7)
+        return mod.subprocess.CompletedProcess(cmd, 0, stdout='{}', stderr='')
+
+    monkeypatch.setattr(mod, 'run_command', fake_run_command)
+    plan = {'steps': [
+        {'name': 'preflight', 'command': ['preflight']},
+        {'name': 'retain_session_manifest', 'command': ['retain']},
+        {'name': 'daily_reflect', 'command': ['daily']},
+        {'name': 'restore_observations_off', 'command': ['restore']},
+    ]}
+    try:
+        mod.execute_plan(plan, args)
+    except SystemExit as exc:
+        assert exc.code == 7
+    else:
+        raise AssertionError('expected the original daily-reflect failure')
+    assert ['restore'] in calls
+
+
+def test_restore_observations_off_patches_then_verifies_both_values(monkeypatch):
+    mod = load_module()
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            import json
+            return json.dumps(self.payload).encode()
+
+    def fake_urlopen(request, timeout):
+        calls.append(request)
+        if request.method == 'PATCH':
+            return Response({'config': {'enable_observations': False}})
+        return Response({'config': {'enable_observations': False}, 'overrides': {'enable_observations': False}})
+
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', fake_urlopen)
+    result = mod.restore_observations_off('http://hindsight.test:8888', 'hermes')
+    assert [request.method for request in calls] == ['PATCH', 'GET']
+    assert result == {'config_enable_observations': False, 'override_enable_observations': False}
+
+
+def test_restore_observations_off_fails_if_readback_is_inconsistent(monkeypatch):
+    mod = load_module()
+    responses = [
+        {'config': {'enable_observations': False}},
+        {'config': {'enable_observations': False}, 'overrides': {'enable_observations': True}},
+    ]
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            import json
+            return json.dumps(self.payload).encode()
+
+    monkeypatch.setattr(mod.urllib.request, 'urlopen', lambda *_args, **_kwargs: Response(responses.pop(0)))
+    try:
+        mod.restore_observations_off('http://hindsight.test:8888', 'hermes')
+    except RuntimeError as exc:
+        assert 'readback' in str(exc).lower()
+    else:
+        raise AssertionError('inconsistent bank settings must fail closed')

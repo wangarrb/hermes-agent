@@ -195,19 +195,27 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(pending, (int, float)) and int(pending) > 0:
                 processing_ops = (last.get("operations") or {}).get("processing", 0)
                 if isinstance(processing_ops, (int, float)) and int(processing_ops) == 0:
-                    if prev_pending is not None and int(pending) == prev_pending:
+                    # A trigger may complete synchronously without changing
+                    # pending_consolidation.  Clear the one-cycle guard once
+                    # that happens; otherwise triggered_this_cycle remains
+                    # true forever and the max-trigger stale exit can never
+                    # be reached.
+                    if triggered_this_cycle:
+                        triggered_this_cycle = False
+                        stall_count = 0
+                    elif prev_pending is not None and int(pending) == prev_pending:
                         stall_count += 1
                     else:
                         stall_count = 0
                     if stall_count >= int(args.stall_cycles) and not triggered_this_cycle:
                         if trigger_count >= int(args.max_triggers):
                             print(f"[trigger] max triggers ({args.max_triggers}) reached, pending_consolidation stuck at {pending}. "
-                                  f"Stats may be stale; exiting with ready=true to unblock pipeline.",
+                                  "Failing closed; do not unblock the publish pipeline.",
                                   file=sys.stderr, flush=True)
                             last["trigger_stale_exit"] = True
-                            last["ready"] = True
+                            last["ready"] = False
                             print(json.dumps(last, ensure_ascii=False, indent=2, sort_keys=True))
-                            return 0
+                            return 2
                         try:
                             resp = trigger_consolidation(
                                 args.api_url, args.tenant, args.bank,

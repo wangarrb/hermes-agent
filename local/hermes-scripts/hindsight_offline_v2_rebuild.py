@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,14 +25,15 @@ from typing import Any
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
 SCRIPT_DIR = HERMES_HOME / "scripts"
-DEFAULT_OUTPUT_DIR = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_rebuild"
-DEFAULT_CARDS_ROOT = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
+DEFAULT_OUTPUT_DIR = Path("/var/lib/hindsight-offline-reflect") / "v2_rebuild"
+DEFAULT_CARDS_ROOT = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
 DEFAULT_GENERIC_BENCH = HERMES_HOME / "hindsight" / "eval" / "benchmark_queries.jsonl"
 DEFAULT_LOCAL_BENCH = HERMES_HOME / "hindsight" / "eval" / "benchmark_queries.local.jsonl"
+DEFAULT_EMBEDDING_BASE_URL = os.environ.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
 
 
-def run_json(cmd: list[str], *, cwd: Path | None = None, timeout: int = 3600) -> dict[str, Any]:
-    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(cwd) if cwd else None, timeout=timeout)
+def run_json(cmd: list[str], *, cwd: Path | None = None, timeout: int = 3600, env: dict[str, str] | None = None) -> dict[str, Any]:
+    proc = subprocess.run(cmd, text=True, capture_output=True, cwd=str(cwd) if cwd else None, timeout=timeout, env=env)
     if proc.returncode != 0:
         raise RuntimeError(
             "command failed\n"
@@ -89,9 +92,27 @@ def eval_pair(label: str, bench: Path, cards_root: Path, out_dir: Path, *, api: 
     if not include_hindsight_observations:
         baseline_cmd.append("--no-hindsight-observations")
         cards_cmd.append("--no-hindsight-observations")
-    baseline = run_json(baseline_cmd, timeout=1800)
-    cards = run_json(cards_cmd, timeout=1800)
-    return baseline, cards
+    # 2026-09-30: eval recall hits the live API whose pgvector queries can block
+    # minutes on the HDD under IO pressure (observed 207s DB_WAITS during a
+    # rebuild). A single transient TimeoutError used to hard-fail the whole
+    # rebuild. Retry each eval once after a cool-down; per-request timeout is
+    # raised via HINDSIGHT_EVAL_REQUEST_TIMEOUT (set below) so a slow recall
+    # response no longer aborts the benchmark mid-run.
+    eval_env = {**os.environ, "HINDSIGHT_EVAL_REQUEST_TIMEOUT": "600"}
+    eval_timeout = 3600
+    attempts = 2
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            baseline = run_json(baseline_cmd, timeout=eval_timeout, env=eval_env)
+            cards = run_json(cards_cmd, timeout=eval_timeout, env=eval_env)
+            return baseline, cards
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            last_err = exc
+            if attempt < attempts:
+                print(f"[eval-retry] {label}: attempt {attempt} failed ({exc}); retrying in 60s", flush=True)
+                time.sleep(60)
+    raise last_err  # type: ignore[misc]
 
 
 def publish_safety_errors(args: argparse.Namespace) -> list[str]:
@@ -105,6 +126,17 @@ def publish_safety_errors(args: argparse.Namespace) -> list[str]:
     if args.skip_eval_gate:
         errors.append("publish with --skip-eval-gate is unsafe and blocked")
     return errors
+
+
+def reduce_parse_error_count(report: dict[str, Any]) -> int:
+    """Return reducer parse errors as a hard quality-gate input."""
+    stats = report.get("stats") if isinstance(report, dict) else None
+    if not isinstance(stats, dict):
+        raise ValueError("reducer report is missing stats")
+    value = stats.get("parse_errors")
+    if type(value) is not int or value < 0:
+        raise ValueError(f"reducer stats.parse_errors must be a non-negative integer, got {value!r}")
+    return value
 
 
 def main() -> None:
@@ -121,7 +153,10 @@ def main() -> None:
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--max-topics", type=int, default=30)
     ap.add_argument("--max-observations-per-card", type=int, default=120)
-    ap.add_argument("--embedding-provider", choices=["auto", "docker", "none"], default="auto")
+    ap.add_argument("--embedding-provider", choices=["ollama", "auto", "docker", "none"], default="ollama")
+    ap.add_argument("--embedding-model", default=os.environ.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL", "bge-m3"))
+    ap.add_argument("--embedding-base-url", default=DEFAULT_EMBEDDING_BASE_URL)
+    ap.add_argument("--embedding-batch-size", type=int, default=128)
     ap.add_argument("--skip-eval-gate", action="store_true", help="Publish without eval gate; not recommended")
     ap.add_argument("--allow-gate-blocked-publish", action="store_true", help="Still publish when the gate is blocked; for forced rebuilds only")
     ap.add_argument("--include-hindsight-observations-in-gate", action="store_true", help="Gate baseline includes already-published Hindsight observations; default excludes them for raw baseline isolation")
@@ -184,8 +219,15 @@ def main() -> None:
             str(args.max_observations_per_card),
             "--json",
         ]
-        reduce_report = run_json(reduce_cmd, timeout=600)
+        reduce_report = run_json(reduce_cmd, timeout=1800)
         report["steps"]["reduce"] = reduce_report
+        parse_errors = reduce_parse_error_count(reduce_report)
+        report["steps"]["reduce_quality"] = {
+            "parse_errors": parse_errors,
+            "passed": parse_errors == 0,
+        }
+        if parse_errors:
+            raise RuntimeError(f"reduce produced parse_errors={parse_errors}; refusing conflict/eval/publish")
 
         conflict_report = None
         conflict_pass = True
@@ -196,7 +238,7 @@ def main() -> None:
                 "--cards-root",
                 str(cards_root),
                 "--offline-root",
-                str(HERMES_HOME / "hindsight" / "offline_reflect"),
+                str(Path("/var/lib/hindsight-offline-reflect")),
                 "--output-dir",
                 str(out_dir / "conflict_audit"),
                 "--bank",
@@ -205,7 +247,9 @@ def main() -> None:
                 args.conflict_block_severity,
                 "--json",
             ]
-            conflict_report = run_json(conflict_cmd, timeout=1200)
+            # Large offline roots can take >20 minutes to scan; fail closed, but
+            # don't misclassify a progressing audit as a broken report.
+            conflict_report = run_json(conflict_cmd, timeout=3600)
             report["steps"]["conflict_audit"] = conflict_report
             conflict_pass = conflict_report.get("decision") == "pass"
         else:
@@ -289,9 +333,15 @@ def main() -> None:
                 "--replace",
                 "--embedding-provider",
                 args.embedding_provider,
+                "--embedding-model",
+                args.embedding_model,
+                "--embedding-base-url",
+                args.embedding_base_url,
+                "--embedding-batch-size",
+                str(args.embedding_batch_size),
                 "--json",
             ]
-            publish_report = run_json(publish_cmd, timeout=1800)
+            publish_report = run_json(publish_cmd, timeout=3600)
             report["steps"]["publish"] = publish_report
             report["published"] = publish_report.get("inserted_observations", 0) > 0
         else:
@@ -308,7 +358,10 @@ def main() -> None:
         # Post-publish verification uses default V2 recall, including Hindsight observations and local cards.
         audit_cmd = [sys.executable, str(SCRIPT_DIR / "hindsight_offline_v2_audit.py"), "--api", args.api, "--bank", args.bank, "--json"]
         try:
-            report["steps"]["audit"] = run_json(audit_cmd, timeout=1200)
+            # This audit scans canonical memory and can exceed 20 minutes at
+            # current bank size; allow it to finish rather than report a false
+            # post-publish verification failure.
+            report["steps"]["audit"] = run_json(audit_cmd, timeout=3600)
         except Exception as e:
             report["errors"].append({"step": "audit", "error": repr(e)})
 

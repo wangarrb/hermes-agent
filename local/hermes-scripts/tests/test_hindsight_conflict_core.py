@@ -1,19 +1,25 @@
 import importlib.util
 from pathlib import Path
 
-ROOT = Path('/home/wyr/.hermes/scripts')
+ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('hindsight_conflict_core', ROOT / 'hindsight_conflict_core.py')
 core = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(core)
 
 
 def test_detect_contamination_flags_heartbeat_and_handoff():
-    text = 'CONTEXT COMPACTION — REFERENCE ONLY\nHEARTBEAT: still running\nnormal fact'
+    text = '[CONTEXT COMPACTION] — REFERENCE ONLY\nHEARTBEAT: still running\nnormal fact'
     hits = core.detect_contamination(text)
     names = {h['name'] for h in hits}
     assert 'context_compaction' in names
     assert 'heartbeat' in names
     assert max(h['severity'] for h in hits) in {'P0', 'P1', 'P2'}
+
+
+def test_technical_mentions_are_not_prompt_or_compaction_leaks():
+    text = 'Context compaction thresholds were updated; Qwen/GLM use <think> tags in technical documentation.'
+    hits = core.detect_contamination(text)
+    assert not any(h['severity'] == 'P1' for h in hits)
 
 
 def test_extract_source_sessions_from_import_bundle_header():

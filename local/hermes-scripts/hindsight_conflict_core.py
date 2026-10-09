@@ -21,7 +21,7 @@ NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?\s*(?:
 SEVERITY_ORDER = {"OK": 0, "P3": 1, "P2": 2, "P1": 3, "P0": 4}
 
 CONTAMINATION_PATTERNS = [
-    ("context_compaction", re.compile(r"(?m)^\s*(?:\[?CONTEXT COMPACTION|---\s*END OF CONTEXT SUMMARY)", re.I), "P1"),
+    ("context_compaction", re.compile(r"(?m)^\s*(?:\[\s*CONTEXT COMPACTION(?:\]|:)|---\s*END OF CONTEXT SUMMARY\s*-*\s*$)", re.I), "P1"),
     # Actual leaked heartbeat lines are usually line-leading markers. Merely
     # mentioning HEARTBEAT as a known pollution class is a legitimate technical fact.
     ("heartbeat", re.compile(r"(?m)^\s*(?:\[[^\]]+\]\s*)?HEARTBEAT\s*[:|\-]", re.I), "P1"),
@@ -30,7 +30,7 @@ CONTAMINATION_PATTERNS = [
     ("tool_log_mention", re.compile(r"PENDING_BREAKDOWN|WORKER_TASK|STREAMING RETAIN COMPLETE|docker logs|tcsetattr|exit code 130", re.I), "P3"),
     ("json_retry_loop_mention", re.compile(r"JSON parse retry|STUCK|payload_null|rate limited|HTTP 429", re.I), "P3"),
     ("raw_stack_trace", re.compile(r"Traceback \(most recent call last\)|ModuleNotFoundError|PermissionError|FileNotFoundError", re.I), "P2"),
-    ("prompt_leak", re.compile(r"<think>|Let me analyze the input material|strict JSON in the specified schema", re.I), "P1"),
+    ("prompt_leak", re.compile(r"<think>\s*[^<\n]{20,}</think>|Let me analyze the input material|strict JSON in the specified schema", re.I), "P1"),
 ]
 
 GENERIC_TOKENS = {

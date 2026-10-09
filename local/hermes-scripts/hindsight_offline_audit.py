@@ -32,7 +32,7 @@ HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
 DEFAULT_DB = HERMES_HOME / "state.db"
 DEFAULT_PROGRESS = HERMES_HOME / "hindsight" / "sqlite_import_progress.json"
-DEFAULT_OFFLINE_PROGRESS = HERMES_HOME / "hindsight" / "offline_reflect" / "offline_reflect_progress.json"
+DEFAULT_OFFLINE_PROGRESS = Path("/var/lib/hindsight-offline-reflect") / "offline_reflect_progress.json"
 
 
 def load_json(path: Path, default: Any) -> Any:

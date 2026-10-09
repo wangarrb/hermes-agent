@@ -131,7 +131,9 @@ OLLAMA_MODEL = os.environ.get("HINDSIGHT_LOCAL_OLLAMA_MODEL", "qwen3.5:9b-local"
 MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
 MINIMAX_MODEL = "MiniMax-M2.7"
 # Static fallback only when pipeline_config.json has no logical profile.
-DEFAULT_OFFLINE_LLM_PROFILE = "xunfei-coding"
+# This profile uses local One API + auto_cheep_model; the old xunfei-coding
+# name remains only as a compatibility alias below.
+DEFAULT_OFFLINE_LLM_PROFILE = "oneapi-auto-cheep"
 DEFAULT_PAID_LLM_CONCURRENCY = 8
 
 
@@ -197,9 +199,10 @@ BUILTIN_LLM_PROFILES: dict[str, dict[str, Any]] = {
         "response_format": True,
         "strict_schema": False,
     },
-    "xunfei-coding": {
-        "label": "xunfei-coding",
+    "oneapi-auto-cheep": {
+        "label": "oneapi-auto-cheep",
         "hindsight_provider": "openai",
+        "model": "auto_cheep_model",
         "base_url": "http://127.0.0.1:3000/v1",
         "api_key_envs": ["ONEAPI_API_KEY"],
         "response_format": True,
@@ -233,6 +236,9 @@ PROFILE_ALIASES = {
     "opencode-go": "opencode-go-deepseek-v4-flash",
     "opencode-free": "opencode-free-deepseek-v4-flash-free",
     "zen-free": "opencode-free-deepseek-v4-flash-free",
+    # Backward compatibility for old pipeline configs; canonical name is
+    # oneapi-auto-cheep because this route is local One API, not Xunfei.
+    "xunfei-coding": "oneapi-auto-cheep",
 }
 
 
@@ -1367,6 +1373,20 @@ def run_session_manifest_retain_llm(args: argparse.Namespace) -> int:
             print(f"WARNING: --no-wait used; remaining queue will be processed after restore by the default remote profile ({DEFAULT_OFFLINE_LLM_PROFILE}), not {label}")
     finally:
         if no_switch:
+            # Native deployment: container is NOT recreated, but the bank config
+            # enable_observations=True we patched before the run persists in the DB.
+            # Restore it (cheap API PATCH) so observations stay off outside the
+            # offline window (design: enabled only during offline runs).
+            # DEFERRED MODE: the full pipeline has up to three drain steps that
+            # run AFTER this wrapper returns; with observations restored here the
+            # next drain would see status=disabled and block forever. When
+            # HINDSIGHT_DEFER_OBSERVATIONS_RESTORE=1 the pipeline owns the final
+            # restore and we leave the bank enabled.
+            if os.environ.get("HINDSIGHT_DEFER_OBSERVATIONS_RESTORE", "").strip() not in {"1", "true", "yes"}:
+                try:
+                    patch_bank_config(enable_observations=False, bank=target_bank)
+                except Exception as e:
+                    print(f"WARNING: failed to restore bank observations=off for {target_bank}: {e}", file=sys.stderr)
             print("--no-switch-mode: skipping normal-local restore (container unchanged)")
         else:
             print("restoring precision remote mode...")
@@ -1465,6 +1485,20 @@ def run_offline_reflect_minimax(args: argparse.Namespace) -> int:
         return proc.returncode
     finally:
         if no_switch:
+            # Native deployment: container is NOT recreated, but the bank config
+            # enable_observations=True we patched before the run persists in the DB.
+            # Restore it (cheap API PATCH) so observations stay off outside the
+            # offline window (design: enabled only during offline runs).
+            # DEFERRED MODE: the full pipeline has up to three drain steps that
+            # run AFTER this wrapper returns; with observations restored here the
+            # next drain would see status=disabled and block forever. When
+            # HINDSIGHT_DEFER_OBSERVATIONS_RESTORE=1 the pipeline owns the final
+            # restore and we leave the bank enabled.
+            if os.environ.get("HINDSIGHT_DEFER_OBSERVATIONS_RESTORE", "").strip() not in {"1", "true", "yes"}:
+                try:
+                    patch_bank_config(enable_observations=False, bank=target_bank)
+                except Exception as e:
+                    print(f"WARNING: failed to restore bank observations=off for {target_bank}: {e}", file=sys.stderr)
             print("--no-switch-mode: skipping normal-local restore (container unchanged)")
         else:
             print("restoring precision remote mode...")

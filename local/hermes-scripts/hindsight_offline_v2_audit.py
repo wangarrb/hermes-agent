@@ -35,7 +35,7 @@ HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
 DEFAULT_API = HINDSIGHT_DEFAULT_API
 DEFAULT_BANK = "hermes"
-DEFAULT_OFFLINE_ROOT = HERMES_HOME / "hindsight" / "offline_reflect"
+DEFAULT_OFFLINE_ROOT = Path("/var/lib/hindsight-offline-reflect")
 
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 

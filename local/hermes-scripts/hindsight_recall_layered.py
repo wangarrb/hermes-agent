@@ -24,8 +24,14 @@ from typing import Any
 
 DEFAULT_API = "http://127.0.0.1:8888"
 DEFAULT_BANK = "hermes"
-DEFAULT_REQUEST_TIMEOUT = 120.0
-DEFAULT_CARDS_ROOT = Path.home() / ".hermes" / "hindsight" / "offline_reflect" / "v2_cards"
+# 2026-09-30: allow callers (e.g. hindsight_offline_v2_rebuild eval) to raise the
+# per-request timeout via env — pgvector recall on the HDD can legitimately take
+# minutes under IO pressure. Default unchanged (120s) when env is unset.
+import os as _os
+DEFAULT_REQUEST_TIMEOUT = float(
+    _os.environ.get("HINDSIGHT_EVAL_REQUEST_TIMEOUT", "120.0")
+) or 120.0
+DEFAULT_CARDS_ROOT = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
 DEFAULT_REPAIR_SIDECAR_ROOT = Path.home() / ".hermes" / "hindsight" / "review_repair" / "approved"
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-\.]+|[\u4e00-\u9fff]{2,}")

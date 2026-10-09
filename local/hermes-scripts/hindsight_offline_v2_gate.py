@@ -33,8 +33,8 @@ except Exception:  # pragma: no cover - gate still reports missing dependency vi
 
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
-DEFAULT_CARDS_ROOT = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
-DEFAULT_OUTPUT_DIR = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_publish_gate"
+DEFAULT_CARDS_ROOT = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
+DEFAULT_OUTPUT_DIR = Path("/var/lib/hindsight-offline-reflect") / "v2_publish_gate"
 
 
 def slugify(text: str, *, prefix: str = "item") -> str:

@@ -17,6 +17,8 @@ import os
 import shlex
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -86,6 +88,16 @@ def py(script: str, args: argparse.Namespace | None = None) -> str:
 def pipeline_env(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
     t = consolidation_tuning(get_cfg(args))
+    cfg = get_cfg(args)
+    env["HINDSIGHT_API_URL"] = str(cfg.get("api_url") or env.get("HINDSIGHT_API_URL") or "http://127.0.0.1:8888")
+    # The wrapper's finally block must leave observations enabled until this
+    # orchestrator has completed all downstream drain/gate steps.
+    env.pop("HINDSIGHT_DEFER_OBSERVATIONS_RESTORE", None)
+    opens_observation_window = args.mode == "daily" or (
+        args.mode == "full" and not bool(getattr(args, "skip_daily", False))
+    )
+    if bool(getattr(args, "execute", False)) and opens_observation_window:
+        env["HINDSIGHT_DEFER_OBSERVATIONS_RESTORE"] = "1"
     env.update({
         "HINDSIGHT_NATIVE_CONSOLIDATION_BATCH_SIZE": str(t["consolidation_batch_size"]),
         "HINDSIGHT_NATIVE_CONSOLIDATION_LLM_BATCH_SIZE": str(t["consolidation_llm_batch_size"]),
@@ -229,14 +241,14 @@ def manual_review_sample_step(args: argparse.Namespace) -> Step:
         str(path_from_config(get_cfg(args), "manifest_dir")),
         "--bank",
         args.bank,
-        "--execute",
-        "--submit",
     ]
+    if getattr(args, "manual_review_enabled", False):
+        cmd += ["--execute", "--submit"]
     return Step(
         name="manual_review_sampling",
-        description="Importance-score the manual_review backlog, sample top-N, LLM-judge each, and retain promoted records (writes Hindsight only for promoted docs).",
+        description="Sample manual_review backlog; paid review and retain are opt-in because ambiguous historical sessions are not production input by default.",
         command=cmd,
-        mutating=bool(args.execute),
+        mutating=bool(args.execute and getattr(args, "manual_review_enabled", False)),
         writes_local=True,
         consumes={"manifest": "build_session_manifest"},
     )
@@ -454,6 +466,71 @@ def proposal_review_step(args: argparse.Namespace) -> Step:
     )
 
 
+def restore_observations_step(args: argparse.Namespace) -> Step:
+    """Turn the bank's enable_observations back off once the offline window ends.
+
+    The retain step enables observations so native consolidation can drain the
+    freshly extracted source facts. Every downstream quality gate (v2 rebuild,
+    conflict audit, weekly) needs that drain to have happened, so the restore
+    must be the LAST step of the plan — not the end of each wrapper invocation.
+    """
+    code = (
+        "import json,sys\n"
+        f"sys.path.insert(0,{str(SCRIPT_DIR)!r})\n"
+        "import hindsight_memory_pipeline as pipeline\n"
+        "print(json.dumps(pipeline.restore_observations_off(sys.argv[1],sys.argv[2])))\n"
+    )
+    api_url = str(get_cfg(args).get("api_url") or "http://127.0.0.1:8888")
+    return Step(
+        name="restore_observations_off",
+        description="Restore bank enable_observations=false and verify config/override readback.",
+        command=[sys.executable, "-c", code, api_url, str(args.bank)],
+        mutating=True,
+        writes_local=False,
+    )
+
+
+def _bank_config_url(api_url: str, bank: str) -> str:
+    return f"{api_url.rstrip('/')}/v1/default/banks/{urllib.parse.quote(bank, safe='')}/config"
+
+
+def bank_observations_state(api_url: str, bank: str, *, timeout: int = 8) -> tuple[bool, bool | None]:
+    request = urllib.request.Request(
+        _bank_config_url(api_url, bank),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    config = payload.get("config") if isinstance(payload, dict) else None
+    overrides = payload.get("overrides") if isinstance(payload, dict) else None
+    if not isinstance(config, dict) or not isinstance(overrides, dict):
+        raise RuntimeError("bank config readback is missing config/overrides")
+    configured = config.get("enable_observations")
+    override = overrides.get("enable_observations")
+    if not isinstance(configured, bool) or (override is not None and not isinstance(override, bool)):
+        raise RuntimeError("bank config readback has unknown enable_observations values")
+    return configured, override
+
+
+def restore_observations_off(api_url: str, bank: str, *, timeout: int = 60) -> dict[str, bool]:
+    request = urllib.request.Request(
+        _bank_config_url(api_url, bank),
+        data=json.dumps({"updates": {"enable_observations": False}}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="PATCH",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
+    configured, override = bank_observations_state(api_url, bank, timeout=timeout)
+    if configured is not False or override is not False:
+        raise RuntimeError(
+            "bank observations restore readback mismatch: "
+            f"config={configured!r}, overrides={override!r}"
+        )
+    return {"config_enable_observations": configured, "override_enable_observations": override}
+
+
 def wiki_step(args: argparse.Namespace) -> Step:
     cmd = [
         sys.executable,
@@ -541,7 +618,11 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 name="native_consolidation_drain_after_daily",
                 description="Wait until Hindsight native source-fact consolidation is drained after daily/session ingestion, before V2 quality gates.",
             ))
-        steps.append(v2_rebuild_step(args))
+        # Full mode must finish weekly all-history backfill before any
+        # publish-capable V2 reduction. Daily-only mode still gates directly
+        # after its own native-consolidation drain.
+        if args.mode == "daily":
+            steps.append(v2_rebuild_step(args))
     if args.mode in {"weekly", "full"}:
         if wait_native_consolidation and (args.mode == "weekly" or getattr(args, "skip_daily", False)):
             steps.append(native_consolidation_drain_step(
@@ -563,6 +644,17 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 steps.append(proposal_review_step(args))
     if args.mode == "full" and args.include_wiki:
         steps.append(wiki_step(args))
+    # Restore bank enable_observations=false ONLY after every drain step has run.
+    # Design: observations are enabled for the offline window (retain -> native
+    # consolidation drain -> v2/weekly gates) and off the rest of the time. The
+    # per-invocation restore in hindsight_minimax_import.py would close the gate
+    # right after retain, making the following drain wait forever on a
+    # status=disabled consolidation.
+    opens_observation_window = args.mode == "daily" or (
+        args.mode == "full" and not bool(getattr(args, "skip_daily", False))
+    )
+    if opens_observation_window:
+        steps.append(restore_observations_step(args))
     tuning = consolidation_tuning(cfg)
     return {
         "schema_version": "hindsight-memory-pipeline-plan-v2",
@@ -623,53 +715,94 @@ def execute_plan(plan: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     run_report: dict[str, Any] = {"started_at": iso_now(), "steps": [], "mode": args.mode, "history": args.history, "skip_daily": bool(getattr(args, "skip_daily", False)), "config_path": str(get_cfg(args).get("config_path")), "consolidation_tuning": consolidation_tuning(get_cfg(args)), "wait_native_consolidation": not bool(getattr(args, "no_wait_native_consolidation", False))}
     manifest_path: str | None = None
     proposal_jsons: list[str] = []
-    for step in plan["steps"]:
-        cmd = list(step["command"])
-        if "{{manifest}}" in cmd:
-            if not manifest_path:
-                raise SystemExit("retain step requires manifest from build_session_manifest")
-            cmd = [manifest_path if x == "{{manifest}}" else x for x in cmd]
-        if "{{proposal_jsons}}" in cmd:
-            if not proposal_jsons:
-                run_report["steps"].append({"name": step["name"], "status": "skipped", "reason": "no proposal jsons generated in this run"})
+    restore_step = next((step for step in plan["steps"] if step["name"] == "restore_observations_off"), None)
+    observation_window_may_be_open = False
+    original_failure: tuple[BaseException, Any] | None = None
+    cleanup_failure: tuple[BaseException, Any] | None = None
+    try:
+        for step in plan["steps"]:
+            if step["name"] == "restore_observations_off":
+                # This is a finally action, not a normal pipeline stage.
                 continue
-            expanded: list[str] = []
-            for x in cmd:
-                if x == "{{proposal_jsons}}":
-                    for proposal_json in proposal_jsons:
-                        expanded += ["--proposal-json", proposal_json]
-                else:
-                    expanded.append(x)
-            cmd = expanded
-        if "{{approved_index}}" in cmd:
-            approved_files = sorted(DEFAULT_APPROVED_ROOT.glob("*-observations_index.jsonl"))
-            if not approved_files:
-                run_report["steps"].append({"name": step["name"], "status": "skipped", "reason": "no approved sidecar indexes"})
+            cmd = list(step["command"])
+            if "{{manifest}}" in cmd:
+                if not manifest_path:
+                    raise SystemExit("retain step requires manifest from build_session_manifest")
+                cmd = [manifest_path if x == "{{manifest}}" else x for x in cmd]
+            if "{{proposal_jsons}}" in cmd:
+                if not proposal_jsons:
+                    run_report["steps"].append({"name": step["name"], "status": "skipped", "reason": "no proposal jsons generated in this run"})
+                    continue
+                expanded: list[str] = []
+                for x in cmd:
+                    if x == "{{proposal_jsons}}":
+                        for proposal_json in proposal_jsons:
+                            expanded += ["--proposal-json", proposal_json]
+                    else:
+                        expanded.append(x)
+                cmd = expanded
+            if "{{approved_index}}" in cmd:
+                approved_files = sorted(DEFAULT_APPROVED_ROOT.glob("*-observations_index.jsonl"))
+                if not approved_files:
+                    run_report["steps"].append({"name": step["name"], "status": "skipped", "reason": "no approved sidecar indexes"})
+                    continue
+                for approved in approved_files:
+                    stem = approved.name.replace("-observations_index.jsonl", "")
+                    c = [str(approved) if x == "{{approved_index}}" else x for x in cmd]
+                    c += ["--stem", stem]
+                    proc = run_command(c, env=pipeline_env(args))
+                    parsed = parse_last_json(proc.stdout or "")
+                    proposal_json = ((parsed.get("paths") or {}).get("proposal_json")) if isinstance(parsed, dict) else None
+                    if proposal_json:
+                        proposal_jsons.append(str(proposal_json))
+                    run_report["steps"].append({
+                        "name": step["name"],
+                        "status": "ok",
+                        "approved_index": str(approved),
+                        "returncode": proc.returncode,
+                        "proposal_json": proposal_json,
+                    })
                 continue
-            for approved in approved_files:
-                stem = approved.name.replace("-observations_index.jsonl", "")
-                c = [str(approved) if x == "{{approved_index}}" else x for x in cmd]
-                c += ["--stem", stem]
-                proc = run_command(c, env=pipeline_env(args))
-                parsed = parse_last_json(proc.stdout or "")
-                proposal_json = ((parsed.get("paths") or {}).get("proposal_json")) if isinstance(parsed, dict) else None
-                if proposal_json:
-                    proposal_jsons.append(str(proposal_json))
-                run_report["steps"].append({
-                    "name": step["name"],
-                    "status": "ok",
-                    "approved_index": str(approved),
-                    "returncode": proc.returncode,
-                    "proposal_json": proposal_json,
-                })
-            continue
-        proc = run_command(cmd, env=pipeline_env(args))
-        parsed = parse_last_json(proc.stdout or "")
-        if step["name"] == "build_session_manifest":
-            manifest_path = str(((parsed.get("paths") or {}).get("manifest")) or "")
-            if not manifest_path:
-                raise SystemExit("build_session_manifest did not return paths.manifest")
-        run_report["steps"].append({"name": step["name"], "status": "ok", "returncode": proc.returncode, "parsed_keys": sorted(parsed.keys())[:20]})
+            if step["name"] == "retain_session_manifest":
+                if restore_step is None:
+                    raise RuntimeError("retain step has no observation cleanup step; refusing execution")
+                cfg = get_cfg(args)
+                api_url = str(cfg.get("api_url") or "http://127.0.0.1:8888")
+                configured, override = bank_observations_state(api_url, str(args.bank))
+                if configured is not False or override not in (False, None):
+                    raise RuntimeError(
+                        "refusing to open observation window from a non-disabled/unknown bank state: "
+                        f"config={configured!r}, overrides={override!r}"
+                    )
+                # Set before invoking the wrapper: it may PATCH true and then fail.
+                observation_window_may_be_open = True
+            proc = run_command(cmd, env=pipeline_env(args))
+            parsed = parse_last_json(proc.stdout or "")
+            if step["name"] == "build_session_manifest":
+                manifest_path = str(((parsed.get("paths") or {}).get("manifest")) or "")
+                if not manifest_path:
+                    raise SystemExit("build_session_manifest did not return paths.manifest")
+            run_report["steps"].append({"name": step["name"], "status": "ok", "returncode": proc.returncode, "parsed_keys": sorted(parsed.keys())[:20]})
+    except BaseException as exc:
+        original_failure = (exc, exc.__traceback__)
+    finally:
+        if observation_window_may_be_open:
+            try:
+                if restore_step is None:
+                    raise RuntimeError("observation cleanup step is missing")
+                proc = run_command(list(restore_step["command"]), env=pipeline_env(args))
+                run_report["steps"].append({"name": restore_step["name"], "status": "ok", "returncode": proc.returncode})
+            except BaseException as exc:
+                cleanup_failure = (exc, exc.__traceback__)
+    if original_failure:
+        if cleanup_failure:
+            raise RuntimeError(
+                "pipeline failed and observation cleanup also failed: "
+                f"pipeline={original_failure[0]!r}; cleanup={cleanup_failure[0]!r}"
+            ) from original_failure[0]
+        raise original_failure[0].with_traceback(original_failure[1])
+    if cleanup_failure:
+        raise cleanup_failure[0].with_traceback(cleanup_failure[1])
     run_report["finished_at"] = iso_now()
     run_report["status"] = "ok"
     DEFAULT_STATUS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -679,11 +812,13 @@ def execute_plan(plan: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     return run_report
 
 
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Run/plan Hindsight memory pipeline modes: daily, weekly, full")
     ap.add_argument("mode", choices=["preflight", "daily", "weekly", "full"])
     ap.add_argument("--config", type=Path, help="Path to pipeline_config.json; defaults to $HINDSIGHT_PIPELINE_CONFIG or ~/.hermes/hindsight/pipeline_config.json")
     ap.add_argument("--history", choices=["incremental", "all"], default="incremental", help="incremental uses submit_state skip; all ignores submit_state and re-retains all manifest records")
+    ap.add_argument("--enable-manual-review", dest="manual_review_enabled", action="store_true", help="allow paid LLM review and automatic submit of manual_review records")
     ap.add_argument("--bank", default=None)
     ap.add_argument("--llm-profile", default=None)
     ap.add_argument("--prefilter", choices=["safe", "balanced", "strict"], default="safe")

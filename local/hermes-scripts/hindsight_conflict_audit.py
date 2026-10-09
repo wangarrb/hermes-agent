@@ -30,8 +30,8 @@ from hindsight_native_client import DEFAULT_API, HindsightNativeClient
 
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
-DEFAULT_CARDS_ROOT = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
-DEFAULT_OFFLINE_ROOT = HERMES_HOME / "hindsight" / "offline_reflect"
+DEFAULT_CARDS_ROOT = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
+DEFAULT_OFFLINE_ROOT = Path("/var/lib/hindsight-offline-reflect")
 DEFAULT_OUTPUT_DIR = DEFAULT_OFFLINE_ROOT / "conflict_audit"
 API_SCAN_ERRORS: list[str] = []
 
@@ -220,22 +220,26 @@ def fact_outlier_cases(bank: str, *, api: str = DEFAULT_API, client: HindsightNa
         return []
     counts: Counter[str] = Counter()
     pollutants: Counter[str] = Counter()
+    high_pollutants: Counter[str] = Counter()
     for row in rows:
         doc_id = str(row.get("document_id") or "")
         if not doc_id:
             continue
         counts[doc_id] += 1
-        if core.detect_contamination(str(row.get("text") or "")):
+        hits = core.detect_contamination(str(row.get("text") or ""))
+        if hits:
             pollutants[doc_id] += 1
+            if any(core.severity_at_least(h.get("severity", "OK"), "P1") for h in hits):
+                high_pollutants[doc_id] += 1
     candidates = [
         (doc_id, facts, pollutants.get(doc_id, 0))
         for doc_id, facts in counts.items()
-        if facts >= threshold or pollutants.get(doc_id, 0) > 0
+        if facts >= threshold
     ]
     candidates.sort(key=lambda x: (-x[2], -x[1], x[0]))
     cases: list[dict[str, Any]] = []
     for doc_id, facts, pollutant_count in candidates[:max_cases]:
-        severity = "P1" if pollutant_count > 0 else "P2"
+        severity = "P1" if high_pollutants.get(doc_id, 0) > 0 else "P2"
         cases.append(core._case(  # type: ignore[attr-defined]
             "source_document_fact_outlier",
             severity,

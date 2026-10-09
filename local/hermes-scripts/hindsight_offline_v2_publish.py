@@ -17,11 +17,14 @@ import argparse
 import hashlib
 import json
 import os
+import math
 import re
 import shlex
 import subprocess
 import sys
 import uuid
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,9 +40,10 @@ except ModuleNotFoundError:
 
 HOME = Path.home()
 HERMES_HOME = HOME / ".hermes"
-DEFAULT_CARDS_ROOT = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_cards"
-DEFAULT_BACKUP_DIR = HERMES_HOME / "hindsight" / "offline_reflect" / "v2_publish_backups"
+DEFAULT_CARDS_ROOT = Path("/var/lib/hindsight-offline-reflect") / "v2_cards"
+DEFAULT_BACKUP_DIR = Path("/var/lib/hindsight-offline-reflect") / "v2_publish_backups"
 DEFAULT_DB_DSN = "dbname=hindsight user=hindsight host=/tmp port=5432"
+DEFAULT_EMBEDDING_BASE_URL = os.environ.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
 CANONICAL_PREFIX = "hermes-offline-canonical::"
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 
@@ -218,6 +222,70 @@ def source_memory_uuid_array(obs: dict[str, Any]) -> list[str]:
     return [x for x in ids if not (x.lower() in seen or seen.add(x.lower()))][:40]
 
 
+def ollama_encode(
+    texts: list[str],
+    *,
+    model: str,
+    base_url: str = DEFAULT_EMBEDDING_BASE_URL,
+    batch_size: int = 128,
+    timeout: int = 300,
+) -> list[list[float]]:
+    """Encode through the active native OpenAI-compatible embedding service.
+
+    Hindsight now runs as native systemd and its configured embedding backend is
+    Ollama at /v1/embeddings. Fail closed on any transport, count, ordering, or
+    dimensionality error; NULL embeddings are never a valid publish fallback.
+    """
+    if not texts:
+        return []
+    url = base_url.rstrip("/") + "/embeddings"
+    output: list[list[float]] = []
+    expected_dimension: int | None = None
+    for start in range(0, len(texts), max(1, int(batch_size))):
+        batch = texts[start:start + max(1, int(batch_size))]
+        payload = json.dumps({"model": model, "input": batch}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError(f"native embedding request failed at batch {start}: {exc}") from exc
+        try:
+            obj = json.loads(body)
+            rows = list(obj.get("data") or [])
+            indices: list[int] = []
+            for row in rows:
+                if not isinstance(row, dict) or type(row.get("index")) is not int:
+                    raise ValueError("embedding row has a missing/invalid index")
+                indices.append(row["index"])
+            if sorted(indices) != list(range(len(batch))):
+                raise ValueError(f"embedding indices must cover 0..{len(batch) - 1} exactly; got {indices!r}")
+            rows_by_index = {row["index"]: row for row in rows}
+            rows = [rows_by_index[index] for index in range(len(batch))]
+            vectors = [list(row["embedding"]) for row in rows]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError(f"invalid native embedding response at batch {start}: {exc}") from exc
+        if len(vectors) != len(batch):
+            raise RuntimeError(f"native embedding count mismatch at batch {start}: got {len(vectors)}, expected {len(batch)}")
+        for vector in vectors:
+            if not vector:
+                raise RuntimeError(f"native embedding returned an empty vector at batch {start}")
+            dimension = len(vector)
+            if expected_dimension is None:
+                expected_dimension = dimension
+            if dimension != expected_dimension:
+                raise RuntimeError(f"native embedding dimension mismatch: got {dimension}, expected {expected_dimension}")
+        output.extend(vectors)
+    if len(output) != len(texts):
+        raise RuntimeError(f"native embedding total mismatch: got {len(output)}, expected {len(texts)}")
+    return output
+
+
 def docker_encode(texts: list[str], *, model: str, batch_size: int = 64) -> list[list[float]]:
     code = r'''
 import json, os, sys, warnings
@@ -247,17 +315,44 @@ print(json.dumps({"dimension": len(out[0]) if out else 0, "embeddings": out}))
     return embeddings
 
 
-def maybe_embeddings(texts: list[str], provider: str, model: str) -> tuple[list[list[float] | None], str]:
-    if provider == "none" or not texts:
+def maybe_embeddings(
+    texts: list[str],
+    provider: str,
+    model: str,
+    *,
+    base_url: str = DEFAULT_EMBEDDING_BASE_URL,
+    batch_size: int = 128,
+) -> tuple[list[list[float] | None], str]:
+    if provider == "none":
         return [None for _ in texts], "none"
-    if provider in {"auto", "docker"}:
-        try:
-            return docker_encode(texts, model=model), "docker"
-        except Exception as e:
-            if provider == "docker":
-                raise
-            print(f"WARN: docker embeddings unavailable, falling back to NULL embeddings: {e}", file=sys.stderr)
-    return [None for _ in texts], "none"
+    if not texts:
+        return [], provider
+    if provider in {"auto", "ollama"}:
+        return ollama_encode(texts, model=model, base_url=base_url, batch_size=batch_size), "ollama"
+    if provider == "docker":
+        return docker_encode(texts, model=model), "docker"
+    raise ValueError(f"unsupported embedding provider: {provider}")
+
+
+def validate_embeddings(embeddings: list[list[float] | None], expected_count: int) -> int | None:
+    """Require a complete, finite, fixed-width embedding matrix before DB writes."""
+    if len(embeddings) != expected_count:
+        raise RuntimeError(f"embedding count mismatch: got {len(embeddings)}, expected {expected_count}")
+    if expected_count == 0:
+        return None
+    dimension: int | None = None
+    for index, vector in enumerate(embeddings):
+        if vector is None:
+            raise RuntimeError(f"NULL embedding at observation index {index}; canonical publish requires embeddings")
+        if not isinstance(vector, (list, tuple)) or not vector:
+            raise RuntimeError(f"missing/empty embedding at observation index {index}")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in vector):
+            raise RuntimeError(f"invalid non-finite/nonnumeric embedding value at observation index {index}")
+        if dimension is None:
+            dimension = len(vector)
+        elif len(vector) != dimension:
+            raise RuntimeError(f"embedding dimension mismatch at observation index {index}: got {len(vector)}, expected {dimension}")
+    return dimension
 
 
 def vector_literal(vec: list[float] | None) -> str | None:
@@ -289,9 +384,6 @@ def connect(dsn: str):
 
 
 def backup_existing(conn, bank: str, backup_dir: Path) -> Path:
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = backup_dir / f"canonical-backup-{ts}.json"
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT id, bank_id, original_text, metadata, created_at::text, updated_at::text, tags
@@ -309,7 +401,25 @@ def backup_existing(conn, bank: str, backup_dir: Path) -> Path:
         """, (bank, CANONICAL_PREFIX + "%"))
         units = cur.fetchall()
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "bank": bank, "document_count": len(docs), "unit_count": len(units), "documents": docs, "memory_units": units}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    run_dir = backup_dir / f"canonical-backup-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    run_dir.mkdir(mode=0o700)
+    os.chmod(run_dir, 0o700)
+    path = run_dir / "backup.json"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            stream.write("\n")
+    except BaseException:
+        # fdopen owns/closes fd after entering its context; close only if the
+        # context was never entered (e.g. an exceptional fdopen setup failure).
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -337,7 +447,19 @@ def filter_semantic_rows_to_existing_targets(
     return {"kept": kept, "skipped_missing_targets": skipped}
 
 
-def publish(cards: list[dict[str, Any]], *, dsn: str, bank: str, mode: str, replace: bool, embedding_provider: str, embedding_model: str, backup_dir: Path) -> dict[str, Any]:
+def publish(
+    cards: list[dict[str, Any]],
+    *,
+    dsn: str,
+    bank: str,
+    mode: str,
+    replace: bool,
+    embedding_provider: str,
+    embedding_model: str,
+    embedding_base_url: str,
+    embedding_batch_size: int,
+    backup_dir: Path,
+) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     rebuild_id = f"offline-v2-rebuild::{now.strftime('%Y%m%d-%H%M%S')}::{sha1_short(json.dumps([c.get('card_id') for c in cards], ensure_ascii=False), 8)}"
     docs = []
@@ -396,10 +518,17 @@ def publish(cards: list[dict[str, Any]], *, dsn: str, bank: str, mode: str, repl
         return report
 
     texts = [o["text"] for o in observations]
-    embeddings, used_provider = maybe_embeddings(texts, embedding_provider, embedding_model)
+    embeddings, used_provider = maybe_embeddings(
+        texts,
+        embedding_provider,
+        embedding_model,
+        base_url=embedding_base_url,
+        batch_size=embedding_batch_size,
+    )
     report["embedding_provider_used"] = used_provider
-    if embeddings and embeddings[0] is not None:
-        report["embedding_dimension"] = len(embeddings[0])
+    embedding_dimension = validate_embeddings(embeddings, len(observations))
+    if embedding_dimension is not None:
+        report["embedding_dimension"] = embedding_dimension
 
     conn = connect(dsn)
     try:
@@ -551,8 +680,10 @@ def main() -> None:
     ap.add_argument("--mode", choices=["dry-run", "publish"], default="dry-run")
     ap.add_argument("--replace", dest="replace", action="store_true", default=True, help="Replace all existing hermes-offline-canonical::* docs before publish (default)")
     ap.add_argument("--no-replace", dest="replace", action="store_false", help="Replace only the currently generated canonical document IDs")
-    ap.add_argument("--embedding-provider", choices=["auto", "docker", "none"], default="auto")
-    ap.add_argument("--embedding-model", default=os.environ.get("HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL", "BAAI/bge-m3"))
+    ap.add_argument("--embedding-provider", choices=["ollama", "auto", "docker", "none"], default="ollama")
+    ap.add_argument("--embedding-model", default=os.environ.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL", "bge-m3"))
+    ap.add_argument("--embedding-base-url", default=DEFAULT_EMBEDDING_BASE_URL)
+    ap.add_argument("--embedding-batch-size", type=int, default=128)
     ap.add_argument("--backup-dir", default=str(DEFAULT_BACKUP_DIR))
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -567,6 +698,8 @@ def main() -> None:
         replace=args.replace,
         embedding_provider=args.embedding_provider,
         embedding_model=args.embedding_model,
+        embedding_base_url=args.embedding_base_url,
+        embedding_batch_size=args.embedding_batch_size,
         backup_dir=Path(args.backup_dir).expanduser(),
     )
     if args.json:
