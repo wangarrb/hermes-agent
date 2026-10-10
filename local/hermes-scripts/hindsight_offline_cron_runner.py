@@ -326,6 +326,11 @@ def weekly_submit_cmd(args: argparse.Namespace, week: str) -> list[str]:
         "submit",
         "--prefilter",
         args.prefilter,
+        "--enforce-budget",
+        "--budget-max-pending-units",
+        str(args.weekly_budget_max_pending_units),
+        "--budget-max-pending-chars",
+        str(args.weekly_budget_max_pending_chars),
         *offline_reflect_llm_args(args),
     ]
     return cmd
@@ -445,6 +450,11 @@ def weekly(args: argparse.Namespace, log_fh) -> str:
         log_fh.write(f"[{iso_now()}] WEEKLY dry-run budget only; skip paid LLM submit and V2 publish\n")
         log_fh.flush()
         return week
+    if not isinstance(budget_report, dict) or budget_report.get("budget_decision") != "pass":
+        message = f"Weekly submit blocked by budget preflight: {budget_report.get('budget_decision') if isinstance(budget_report, dict) else 'unknown'}"
+        log_fh.write(f"[{iso_now()}] {message}\n")
+        log_fh.flush()
+        raise SystemExit(2)
     run(weekly_submit_cmd(args, week), log_fh)
     refresh_v2_cards(log_fh)
     status(log_fh)
@@ -460,11 +470,11 @@ def main() -> None:
     parser.add_argument("--prefilter", default="safe", choices=["safe", "balanced", "strict"])
     parser.add_argument("--poll", type=int, default=60)
     parser.add_argument("--timeout", type=int, default=0, help="0 means no timeout")
-    parser.add_argument("--weekly-budget-max-pending-units", type=int, default=200, help="Fail closed before paid LLM if regular weekly would process more pending units")
-    parser.add_argument("--weekly-budget-max-pending-chars", type=int, default=10000000, help="Fail closed before paid LLM if regular weekly pending chars exceeds this")
+    parser.add_argument("--weekly-budget-max-pending-units", type=int, default=12, help="Fail closed before paid LLM if weekly/catch-up would exceed this many pending units")
+    parser.add_argument("--weekly-budget-max-pending-chars", type=int, default=500000, help="Fail closed before paid LLM if weekly/catch-up pending chars exceeds this")
     parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly scope: all-history=full history; week=current ISO week only")
     backfill_group = parser.add_mutually_exclusive_group()
-    backfill_group.add_argument("--backfill-missing-daily", dest="backfill_missing_daily", action="store_true", help="Explicitly authorize paid LLM backfill of incomplete daily units before weekly")
+    backfill_group.add_argument("--backfill-missing-daily", dest="backfill_missing_daily", action="store_true", help="Explicitly include pre-checkpoint historical gaps; weekly catch-up after the checkpoint is automatic")
     backfill_group.add_argument("--no-backfill-missing-daily", dest="backfill_missing_daily", action="store_false", help=argparse.SUPPRESS)
     parser.set_defaults(backfill_missing_daily=False)
     parser.add_argument("--dry-run-budget-only", action="store_true", help="For weekly/both: run read-only weekly budget check and skip paid LLM submit/V2 publish")

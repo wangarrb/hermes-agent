@@ -330,18 +330,30 @@ def test_restore_observations_off_fails_if_readback_is_inconsistent(monkeypatch)
         raise AssertionError('inconsistent bank settings must fail closed')
 
 
-def test_weekly_plan_does_not_backfill_legacy_daily_outputs_by_default():
+def test_weekly_plan_does_not_opt_into_pre_checkpoint_history_repair_by_default():
     mod = load_module()
     plan = mod.build_plan(ns(mode='weekly'))
     weekly = next(step for step in plan['steps'] if step['name'] == 'weekly_reflect')
     assert '--backfill-missing-daily' not in weekly['command']
 
 
-def test_weekly_plan_backfills_only_with_explicit_opt_in():
+def test_weekly_plan_requires_opt_in_for_pre_checkpoint_history_repair():
     mod = load_module()
     plan = mod.build_plan(ns(mode='weekly', backfill_missing_daily=True))
     weekly = next(step for step in plan['steps'] if step['name'] == 'weekly_reflect')
     assert '--backfill-missing-daily' in weekly['command']
+
+
+def test_weekly_execute_plan_enforces_budget_on_the_submit_path():
+    mod = load_module()
+    step = mod.weekly_reflect_step(ns(mode='weekly', execute=True))
+    command = step.command
+
+    assert '--enforce-budget' in command
+    unit_flag = command.index('--budget-max-pending-units')
+    char_flag = command.index('--budget-max-pending-chars')
+    assert command[unit_flag + 1] == '12'
+    assert command[char_flag + 1] == '500000'
 
 
 def test_backfill_opt_in_is_rejected_for_daily_mode():

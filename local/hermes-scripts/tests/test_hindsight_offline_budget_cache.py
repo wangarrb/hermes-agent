@@ -390,8 +390,8 @@ def test_budget_report_counts_cached_pending_and_blocks_when_over_threshold(tmp_
     cached_output.write_text('result', encoding='utf-8')
     progress = {
         'processed_units_v2': {
-            cached_key: {'document_id': 'doc-a', 'output_markdown': str(cached_output)},
-            stale_key: {'document_id': 'doc-b', 'output_markdown': str(tmp_path / 'weekly' / 'missing.md')},
+            cached_key: {'bank': 'hermes', 'document_id': 'doc-a', 'output_markdown': str(cached_output)},
+            stale_key: {'bank': 'hermes', 'document_id': 'doc-b', 'output_markdown': str(tmp_path / 'weekly' / 'missing.md')},
         },
         'processed_unit_keys': [],
         'processed_document_ids': [],

@@ -39,6 +39,7 @@ REQUIRED_SCRIPTS = [
     "hindsight_session_retain_runner.py",
     "hindsight_minimax_import.py",
     "offline_hindsight_reflect_consolidate.py",
+    "hindsight_daily_checkpoint.py",
     "hindsight_offline_v2_rebuild.py",
     "hindsight_conflict_audit.py",
     "hindsight_repair_proposal_build.py",

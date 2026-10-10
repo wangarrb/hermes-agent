@@ -334,6 +334,13 @@ def weekly_reflect_step(args: argparse.Namespace) -> Step:
             args.prefilter,
         ]
         cmd = [c for c in cmd if c]
+        cmd += [
+            "--enforce-budget",
+            "--budget-max-pending-units",
+            str(args.weekly_budget_max_pending_units),
+            "--budget-max-pending-chars",
+            str(args.weekly_budget_max_pending_chars),
+        ]
     else:
         cmd = [
             sys.executable,
@@ -364,7 +371,7 @@ def weekly_reflect_step(args: argparse.Namespace) -> Step:
         cmd.append("--backfill-missing-daily")
     return Step(
         name="weekly_reflect",
-        description="Weekly/all-history integration from complete daily outputs; missing daily units fail closed unless explicit backfill opt-in is set.",
+        description="Weekly/all-history integration from a verified daily checkpoint; automatically catch up only later/new units and require explicit authorization for pre-checkpoint history repair.",
         command=cmd,
         mutating=bool(args.execute),
         writes_local=True,
@@ -620,10 +627,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 name="native_consolidation_drain_after_daily",
                 description="Wait until Hindsight native source-fact consolidation is drained after daily/session ingestion, before V2 quality gates.",
             ))
-        # Full mode must finish weekly all-history integration before any
-        # publish-capable V2 reduction. Incomplete daily inputs fail closed by
-        # default; only the explicit --backfill-missing-daily opt-in may spend
-        # LLM calls to regenerate them.
+        # Full mode must finish incremental daily catch-up and weekly all-history
+        # integration before any publish-capable V2 reduction. Catch-up is bounded
+        # by the verified checkpoint; only older history requires explicit opt-in.
         if args.mode == "daily":
             steps.append(v2_rebuild_step(args))
     if args.mode in {"weekly", "full"}:
@@ -843,7 +849,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--weekly-budget-max-pending-chars", type=int, default=500000)
     ap.add_argument("--include-wiki", action="store_true", help="For full mode, include long-cycle wiki candidate maintenance")
     ap.add_argument("--skip-daily", action="store_true", help="For full mode resume runs, skip session manifest/retain, daily reflect, and the daily V2 rebuild gate")
-    ap.add_argument("--backfill-missing-daily", action="store_true", help="Explicitly authorize paid LLM backfill of incomplete daily artifacts before weekly; default is fail closed without backfill")
+    ap.add_argument("--backfill-missing-daily", action="store_true", help="For weekly/full, explicitly include pre-checkpoint historical gaps; post-checkpoint incremental catch-up is automatic")
     ap.add_argument("--no-switch-mode", action="store_true", default=True, help="Skip LLM provider switch_mode in retain/reflect wrappers; container is pre-configured via start-hindsight.sh (default: True)")
     ap.add_argument("--skip-repair-zone", action="store_true", help="For weekly/full, skip approved repair sidecar proposal sweep")
     ap.add_argument("--skip-proposal-review", action="store_true", help="For weekly/full, skip local proposal LLM/human review packet generation")

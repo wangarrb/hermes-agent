@@ -34,9 +34,24 @@ import requests
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")).expanduser()
 SCRIPTS_DIR = HERMES_HOME / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+SCRIPT_DIR = Path(__file__).resolve().parent
+for scripts_path in (SCRIPT_DIR, SCRIPTS_DIR):
+    if str(scripts_path) not in sys.path:
+        sys.path.insert(0, str(scripts_path))
 
+from hindsight_daily_checkpoint import (  # noqa: E402
+    CHECKPOINT_API_VERSION as _DAILY_CHECKPOINT_API_VERSION,
+    CHECKPOINT_FILENAME as DAILY_CHECKPOINT_FILENAME,
+    CHECKPOINT_SCHEMA_VERSION as DAILY_CHECKPOINT_SCHEMA_VERSION,
+    checkpoint_contains_unit,
+    date_list_hash,
+    load_daily_completion_checkpoint,
+    provisionalize_checkpoint_for_repair,
+    record_completed_days,
+)
+EXPECTED_DAILY_CHECKPOINT_API_VERSION = 1
+if _DAILY_CHECKPOINT_API_VERSION != EXPECTED_DAILY_CHECKPOINT_API_VERSION:
+    raise RuntimeError("daily checkpoint helper API version is incompatible with this worker")
 import import_sqlite_to_hindsight as sqlite_import  # noqa: E402
 
 DEFAULT_DB_PATH = HERMES_HOME / "state.db"
@@ -55,6 +70,8 @@ PIPELINE_VERSION = "offline-reflect-cache-v2"
 PROMPT_VERSION = "offline-reflect-prompt-v2-20260507"
 SCHEMA_VERSION = "canonical-observations-v1"
 DAILY_ARTIFACT_SCHEMA_VERSION = "daily-artifact-v2"
+# These retained-fact event dates are known sentinel corruption, not valid work dates.
+KNOWN_ANOMALOUS_DAILY_FACT_DATES = frozenset({"1950-01-01", "1988-01-01"})
 WEEKLY_INPUT_PROJECTION_VERSION = "weekly-markdown-no-duplicate-json-v1"
 
 
@@ -660,7 +677,8 @@ def iter_days(start: datetime, end: datetime) -> list[str]:
 
 def load_daily_markdowns_for_days(output_dir: Path, days: list[str]) -> dict[str, list[tuple[Path, str]]]:
     by_topic: dict[str, list[tuple[Path, str]]] = {}
-    for day in sorted(days):
+    allowed_days, _excluded_anomalous = split_known_anomalous_daily_dates(days)
+    for day in allowed_days:
         day_dir = output_dir / "daily" / day
         if not day_dir.exists():
             continue
@@ -714,6 +732,96 @@ WHERE day_key IS NOT NULL;
     return [str(x) for x in rows if x]
 
 
+def retained_legacy_fact_days(bank: str) -> list[str]:
+    """Find legacy document dates only for first-class facts without event_date."""
+    session_date = "hermes-session::(?:(?:[^:]+)::)?(?:session_)?([0-9]{8})"
+    sql = f"""
+SELECT COALESCE(json_agg(day_key ORDER BY day_key), '[]'::json)
+FROM (
+  SELECT DISTINCT substring(document_id from 'hermes-sqlite::day-topic::([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})') AS day_key
+  FROM memory_units
+  WHERE bank_id = {sql_quote(bank)}
+    AND fact_type IN ('world', 'experience')
+    AND document_id LIKE 'hermes-sqlite::day-topic::%'
+    AND event_date IS NULL
+    AND document_id NOT LIKE 'hermes-offline-consolidation%'
+    AND document_id NOT LIKE 'hermes-offline-canonical%'
+    AND text IS NOT NULL
+    AND length(text) > 0
+  UNION
+  SELECT DISTINCT to_char(to_date(substring(document_id from '{session_date}'), 'YYYYMMDD'), 'YYYY-MM-DD') AS day_key
+  FROM memory_units
+  WHERE bank_id = {sql_quote(bank)}
+    AND fact_type IN ('world', 'experience')
+    AND document_id LIKE 'hermes-session::%'
+    AND event_date IS NULL
+    AND substring(document_id from '{session_date}') IS NOT NULL
+    AND document_id NOT LIKE 'hermes-offline-consolidation%'
+    AND document_id NOT LIKE 'hermes-offline-canonical%'
+    AND text IS NOT NULL
+    AND length(text) > 0
+) t
+WHERE day_key IS NOT NULL;
+"""
+    days = {str(value) for value in psql_json(sql) if value}
+    for day in days:
+        date.fromisoformat(day)
+    return sorted(days)
+
+
+def retained_daily_fact_days(bank: str) -> list[str]:
+    """Union explicit event dates with document dates for facts lacking event_date."""
+    sql = f"""
+SELECT COALESCE(json_agg(day_key ORDER BY day_key), '[]'::json)
+FROM (
+  SELECT DISTINCT to_char(event_date::date, 'YYYY-MM-DD') AS day_key
+  FROM memory_units
+  WHERE bank_id = {sql_quote(bank)}
+    AND fact_type IN ('world', 'experience')
+    AND document_id NOT LIKE 'hermes-offline-consolidation%'
+    AND document_id NOT LIKE 'hermes-offline-canonical%'
+    AND event_date IS NOT NULL
+    AND text IS NOT NULL
+    AND length(text) > 0
+) t;
+"""
+    event_days = {str(value) for value in psql_json(sql) if value}
+    for day in event_days:
+        date.fromisoformat(day)
+    return sorted(set(retained_legacy_fact_days(bank)) | event_days)
+
+
+def load_daily_checkpoint_for_run(
+    output_dir: Path,
+    bank: str,
+    args: argparse.Namespace | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Bootstrap from a marked manifest or exact legacy date inventory, then verify legacy POST evidence."""
+    output_dir = Path(output_dir).expanduser()
+    checkpoint_path = output_dir / DAILY_CHECKPOINT_FILENAME
+    legacy_history_days = None
+    manifest_dir = output_dir / "completion_manifests"
+    has_manifest_candidates = manifest_dir.is_dir() and any(manifest_dir.glob("*.json"))
+    if not checkpoint_path.exists() and has_manifest_candidates:
+        legacy_history_days = retained_sqlite_days(bank)
+    checkpoint, bootstrapped = load_daily_completion_checkpoint(
+        output_dir,
+        bank,
+        legacy_history_days=legacy_history_days,
+    )
+    coverage_scope = (checkpoint.get("baseline_manifest") or {}).get("coverage_scope")
+    if bootstrapped and coverage_scope in {"legacy-document-inventory", "all-history"}:
+        invalid_days = (
+            manifest_success_gaps(output_dir, checkpoint, args)
+            if args is not None
+            else list(checkpoint.get("completed_days") or {})
+        )
+        if invalid_days:
+            checkpoint = provisionalize_checkpoint_for_repair(checkpoint, invalid_days)
+            return checkpoint, False
+    return checkpoint, bootstrapped
+
+
 def bounds_for_days(days: list[str]) -> tuple[datetime, datetime]:
     if not days:
         now = datetime.now()
@@ -722,6 +830,14 @@ def bounds_for_days(days: list[str]) -> tuple[datetime, datetime]:
     start = datetime.combine(parsed[0], datetime.min.time())
     end = datetime.combine(parsed[-1] + timedelta(days=1), datetime.min.time())
     return start, end
+
+
+def split_known_anomalous_daily_dates(days: list[str]) -> tuple[list[str], list[str]]:
+    """Keep raw discovery auditable while excluding known ancient date sentinels from work scopes."""
+    unique_days = sorted({str(day) for day in days})
+    excluded = [day for day in unique_days if day in KNOWN_ANOMALOUS_DAILY_FACT_DATES]
+    candidates = [day for day in unique_days if day not in KNOWN_ANOMALOUS_DAILY_FACT_DATES]
+    return candidates, excluded
 
 
 def history_period_for(days: list[str]) -> str:
@@ -739,8 +855,13 @@ def build_weekly_units_from_daily(
     end: datetime,
     max_input_chars: int,
     weekly_group_by: str = "all",
+    *,
+    allowed_days: list[str] | None = None,
 ) -> list[ReflectUnit]:
-    by_topic = load_daily_markdowns(output_dir, start, end)
+    if allowed_days is None:
+        by_topic = load_daily_markdowns(output_dir, start, end)
+    else:
+        by_topic = load_daily_markdowns_for_days(output_dir, allowed_days)
     if weekly_group_by == "all":
         grouped: dict[str, list[tuple[Path, str]]] = {
             "cross-topic": [item for topic in sorted(by_topic) for item in by_topic[topic]]
@@ -1266,6 +1387,8 @@ def print_units(units: list[ReflectUnit]) -> None:
 def build_daily_for_args(args: argparse.Namespace) -> tuple[list[ReflectUnit], str, datetime, datetime, dict[str, int]]:
     d = parse_day(args.date)
     start, end, period = day_bounds(d)
+    if period in KNOWN_ANOMALOUS_DAILY_FACT_DATES:
+        raise SystemExit(f"Daily processing blocked: {period} is a known anomalous date sentinel and is excluded from work scopes.")
     if args.daily_source == "facts":
         facts = query_facts_for_days(args.bank, [period])
         print(f"Daily period={period} source=facts facts={len(facts)}")
@@ -1299,18 +1422,43 @@ def build_weekly_for_args(args: argparse.Namespace) -> tuple[list[ReflectUnit], 
     weekly_window = getattr(args, "weekly_window", "all-history")
 
     if weekly_window == "all-history":
-        retained_days = retained_sqlite_days(args.bank)
-        daily_days = existing_daily_output_days(output_dir)
-        days = retained_days or daily_days
+        if args.weekly_source == "daily":
+            raw_daily_days = existing_daily_output_days(output_dir)
+            daily_days, _ = split_known_anomalous_daily_dates(raw_daily_days)
+            raw_candidate_days = list(getattr(args, "_daily_candidate_days", []) or [])
+            candidate_days, _ = split_known_anomalous_daily_dates(raw_candidate_days)
+            days = sorted(set(daily_days) | set(candidate_days))
+        elif args.weekly_source == "facts":
+            fact_days = getattr(args, "_weekly_fact_days", None)
+            if fact_days is None:
+                raise RuntimeError("all-history facts source requires checkpoint date-scope resolution")
+            days, _ = split_known_anomalous_daily_dates(list(fact_days))
+        else:
+            raise SystemExit("weekly --weekly-window all-history does not support --weekly-source raw; use processed daily/facts to avoid LLM-call explosion")
         start, end = bounds_for_days(days)
         period = history_period_for(days)
     else:
         y, w, period = parse_week(args.week)
         start, end, _ = week_bounds(y, w)
         days = iter_days(start, end)
+        if args.weekly_source == "daily":
+            days, _ = split_known_anomalous_daily_dates(days)
+        if args.weekly_source == "facts":
+            fact_days = getattr(args, "_weekly_fact_days", None)
+            if fact_days is None:
+                raise RuntimeError("weekly facts source requires checkpoint date-scope resolution")
+            days = sorted(set(fact_days))
 
     if args.weekly_source == "daily":
-        units = build_weekly_units_from_daily(output_dir, period, start, end, args.max_input_chars, args.weekly_group_by)
+        units = build_weekly_units_from_daily(
+            output_dir,
+            period,
+            start,
+            end,
+            args.max_input_chars,
+            args.weekly_group_by,
+            allowed_days=days,
+        )
         print(
             f"Weekly period={period} window={weekly_window} source=daily group_by={args.weekly_group_by} "
             f"days={len(days)} daily_topics={len({u.topic for u in units})} units={len(units)}"
@@ -1329,8 +1477,6 @@ def build_weekly_for_args(args: argparse.Namespace) -> tuple[list[ReflectUnit], 
             end=end,
         )
     else:
-        if weekly_window == "all-history":
-            raise SystemExit("weekly --weekly-window all-history does not support --weekly-source raw; use processed daily/facts to avoid LLM-call explosion")
         records, skipped = build_records_between(
             Path(args.db),
             start.timestamp(),
@@ -1370,6 +1516,7 @@ def stable_unit_content(unit: ReflectUnit) -> str:
 def unit_cache_payload(unit: ReflectUnit, args: argparse.Namespace | None = None) -> dict[str, Any]:
     args = args or argparse.Namespace()
     payload = {
+        "bank": str(getattr(args, "bank", DEFAULT_BANK)),
         "pipeline_version": PIPELINE_VERSION,
         "prompt_version": PROMPT_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -1403,6 +1550,30 @@ def processed_units_v2(progress: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value, dict):
         value = {}
         progress["processed_units_v2"] = value
+    return value
+
+
+def progress_values_for_bank(progress: dict[str, Any], field: str, bank: str) -> set[str]:
+    scoped = progress.get(f"{field}_by_bank")
+    if isinstance(scoped, dict) and isinstance(scoped.get(bank), list):
+        return {str(value) for value in scoped[bank]}
+    if bank == DEFAULT_BANK:
+        return {str(value) for value in (progress.get(field) or [])}
+    return set()
+
+
+def progress_sets_for_bank(progress: dict[str, Any], bank: str) -> tuple[set[str], set[str]]:
+    return (
+        progress_values_for_bank(progress, "processed_document_ids", bank),
+        progress_values_for_bank(progress, "processed_unit_keys", bank),
+    )
+
+
+def bank_scoped_progress_map(progress: dict[str, Any], field: str) -> dict[str, Any]:
+    value = progress.setdefault(f"{field}_by_bank", {})
+    if not isinstance(value, dict):
+        value = {}
+        progress[f"{field}_by_bank"] = value
     return value
 
 
@@ -1447,9 +1618,12 @@ def record_v2_progress(progress: dict[str, Any], unit: ReflectUnit, args: argpar
         entries[key] = progress_entry(unit, args, document_id=document_id, output_markdown=output_markdown, reused_from=reused_from)
 
 
-def save_progress(progress: dict[str, Any], processed_docs: set[str], processed_units: set[str]) -> None:
-    progress["processed_document_ids"] = sorted(processed_docs)
-    progress["processed_unit_keys"] = sorted(processed_units)
+def save_progress(progress: dict[str, Any], processed_docs: set[str], processed_units: set[str], *, bank: str) -> None:
+    bank_scoped_progress_map(progress, "processed_document_ids")[bank] = sorted(processed_docs)
+    bank_scoped_progress_map(progress, "processed_unit_keys")[bank] = sorted(processed_units)
+    if bank == DEFAULT_BANK:
+        progress["processed_document_ids"] = sorted(processed_docs)
+        progress["processed_unit_keys"] = sorted(processed_units)
     progress["last_run"] = datetime.now().isoformat()
     save_json(DEFAULT_PROGRESS_FILE, progress)
 
@@ -1470,16 +1644,26 @@ def call_llm_for_unit(args: argparse.Namespace, unit: ReflectUnit) -> tuple[dict
 
 
 def build_budget_report(units: list[ReflectUnit], progress: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    processed_units = set(progress.get("processed_unit_keys") or [])
+    bank = str(getattr(args, "bank", DEFAULT_BANK))
+    processed_units = progress_values_for_bank(progress, "processed_unit_keys", bank)
     entries_v2 = processed_units_v2(progress)
     output_dir = Path(getattr(args, "output_dir", None) or DEFAULT_OUTPUT_DIR)
+    checkpoint = None
+    if any(unit.scope == "daily" for unit in units):
+        checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, str(getattr(args, "bank", DEFAULT_BANK)), args=args)
     pending: list[dict[str, Any]] = []
     reused_v2 = 0
     reused_legacy = 0
     for i, unit in enumerate(units, 1):
         key = unit_progress_key(unit, args)
         legacy_key = legacy_unit_progress_key(unit)
-        if v2_progress_entry_is_reusable(output_dir, unit, entries_v2.get(key)) and not getattr(args, "force_repost", False):
+        if v2_progress_entry_is_reusable(output_dir, unit, entries_v2.get(key), args=args) and not getattr(args, "force_repost", False):
+            reused_v2 += 1
+            continue
+        if checkpointed_daily_artifact_is_reusable(output_dir, unit, checkpoint, args=args, progress=progress) and not getattr(args, "force_repost", False):
+            reused_v2 += 1
+            continue
+        if legacy_daily_progress_entry_is_reusable(output_dir, unit, entries_v2, bank=str(getattr(args, "bank", DEFAULT_BANK))) and not getattr(args, "force_repost", False):
             reused_v2 += 1
             continue
         if unit.scope != "daily" and legacy_key in processed_units and not getattr(args, "force_repost", False):
@@ -1503,6 +1687,8 @@ def build_budget_report(units: list[ReflectUnit], progress: dict[str, Any], args
     missing_daily = list(getattr(args, "_budget_missing_daily", []) or [])
     has_backfill_estimate = any(unit.scope == "daily" for unit in units)
     block_reasons: list[str] = []
+    if bool(getattr(args, "enforce_budget", False)) and max_units < 0 and max_chars < 0:
+        block_reasons.append("enforce_budget requires at least one finite unit or character limit")
     if missing_daily and not has_backfill_estimate:
         block_reasons.append(f"missing_daily_outputs {len(missing_daily)} require backfill estimate before weekly budget can be trusted")
     if max_units >= 0 and pending_units > max_units:
@@ -1564,27 +1750,146 @@ def progress_output_is_live(output_dir: Path, unit: ReflectUnit, entry: dict[str
         return False
 
 
-def v2_progress_entry_is_reusable(output_dir: Path, unit: ReflectUnit, entry: Any) -> bool:
+def v2_progress_entry_is_reusable(
+    output_dir: Path,
+    unit: ReflectUnit,
+    entry: Any,
+    args: argparse.Namespace | None = None,
+) -> bool:
     if not isinstance(entry, dict) or not progress_output_is_live(output_dir, unit, entry):
         return False
+    if entry.get("bank") != str(getattr(args, "bank", DEFAULT_BANK)):
+        return False
     if unit.scope == "daily":
-        return (
-            entry.get("input_content_hash") == short_hash(unit.content, 24)
-            and entry.get("artifact_schema_version") == DAILY_ARTIFACT_SCHEMA_VERSION
-            and daily_artifact_is_complete(output_dir, unit)
+        document_id = entry.get("document_id")
+        if not isinstance(document_id, str) or not document_id.strip():
+            return False
+        expected_hash = short_hash(unit.content, 24)
+        entry_hash = entry.get("input_content_hash")
+        if entry_hash is not None and entry_hash != expected_hash:
+            return False
+        stable_hash = short_hash(stable_unit_content(unit), 24)
+        if entry.get("stable_content_hash") != stable_hash:
+            return False
+        if entry.get("scope") != unit.scope or entry.get("topic") != unit.topic:
+            return False
+        try:
+            if int(entry.get("index", -1)) != unit.index or int(entry.get("source_count", -1)) != unit.source_count:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if entry.get("source_ids") != sorted(str(value) for value in unit.source_ids):
+            return False
+        if entry.get("artifact_schema_version") not in (None, DAILY_ARTIFACT_SCHEMA_VERSION):
+            return False
+        return daily_artifact_is_complete(
+            output_dir,
+            unit,
+            allow_legacy=True,
+            expected_markdown_path=str(entry.get("output_markdown") or ""),
+            expected_document_id=document_id,
         )
     return True
+
+
+def legacy_daily_progress_entry_is_reusable(
+    output_dir: Path,
+    unit: ReflectUnit,
+    progress_entries: dict[str, Any],
+    *,
+    bank: str = DEFAULT_BANK,
+    progress_index: dict[Any, list[dict[str, Any]]] | None = None,
+) -> bool:
+    """Reuse legacy metadata only when the exact stable source key and artifact pair agree."""
+    if not legacy_daily_progress_is_unambiguous(unit):
+        return False
+    lookup_key = daily_progress_lookup_key(unit)
+    index = progress_index if progress_index is not None else daily_progress_index(progress_entries)
+    for entry in index.get(lookup_key, []):
+        if not progress_output_is_live(output_dir, unit, entry):
+            continue
+        document_id = entry.get("document_id")
+        if not isinstance(document_id, str) or not document_id.strip():
+            continue
+        entry_bank = entry.get("bank")
+        if entry_bank != bank and not (entry_bank is None and bank == DEFAULT_BANK):
+            continue
+        if (
+            entry.get("pipeline_version") != PIPELINE_VERSION
+            or entry.get("prompt_version") != PROMPT_VERSION
+            or entry.get("schema_version") != SCHEMA_VERSION
+            or entry.get("artifact_schema_version") not in (None, DAILY_ARTIFACT_SCHEMA_VERSION)
+        ):
+            continue
+        input_hash = entry.get("input_content_hash")
+        if input_hash is not None and input_hash != short_hash(unit.content, 24):
+            continue
+        if daily_artifact_is_complete(
+            output_dir,
+            unit,
+            allow_legacy=True,
+            expected_markdown_path=str(entry.get("output_markdown") or ""),
+            expected_document_id=document_id,
+        ):
+            return True
+    return False
+
+
+def checkpointed_daily_artifact_is_reusable(
+    output_dir: Path,
+    unit: ReflectUnit,
+    checkpoint: dict[str, Any] | None,
+    *,
+    args: argparse.Namespace | None = None,
+    progress: dict[str, Any] | None = None,
+) -> bool:
+    if unit.scope != "daily" or not checkpoint_contains_unit(checkpoint, unit):
+        return False
+    signature = {
+        "topic": unit.topic,
+        "index": unit.index,
+        "source_ids": list(unit.source_ids),
+        "input_content_hash": short_hash(unit.content, 24),
+    }
+    effective_progress = progress if progress is not None else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    bank = str(getattr(args, "bank", (checkpoint or {}).get("bank", DEFAULT_BANK)))
+    expected_document_ids = checkpointed_progress_document_ids(effective_progress, signature, bank)
+    return checkpointed_daily_artifact_pair_is_valid(
+        output_dir,
+        unit.period,
+        signature,
+        expected_document_ids=expected_document_ids,
+    )
 
 
 def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
     output_dir = Path(args.output_dir)
     progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_document_ids": [], "processed_unit_keys": [], "processed_units_v2": {}, "last_run": None})
-    processed_docs = set(progress.get("processed_document_ids") or [])
-    processed_units = set(progress.get("processed_unit_keys") or [])
+    processed_docs, processed_units = progress_sets_for_bank(progress, str(getattr(args, "bank", DEFAULT_BANK)))
+    checkpoint = None
+    if any(unit.scope == "daily" for unit in units):
+        checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, args.bank, args=args)
 
-    if getattr(args, "budget_json", False):
+    budget_json = bool(getattr(args, "budget_json", False))
+    enforce_budget = bool(getattr(args, "enforce_budget", False))
+    if budget_json:
         report = emit_budget_report(units, args, progress=progress)
         return 2 if report["budget_decision"] != "pass" else 0
+    if enforce_budget and getattr(args, "_budget_phase", None) != "catchup_prechecked":
+        budget_args = args
+        spent_units = int(getattr(args, "_budget_spent_units", 0)) if getattr(args, "_budget_phase", None) == "weekly" else 0
+        spent_chars = int(getattr(args, "_budget_spent_chars", 0)) if getattr(args, "_budget_phase", None) == "weekly" else 0
+        if spent_units or spent_chars:
+            budget_args = argparse.Namespace(**vars(args))
+            unit_limit = int(getattr(args, "budget_max_pending_units", -1))
+            char_limit = int(getattr(args, "budget_max_pending_chars", -1))
+            if unit_limit >= 0:
+                budget_args.budget_max_pending_units = max(0, unit_limit - spent_units)
+            if char_limit >= 0:
+                budget_args.budget_max_pending_chars = max(0, char_limit - spent_chars)
+        report = emit_budget_report(units, budget_args, progress=progress)
+        if report["budget_decision"] != "pass":
+            return 2
 
     if args.mode == "dry-run":
         print_units(units)
@@ -1607,11 +1912,19 @@ def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
         key = unit_progress_key(unit, args)
         legacy_key = legacy_unit_progress_key(unit)
         existing_entry = entries_v2.get(key)
-        if v2_progress_entry_is_reusable(output_dir, unit, existing_entry) and not args.force_repost:
+        if v2_progress_entry_is_reusable(output_dir, unit, existing_entry, args=args) and not args.force_repost:
             print(f"[{i}/{len(units)}] skip LLM; already processed v2 unit: {key}")
             record_v2_progress(progress, unit, args)
             ok_count += 1
-            save_progress(progress, processed_docs, processed_units)
+            save_progress(progress, processed_docs, processed_units, bank=str(getattr(args, "bank", DEFAULT_BANK)))
+            continue
+        if checkpointed_daily_artifact_is_reusable(output_dir, unit, checkpoint, args=args, progress=progress) and not args.force_repost:
+            print(f"[{i}/{len(units)}] skip LLM; verified daily checkpoint unit: {key}")
+            ok_count += 1
+            continue
+        if legacy_daily_progress_entry_is_reusable(output_dir, unit, entries_v2, bank=str(getattr(args, "bank", DEFAULT_BANK))) and not args.force_repost:
+            print(f"[{i}/{len(units)}] skip LLM; verified legacy daily progress signature: {key}")
+            ok_count += 1
             continue
         if existing_entry is not None and not args.force_repost:
             print(f"[{i}/{len(units)}] stale v2 cache artifact; rebuilding unit: {key}")
@@ -1620,7 +1933,7 @@ def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
             print(f"[{i}/{len(units)}] skip LLM; already processed legacy unit: {legacy_key}")
             record_v2_progress(progress, unit, args, reused_from=legacy_key)
             ok_count += 1
-            save_progress(progress, processed_docs, processed_units)
+            save_progress(progress, processed_docs, processed_units, bank=str(getattr(args, "bank", DEFAULT_BANK)))
             continue
         pending.append((i, unit, key))
 
@@ -1658,7 +1971,7 @@ def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
                 processed_units.add(key)
                 record_v2_progress(progress, unit, args, document_id=result.document_id, output_markdown=str(result.output_md_path))
                 ok_count += 1
-                save_progress(progress, processed_docs, processed_units)
+                save_progress(progress, processed_docs, processed_units, bank=str(getattr(args, "bank", DEFAULT_BANK)))
                 continue
             print(f"  saved: {result.output_md_path}")
             ok, err = post_to_hindsight(args.api, args.bank, result, model=args.llm_model, label=args.llm_label)
@@ -1668,7 +1981,7 @@ def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
                 processed_units.add(key)
                 record_v2_progress(progress, unit, args, document_id=result.document_id, output_markdown=str(result.output_md_path))
                 ok_count += 1
-                save_progress(progress, processed_docs, processed_units)
+                save_progress(progress, processed_docs, processed_units, bank=str(getattr(args, "bank", DEFAULT_BANK)))
             else:
                 print(f"  post failed: {err}", file=sys.stderr)
                 fail_count += 1
@@ -1686,7 +1999,7 @@ def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
             )
             time.sleep(args.rate_limit_backoff_seconds)
 
-    save_progress(progress, processed_docs, processed_units)
+    save_progress(progress, processed_docs, processed_units, bank=str(getattr(args, "bank", DEFAULT_BANK)))
     print(f"Submit complete: ok={ok_count} failed={fail_count} progress={DEFAULT_PROGRESS_FILE}")
     return 0 if fail_count == 0 else 1
 
@@ -1781,6 +2094,59 @@ def build_daily_fact_units_for_days(args: argparse.Namespace, days: list[str]) -
             end=end,
         )
     return result
+
+
+def manifest_success_gaps(
+    output_dir: Path,
+    checkpoint: dict[str, Any],
+    args: argparse.Namespace,
+) -> list[str]:
+    """Require exact current inputs and posted progress for a markerless legacy baseline."""
+    completed_days = checkpoint.get("completed_days") or {}
+    if not isinstance(completed_days, dict):
+        return ["<invalid-checkpoint>"]
+    days = sorted(str(day) for day in completed_days)
+    units_by_day = build_daily_fact_units_for_days(args, days)
+    progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    entries = processed_units_v2(progress)
+    progress_index = daily_progress_index(entries)
+    gaps: list[str] = []
+    for day in days:
+        record = completed_days.get(day)
+        if not isinstance(record, dict):
+            gaps.append(day)
+            continue
+        saved: set[tuple[str, int, tuple[str, ...], str]] = set()
+        try:
+            for signature in record.get("unit_signatures", []):
+                saved.add((
+                    str(signature["topic"]),
+                    int(signature["index"]),
+                    tuple(sorted(str(value) for value in signature["source_ids"])),
+                    str(signature["input_content_hash"]),
+                ))
+        except (KeyError, TypeError, ValueError):
+            gaps.append(day)
+            continue
+        units = units_by_day.get(day, [])
+        if {unit_completion_signature(unit) for unit in units} != saved:
+            gaps.append(day)
+            continue
+        for unit in units:
+            entry = entries.get(unit_progress_key(unit, args))
+            if v2_progress_entry_is_reusable(output_dir, unit, entry, args=args):
+                continue
+            if legacy_daily_progress_entry_is_reusable(
+                output_dir,
+                unit,
+                entries,
+                bank=str(getattr(args, "bank", DEFAULT_BANK)),
+                progress_index=progress_index,
+            ):
+                continue
+            gaps.append(day)
+            break
+    return sorted(set(gaps))
 
 
 def parse_markdown_header_and_sources(path: Path) -> tuple[dict[str, str], list[str]]:
@@ -1878,43 +2244,15 @@ def daily_markdown_matches_sidecar(data: dict[str, Any], markdown_path: Path) ->
         return False
 
 
-def daily_json_completion_signatures(output_dir: Path, day: str) -> set[tuple[str, int, tuple[str, ...], str]]:
-    signatures: set[tuple[str, int, tuple[str, ...], str]] = set()
-    day_dir = output_dir / "daily" / day
-    for path in day_dir.glob("*.json"):
-        data = load_json(path, {})
-        unit = data.get("unit") if isinstance(data, dict) else None
-        if not isinstance(unit, dict):
-            continue
-        if data.get("artifact_schema_version") != DAILY_ARTIFACT_SCHEMA_VERSION:
-            continue
-        if unit.get("scope") != "daily" or unit.get("period") != day:
-            continue
-        topic = str(unit.get("topic") or "")
-        source_ids = unit.get("source_ids")
-        content_hash = str(unit.get("input_content_hash") or "")
-        markdown_path = Path(str(data.get("markdown_path") or ""))
-        try:
-            index = int(unit.get("index"))
-        except (TypeError, ValueError):
-            continue
-        expected_markdown = path.with_suffix(".md")
-        if (
-            not topic
-            or not isinstance(source_ids, list)
-            or not content_hash
-            or not markdown_path.is_file()
-            or markdown_path.resolve() != expected_markdown.resolve()
-            or markdown_path.parent.resolve() != day_dir.resolve()
-            or not daily_markdown_matches_sidecar(data, markdown_path)
-        ):
-            continue
-        signatures.add((topic, index, tuple(sorted(str(value) for value in source_ids)), content_hash))
-    return signatures
-
-
-def daily_artifact_is_complete(output_dir: Path, unit: ReflectUnit) -> bool:
-    """Return whether one daily unit has a complete current JSON/Markdown pair."""
+def daily_artifact_is_complete(
+    output_dir: Path,
+    unit: ReflectUnit,
+    *,
+    allow_legacy: bool = False,
+    expected_markdown_path: str | None = None,
+    expected_document_id: str | None = None,
+) -> bool:
+    """Validate sidecar/Markdown integrity; this alone does not prove the Hindsight POST succeeded."""
     if unit.scope != "daily":
         return False
     day_dir = output_dir / "daily" / unit.period
@@ -1923,13 +2261,32 @@ def daily_artifact_is_complete(output_dir: Path, unit: ReflectUnit) -> bool:
     expected_hash = short_hash(unit.content, 24)
     for json_path in day_dir.glob(pattern):
         data = load_json(json_path, {})
-        if not isinstance(data, dict) or data.get("artifact_schema_version") != DAILY_ARTIFACT_SCHEMA_VERSION:
+        if not isinstance(data, dict):
             continue
+        schema = data.get("artifact_schema_version")
+        sidecar_document_id = data.get("document_id")
+        if schema == DAILY_ARTIFACT_SCHEMA_VERSION and (not isinstance(sidecar_document_id, str) or not sidecar_document_id.strip()):
+            continue
+        if expected_document_id is not None:
+            if sidecar_document_id is None:
+                if schema is not None or not allow_legacy:
+                    continue
+            elif sidecar_document_id != expected_document_id:
+                continue
         sidecar = data.get("unit")
         if not isinstance(sidecar, dict):
             continue
+        sidecar_hash = sidecar.get("input_content_hash")
+        schema_is_trustworthy = (
+            (schema == DAILY_ARTIFACT_SCHEMA_VERSION and sidecar_hash == expected_hash)
+            or (schema is None and sidecar_hash == expected_hash)
+            or (allow_legacy and schema is None and sidecar_hash is None)
+        )
+        if not schema_is_trustworthy:
+            continue
         try:
             sidecar_index = int(sidecar.get("index", -1))
+            sidecar_source_count = int(sidecar.get("source_count", -1))
         except (TypeError, ValueError):
             continue
         if (
@@ -1937,8 +2294,115 @@ def daily_artifact_is_complete(output_dir: Path, unit: ReflectUnit) -> bool:
             or sidecar.get("period") != unit.period
             or sidecar.get("topic") != unit.topic
             or sidecar_index != unit.index
+            or sidecar_source_count != unit.source_count
             or tuple(sorted(str(value) for value in (sidecar.get("source_ids") or []))) != expected_source_ids
-            or sidecar.get("input_content_hash") != expected_hash
+            or sidecar.get("date_range_start") != unit.date_range_start
+            or sidecar.get("date_range_end") != unit.date_range_end
+            or (sidecar_hash != expected_hash and not (allow_legacy and schema is None and sidecar_hash is None))
+        ):
+            continue
+        markdown_path = Path(str(data.get("markdown_path") or "")).expanduser()
+        try:
+            if not markdown_path.is_file() or markdown_path.resolve() != json_path.with_suffix(".md").resolve():
+                continue
+            if markdown_path.parent.resolve() != day_dir.resolve():
+                continue
+            if expected_markdown_path and markdown_path.resolve() != Path(expected_markdown_path).expanduser().resolve():
+                continue
+            if not daily_markdown_matches_sidecar(data, markdown_path):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        return True
+    return False
+
+
+def checkpointed_progress_document_ids(progress: dict[str, Any], signature: dict[str, Any], bank: str) -> set[str]:
+    """Return only persisted POST IDs tied to the exact checkpoint input signature."""
+    try:
+        topic = str(signature["topic"])
+        index = int(signature["index"])
+        source_ids = sorted(str(value) for value in signature["source_ids"])
+        input_hash = str(signature["input_content_hash"])
+    except (KeyError, TypeError, ValueError):
+        return set()
+    document_ids: set[str] = set()
+    for entry in processed_units_v2(progress).values():
+        if not isinstance(entry, dict) or entry.get("scope") != "daily" or entry.get("topic") != topic:
+            continue
+        entry_bank = entry.get("bank")
+        if entry_bank != bank and not (entry_bank is None and bank == DEFAULT_BANK):
+            continue
+        try:
+            if int(entry.get("index", -1)) != index:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if sorted(str(value) for value in (entry.get("source_ids") or [])) != source_ids:
+            continue
+        entry_hash = entry.get("input_content_hash")
+        if entry_hash != input_hash and not (
+            entry_hash is None and entry.get("artifact_schema_version") is None
+        ):
+            continue
+        document_id = entry.get("document_id")
+        if isinstance(document_id, str) and document_id.strip():
+            document_ids.add(document_id)
+    return document_ids
+
+
+def checkpointed_daily_artifact_pair_is_valid(
+    output_dir: Path,
+    day: str,
+    signature: dict[str, Any],
+    *,
+    expected_document_ids: set[str] | None = None,
+) -> bool:
+    """Validate an archived pair against a trusted checkpoint and, for v2, exact POST evidence."""
+    try:
+        topic = str(signature["topic"])
+        index = int(signature["index"])
+        source_ids = sorted(str(value) for value in signature["source_ids"])
+        input_hash = str(signature["input_content_hash"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    day_dir = Path(output_dir) / "daily" / day
+    pattern = f"{safe_filename(topic)}__{index:02d}__*.json"
+    for json_path in day_dir.glob(pattern):
+        data = load_json(json_path, {})
+        if not isinstance(data, dict):
+            continue
+        schema = data.get("artifact_schema_version")
+        if schema not in (None, DAILY_ARTIFACT_SCHEMA_VERSION):
+            continue
+        sidecar_document_id = data.get("document_id")
+        if schema == DAILY_ARTIFACT_SCHEMA_VERSION and (
+            not isinstance(sidecar_document_id, str)
+            or not sidecar_document_id.strip()
+            or expected_document_ids is None
+            or sidecar_document_id not in expected_document_ids
+        ):
+            continue
+        if schema is None and expected_document_ids and sidecar_document_id is not None and sidecar_document_id not in expected_document_ids:
+            continue
+        sidecar = data.get("unit")
+        if not isinstance(sidecar, dict):
+            continue
+        try:
+            sidecar_index = int(sidecar.get("index", -1))
+            source_count = int(sidecar.get("source_count", -1))
+        except (TypeError, ValueError):
+            continue
+        sidecar_hash = sidecar.get("input_content_hash")
+        if (
+            sidecar.get("scope") != "daily"
+            or sidecar.get("period") != day
+            or sidecar.get("topic") != topic
+            or sidecar_index != index
+            or source_count != len(source_ids)
+            or sorted(str(value) for value in (sidecar.get("source_ids") or [])) != source_ids
+            or (schema == DAILY_ARTIFACT_SCHEMA_VERSION and sidecar_hash != input_hash)
+            or (schema is None and sidecar_hash not in (None, input_hash))
         ):
             continue
         markdown_path = Path(str(data.get("markdown_path") or "")).expanduser()
@@ -1955,29 +2419,107 @@ def daily_artifact_is_complete(output_dir: Path, unit: ReflectUnit) -> bool:
     return False
 
 
-def evaluate_daily_completion(output_dir: Path, units_by_day: dict[str, list[ReflectUnit]]) -> dict[str, Any]:
-    """Evaluate one frozen unit snapshot without querying Hindsight again."""
+def checkpointed_daily_artifact_gaps(
+    output_dir: Path,
+    checkpoint: dict[str, Any],
+    through: str | None = None,
+    *,
+    args: argparse.Namespace | None = None,
+    progress: dict[str, Any] | None = None,
+) -> list[str]:
+    gaps: list[str] = []
+    completed_days = checkpoint.get("completed_days") or {}
+    if not isinstance(completed_days, dict):
+        return ["<invalid-checkpoint>"]
+    effective_progress = progress if progress is not None else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    bank = str(getattr(args, "bank", checkpoint.get("bank", DEFAULT_BANK)))
+    limit = through or checkpoint.get("baseline_through")
+    for day, record in completed_days.items():
+        if limit is not None and str(day) > str(limit):
+            continue
+        if not isinstance(record, dict):
+            gaps.append(str(day))
+            continue
+        signatures = record.get("unit_signatures")
+        if not isinstance(signatures, list):
+            gaps.append(str(day))
+            continue
+        if any(
+            not checkpointed_daily_artifact_pair_is_valid(
+                output_dir,
+                str(day),
+                signature,
+                expected_document_ids=checkpointed_progress_document_ids(effective_progress, signature, bank),
+            )
+            for signature in signatures
+        ):
+            gaps.append(str(day))
+    return sorted(set(gaps))
+
+
+def evaluate_daily_completion(
+    output_dir: Path,
+    units_by_day: dict[str, list[ReflectUnit]],
+    *,
+    args: argparse.Namespace | None = None,
+    progress: dict[str, Any] | None = None,
+    checkpoint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate a frozen daily snapshot against artifacts and trusted success records."""
     output_dir = Path(output_dir)
+    effective_progress: dict[str, Any] = progress if progress is not None else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    if checkpoint is None:
+        bank = str(getattr(args, "bank", DEFAULT_BANK))
+        checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, bank, args=args)
+    entries = processed_units_v2(effective_progress)
     done_days: list[str] = []
     missing_days: list[str] = []
     details: dict[str, dict[str, Any]] = {}
+    missing_unit_signatures_by_day: dict[str, list[tuple[str, int, tuple[str, ...], str]]] = {}
     for day in units_by_day:
         units = units_by_day.get(day, [])
         expected = {unit_completion_signature(unit) for unit in units}
-        observed = daily_json_completion_signatures(output_dir, day)
-        matched = expected & observed
+        matched: set[tuple[str, int, tuple[str, ...], str]] = set()
+        for unit in units:
+            signature = unit_completion_signature(unit)
+            if checkpointed_daily_artifact_is_reusable(
+                output_dir,
+                unit,
+                checkpoint,
+                args=args,
+                progress=effective_progress,
+            ):
+                matched.add(signature)
+                continue
+            entry = entries.get(unit_progress_key(unit, args)) if args is not None else None
+            if v2_progress_entry_is_reusable(output_dir, unit, entry, args=args):
+                matched.add(signature)
+            elif legacy_daily_progress_entry_is_reusable(
+                output_dir,
+                unit,
+                entries,
+                bank=str(getattr(args, "bank", DEFAULT_BANK)),
+            ):
+                matched.add(signature)
         missing = expected - matched
         details[day] = {
             "expected_units": len(expected),
-            "observed_outputs": len(observed),
+            "observed_outputs": len(matched),
             "matched_units": len(matched),
             "missing_units": len(missing),
         }
+        missing_units = [unit for unit in units if unit_completion_signature(unit) not in matched]
         if expected and missing:
             missing_days.append(day)
+            missing_unit_signatures_by_day[day] = [unit_completion_signature(unit) for unit in missing_units]
         else:
             done_days.append(day)
-    return {"done_days": done_days, "missing_days": missing_days, "details": details}
+    return {
+        "done_days": done_days,
+        "missing_days": missing_days,
+        "missing_unit_signatures_by_day": missing_unit_signatures_by_day,
+        "details": details,
+    }
 
 
 def build_daily_completion_snapshot(
@@ -1986,7 +2528,15 @@ def build_daily_completion_snapshot(
 ) -> tuple[dict[str, list[ReflectUnit]], dict[str, Any]]:
     """Build expected units once and evaluate them against current artifacts."""
     units_by_day = build_daily_fact_units_for_days(args, days)
-    return units_by_day, evaluate_daily_completion(Path(args.output_dir), units_by_day)
+    progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    checkpoint, _bootstrapped = load_daily_checkpoint_for_run(Path(args.output_dir), args.bank, args=args)
+    return units_by_day, evaluate_daily_completion(
+        Path(args.output_dir),
+        units_by_day,
+        args=args,
+        progress=progress,
+        checkpoint=checkpoint,
+    )
 
 
 def daily_completion_report(args: argparse.Namespace, days: list[str]) -> dict[str, Any]:
@@ -2013,6 +2563,8 @@ def write_daily_completion_manifest(
         "pipeline_version": PIPELINE_VERSION,
         "prompt_version": PROMPT_VERSION,
         "artifact_schema_version": DAILY_ARTIFACT_SCHEMA_VERSION,
+        "coverage_scope": completion.get("coverage_scope") or "post-checkpoint-increment",
+        "coverage_days_hash": date_list_hash(days) if completion.get("coverage_scope") == "all-history" else None,
         "units": {
             day: [
                 {
@@ -2027,6 +2579,10 @@ def write_daily_completion_manifest(
         },
         "missing_before": list(completion.get("missing_days") or []),
         "details_before": completion.get("details") or {},
+        "checkpoint": completion.get("checkpoint") or {},
+        "auto_catchup_days": list(completion.get("auto_catchup_days") or []),
+        "pre_checkpoint_ignored_days": list(completion.get("pre_checkpoint_ignored_days") or []),
+        "pre_checkpoint_blocked_days": list(completion.get("pre_checkpoint_blocked_days") or []),
     }
     save_json(path, payload)
     return path
@@ -2041,75 +2597,399 @@ def existing_daily_periods(output_dir: Path, days: list[str]) -> set[str]:
     return done
 
 
+def update_daily_completion_checkpoint(
+    args: argparse.Namespace,
+    units_by_day: dict[str, list[ReflectUnit]],
+    *,
+    source: str,
+    advance_through: str | None = None,
+) -> None:
+    """Persist a compact checkpoint separately from the large per-unit progress cache."""
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    checkpoint, bootstrapped = load_daily_checkpoint_for_run(output_dir, args.bank, args=args)
+    if bootstrapped and checkpoint.get("baseline_through") is not None:
+        broken_checkpoint_days = checkpointed_daily_artifact_gaps(output_dir, checkpoint, args=args)
+        if broken_checkpoint_days:
+            raise RuntimeError(
+                "archived checkpoint artifacts are missing or invalid for "
+                f"{len(broken_checkpoint_days)} date(s): {', '.join(broken_checkpoint_days)}; "
+                "refusing to persist an unverified bootstrap"
+            )
+    checkpoint = record_completed_days(
+        checkpoint,
+        units_by_day,
+        source=source,
+        advance_through=advance_through,
+    )
+    checkpoint_path = output_dir / DAILY_CHECKPOINT_FILENAME
+    save_json(checkpoint_path, checkpoint)
+    print(
+        f"Daily checkpoint updated: {checkpoint_path} "
+        f"baseline_through={checkpoint.get('baseline_through')} "
+        f"latest_successful_date={checkpoint.get('latest_successful_date')} "
+        f"completed_days={len(checkpoint.get('completed_days') or {})}"
+    )
+
+
 def resolve_missing_daily_args(args: argparse.Namespace) -> None:
-    """Validate weekly daily inputs; backfill only after an explicit opt-in."""
-    if args.weekly_source != "daily":
+    """Resolve checkpoint-bounded dates and catch up only missing daily signatures."""
+    if args.weekly_source not in {"daily", "facts"}:
         return
     weekly_window = getattr(args, "weekly_window", "all-history")
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    raw_existing_daily_days: list[str] = []
     if weekly_window == "all-history":
-        days = retained_sqlite_days(args.bank) or existing_daily_output_days(output_dir)
-        period = history_period_for(days)
+        days = retained_daily_fact_days(args.bank)
+        if args.weekly_source == "daily":
+            raw_existing_daily_days = existing_daily_output_days(output_dir)
     else:
         y, w, period = parse_week(args.week)
         start, end, _ = week_bounds(y, w)
         days = iter_dates_between(start.date(), end.date())
-    units_by_day, completion = build_daily_completion_snapshot(args, days)
-    missing = list(completion["missing_days"])
-    missing_details = {day: completion["details"].get(day, {}) for day in missing}
-    if missing:
-        manifest_path = write_daily_completion_manifest(output_dir, args, days, units_by_day, completion)
-        print(f"Daily completion manifest: {manifest_path}")
-    if not missing:
-        print(f"Weekly {period}: all {len(days)} daily outputs already exist and match expected units.")
+    candidate_inventory_days, excluded_fact_anomalies = split_known_anomalous_daily_dates(days)
+    existing_daily_candidate_days, excluded_output_anomalies = split_known_anomalous_daily_dates(raw_existing_daily_days)
+    excluded_anomalous_dates = sorted(set(excluded_fact_anomalies) | set(excluded_output_anomalies))
+    if weekly_window == "all-history":
+        period = history_period_for(candidate_inventory_days or existing_daily_candidate_days)
+
+    checkpoint, bootstrapped = load_daily_checkpoint_for_run(output_dir, args.bank, args=args)
+    baseline_from = checkpoint.get("baseline_from")
+    baseline_through = checkpoint.get("baseline_through")
+    include_history = bool(getattr(args, "backfill_missing_daily", False))
+    if args.weekly_source == "facts":
+        prior_baseline_from = baseline_from
+        prior_baseline_through = baseline_through
+        broken_fact_baseline_days: list[str] = []
+        if baseline_through is not None:
+            broken_fact_baseline_days = checkpointed_daily_artifact_gaps(output_dir, checkpoint, through=baseline_through, args=args)
+        provisionalized_fact_days: list[str] = []
+        if broken_fact_baseline_days and include_history:
+            checkpoint = provisionalize_checkpoint_for_repair(checkpoint, broken_fact_baseline_days)
+            baseline_from = None
+            baseline_through = None
+            bootstrapped = False
+            provisionalized_fact_days = list(broken_fact_baseline_days)
+        if baseline_through is None and not include_history and candidate_inventory_days:
+            raise SystemExit(
+                "Weekly facts blocked: no verified all-history daily checkpoint exists. "
+                "Refusing unbounded facts replay; establish a baseline or explicitly authorize "
+                "--backfill-missing-daily."
+            )
+        if broken_fact_baseline_days and not include_history:
+            raise SystemExit(
+                "Weekly facts blocked: archived checkpoint artifacts are missing or invalid for "
+                f"{len(broken_fact_baseline_days)} date(s): {', '.join(broken_fact_baseline_days)}."
+            )
+        fact_days = (
+            list(candidate_inventory_days)
+            if include_history
+            else [day for day in candidate_inventory_days if baseline_through is not None and day > baseline_through]
+        )
+        ignored_fact_days = (
+            [
+                day for day in candidate_inventory_days
+                if baseline_through is not None
+                and day <= baseline_through
+                and day not in (checkpoint.get("completed_days") or {})
+            ]
+            if not include_history
+            else []
+        )
+        if include_history:
+            facts_scope = "explicit-history-repair"
+        elif weekly_window == "all-history":
+            facts_scope = "post-checkpoint-increment"
+        else:
+            facts_scope = "bounded-window"
+        checkpoint["last_reconciliation"] = {
+            "recorded_at": datetime.now().isoformat(),
+            "scope": facts_scope,
+            "baseline_from": prior_baseline_from,
+            "baseline_through": prior_baseline_through,
+            "prior_baseline_from": prior_baseline_from,
+            "prior_baseline_through": prior_baseline_through,
+            "provisionalized_checkpoint_days": list(provisionalized_fact_days),
+            "provisionalized_checkpoint_days_hash": date_list_hash(provisionalized_fact_days),
+            "discovered_date_count": len(days),
+            "discovered_dates_hash": date_list_hash(days),
+            "post_checkpoint_dates": list(fact_days),
+            "post_checkpoint_dates_hash": date_list_hash(fact_days),
+            "uncovered_pre_checkpoint_dates": list(ignored_fact_days),
+            "uncovered_pre_checkpoint_dates_hash": date_list_hash(ignored_fact_days),
+            "excluded_anomalous_dates": list(excluded_anomalous_dates),
+            "excluded_anomalous_dates_hash": date_list_hash(excluded_anomalous_dates),
+        }
+        if args.mode == "submit" and not getattr(args, "budget_json", False):
+            checkpoint["updated_at"] = datetime.now().isoformat()
+            save_json(output_dir / DAILY_CHECKPOINT_FILENAME, checkpoint)
+        setattr(args, "_daily_candidate_days", fact_days)
+        setattr(args, "_weekly_fact_days", fact_days)
+        setattr(args, "_budget_missing_daily", [])
+        setattr(args, "_budget_missing_daily_details", {})
+        setattr(args, "_backfill_units", [])
+        if excluded_anomalous_dates:
+            print(f"Weekly facts: excluding {len(excluded_anomalous_dates)} known anomalous date(s): {', '.join(excluded_anomalous_dates)}")
+        if ignored_fact_days:
+            print(f"Weekly facts: excluding {len(ignored_fact_days)} uncovered pre-checkpoint date(s): {', '.join(ignored_fact_days)}")
+        print(f"Weekly facts: source date scope contains {len(fact_days)} date(s); historical backfill={include_history}")
+        return
+    provisionalized_for_repair = False
+    broken_checkpoint_days: list[str] = []
+    if baseline_through is not None:
+        validation_limit = "9999-12-31" if include_history else baseline_through
+        broken_checkpoint_days = checkpointed_daily_artifact_gaps(output_dir, checkpoint, through=validation_limit, args=args)
+    if broken_checkpoint_days:
+        if not include_history:
+            raise SystemExit(
+                "Weekly blocked: archived checkpoint artifacts are missing or invalid for "
+                f"{len(broken_checkpoint_days)} date(s): {', '.join(broken_checkpoint_days)}. "
+                "No LLM call was made; use --backfill-missing-daily only after authorizing historical repair."
+            )
+        checkpoint = provisionalize_checkpoint_for_repair(checkpoint, broken_checkpoint_days)
+        baseline_from = None
+        baseline_through = None
+        bootstrapped = False
+        provisionalized_for_repair = True
+    if baseline_through is None and not include_history and candidate_inventory_days:
+        raise SystemExit(
+            "Weekly blocked: no verified all-history daily checkpoint exists. "
+            "A successful single-day run is only a per-day record, not proof that older history is complete. "
+            "Refusing unbounded replay; establish a baseline from a complete manifest or explicitly "
+            "authorize --backfill-missing-daily for initial history recovery."
+        )
+    if include_history:
+        candidate_days = list(candidate_inventory_days)
+    elif baseline_through is not None:
+        candidate_days = [day for day in candidate_inventory_days if day > baseline_through]
+    else:
+        candidate_days = []
+    ignored_pre_checkpoint_days = (
+        [
+            day
+            for day in candidate_inventory_days
+            if baseline_through is not None
+            and day <= baseline_through
+            and day not in (checkpoint.get("completed_days") or {})
+        ]
+        if not include_history
+        else []
+    )
+    if excluded_anomalous_dates:
+        print(f"Daily checkpoint: excluding {len(excluded_anomalous_dates)} known anomalous fact date(s): {', '.join(excluded_anomalous_dates)}")
+    if ignored_pre_checkpoint_days:
+        print(
+            f"Daily checkpoint: excluding {len(ignored_pre_checkpoint_days)} uncovered pre-checkpoint fact date(s) "
+            f"({min(ignored_pre_checkpoint_days)}..{max(ignored_pre_checkpoint_days)}) from automatic catch-up."
+        )
+    setattr(args, "_daily_candidate_days", candidate_days)
+    if include_history:
+        reconciliation_scope = "explicit-history-repair"
+    elif weekly_window == "all-history":
+        reconciliation_scope = "post-checkpoint-increment"
+    else:
+        reconciliation_scope = "bounded-window"
+    checkpoint["last_reconciliation"] = {
+        "recorded_at": datetime.now().isoformat(),
+        "scope": reconciliation_scope,
+        "baseline_from": baseline_from,
+        "baseline_through": baseline_through,
+        "discovered_date_count": len(days),
+        "discovered_dates_hash": date_list_hash(days),
+        "post_checkpoint_dates": list(candidate_days),
+        "post_checkpoint_dates_hash": date_list_hash(candidate_days),
+        "uncovered_pre_checkpoint_dates": list(ignored_pre_checkpoint_days),
+        "uncovered_pre_checkpoint_dates_hash": date_list_hash(ignored_pre_checkpoint_days),
+        "excluded_anomalous_dates": list(excluded_anomalous_dates),
+        "excluded_anomalous_dates_hash": date_list_hash(excluded_anomalous_dates),
+    }
+    should_persist_reconciliation = (
+        checkpoint.get("baseline_through") is not None
+        or include_history
+        or bootstrapped
+        or provisionalized_for_repair
+        or bool(excluded_anomalous_dates)
+    )
+    if args.mode == "submit" and not getattr(args, "budget_json", False) and should_persist_reconciliation:
+        checkpoint_path = output_dir / DAILY_CHECKPOINT_FILENAME
+        save_json(checkpoint_path, checkpoint)
+        if provisionalized_for_repair:
+            print(
+                f"Daily checkpoint downgraded to an unwatermarked repair state: {checkpoint_path}; "
+                f"invalid_days={len(broken_checkpoint_days)}"
+            )
+        elif bootstrapped:
+            source = (checkpoint.get("baseline_manifest") or {}).get("path")
+            print(
+                f"Daily checkpoint bootstrapped: {checkpoint_path} "
+                f"baseline_through={baseline_through} manifest={source}"
+            )
+    if args.weekly_source == "facts":
+        setattr(args, "_weekly_fact_days", list(candidate_days))
+        setattr(args, "_budget_missing_daily", [])
+        setattr(args, "_budget_missing_daily_details", {})
+        setattr(args, "_backfill_units", [])
+        print(
+            f"Weekly {period}: facts source restricted to {len(candidate_days)} "
+            f"checkpoint-scoped date(s); excluded_pre_checkpoint={len(ignored_pre_checkpoint_days)}"
+        )
+        return
+    if not candidate_days:
+        if ignored_pre_checkpoint_days:
+            print(
+                f"Weekly {period}: excluding {len(ignored_pre_checkpoint_days)} pre-checkpoint uncovered date(s) "
+                f"from automatic processing: {', '.join(ignored_pre_checkpoint_days)}"
+            )
+        print(f"Weekly {period}: no post-checkpoint daily fact dates require reconciliation.")
         setattr(args, "_budget_missing_daily", [])
         setattr(args, "_budget_missing_daily_details", {})
         setattr(args, "_backfill_units", [])
         return
 
-    setattr(args, "_budget_missing_daily", missing)
-    setattr(args, "_budget_missing_daily_details", missing_details)
-    if not getattr(args, "backfill_missing_daily", False):
-        raise SystemExit(
-            "Weekly blocked: daily inputs are missing or fail sidecar/Markdown integrity checks "
-            f"for {len(missing)} retained date(s): {', '.join(missing)}. "
-            "No LLM backfill was run. Use --backfill-missing-daily only after explicitly authorizing the cost."
-        )
+    units_by_day, completion = build_daily_completion_snapshot(args, candidate_days)
+    missing = list(completion["missing_days"])
+    missing_unit_signatures_by_day = completion.get("missing_unit_signatures_by_day") or {}
+    if not isinstance(missing_unit_signatures_by_day, dict):
+        missing_unit_signatures_by_day = {}
 
-    print(f"Weekly {period}: backfilling missing/incomplete daily outputs before weekly: {', '.join(missing)}")
+    def incomplete_units_for_day(day: str) -> list[ReflectUnit]:
+        raw_signatures = missing_unit_signatures_by_day.get(day)
+        if not isinstance(raw_signatures, list):
+            return list(units_by_day.get(day, []))
+        wanted: set[tuple[str, int, tuple[str, ...], str]] = set()
+        for raw in raw_signatures:
+            if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+                continue
+            try:
+                wanted.add((str(raw[0]), int(raw[1]), tuple(str(value) for value in raw[2]), str(raw[3])))
+            except (TypeError, ValueError):
+                continue
+        return [unit for unit in units_by_day.get(day, []) if unit_completion_signature(unit) in wanted]
+
+    auto_missing = list(missing)
+    completion["checkpoint"] = {
+        "baseline_from": baseline_from,
+        "baseline_through": baseline_through,
+        "latest_successful_date": checkpoint.get("latest_successful_date"),
+    }
+    completion["auto_catchup_days"] = auto_missing
+    completion["pre_checkpoint_ignored_days"] = ignored_pre_checkpoint_days
+    completion["pre_checkpoint_blocked_days"] = []
+    if weekly_window != "all-history":
+        completion["coverage_scope"] = "bounded-window"
+    elif include_history:
+        completion["coverage_scope"] = "all-history"
+    else:
+        completion["coverage_scope"] = "post-checkpoint-increment"
+    if missing:
+        manifest_path = write_daily_completion_manifest(output_dir, args, candidate_days, units_by_day, completion)
+        print(f"Daily completion manifest: {manifest_path}")
+
+    setattr(args, "_budget_missing_daily", auto_missing)
+    setattr(args, "_budget_missing_daily_details", {day: completion["details"].get(day, {}) for day in auto_missing})
+    setattr(args, "_backfill_units", [])
+    if auto_missing and args.mode == "submit" and bool(getattr(args, "enforce_budget", False)):
+        aggregate_catchup_units = [
+            unit
+            for day in auto_missing
+            for unit in incomplete_units_for_day(day)
+        ]
+        budget_progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+        budget_report = emit_budget_report(aggregate_catchup_units, args, progress=budget_progress)
+        if budget_report["budget_decision"] != "pass":
+            print("Automatic daily catch-up blocked by aggregate weekly LLM budget.")
+            raise SystemExit(2)
+        setattr(args, "_budget_spent_units", int(budget_report["pending_units"]))
+        setattr(args, "_budget_spent_chars", int(budget_report["pending_chars"]))
+        setattr(args, "_budget_phase", "catchup_prechecked")
+    if ignored_pre_checkpoint_days:
+        print(
+            f"Weekly {period}: excluding {len(ignored_pre_checkpoint_days)} pre-checkpoint uncovered date(s) "
+            f"from automatic catch-up: {', '.join(ignored_pre_checkpoint_days)}"
+        )
+    if not auto_missing:
+        print(f"Weekly {period}: all {len(candidate_days)} post-checkpoint daily unit signatures are complete.")
+        if args.mode == "submit" and not getattr(args, "budget_json", False):
+            update_daily_completion_checkpoint(
+                args,
+                units_by_day,
+                source="verified_weekly_snapshot",
+                advance_through=max(candidate_days) if weekly_window == "all-history" and candidate_days else None,
+            )
+        return
+
+    if args.mode == "dry-run" or getattr(args, "budget_json", False):
+        pending_units: list[ReflectUnit] = []
+        for day in auto_missing:
+            units = incomplete_units_for_day(day)
+            pending_units.extend(units)
+        print(
+            f"Weekly {period}: would catch up {len(pending_units)} new/incomplete unit(s) "
+            f"across {len(auto_missing)} date(s): {', '.join(auto_missing)}"
+        )
+        setattr(args, "_backfill_units", pending_units)
+        return
+
+    print(f"Weekly {period}: catching up only new/incomplete unit signatures: {', '.join(auto_missing)}")
     original_scope = args.scope
     original_date = args.date
     original_daily_source = args.daily_source
     original_group_by = args.group_by
-    backfill_units: list[ReflectUnit] = []
+    ignored_days = set(ignored_pre_checkpoint_days)
+    verification_days = [day for day in candidate_days if day not in ignored_days]
     try:
         args.scope = "daily"
         args.daily_source = "facts"
         args.group_by = "topic"
-        for day in missing:
+        for day in auto_missing:
             args.date = day
-            units = list(units_by_day.get(day, []))
-            print_units(units)
-            if args.mode == "dry-run":
-                backfill_units.extend(units)
-                continue
-            code = run_units(args, units)
+            day_units = list(units_by_day.get(day, []))
+            incomplete_units = incomplete_units_for_day(day)
+            print_units(incomplete_units)
+            code = run_units(args, incomplete_units)
             if code != 0:
                 raise SystemExit(code)
-        if args.mode != "dry-run":
-            remaining = evaluate_daily_completion(
+            progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+            checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, args.bank, args=args)
+            remaining_for_day = evaluate_daily_completion(
                 output_dir,
-                {day: units_by_day.get(day, []) for day in missing},
+                {day: day_units},
+                args=args,
+                progress=progress,
+                checkpoint=checkpoint,
             )["missing_days"]
-            if remaining:
-                raise RuntimeError(f"daily backfill completed but artifacts are still missing: {', '.join(remaining)}")
+            if remaining_for_day:
+                raise RuntimeError(f"daily catch-up completed but artifacts are still missing for {day}")
+            update_daily_completion_checkpoint(
+                args,
+                {day: day_units},
+                source="weekly_incremental_catchup" if not include_history else "explicit_historical_backfill",
+            )
+        progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+        checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, args.bank, args=args)
+        remaining = evaluate_daily_completion(
+            output_dir,
+            {day: units_by_day.get(day, []) for day in verification_days},
+            args=args,
+            progress=progress,
+            checkpoint=checkpoint,
+        )["missing_days"]
+        if remaining:
+            raise RuntimeError(f"daily catch-up completed but artifacts are still missing: {', '.join(remaining)}")
+        update_daily_completion_checkpoint(
+            args,
+            {day: units_by_day.get(day, []) for day in verification_days},
+            source="verified_weekly_snapshot",
+            advance_through=max(candidate_days) if weekly_window == "all-history" and candidate_days else None,
+        )
     finally:
         args.scope = original_scope
         args.date = original_date
         args.daily_source = original_daily_source
         args.group_by = original_group_by
-        if args.mode == "dry-run":
-            setattr(args, "_backfill_units", backfill_units)
+    if getattr(args, "_budget_phase", None) == "catchup_prechecked":
+        args._budget_phase = "weekly"
+        args._budget_missing_daily = []
+        args._budget_missing_daily_details = {}
 
 
 def main() -> None:
@@ -2121,7 +3001,7 @@ def main() -> None:
     parser.add_argument("--weekly-source", choices=["daily", "facts", "raw"], default="daily", help="weekly 默认跨话题+跨历史周期整合 daily consolidation 结果；facts=直接整合 processed facts；raw 仅诊断，成本高")
     parser.add_argument("--weekly-window", choices=["all-history", "week"], default="all-history", help="weekly 默认 all-history，刷新整个 Hindsight 高层知识；week 仅整合 --week 指定 ISO 周")
     parser.add_argument("--weekly-group-by", choices=["all", "topic"], default="topic", help="V2 默认 topic：先做 topic history reduce；global canonical cards 由 v2 reducer 再统一生成。all 仅用于诊断或兼容旧 cross-topic chunk")
-    parser.add_argument("--backfill-missing-daily", action="store_true", help="weekly-source=daily 时显式授权对缺失日执行 processed-facts daily LLM 回补；默认 fail-closed，不产生回补费用")
+    parser.add_argument("--backfill-missing-daily", action="store_true", help="weekly-source=daily 时显式允许回补 checkpoint 之前的历史缺口；checkpoint 之后的增量追赶默认自动执行")
     parser.add_argument("--mode", choices=["dry-run", "submit"], default="dry-run")
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--api", default=DEFAULT_API)
@@ -2142,9 +3022,10 @@ def main() -> None:
     parser.add_argument("--no-response-format", action="store_true", help="不传 OpenAI json_object response_format；用于 provider 不兼容时")
     parser.add_argument("--force-repost", action="store_true", help="即使 progress 中已有相同 document_id / unit key 也重新 post 到 Hindsight")
     parser.add_argument("--budget-json", action="store_true", help="只输出 paid LLM 预算/缓存报告；不调用 LLM、不写 Hindsight。超预算返回 exit 2")
+    parser.add_argument("--enforce-budget", action="store_true", help="submit 前按当前冻结 unit 集合执行预算门禁；超预算返回 exit 2，通过后继续执行")
     parser.add_argument("--budget-json-pretty", action="store_true", help="pretty-print --budget-json 输出")
-    parser.add_argument("--budget-max-pending-units", type=int, default=-1, help="--budget-json 门禁：pending LLM units 超过该值则 exit 2；-1 表示不限制")
-    parser.add_argument("--budget-max-pending-chars", type=int, default=-1, help="--budget-json 门禁：pending input chars 超过该值则 exit 2；-1 表示不限制")
+    parser.add_argument("--budget-max-pending-units", type=int, default=-1, help="预算门禁：pending LLM units 超过该值则 exit 2；-1 表示不限制")
+    parser.add_argument("--budget-max-pending-chars", type=int, default=-1, help="预算门禁：pending input chars 超过该值则 exit 2；-1 表示不限制")
     parser.add_argument("--concurrency", type=int, default=4, help="LLM 并发数；默认 4。遇到 429 时自适应减半")
     parser.add_argument("--min-concurrency", type=int, default=1, help="429 自适应降并发的下限；默认 1")
     parser.add_argument("--rate-limit-backoff-seconds", type=int, default=RATE_LIMIT_BACKOFF_SECONDS, help="遇到 429 后 sleep 秒数；默认 300")
@@ -2155,6 +3036,7 @@ def main() -> None:
         raise SystemExit(f"SQLite DB not found: {args.db}")
 
     all_units: list[ReflectUnit] = []
+    daily_units_by_day: dict[str, list[ReflectUnit]] = {}
     print("=" * 70, file=sys.stderr if args.budget_json else sys.stdout)
     print("Hermes Offline Consolidation", file=sys.stderr if args.budget_json else sys.stdout)
     print("=" * 70, file=sys.stderr if args.budget_json else sys.stdout)
@@ -2169,13 +3051,30 @@ def main() -> None:
             all_units.extend(getattr(args, "_backfill_units", []) or [])
 
         if args.scope in {"daily", "both"}:
-            units, *_ = build_daily_for_args(args)
+            units, period, *_ = build_daily_for_args(args)
+            daily_units_by_day[period] = units
             all_units.extend(units)
         if args.scope in {"weekly", "both"}:
             units, *_ = build_weekly_for_args(args)
             all_units.extend(units)
 
     code = run_units(args, all_units)
+    if code == 0 and args.mode == "submit" and not getattr(args, "budget_json", False) and daily_units_by_day:
+        progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+        checkpoint, _bootstrapped = load_daily_checkpoint_for_run(Path(args.output_dir), args.bank, args=args)
+        completion = evaluate_daily_completion(
+            Path(args.output_dir),
+            daily_units_by_day,
+            args=args,
+            progress=progress,
+            checkpoint=checkpoint,
+        )
+        if completion["missing_days"]:
+            raise RuntimeError(
+                "daily run returned success but checkpoint validation found incomplete artifacts: "
+                + ", ".join(completion["missing_days"])
+            )
+        update_daily_completion_checkpoint(args, daily_units_by_day, source="successful_daily_run")
     raise SystemExit(code)
 
 
