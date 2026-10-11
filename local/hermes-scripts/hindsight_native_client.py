@@ -16,6 +16,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator
 
@@ -34,7 +35,13 @@ RECOVER_CONSOLIDATION_CONFIRM = "recover-hindsight-consolidation"
 
 
 class HindsightApiError(RuntimeError):
-    """Raised when the public Hindsight API call fails."""
+    """Raised with structured classification; response bodies are never logged."""
+
+    def __init__(self, message, *, status_code=None, retry_after=None, error_class=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.error_class = error_class
 
 
 class HindsightUnsafeOperation(RuntimeError):
@@ -82,7 +89,7 @@ class HindsightNativeClient:
             suffix = "/" + suffix
         return f"/v1/default/banks/{urllib.parse.quote(self.bank, safe='')}{suffix}"
 
-    def request(self, method: str, path: str, *, payload: dict[str, Any] | None = None, params: dict[str, Any] | None = None, timeout: int | None = None) -> Any:
+    def request(self, method: str, path: str, *, payload: dict[str, Any] | None = None, params: dict[str, Any] | None = None, timeout: float | None = None) -> Any:
         method = method.upper()
         if not path.startswith("/"):
             path = "/" + path
@@ -107,17 +114,19 @@ class HindsightNativeClient:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-            raise HindsightApiError(f"{method} {path} failed HTTP {e.code}: {clean_json_text(body)[:500]}") from e
+            from hindsight_offline_retry import parse_retry_after
+            import time
+            raise HindsightApiError(f"{method} failed HTTP {e.code}", status_code=e.code,
+                                    retry_after=parse_retry_after(e.headers, now=time.time())) from e
         except Exception as e:
-            raise HindsightApiError(f"{method} {path} failed: {type(e).__name__}: {e}") from e
+            raise HindsightApiError(f"{method} transport failed", error_class="transport") from e
         raw = clean_json_text(raw).strip()
         if not raw:
             return {}
         try:
             return json.loads(raw)
         except Exception as e:
-            raise HindsightApiError(f"{method} {path} returned non-JSON: {raw[:500]}") from e
+            raise HindsightApiError(f"{method} returned non-JSON", error_class="invalid_response") from e
 
     # Health / config / stats -------------------------------------------------
     def health(self) -> dict[str, Any]:
@@ -224,10 +233,16 @@ class HindsightNativeClient:
         payload.update({k: v for k, v in extra.items() if v is not None})
         return self.request("POST", self.bank_path("memories/recall"), payload=payload, timeout=max(self.timeout, 45))
 
-    def retain_items(self, items: list[dict[str, Any]], *, async_mode: bool = True) -> dict[str, Any]:
-        """Submit MemoryItem payloads through the official retain endpoint."""
+    def retain_items(self, items: list[dict[str, Any]], *, async_mode: bool = True,
+                     operation_id: str | None = None, timeout: float | None = None) -> dict[str, Any]:
+        """Caller binds operation_id to an immutable payload before calling."""
         payload = {"async": async_mode, "items": items}
-        return self.request("POST", self.bank_path("memories"), payload=payload, timeout=max(self.timeout, 120))
+        if operation_id is not None:
+            if str(uuid.UUID(operation_id)) != operation_id:
+                raise ValueError("operation_id must be a canonical UUID")
+            payload["operation_id"] = operation_id
+        return self.request("POST", self.bank_path("memories"), payload=payload,
+                            timeout=timeout if timeout is not None else max(self.timeout, 120))
 
     def retain_batch(self, items: list[dict[str, Any]], *, retain_async: bool = False, document_tags: list[str] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"items": items, "async": bool(retain_async)}
@@ -279,11 +294,11 @@ class HindsightNativeClient:
             if len(items) < limit:
                 break
 
-    def get_operation(self, operation_id: str, *, include_payload: bool = False) -> dict[str, Any]:
+    def get_operation(self, operation_id: str, *, include_payload: bool = False, timeout: float | None = None) -> dict[str, Any]:
         return self.request(
             "GET",
             self.bank_path("operations/" + urllib.parse.quote(operation_id, safe="")),
-            params={"include_payload": include_payload},
+            params={"include_payload": include_payload}, timeout=timeout,
         )
 
     def delete_operation(self, operation_id: str, *, dry_run: bool = True, confirm: str | None = None) -> dict[str, Any]:

@@ -3,7 +3,16 @@ import json
 import sys
 from pathlib import Path
 
-ROOT = Path('/home/wyr/.hermes/scripts')
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes'))
+    monkeypatch.syspath_prepend(str(ROOT))
 
 
 def load_module(name):
@@ -432,3 +441,48 @@ def test_execute_does_not_update_submit_state_when_async_operation_fails(tmp_pat
     else:
         raise AssertionError('failed async operation should raise')
     assert not state_path.exists()
+
+
+def test_completed_parent_with_failed_child_never_commits(tmp_path):
+    runner = load_module('hindsight_session_retain_runner')
+    class Client:
+        bank = 'isolated'
+        def get_operation(self, operation_id, **kwargs):
+            return {'id': operation_id, 'status': 'completed',
+                    'child_operations': [{'id': 'child', 'status': 'failed'}]}
+    with pytest.raises(runner.RetainOperationFailed):
+        runner.wait_for_operation_ids(Client(), ['parent'], timeout_s=1, poll_s=0)
+
+
+def test_successful_batch_saved_before_later_failure(tmp_path):
+    runner = load_module('hindsight_session_retain_runner')
+    records = [{'document_id': f'd{i}', 'content': f'fact{i}', 'action': 'production',
+                'metadata': {'content_sha256': str(i)}} for i in range(2)]
+    manifest = tmp_path / 'manifest.jsonl'
+    manifest.write_text('\n'.join(json.dumps(r) for r in records))
+    state = tmp_path / 'state.json'
+    class Client:
+        bank = 'isolated'
+        calls = 0
+        def retain_items(self, items, **kwargs):
+            self.calls += 1
+            return {'operation_id': f'op{self.calls}'}
+        def get_operation(self, operation_id, **kwargs):
+            return {'id': operation_id, 'status': 'completed' if operation_id == 'op1' else 'failed'}
+    with pytest.raises(runner.RetainOperationFailed):
+        runner.run_manifest(manifest, client=Client(), bank='isolated', dry_run=False,
+                            confirm=runner.RETAIN_CONFIRM, batch_size=1, submit_state_path=state)
+    assert set(json.loads(state.read_text())['documents']) == {'isolated::d0'}
+
+
+def test_missing_async_receipt_cannot_be_recorded_as_success(tmp_path):
+    runner = load_module('hindsight_session_retain_runner')
+    manifest = tmp_path / 'manifest.jsonl'
+    manifest.write_text(json.dumps({'document_id': 'd', 'content': 'fact', 'action': 'production'}))
+    class Client:
+        def retain_items(self, *args, **kwargs):
+            return {}
+    with pytest.raises(runner.RetainOperationFailed):
+        runner.run_manifest(manifest, client=Client(), dry_run=False, confirm=runner.RETAIN_CONFIRM,
+                            submit_state_path=tmp_path / 'state.json')
+    assert not (tmp_path / 'state.json').exists()

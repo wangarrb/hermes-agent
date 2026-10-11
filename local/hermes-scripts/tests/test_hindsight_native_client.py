@@ -82,3 +82,18 @@ def test_v061_observability_export_import_and_repair_paths_are_wrapped():
     preview = c.recover_consolidation()
     assert preview['dry_run'] is True
     assert preview['required_confirm'] == native.RECOVER_CONSOLIDATION_CONFIRM
+
+
+def test_retain_passes_caller_uuid_and_exact_request_timeout():
+    native = load_module('hindsight_native_client')
+    import uuid
+    import pytest
+    calls = []
+    operation_id = str(uuid.uuid4())
+    client = native.HindsightNativeClient(bank='isolated', transport=lambda *a, **kw: calls.append((a, kw)) or {})
+    client.retain_items([{'content': 'fact'}], operation_id=operation_id, timeout=7)
+    assert calls[0][1]['payload']['operation_id'] == operation_id
+    assert calls[0][1]['payload']['async'] is True
+    with pytest.raises(ValueError):
+        client.retain_items([{'content': 'fact'}], operation_id='not-a-uuid')
+    assert len(calls) == 1

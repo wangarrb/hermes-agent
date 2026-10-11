@@ -76,7 +76,12 @@ WEEKLY_INPUT_PROJECTION_VERSION = "weekly-markdown-no-duplicate-json-v1"
 
 
 class RateLimitError(RuntimeError):
-    """Signal a provider 429 so the outer adaptive scheduler can slow down."""
+    """Signal a provider 429 without leaking its body or swallowing it."""
+
+    def __init__(self, message="http_429", *, retry_after=None):
+        super().__init__(message)
+        self.status_code = 429
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -1150,6 +1155,7 @@ def call_llm(
     output_language: str = "auto",
     raise_on_429: bool = False,
     rate_limit_backoff_seconds: int = RATE_LIMIT_BACKOFF_SECONDS,
+    retry_policy=None,
 ) -> tuple[dict[str, Any] | None, str]:
     key = get_llm_key(api_key_env)
     base = base_url.rstrip("/")
@@ -1173,55 +1179,52 @@ def call_llm(
     if _effort:
         payload["reasoning_effort"] = _effort
 
-    last_err = ""
-    # OpenCode Go free-tier endpoints route by session header; without it the
-    # API rejects with MissingSessionID even with a valid bearer key.
+    from hindsight_offline_retry import budget_for, classify_error, parse_retry_after, RemoteCallError
+
+    budget = budget_for(retry_policy)
     extra_headers: dict[str, str] = {}
     if "opencode.ai" in base:
         extra_headers["x-opencode-session"] = "hindsight-offline-reflect"
-    for attempt in range(MAX_RETRIES + 1):
+    attempt = 0
+    while True:
+        attempt += 1
+        timeout = budget.charge(kind='llm')
         try:
             resp = requests.post(
                 f"{base}/chat/completions",
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", **extra_headers},
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
+                json=dict(payload), timeout=timeout,
             )
-            if resp.status_code == 400 and "response_format" in resp.text[:1000] and payload.get("response_format"):
-                # Some OpenAI-compatible backends (e.g. opencode zen) reject
-                # response_format; retry once without it — JSON is still
-                # elicited by the prompt itself.
-                payload.pop("response_format", None)
-                resp = requests.post(
-                    f"{base}/chat/completions",
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", **extra_headers},
-                    json=payload,
-                    timeout=REQUEST_TIMEOUT,
-                )
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {resp.status_code}: {resp.text[:500]}"
-                if resp.status_code == 429 and raise_on_429:
-                    raise RateLimitError(last_err)
-                if attempt < MAX_RETRIES:
-                    delay = rate_limit_backoff_seconds if resp.status_code == 429 else min(60, 10 * (attempt + 1))
-                    print(f"  {label} retry after {delay}s: {last_err[:160]}", file=sys.stderr)
-                    time.sleep(delay)
-                    continue
-            resp.raise_for_status()
+        except (requests.RequestException, TimeoutError, ConnectionError, OSError) as error:
+            category, transient = classify_error(error)
+            if not transient:
+                raise RemoteCallError(category) from None
+            budget.wait(category, attempt)
+            continue
+        if resp.status_code == 400 and "response_format" in resp.text[:1000] and payload.get("response_format"):
+            payload.pop("response_format")
+            budget.wait("format_negotiation", attempt, retry_after=0)
+            continue
+        if not 200 <= resp.status_code < 300:
+            retry_after = parse_retry_after(getattr(resp, "headers", None), now=budget.policy.wall_clock())
+            category = f"http_{resp.status_code}"
+            if resp.status_code == 429 and raise_on_429:
+                raise RateLimitError(category, retry_after=retry_after)
+            if resp.status_code not in {429, 500, 502, 503, 504}:
+                raise RemoteCallError(category, status_code=resp.status_code)
+            budget.wait(category, attempt, retry_after=retry_after)
+            continue
+        try:
             data = resp.json()
             raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             if not raw and "reply" in data:
                 raw = str(data.get("reply") or "")
-            return extract_json_object(raw), raw
-        except Exception as e:
-            last_err = repr(e)
-            if attempt < MAX_RETRIES:
-                delay = min(60, 10 * (attempt + 1))
-                print(f"  {label} retry after {delay}s: {last_err[:160]}", file=sys.stderr)
-                time.sleep(delay)
-                continue
-            raise RuntimeError(f"{label} call failed for {unit.scope} {unit.period} {unit.topic}: {last_err}")
-    raise RuntimeError(f"{label} call failed: {last_err}")
+            obj = extract_json_object(raw)
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            raise RemoteCallError("invalid_output") from None
+        if not isinstance(raw, str) or not raw.strip() or not isinstance(obj, dict) or not obj:
+            raise RemoteCallError("invalid_output")
+        return obj, raw
 
 
 def render_markdown(unit: ReflectUnit, obj: dict[str, Any] | None, raw_text: str, *, model: str) -> str:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 import sys
 import time
 from collections import Counter
@@ -61,7 +63,16 @@ def load_submit_state(path: str | Path | None) -> dict[str, Any]:
 def save_submit_state(path: str | Path, state: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    fd, temporary = tempfile.mkstemp(prefix=p.name + ".", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, p)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def record_incremental_key(record: dict[str, Any]) -> dict[str, Any]:
@@ -246,35 +257,34 @@ def operation_id_from_record(op: dict[str, Any]) -> str | None:
 
 
 def wait_for_operation_ids(client: Any, operation_ids: list[str], *, timeout_s: int = 300, poll_s: float = 5.0) -> dict[str, dict[str, Any]]:
-    if not operation_ids:
-        return {}
-    wanted = set(operation_ids)
-    deadline = time.time() + max(1, timeout_s)
-    seen: dict[str, dict[str, Any]] = {}
+    from hindsight_incremental_delivery import operation_receipt
+    from hindsight_offline_retry import RemoteCallError
+
+    deadline = time.monotonic() + max(0, timeout_s)
     while True:
-        for op in client.iter_operations(max_items=1000):
-            op_id = operation_id_from_record(op)
-            if op_id in wanted:
-                seen[op_id] = op
-        statuses = {op_id: (seen.get(op_id) or {}).get("status") for op_id in wanted}
-        failed = {op_id: status for op_id, status in statuses.items() if status in {"failed", "cancelled", "error"}}
-        if failed:
-            # Log failures but don't raise — individual batch failures (e.g. FK
-            # violations in Hindsight) should not abort the entire pipeline.
-            # The caller can decide whether to treat partial failure as fatal.
-            print(f"WARNING: {len(failed)} retain operation(s) failed: {failed}", flush=True)
-            # Remove failed ops from wanted so we can still complete the rest
-            wanted -= set(failed.keys())
-            seen.update({op_id: {"status": s} for op_id, s in failed.items()})
-            if not wanted:
-                # All operations resolved (all failed)
-                return seen
-            continue
-        if wanted.issubset(seen) and all(status == "completed" for status in statuses.values()):
-            return seen
-        if time.time() >= deadline:
-            raise RetainOperationFailed(f"retain async operation timeout: {statuses}")
-        time.sleep(poll_s)
+        proofs = {}
+        # Older injected clients only expose list; the native real path always
+        # uses precise GET and cannot lose IDs to a paginated queue scan.
+        listed = None if hasattr(client, "get_operation") else {
+            operation_id_from_record(op): op for op in client.iter_operations(max_items=1000)}
+        for operation_id in operation_ids:
+            op = client.get_operation(operation_id) if listed is None else listed.get(operation_id)
+            if op is None:
+                continue
+            if op.get("child_operation_ids") and not op.get("child_operations"):
+                op = dict(op)
+                op["child_operations"] = [client.get_operation(child_id) for child_id in op["child_operation_ids"]]
+            try:
+                proofs[operation_id] = operation_receipt(op, operation_id, getattr(client, "bank", None))
+            except RemoteCallError as error:
+                if error.error_class != "operation_pending":
+                    raise RetainOperationFailed(f"{operation_id}: {error.error_class}") from None
+        if len(proofs) == len(operation_ids):
+            return proofs
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RetainOperationFailed("retain async operation timeout")
+        time.sleep(min(poll_s, remaining))
 
 
 def batch_items(items: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
@@ -306,27 +316,30 @@ def run_manifest(path: str | Path, *, client: Any | None = None, bank: str = "he
     if confirm != RETAIN_CONFIRM:
         raise UnsafeRetainOperation(f"submit retain requires confirm={RETAIN_CONFIRM}")
     client = client or HindsightNativeClient(api=api, bank=bank, timeout=120)
-    operation_ids: list[str] = []
-    for batch in batch_items(items, max(1, batch_size)):
+    result["submit_state_updated"] = False
+    result["operations"] = {}
+    for offset in range(0, len(items), max(1, batch_size)):
+        batch = items[offset:offset + max(1, batch_size)]
         response = client.retain_items(batch, async_mode=True)
         result["responses"].append(response)
-        operation_ids.extend(extract_operation_ids(response))
+        operation_ids = extract_operation_ids(response)
+        if not operation_ids:
+            raise RetainOperationFailed("async retain missing exact operation receipt")
+        result["operation_ids"].extend(operation_ids)
         result["submitted_items"] += len(batch)
-    result["operation_ids"] = list(dict.fromkeys(operation_ids))
-    if wait and operation_ids:
-        result["operations"] = wait_for_operation_ids(client, result["operation_ids"], timeout_s=wait_timeout_s, poll_s=poll_s)
+        if not wait:
+            result["submit_state_pending_reason"] = "async_operations_not_waited"
+            continue
+        proofs = wait_for_operation_ids(client, operation_ids, timeout_s=wait_timeout_s, poll_s=poll_s)
+        result["operations"].update(proofs)
         result["waited_for_operations"] = True
-    elif operation_ids:
-        result["submit_state_pending_reason"] = "async_operations_not_waited"
-    if submit_state_path and selected_records:
-        if operation_ids and not result.get("waited_for_operations"):
-            result["submit_state_updated"] = False
-        else:
-            update_submit_state_for_items(submit_state, selected_records, manifest_path=path, bank=bank)
+        if submit_state_path:
+            confirmed_records = selected_records[offset:offset + len(batch)]
+            update_submit_state_for_items(submit_state, confirmed_records, manifest_path=path, bank=bank)
+            for record in confirmed_records:
+                submit_state["documents"][submit_state_document_key(record["document_id"], bank)]["operation_receipts"] = proofs
             save_submit_state(submit_state_path, submit_state)
             result["submit_state_updated"] = True
-    else:
-        result["submit_state_updated"] = False
     return result
 
 
