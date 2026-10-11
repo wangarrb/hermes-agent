@@ -546,8 +546,21 @@ def test_unbanked_legacy_daily_progress_is_only_compatible_with_default_bank(tmp
     sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
     entries = {"legacy-unbanked-entry": entry}
 
-    assert module.legacy_daily_progress_entry_is_reusable(tmp_path, expected, entries, bank="hermes")
-    assert not module.legacy_daily_progress_entry_is_reusable(tmp_path, expected, entries, bank="other-bank")
+    assert not module.legacy_daily_progress_entry_is_reusable(tmp_path, expected, entries, bank="hermes")
+    assert module.legacy_daily_progress_entry_is_reusable(
+        tmp_path,
+        expected,
+        entries,
+        bank="hermes",
+        allow_unbanked_default_bank_migration=True,
+    )
+    assert not module.legacy_daily_progress_entry_is_reusable(
+        tmp_path,
+        expected,
+        entries,
+        bank="other-bank",
+        allow_unbanked_default_bank_migration=True,
+    )
 
 
 def test_completion_accepts_exact_json_hash_and_rejects_legacy_markdown(tmp_path, monkeypatch):
@@ -616,13 +629,13 @@ def test_completion_accepts_exact_json_hash_and_rejects_legacy_markdown(tmp_path
         "source_ids": expected.source_ids,
         "input_content_hash": module.short_hash(expected.content, 24),
     }
-    assert module.checkpointed_daily_artifact_pair_is_valid(tmp_path, "2026-05-07", signature, expected_document_ids={doc_id})
+    assert module.checkpointed_daily_artifact_pair_is_valid(tmp_path, "2026-05-07", signature, expected_posted_artifacts={(doc_id, str(markdown.resolve()))})
     current_data = json.loads(sidecar.read_text(encoding="utf-8"))
     del current_data["unit"]["input_content_hash"]
     sidecar.write_text(json.dumps(current_data), encoding="utf-8")
     report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
     assert report["missing_days"] == ["2026-05-07"]
-    assert not module.checkpointed_daily_artifact_pair_is_valid(tmp_path, "2026-05-07", signature, expected_document_ids={doc_id})
+    assert not module.checkpointed_daily_artifact_pair_is_valid(tmp_path, "2026-05-07", signature, expected_posted_artifacts={(doc_id, str(markdown.resolve()))})
     current_data["unit"]["input_content_hash"] = module.short_hash(expected.content, 24)
     sidecar.write_text(json.dumps(current_data), encoding="utf-8")
     report = module.daily_completion_report(args_for(tmp_path), ["2026-05-07"])
@@ -634,7 +647,7 @@ def test_completion_accepts_exact_json_hash_and_rejects_legacy_markdown(tmp_path
     progress_path.write_text(json.dumps({"processed_units_v2": {key: wrong_document_id}}), encoding="utf-8")
     report = module.daily_completion_report(args, ["2026-05-07"])
     assert report["missing_days"] == ["2026-05-07"]
-    assert not module.checkpointed_daily_artifact_pair_is_valid(tmp_path, "2026-05-07", signature, expected_document_ids={doc_id})
+    assert not module.checkpointed_daily_artifact_pair_is_valid(tmp_path, "2026-05-07", signature, expected_posted_artifacts={(doc_id, str(markdown.resolve()))})
     missing_sidecar_document_id["document_id"] = doc_id
     sidecar.write_text(json.dumps(missing_sidecar_document_id), encoding="utf-8")
     wrong_document_id = module.progress_entry(expected, args, document_id="different-document", output_markdown=str(markdown))
@@ -645,7 +658,7 @@ def test_completion_accepts_exact_json_hash_and_rejects_legacy_markdown(tmp_path
         tmp_path,
         "2026-05-07",
         signature,
-        expected_document_ids={"different-document"},
+        expected_posted_artifacts={("different-document", str(markdown.resolve()))},
     )
     progress_path.write_text(
         json.dumps({"processed_units_v2": {key: module.progress_entry(expected, args, document_id=doc_id, output_markdown=str(markdown))}}),
@@ -675,10 +688,11 @@ def test_checkpointed_current_schema_reuse_requires_exact_progress_document_id(t
     expected = unit(module, day, "checkpointed current schema fact")
     args = args_for(tmp_path)
     saved = module.save_result(tmp_path, expected, {"executive_summary": ["posted"]}, "raw", model=args.llm_model)
+    original_sidecar_text = saved.output_json_path.read_text(encoding="utf-8")
     checkpoint = module.record_completed_days(
         module.load_daily_completion_checkpoint(tmp_path, "hermes")[0],
         {day: [expected]},
-        source="verified_frozen_completion_scope",
+        source="successful_daily_run",
     )
     progress_path = tmp_path / "progress.json"
     monkeypatch.setattr(module, "DEFAULT_PROGRESS_FILE", progress_path)
@@ -695,6 +709,19 @@ def test_checkpointed_current_schema_reuse_requires_exact_progress_document_id(t
         progress=exact_progress,
     ) == []
 
+    unbanked_entry = dict(exact_entry)
+    unbanked_entry.pop("bank")
+    unbanked_progress = {"processed_units_v2": {key: unbanked_entry}}
+    progress_path.write_text(json.dumps(unbanked_progress), encoding="utf-8")
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+    assert module.checkpointed_daily_artifact_gaps(
+        tmp_path,
+        checkpoint,
+        args=args,
+        progress=unbanked_progress,
+    ) == [day]
+    progress_path.write_text(json.dumps(exact_progress), encoding="utf-8")
+
     sidecar = json.loads(saved.output_json_path.read_text(encoding="utf-8"))
     sidecar["document_id"] = "unrelated-document"
     saved.output_json_path.write_text(json.dumps(sidecar), encoding="utf-8")
@@ -705,6 +732,124 @@ def test_checkpointed_current_schema_reuse_requires_exact_progress_document_id(t
         args=args,
         progress=exact_progress,
     ) == [day]
+
+    sidecar.pop("artifact_schema_version")
+    sidecar.pop("document_id")
+    saved.output_json_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    empty_progress = {"processed_units_v2": {}}
+    progress_path.write_text(json.dumps(empty_progress), encoding="utf-8")
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+    assert module.checkpointed_daily_artifact_gaps(tmp_path, checkpoint, args=args, progress=empty_progress) == [day]
+
+    hashless_sidecar = json.loads(saved.output_json_path.read_text(encoding="utf-8"))
+    hashless_sidecar.pop("unit")["input_content_hash"] = None
+    hashless_sidecar["document_id"] = saved.document_id
+    saved.output_json_path.write_text(json.dumps(hashless_sidecar), encoding="utf-8")
+    hashless_entry = dict(exact_entry, artifact_schema_version=None, input_content_hash=None)
+    hashless_progress = {"processed_units_v2": {key: hashless_entry}}
+    progress_path.write_text(json.dumps(hashless_progress), encoding="utf-8")
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+    assert module.checkpointed_daily_artifact_gaps(tmp_path, checkpoint, args=args, progress=hashless_progress) == [day]
+
+    wrong_bank_entry = dict(exact_entry, bank="other-bank")
+    wrong_bank_progress = {"processed_units_v2": {key: wrong_bank_entry}}
+    progress_path.write_text(json.dumps(wrong_bank_progress), encoding="utf-8")
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+
+    wrong_path_entry = dict(exact_entry, output_markdown=str(tmp_path / "other.md"))
+    wrong_path_progress = {"processed_units_v2": {key: wrong_path_entry}}
+    progress_path.write_text(json.dumps(wrong_path_progress), encoding="utf-8")
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+
+    saved.output_json_path.write_text(original_sidecar_text, encoding="utf-8")
+    progress_path.write_text(json.dumps(exact_progress), encoding="utf-8")
+    assert module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+
+
+def test_hashless_checkpoint_artifact_requires_trusted_legacy_provenance_even_with_post_progress(tmp_path, monkeypatch):
+    module = load_module()
+    day = "2026-05-07"
+    expected = unit(module, day, "hashless checkpoint evidence")
+    args = args_for(tmp_path)
+    saved = module.save_result(tmp_path, expected, {"executive_summary": ["posted"]}, "raw", model=args.llm_model)
+    sidecar = json.loads(saved.output_json_path.read_text(encoding="utf-8"))
+    sidecar.pop("artifact_schema_version")
+    sidecar["unit"]["input_content_hash"] = None
+    saved.output_json_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    entry = module.progress_entry(expected, args, document_id=saved.document_id, output_markdown=str(saved.output_md_path))
+    entry["artifact_schema_version"] = None
+    entry["input_content_hash"] = None
+    progress = {"processed_units_v2": {module.unit_progress_key(expected, args): entry}}
+    monkeypatch.setattr(module, "DEFAULT_PROGRESS_FILE", tmp_path / "progress.json")
+    module.DEFAULT_PROGRESS_FILE.write_text(json.dumps(progress), encoding="utf-8")
+
+    checkpoint = module.record_completed_days(
+        module.load_daily_completion_checkpoint(tmp_path, "hermes")[0],
+        {day: [expected]},
+        source="successful_daily_run",
+    )
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint)
+    assert module.checkpointed_daily_artifact_gaps(tmp_path, checkpoint, args=args, progress=progress) == [day]
+
+    trusted_legacy_checkpoint = module.record_completed_days(
+        module.load_daily_completion_checkpoint(tmp_path, "hermes")[0],
+        {day: [expected]},
+        source="verified_frozen_completion_scope",
+        advance_through=day,
+    )
+    assert module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, trusted_legacy_checkpoint, args=args, progress=progress)
+
+
+def test_hashless_daily_progress_reuse_requires_exact_stable_content_hash(tmp_path):
+    module = load_module()
+    expected = unit(module, "2026-05-07", "hashless progress input")
+    args = args_for(tmp_path)
+    saved = module.save_result(tmp_path, expected, {"executive_summary": ["posted"]}, "raw", model=args.llm_model)
+    sidecar = json.loads(saved.output_json_path.read_text(encoding="utf-8"))
+    sidecar.pop("artifact_schema_version")
+    sidecar["unit"].pop("input_content_hash")
+    saved.output_json_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    entry = module.progress_entry(expected, args, document_id=saved.document_id, output_markdown=str(saved.output_md_path))
+    entry["artifact_schema_version"] = None
+    entry["input_content_hash"] = None
+
+    assert module.v2_progress_entry_is_reusable(tmp_path, expected, entry, args=args)
+    entry["stable_content_hash"] = "stale-stable-hash"
+    assert not module.v2_progress_entry_is_reusable(tmp_path, expected, entry, args=args)
+
+
+def test_verified_default_bank_progress_migration_requires_an_exact_artifact(tmp_path):
+    module = load_module()
+    day = "2026-05-07"
+    expected = unit(module, day, "verified default-bank migration")
+    args = args_for(tmp_path)
+    saved = module.save_result(tmp_path, expected, {"executive_summary": ["posted"]}, "raw", model=args.llm_model)
+    entry = module.progress_entry(expected, args, document_id=saved.document_id, output_markdown=str(saved.output_md_path))
+    entry.pop("bank")
+    unbanked_template = dict(entry)
+    key = module.unit_progress_key(expected, args)
+    progress = {"processed_units_v2": {key: entry}}
+    checkpoint = module.record_completed_days(
+        module.load_daily_completion_checkpoint(tmp_path, "hermes")[0],
+        {day: [expected]},
+        source="successful_daily_run",
+    )
+
+    assert not module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint, progress=progress)
+    assert module.migrate_verified_default_bank_progress_entries(progress, tmp_path, {day: [expected]}, args) == 1
+    assert progress["processed_units_v2"][key]["bank"] == "hermes"
+    assert module.checkpointed_daily_artifact_is_reusable(tmp_path, expected, checkpoint, progress=progress)
+
+    invalid_entry = dict(unbanked_template, output_markdown=str(tmp_path / "outside.md"))
+    invalid_progress = {"processed_units_v2": {key: invalid_entry}}
+    assert module.migrate_verified_default_bank_progress_entries(invalid_progress, tmp_path, {day: [expected]}, args) == 0
+    assert "bank" not in invalid_progress["processed_units_v2"][key]
+
+    other_args = args_for(tmp_path)
+    other_args.bank = "other-bank"
+    other_progress = {"processed_units_v2": {key: dict(unbanked_template)}}
+    assert module.migrate_verified_default_bank_progress_entries(other_progress, tmp_path, {day: [expected]}, other_args) == 0
+    assert "bank" not in other_progress["processed_units_v2"][key]
 
 
 def test_completion_manifest_freezes_unit_signatures_without_raw_text(tmp_path, monkeypatch):
@@ -996,6 +1141,10 @@ def test_run_units_reuses_checkpointed_pair_without_progress_cache(tmp_path, mon
         {expected.period: [expected]},
         source="verified_frozen_completion_scope",
         advance_through=expected.period,
+    )
+    assert module.checkpoint_day_allows_trusted_legacy_pair(checkpoint, expected.period)
+    assert not module.checkpoint_day_allows_trusted_legacy_pair(
+        {**checkpoint, "baseline_provenance": None}, expected.period
     )
     module.save_json(tmp_path / "daily_completion_checkpoint.json", checkpoint)
     progress_path = tmp_path / "progress.json"
@@ -1305,7 +1454,7 @@ def test_checkpoint_requires_consistent_all_history_coverage_marker(tmp_path):
 def test_legacy_manifest_bootstrap_requires_exact_posted_progress(tmp_path, monkeypatch):
     module = load_module()
     day = "2026-03-14"
-    expected = unit(module, day, "current legacy facts")
+    expected = unit(module, day, f"period: {day}\ndate_range: {day}T00:00:00..{day}T23:59:59\ncurrent legacy facts")
     manifest_dir = tmp_path / "completion_manifests"
     manifest_dir.mkdir()
     manifest = {
@@ -1331,18 +1480,38 @@ def test_legacy_manifest_bootstrap_requires_exact_posted_progress(tmp_path, monk
     assert checkpoint["completed_days"] == {}
 
     result = module.save_result(tmp_path, expected, {"executive_summary": ["posted"]}, "raw", model=args.llm_model)
-    key = module.unit_progress_key(expected, args)
+    key = module.legacy_unit_progress_key(expected)
     entry = module.progress_entry(
         expected,
         args,
         document_id=result.document_id,
         output_markdown=str(result.output_md_path),
     )
+    entry.pop("bank")
     progress_path.write_text(json.dumps({"processed_units_v2": {key: entry}}), encoding="utf-8")
 
+    args.mode = "dry-run"
+    checkpoint, bootstrapped = module.load_daily_checkpoint_for_run(tmp_path, "hermes", args=args)
+    assert bootstrapped is True
+    assert "bank" not in json.loads(progress_path.read_text(encoding="utf-8"))["processed_units_v2"][key]
+    assert not hasattr(args, "_bank_scoped_progress")
+    assert module.checkpointed_daily_artifact_gaps(tmp_path, checkpoint, args=args) == [day]
+
+    args.mode = "submit"
+    args.budget_json = True
+    checkpoint, bootstrapped = module.load_daily_checkpoint_for_run(tmp_path, "hermes", args=args)
+    assert bootstrapped is True
+    budget_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert "bank" not in budget_progress["processed_units_v2"][key]
+    assert module.build_budget_report([expected], budget_progress, args)["pending_units"] == 1
+
+    args.budget_json = False
     checkpoint, bootstrapped = module.load_daily_checkpoint_for_run(tmp_path, "hermes", args=args)
     assert bootstrapped is True
     assert checkpoint["baseline_through"] == day
+    migrated_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert migrated_progress["processed_units_v2"][key]["bank"] == "hermes"
+    assert module.checkpointed_daily_artifact_gaps(tmp_path, checkpoint, args=args, progress=migrated_progress) == []
 
 
 def test_marked_all_history_manifest_requires_posted_progress(tmp_path, monkeypatch):

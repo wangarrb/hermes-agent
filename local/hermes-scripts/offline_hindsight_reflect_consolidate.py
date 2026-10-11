@@ -819,6 +819,22 @@ def load_daily_checkpoint_for_run(
         if invalid_days:
             checkpoint = provisionalize_checkpoint_for_repair(checkpoint, invalid_days)
             return checkpoint, False
+        if (
+            args is not None
+            and getattr(args, "mode", None) == "submit"
+            and not getattr(args, "budget_json", False)
+            and coverage_scope == "legacy-document-inventory"
+            and bank == DEFAULT_BANK
+        ):
+            baseline_days = sorted((checkpoint.get("completed_days") or {}).keys())
+            baseline_units = build_daily_fact_units_for_days(args, baseline_days)
+            progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+            migrated = migrate_verified_default_bank_progress_entries(progress, output_dir, baseline_units, args)
+            if migrated:
+                setattr(args, "_bank_scoped_progress", progress)
+                if getattr(args, "mode", None) == "submit" and not getattr(args, "budget_json", False):
+                    save_json(DEFAULT_PROGRESS_FILE, progress)
+                    print(f"Migrated {migrated} verified legacy daily progress entries to bank={DEFAULT_BANK}.")
     return checkpoint, bootstrapped
 
 
@@ -1799,6 +1815,7 @@ def legacy_daily_progress_entry_is_reusable(
     *,
     bank: str = DEFAULT_BANK,
     progress_index: dict[Any, list[dict[str, Any]]] | None = None,
+    allow_unbanked_default_bank_migration: bool = False,
 ) -> bool:
     """Reuse legacy metadata only when the exact stable source key and artifact pair agree."""
     if not legacy_daily_progress_is_unambiguous(unit):
@@ -1812,7 +1829,11 @@ def legacy_daily_progress_entry_is_reusable(
         if not isinstance(document_id, str) or not document_id.strip():
             continue
         entry_bank = entry.get("bank")
-        if entry_bank != bank and not (entry_bank is None and bank == DEFAULT_BANK):
+        if entry_bank != bank and not (
+            allow_unbanked_default_bank_migration
+            and entry_bank is None
+            and bank == DEFAULT_BANK
+        ):
             continue
         if (
             entry.get("pipeline_version") != PIPELINE_VERSION
@@ -1835,6 +1856,74 @@ def legacy_daily_progress_entry_is_reusable(
     return False
 
 
+def checkpoint_day_allows_trusted_legacy_pair(checkpoint: dict[str, Any] | None, day: str) -> bool:
+    if not isinstance(checkpoint, dict):
+        return False
+    record = (checkpoint.get("completed_days") or {}).get(day)
+    provenance = checkpoint.get("baseline_provenance")
+    if not isinstance(record, dict) or not isinstance(provenance, dict):
+        return False
+    verified_days = provenance.get("verified_days")
+    if not isinstance(verified_days, list) or day not in verified_days:
+        return False
+    if (
+        record.get("source") == "verified_frozen_completion_scope"
+        and provenance.get("kind") == "verified-frozen-candidate-set"
+    ):
+        return True
+    manifest = checkpoint.get("baseline_manifest")
+    return (
+        record.get("source") == "verified_completion_manifest"
+        and provenance.get("kind") == "completion-manifest"
+        and provenance.get("coverage_scope") == "legacy-document-inventory"
+        and isinstance(manifest, dict)
+        and manifest.get("coverage_scope") == "legacy-document-inventory"
+        and provenance.get("manifest_sha256") == manifest.get("sha256")
+    )
+
+
+def migrate_verified_default_bank_progress_entries(
+    progress: dict[str, Any],
+    output_dir: Path,
+    units_by_day: dict[str, list[ReflectUnit]],
+    args: argparse.Namespace,
+) -> int:
+    """Mark only artifact-verified unbanked daily entries as default-bank migration candidates."""
+    bank = str(getattr(args, "bank", DEFAULT_BANK))
+    if bank != DEFAULT_BANK:
+        return 0
+    entries = processed_units_v2(progress)
+    progress_index = daily_progress_index(entries)
+    migrated = 0
+    for units in units_by_day.values():
+        for unit in units:
+            if unit.scope != "daily":
+                continue
+            key = unit_progress_key(unit, args)
+            entry = entries.get(key)
+            if isinstance(entry, dict) and entry.get("bank") is None:
+                candidate = {**entry, "bank": bank}
+                if v2_progress_entry_is_reusable(output_dir, unit, candidate, args=args):
+                    entry["bank"] = bank
+                    migrated += 1
+                    continue
+            lookup_key = daily_progress_lookup_key(unit)
+            for legacy_entry in progress_index.get(lookup_key, []):
+                if legacy_entry.get("bank") is not None:
+                    continue
+                if legacy_daily_progress_entry_is_reusable(
+                    output_dir,
+                    unit,
+                    {},
+                    bank=bank,
+                    progress_index={lookup_key: [legacy_entry]},
+                    allow_unbanked_default_bank_migration=True,
+                ):
+                    legacy_entry["bank"] = bank
+                    migrated += 1
+    return migrated
+
+
 def checkpointed_daily_artifact_is_reusable(
     output_dir: Path,
     unit: ReflectUnit,
@@ -1851,26 +1940,40 @@ def checkpointed_daily_artifact_is_reusable(
         "source_ids": list(unit.source_ids),
         "input_content_hash": short_hash(unit.content, 24),
     }
-    effective_progress = progress if progress is not None else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    supplied_progress = progress if progress is not None else getattr(args, "_bank_scoped_progress", None)
+    effective_progress = supplied_progress if isinstance(supplied_progress, dict) else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
     bank = str(getattr(args, "bank", (checkpoint or {}).get("bank", DEFAULT_BANK)))
-    expected_document_ids = checkpointed_progress_document_ids(effective_progress, signature, bank)
+    expected_posted_artifacts = checkpointed_progress_documents(effective_progress, signature, bank)
     return checkpointed_daily_artifact_pair_is_valid(
         output_dir,
         unit.period,
         signature,
-        expected_document_ids=expected_document_ids,
+        expected_posted_artifacts=expected_posted_artifacts,
+        allow_trusted_legacy=checkpoint_day_allows_trusted_legacy_pair(checkpoint, unit.period),
     )
 
 
 def run_units(args: argparse.Namespace, units: list[ReflectUnit]) -> int:
     output_dir = Path(args.output_dir)
-    progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_document_ids": [], "processed_unit_keys": [], "processed_units_v2": {}, "last_run": None})
-    processed_docs, processed_units = progress_sets_for_bank(progress, str(getattr(args, "bank", DEFAULT_BANK)))
+    progress = getattr(args, "_bank_scoped_progress", None)
+    if not isinstance(progress, dict):
+        progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_document_ids": [], "processed_unit_keys": [], "processed_units_v2": {}, "last_run": None})
     checkpoint = None
     if any(unit.scope == "daily" for unit in units):
         checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, args.bank, args=args)
 
     budget_json = bool(getattr(args, "budget_json", False))
+    migrated = (
+        migrate_verified_default_bank_progress_entries(progress, output_dir, {unit.period: [unit] for unit in units if unit.scope == "daily"}, args)
+        if args.mode == "submit" and not budget_json
+        else 0
+    )
+    if migrated:
+        setattr(args, "_bank_scoped_progress", progress)
+        if args.mode == "submit" and not budget_json:
+            save_json(DEFAULT_PROGRESS_FILE, progress)
+            print(f"Migrated {migrated} artifact-verified legacy daily progress entries to bank={DEFAULT_BANK}.")
+    processed_docs, processed_units = progress_sets_for_bank(progress, str(getattr(args, "bank", DEFAULT_BANK)))
     enforce_budget = bool(getattr(args, "enforce_budget", False))
     if budget_json:
         report = emit_budget_report(units, args, progress=progress)
@@ -2110,6 +2213,13 @@ def manifest_success_gaps(
     progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
     entries = processed_units_v2(progress)
     progress_index = daily_progress_index(entries)
+    bank = str(getattr(args, "bank", DEFAULT_BANK))
+    manifest = checkpoint.get("baseline_manifest")
+    allow_unbanked_migration = (
+        bank == DEFAULT_BANK
+        and isinstance(manifest, dict)
+        and manifest.get("coverage_scope") == "legacy-document-inventory"
+    )
     gaps: list[str] = []
     for day in days:
         record = completed_days.get(day)
@@ -2140,8 +2250,9 @@ def manifest_success_gaps(
                 output_dir,
                 unit,
                 entries,
-                bank=str(getattr(args, "bank", DEFAULT_BANK)),
+                bank=bank,
                 progress_index=progress_index,
+                allow_unbanked_default_bank_migration=allow_unbanked_migration,
             ):
                 continue
             gaps.append(day)
@@ -2317,8 +2428,12 @@ def daily_artifact_is_complete(
     return False
 
 
-def checkpointed_progress_document_ids(progress: dict[str, Any], signature: dict[str, Any], bank: str) -> set[str]:
-    """Return only persisted POST IDs tied to the exact checkpoint input signature."""
+def checkpointed_progress_documents(
+    progress: dict[str, Any],
+    signature: dict[str, Any],
+    bank: str,
+) -> set[tuple[str, str]]:
+    """Return persisted POST IDs and exact artifact paths for a checkpoint input."""
     try:
         topic = str(signature["topic"])
         index = int(signature["index"])
@@ -2326,12 +2441,11 @@ def checkpointed_progress_document_ids(progress: dict[str, Any], signature: dict
         input_hash = str(signature["input_content_hash"])
     except (KeyError, TypeError, ValueError):
         return set()
-    document_ids: set[str] = set()
+    posted_artifacts: set[tuple[str, str]] = set()
     for entry in processed_units_v2(progress).values():
         if not isinstance(entry, dict) or entry.get("scope") != "daily" or entry.get("topic") != topic:
             continue
-        entry_bank = entry.get("bank")
-        if entry_bank != bank and not (entry_bank is None and bank == DEFAULT_BANK):
+        if entry.get("bank") != bank:
             continue
         try:
             if int(entry.get("index", -1)) != index:
@@ -2346,9 +2460,15 @@ def checkpointed_progress_document_ids(progress: dict[str, Any], signature: dict
         ):
             continue
         document_id = entry.get("document_id")
-        if isinstance(document_id, str) and document_id.strip():
-            document_ids.add(document_id)
-    return document_ids
+        output_markdown = entry.get("output_markdown")
+        if not isinstance(document_id, str) or not document_id.strip() or not isinstance(output_markdown, str) or not output_markdown.strip():
+            continue
+        try:
+            output_path = str(Path(output_markdown).expanduser().resolve())
+        except (OSError, RuntimeError):
+            continue
+        posted_artifacts.add((document_id, output_path))
+    return posted_artifacts
 
 
 def checkpointed_daily_artifact_pair_is_valid(
@@ -2356,9 +2476,10 @@ def checkpointed_daily_artifact_pair_is_valid(
     day: str,
     signature: dict[str, Any],
     *,
-    expected_document_ids: set[str] | None = None,
+    expected_posted_artifacts: set[tuple[str, str]] | None = None,
+    allow_trusted_legacy: bool = False,
 ) -> bool:
-    """Validate an archived pair against a trusted checkpoint and, for v2, exact POST evidence."""
+    """Validate an archived pair against a checkpoint and exact persisted POST evidence."""
     try:
         topic = str(signature["topic"])
         index = int(signature["index"])
@@ -2376,14 +2497,7 @@ def checkpointed_daily_artifact_pair_is_valid(
         if schema not in (None, DAILY_ARTIFACT_SCHEMA_VERSION):
             continue
         sidecar_document_id = data.get("document_id")
-        if schema == DAILY_ARTIFACT_SCHEMA_VERSION and (
-            not isinstance(sidecar_document_id, str)
-            or not sidecar_document_id.strip()
-            or expected_document_ids is None
-            or sidecar_document_id not in expected_document_ids
-        ):
-            continue
-        if schema is None and expected_document_ids and sidecar_document_id is not None and sidecar_document_id not in expected_document_ids:
+        if schema == DAILY_ARTIFACT_SCHEMA_VERSION and (not isinstance(sidecar_document_id, str) or not sidecar_document_id.strip()):
             continue
         sidecar = data.get("unit")
         if not isinstance(sidecar, dict):
@@ -2411,6 +2525,25 @@ def checkpointed_daily_artifact_pair_is_valid(
                 continue
             if markdown_path.parent.resolve() != day_dir.resolve():
                 continue
+            resolved_markdown = str(markdown_path.resolve())
+            hashless_legacy = schema is None and sidecar_hash is None
+            if hashless_legacy and not allow_trusted_legacy:
+                continue
+            if expected_posted_artifacts:
+                if schema == DAILY_ARTIFACT_SCHEMA_VERSION:
+                    if (sidecar_document_id, resolved_markdown) not in expected_posted_artifacts:
+                        continue
+                elif isinstance(sidecar_document_id, str) and sidecar_document_id.strip():
+                    if (sidecar_document_id, resolved_markdown) not in expected_posted_artifacts:
+                        continue
+                elif not any(path == resolved_markdown for _document_id, path in expected_posted_artifacts):
+                    continue
+            elif not (
+                hashless_legacy
+                and allow_trusted_legacy
+                and not (isinstance(sidecar_document_id, str) and sidecar_document_id.strip())
+            ):
+                continue
             if not daily_markdown_matches_sidecar(data, markdown_path):
                 continue
         except (OSError, RuntimeError):
@@ -2431,7 +2564,8 @@ def checkpointed_daily_artifact_gaps(
     completed_days = checkpoint.get("completed_days") or {}
     if not isinstance(completed_days, dict):
         return ["<invalid-checkpoint>"]
-    effective_progress = progress if progress is not None else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    supplied_progress = progress if progress is not None else getattr(args, "_bank_scoped_progress", None)
+    effective_progress = supplied_progress if isinstance(supplied_progress, dict) else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
     bank = str(getattr(args, "bank", checkpoint.get("bank", DEFAULT_BANK)))
     limit = through or checkpoint.get("baseline_through")
     for day, record in completed_days.items():
@@ -2449,7 +2583,8 @@ def checkpointed_daily_artifact_gaps(
                 output_dir,
                 str(day),
                 signature,
-                expected_document_ids=checkpointed_progress_document_ids(effective_progress, signature, bank),
+                expected_posted_artifacts=checkpointed_progress_documents(effective_progress, signature, bank),
+                allow_trusted_legacy=checkpoint_day_allows_trusted_legacy_pair(checkpoint, str(day)),
             )
             for signature in signatures
         ):
@@ -2467,7 +2602,8 @@ def evaluate_daily_completion(
 ) -> dict[str, Any]:
     """Evaluate a frozen daily snapshot against artifacts and trusted success records."""
     output_dir = Path(output_dir)
-    effective_progress: dict[str, Any] = progress if progress is not None else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    supplied_progress = progress if progress is not None else getattr(args, "_bank_scoped_progress", None)
+    effective_progress: dict[str, Any] = supplied_progress if isinstance(supplied_progress, dict) else load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
     if checkpoint is None:
         bank = str(getattr(args, "bank", DEFAULT_BANK))
         checkpoint, _bootstrapped = load_daily_checkpoint_for_run(output_dir, bank, args=args)
@@ -2528,8 +2664,20 @@ def build_daily_completion_snapshot(
 ) -> tuple[dict[str, list[ReflectUnit]], dict[str, Any]]:
     """Build expected units once and evaluate them against current artifacts."""
     units_by_day = build_daily_fact_units_for_days(args, days)
-    progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
+    progress = getattr(args, "_bank_scoped_progress", None)
+    if not isinstance(progress, dict):
+        progress = load_json(DEFAULT_PROGRESS_FILE, {"processed_units_v2": {}})
     checkpoint, _bootstrapped = load_daily_checkpoint_for_run(Path(args.output_dir), args.bank, args=args)
+    migrated = (
+        migrate_verified_default_bank_progress_entries(progress, Path(args.output_dir), units_by_day, args)
+        if getattr(args, "mode", "dry-run") == "submit" and not getattr(args, "budget_json", False)
+        else 0
+    )
+    if migrated:
+        setattr(args, "_bank_scoped_progress", progress)
+        if getattr(args, "mode", "dry-run") == "submit" and not getattr(args, "budget_json", False):
+            save_json(DEFAULT_PROGRESS_FILE, progress)
+            print(f"Migrated {migrated} artifact-verified legacy daily progress entries to bank={DEFAULT_BANK}.")
     return units_by_day, evaluate_daily_completion(
         Path(args.output_dir),
         units_by_day,
