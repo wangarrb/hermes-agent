@@ -285,7 +285,7 @@ def select_api_key_env(profile: dict[str, Any], dotenv: dict[str, str]) -> str:
     raise SystemExit(f"No usable API key found for profile={label}; tried {envs}")
 
 
-def get_llm_profile(name: str | None = None) -> dict[str, Any]:
+def get_llm_profile(name: str | None = None, *, overrides: dict[str, str] | None = None) -> dict[str, Any]:
     dotenv = read_dotenv()
     requested = (
         name
@@ -323,6 +323,19 @@ def get_llm_profile(name: str | None = None) -> dict[str, Any]:
     response_format_override = env_or_dotenv("HINDSIGHT_OFFLINE_RESPONSE_FORMAT", dotenv)
     if response_format_override:
         profile["response_format"] = response_format_override.lower() not in {"0", "false", "no"}
+
+    # CLI values override environment/profile values BEFORE selecting the key.
+    # An explicit new key-env must not require the old profile credential.
+    if overrides is not None:
+        fields = {"model", "base_url", "api_key_env", "hindsight_provider"}
+        if (not isinstance(overrides, dict) or not set(overrides) <= fields
+                or any(not isinstance(v, str) or not v.strip()
+                       or any(ord(c) < 32 or ord(c) == 127 for c in v) for v in overrides.values())):
+            raise SystemExit("Invalid explicit LLM overrides")
+        profile.update({k: v for k, v in overrides.items() if k != "api_key_env"})
+        if "api_key_env" in overrides:
+            profile["api_key_envs"] = [overrides["api_key_env"]]
+            profile.pop("api_key_env", None)
 
     if not profile.get("model") or not profile.get("base_url"):
         raise SystemExit(f"Incomplete LLM profile: {profile}")

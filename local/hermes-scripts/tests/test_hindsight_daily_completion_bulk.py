@@ -9,6 +9,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def mock_readonly_checkpoint_db(module, monkeypatch, *, document_days=(), facts=()):
+    """Fixture inventory/fact rows at the executor seam; unexpected SQL fails."""
+    queries = []
+    def readonly(sql):
+        assert sql.lstrip().startswith('SELECT '), 'checkpoint tests must not write SQL'
+        assert "bank_id = 'hermes'" in sql
+        queries.append(sql)
+        if 'FROM documents' in sql:
+            return list(document_days)
+        if 'FROM memory_units' in sql and 'AS fact_id' in sql:
+            return list(facts)
+        raise AssertionError(f'unexpected checkpoint fixture SQL: {sql}')
+    monkeypatch.setattr(module, 'psql_json', readonly)
+    return queries
+
+
 def load_module():
     name = "offline_hindsight_reflect_consolidate_daily_bulk"
     spec = importlib.util.spec_from_file_location(name, ROOT / "offline_hindsight_reflect_consolidate.py")
@@ -1517,6 +1533,7 @@ def test_legacy_manifest_bootstrap_requires_exact_posted_progress(tmp_path, monk
 def test_marked_all_history_manifest_requires_posted_progress(tmp_path, monkeypatch):
     module = load_module()
     day = "2026-03-14"
+    queries = mock_readonly_checkpoint_db(module, monkeypatch, document_days=[day])
     expected = unit(module, day, "marked manifest source")
     manifest_dir = tmp_path / "completion_manifests"
     manifest_dir.mkdir()
@@ -1552,6 +1569,7 @@ def test_marked_all_history_manifest_requires_posted_progress(tmp_path, monkeypa
     checkpoint, bootstrapped = module.load_daily_checkpoint_for_run(tmp_path, "hermes", args=args)
     assert bootstrapped is True
     assert checkpoint["baseline_through"] == day
+    assert queries and all('FROM documents' in sql for sql in queries)
 
 
 def test_marked_manifest_requires_explicit_unit_input_hash(tmp_path):
@@ -2103,6 +2121,11 @@ def test_explicit_historical_backfill_includes_pre_checkpoint_dates(tmp_path, mo
 def test_explicit_backfill_downgrades_invalid_checkpoint_before_repair(tmp_path, monkeypatch):
     module = load_module()
     day, later = "2026-03-14", "2026-03-16"
+    queries = mock_readonly_checkpoint_db(module, monkeypatch, facts=[{
+        'fact_id': f'fact-{day}', 'document_id': 'hermes-session::20260314_fixture',
+        'text': 'historical facts', 'fact_type': 'world',
+        'event_date': '', 'created_at': '',
+    }])
     expected = unit(module, day, "historical facts")
     manifest_dir = tmp_path / "completion_manifests"
     manifest_dir.mkdir()
@@ -2154,6 +2177,7 @@ def test_explicit_backfill_downgrades_invalid_checkpoint_before_repair(tmp_path,
     assert states_before_run[0]["baseline_from"] is None
     assert states_before_run[0]["completed_days"] == {}
     assert states_before_run[0]["bootstrap_required"] is True
+    assert queries and all('FROM memory_units' in sql for sql in queries)
     reloaded, bootstrapped = module.load_daily_completion_checkpoint(tmp_path, "hermes")
     assert bootstrapped is False
     assert reloaded["baseline_through"] is None

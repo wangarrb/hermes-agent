@@ -31,16 +31,13 @@ if str(SCRIPT_DIR) not in sys.path:
 from hindsight_minimax_import import get_llm_profile
 
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).expanduser()
-# Do not use Path.home() here: Hermes CLI/profile sessions intentionally
-# redirect HOME to ~/.hermes/profiles/<profile>/home, which would make a manual
-# recovery run target the wrong Hindsight tree. The production daily pipeline is
-# anchored at the real user home unless explicitly overridden.
-HERMES_HOME = Path(os.environ.get("HINDSIGHT_DAILY_HERMES_HOME") or (REAL_HOME / ".hermes")).expanduser()
+# An explicit daily override still supports manual legacy recovery; otherwise
+# respect the caller's profile/HOME rather than escaping to the passwd home.
+HERMES_HOME = Path(os.environ.get("HINDSIGHT_DAILY_HERMES_HOME")
+                   or os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
 PIPELINE_SCRIPT = HERMES_HOME / "scripts" / "hindsight_memory_pipeline.py"
 LOG_DIR = HERMES_HOME / "logs" / "hindsight-offline-pipeline"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 SUMMARY_DIR = LOG_DIR / "summaries"
-SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
 
 TIMESTAMP = time.strftime("%Y%m%d-%H%M%S")
 LOG_FILE = LOG_DIR / f"{TIMESTAMP}-daily-noagent.log"
@@ -50,7 +47,6 @@ LOG_FILE = LOG_DIR / f"{TIMESTAMP}-daily-noagent.log"
 RESEARCH_DIGEST_DIR = Path(
     "/home/wyr/wiki/auto-maintenance/project/egomotion4d/research-digests"
 )
-RESEARCH_DIGEST_DIR.mkdir(parents=True, exist_ok=True)
 TODAY = time.strftime("%Y-%m-%d")
 # Cron runs at 00:01 — "today" has almost no data yet. Report on YESTERDAY.
 from datetime import date, datetime, timedelta
@@ -689,6 +685,7 @@ Regenerate the complete digest and fix only these contract errors."""
             "-->\n\n"
         )
         digest_file = RESEARCH_DIGEST_DIR / f"{report_date}.md"
+        digest_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_file = digest_file.with_suffix(".tmp")
         tmp_file.write_text(metadata + result.strip() + "\n", encoding="utf-8")
         os.replace(tmp_file, digest_file)
@@ -3104,6 +3101,7 @@ def _run_mental_model_daily(
 def main() -> int:
     import argparse as _argparse
     _ap = _argparse.ArgumentParser(description="Hindsight offline pipeline wrapper")
+    _ap.add_argument("--config", default=None, help="Explicit incremental pipeline config path")
     _ap.add_argument("--mode", choices=["daily", "full"], default="daily",
                      help="Pipeline mode: daily (default) or full (daily+weekly+wiki)")
     _ap.add_argument("--include-wiki", action="store_true",
@@ -3209,154 +3207,17 @@ def main() -> int:
             if _publish_review_exports(api_url)["aggregate"] == "PASS_ALL"
             else 1,
         )
-    pipeline_mode = _args.mode
-    include_wiki = _args.include_wiki
-    skip_daily = _args.skip_daily
-
-    start = time.time()
-    print(f"[Hindsight {'Full' if pipeline_mode == 'full' else 'Daily'} Pipeline]", flush=True)
-
-    if not PIPELINE_SCRIPT.exists():
-        print(f"ERROR: script not found: {PIPELINE_SCRIPT}")
-        return 1
-
-    # Pre-step: auto-clean orphaned consolidation units before pipeline runs.
-    print("  Pre-clean...", flush=True)
-    try:
-        fix_script = HERMES_HOME / "scripts" / "fix_orphaned_consolidation.py"
-        if fix_script.exists():
-            import subprocess as _sp
-            fix = _sp.run(
-                [sys.executable, str(fix_script), "--bypass"],
-                capture_output=True, text=True, timeout=30,
-                env={**os.environ, "HOME": str(REAL_HOME)},
-            )
-            if fix.returncode == 0:
-                print(f"  Clean OK: {fix.stdout.strip()}", flush=True)
-            else:
-                print(f"  Clean failed (non-fatal): {fix.stderr[:200]}", flush=True)
-        else:
-            print(f"  Clean script not found (skip)", flush=True)
-    except Exception as e:
-        print(f"  Pre-clean error (non-fatal): {e}", flush=True)
-
-    # Health check
-    if not check_hindsight():
-        print("ERROR: Hindsight not healthy, aborting")
-        return 1
-
-    # Snapshot before
-    before = get_summary()
-
-    # Run pipeline — full output to log, no timeout (cron scheduler handles timeout)
-    with open(LOG_FILE, "w", encoding="utf-8") as log_fh:
-        env = {
-            "HOME": str(REAL_HOME),
-            "HERMES_HOME": str(HERMES_HOME),
-            "HINDSIGHT_SESSION_PROFILE_MODE": "all",
-            "HERMES_ACCEPT_HOOKS": "1",
-            "PYTHONUNBUFFERED": "1",
-            # The pipeline has up to three native-consolidation drain steps that
-            # run after retain. Restoring enable_observations at the end of each
-            # wrapper invocation would make the following drain wait forever on a
-            # disabled consolidation, so the pipeline's final restore_observations_off
-            # step owns the restore instead.
-            "HINDSIGHT_DEFER_OBSERVATIONS_RESTORE": "1",
-        }
-        # Propagate explicit --llm-* overrides into the pipeline subprocess so
-        # hindsight_memory_pipeline.py / hindsight_minimax_import.py use them too.
-        if _LLM_OVERRIDES.get("model"):
-            env["HINDSIGHT_OFFLINE_LLM_MODEL"] = _LLM_OVERRIDES["model"]
-        if _LLM_OVERRIDES.get("base_url"):
-            env["HINDSIGHT_OFFLINE_LLM_BASE_URL"] = _LLM_OVERRIDES["base_url"]
-        if _LLM_OVERRIDES.get("api_key"):
-            env["HINDSIGHT_OFFLINE_LLM_API_KEY"] = _LLM_OVERRIDES["api_key"]
-        # The custom profile resolves its key by ENV NAME
-        # (HINDSIGHT_OFFLINE_LLM_API_KEY_ENV -> api_key_envs), so the name the
-        # caller passed via --llm-api-key-env must be propagated too. Without
-        # this, the setdefault below points every override at ONEAPI_API_KEY and
-        # a non-oneapi endpoint (e.g. opencode.ai) fails with 401.
-        if _args.llm_api_key_env:
-            env["HINDSIGHT_OFFLINE_LLM_API_KEY_ENV"] = _args.llm_api_key_env
-        if _LLM_OVERRIDES.get("provider"):
-            env["HINDSIGHT_OFFLINE_HINDSIGHT_PROVIDER"] = _LLM_OVERRIDES["provider"]
-        if _LLM_OVERRIDES.get("model") or _LLM_OVERRIDES.get("base_url"):
-            env["HINDSIGHT_OFFLINE_LLM_PROFILE"] = "custom"
-            # custom profile needs a full set; default to the local oneapi
-            # gateway + ONEAPI key when the user only overrode the model name.
-            # A caller-supplied --llm-api-key-env must win over the ONEAPI
-            # fallback, otherwise non-oneapi endpoints get the wrong bearer.
-            env.setdefault("HINDSIGHT_OFFLINE_LLM_BASE_URL", "http://127.0.0.1:3000/v1")
-            if not env.get("HINDSIGHT_OFFLINE_LLM_API_KEY_ENV"):
-                env["HINDSIGHT_OFFLINE_LLM_API_KEY_ENV"] = "ONEAPI_API_KEY"
-            env.setdefault("HINDSIGHT_OFFLINE_HINDSIGHT_PROVIDER", "openai")
-        proc = subprocess.run(
-            [
-                sys.executable, "-u",
-                str(PIPELINE_SCRIPT),
-                pipeline_mode,
-                "--execute",
-                "--confirm",
-                "run-hindsight-pipeline",
-            ] + (["--include-wiki"] if include_wiki else []) + (["--skip-daily"] if skip_daily else []),
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env={**subprocess.os.environ, **env},
-        )
-
-    elapsed = time.time() - start
-    mins, secs = divmod(int(elapsed), 60)
-
-    # Snapshot after
-    after = get_summary()
-
-    print(f"Exit code: {proc.returncode}", flush=True)
-    print(f"Elapsed: {mins}m{secs}s", flush=True)
-
-    if before and after:
-        d_doc = after.get("total_documents", 0) - before.get("total_documents", 0)
-        d_obs = after.get("total_observations", 0) - before.get("total_observations", 0)
-        d_node = after.get("total_nodes", 0) - before.get("total_nodes", 0)
-        print(f"Changes: docs={d_doc:+d} obs={d_obs:+d} nodes={d_node:+d}")
-        pend = after.get("pending_operations", 0)
-        proc_count = after.get("operations_by_status", {}).get("processing", 0)
-        if proc_count > 0 or pend > 0:
-            print(f"Hindsight still processing: {proc_count} processing, {pend} pending")
-
-    if proc.returncode == 143:
-        print("Pipeline timed out (SIGTERM) but Hindsight internal work continues")
-    elif proc.returncode != 0:
-        print(f"Pipeline exited with code {proc.returncode}")
-        print(f"Check log: {LOG_FILE}")
-    else:
-        print("Pipeline completed successfully")
-
-    print(f"Log: {LOG_FILE}")
-
-    # --- Phase 2: Research summary (always runs, even if pipeline had errors) ---
-    # Pipeline data may still be in Hindsight even if exit code != 0.
-    summary_rc = run_research_summary(proc.returncode, before, after)
-    if summary_rc != 0:
-        print(f"Research summary failed with code {summary_rc} (pipeline data OK)")
-
-    # Generate Hindsight status report for wiki
-    try:
-        import subprocess as _sp
-        report = _sp.run(
-            [sys.executable, str(REAL_HOME / ".hermes" / "scripts" / "generate_hindsight_status_report.py")],
-            capture_output=True, text=True, timeout=30,
-            env={**os.environ, "HOME": str(REAL_HOME)},
-        )
-        if report.returncode == 0:
-            print(f"HINDSIGHT_STATUS_REPORT {report.stdout.strip()}")
-        else:
-            print(f"Status report generation failed: {report.stderr[:200]}")
-    except Exception as e:
-        print(f"Status report generation skipped: {e}")
-
-    # Return pipeline exit code (not summary exit code) as primary status
-    return proc.returncode
+    # Normal memory execution has one arrival ledger; no legacy pre-clean,
+    # whole-day replay, synchronous research digest or full-history fallback.
+    from hindsight_incremental_entrypoint import run_alias
+    overrides = {key: value for key, value in {'model': _args.llm_model,
+        'provider': _args.llm_provider, 'base_url': _args.llm_base_url,
+        'api_key_env': _args.llm_api_key_env}.items() if value is not None}
+    return run_alias(mode=_args.mode, execute=True,
+        config=_args.config or os.environ.get("HINDSIGHT_PIPELINE_CONFIG")
+        or HERMES_HOME / "hindsight" / "pipeline_config.json",
+        confirm="run-hindsight-pipeline", include_wiki=_args.include_wiki,
+        resume_only=_args.skip_daily, llm_overrides=overrides)
 
 
 if __name__ == "__main__":

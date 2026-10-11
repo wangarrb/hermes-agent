@@ -24,7 +24,7 @@ def test_weekly_wrapper_builds_deterministic_no_agent_command():
 
     assert command == [
         "/venv/python",
-        "/home/wyr/.hermes/scripts/hindsight_daily_noagent.py",
+        str(WRAPPER.with_name("hindsight_daily_noagent.py")),
         "--mode",
         "full",
         "--include-wiki",

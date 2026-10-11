@@ -177,4 +177,6 @@ gate失败：保留旧production和新candidate，标blocked；不能自动旧�
 
 ## 12. 当前交付阶段
 
-只读审计完成，用户已批准本规格所述总体方向；源码尚未实施。本规格经用户复核后进入分任务实现/独立复审/隔离验收。所有未实现验收项必须保持未完成，不能以规格文件或单元测试替代真实路径证据。
+源码已在隔离 worktree 实施并完成组件、真实文件/SQLite、loopback API 及 disposable PostgreSQL 验收；最终独立审查为有条件通过。已补齐 network namespace serving-association 的 P2 缺口，正常 host/service namespace 与实际 private namespace 拒绝均已验证。生产仅支持已审计 native、同 namespace 且整个 observations 窗口排他 producer 的部署边界；本地 flock/初始 empty queue 不是 server fence。
+
+生产尚未切换：需用户授权物理脚本路径/现有受支持解释器配置、preserve-no-replay 迁移与排他最小真实运行。日/周 writer 保持暂停，56 条 inherited pending 不回补也不冒充完成；wiki 明确 degraded。旧 retain 8 项兼容基线失败和 standalone core/PG skips 单列。隔离证据不能代替生产 native workers/embedding/gate/readback 和零付费 no-op 验收，因此 full 尚未完成。

@@ -867,7 +867,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.mode != "preflight":
+        if args.history != "incremental" or args.backfill_missing_daily or args.manual_review_enabled:
+            parser.error("normal arrival mode forbids historical replay/manual-review promotion; use a separately authorized repair workflow")
+        if args.date_mode != "auto" or args.week_mode != "current":
+            parser.error("arrival consumption is not selected by event dates or week labels")
+        if not 1 <= args.weekly_budget_max_pending_units <= 12 or not 1 <= args.weekly_budget_max_pending_chars <= 500000:
+            parser.error("normal incremental limits remain 12 units / 500000 chars")
+        supplied = list(argv) if argv is not None else sys.argv[1:]
+        explicit = {token.partition('=')[0] for token in supplied}
+        from hindsight_incremental_entrypoint import run_alias
+        return run_alias(mode=args.mode, execute=args.execute and not args.plan_json, config=args.config,
+            confirm=args.confirm, include_wiki=args.include_wiki, resume_only=args.skip_daily,
+            bank=args.bank, llm_profile=args.llm_profile,
+            max_units=args.weekly_budget_max_pending_units if '--weekly-budget-max-pending-units' in explicit else None,
+            max_chars=args.weekly_budget_max_pending_chars if '--weekly-budget-max-pending-chars' in explicit else None)
     plan = build_plan(args)
     if args.plan_json:
         print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))

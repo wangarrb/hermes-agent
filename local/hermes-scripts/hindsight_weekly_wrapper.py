@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 
-PIPELINE = "/home/wyr/.hermes/scripts/hindsight_daily_noagent.py"
+PIPELINE = str(Path(__file__).resolve().with_name("hindsight_daily_noagent.py"))
 
 
 def build_command(python: str = sys.executable) -> list[str]:
