@@ -15,7 +15,7 @@ def load_module(name, filename):
     return module
 
 
-def test_stalled_consolidation_fails_closed_after_trigger_budget(monkeypatch):
+def test_stalled_consolidation_fails_closed_after_trigger_budget(monkeypatch, capsys):
     module = load_module("hindsight_wait_native_consolidation_test", "hindsight_wait_native_consolidation.py")
     monkeypatch.setattr(module, "snapshot", lambda args: {
         "bank": "hermes",
@@ -38,6 +38,11 @@ def test_stalled_consolidation_fails_closed_after_trigger_budget(monkeypatch):
     ])
 
     assert rc == 2
+    final_report = json.loads(capsys.readouterr().out)
+    assert final_report["ready"] is False
+    assert final_report["trigger_stale_exit"] is True
+    assert final_report["pending_consolidation"] == 5
+
 
 
 def test_reduce_parse_errors_are_hard_gate_input():
