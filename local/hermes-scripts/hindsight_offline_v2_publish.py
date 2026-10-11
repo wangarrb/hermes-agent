@@ -34,7 +34,7 @@ try:
     from psycopg2.extras import RealDictCursor, execute_values
 except ModuleNotFoundError:
     alt_python = Path("/home/wyr/miniconda/envs/hindsight/bin/python")
-    if alt_python.exists() and Path(sys.executable).resolve() != alt_python.resolve():
+    if __name__ == "__main__" and alt_python.exists() and Path(sys.executable).resolve() != alt_python.resolve():
         os.execv(str(alt_python), [str(alt_python), __file__, *sys.argv[1:]])
     raise
 
@@ -61,44 +61,38 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_cards(cards_root: Path) -> list[dict[str, Any]]:
-    manifest = cards_root / "manifest.json"
-    if not manifest.exists():
-        raise SystemExit(f"cards manifest not found: {manifest}")
-    paths = sorted(list((cards_root / "topics").glob("*.json")) + list((cards_root / "global").glob("*.json")))
-    cards = [load_json(p) for p in paths]
-    if not cards:
-        raise SystemExit(f"no cards found under {cards_root}")
+def load_cards(cards_root: Path, *, bank: str | None = None) -> list[dict[str, Any]]:
+    # Freeze selection before any embedding/DB call. Legacy compatibility is
+    # restricted to a complete, unmixed reducer manifest; never reconstruct a
+    # missing/partial declaration from every file lying around the directory.
+    from hindsight_incremental_merge import load_manifest_artifacts, publication_observation
 
-    # Complete V2 publish uses the detailed observations_index when available,
-    # not only the compact card top-N. Cards remain the document grouping layer;
-    # all deduped observations become observation memory_units.
-    index_path = cards_root / "observations_index.jsonl"
-    if index_path.exists():
-        index_obs: list[dict[str, Any]] = []
-        for line in index_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(obj, dict) and obj.get("insight"):
-                index_obs.append(obj)
-        if index_obs:
-            topic_cards = {str(c.get("topic") or ""): c for c in cards if c.get("scope") == "topic"}
-            global_card = next((c for c in cards if c.get("scope") == "global"), None) or cards[-1]
-            for c in cards:
-                c["compact_card_observation_count"] = len(c.get("canonical_observations") or [])
-                c["canonical_observations"] = []
-            for obs in index_obs:
-                topic = str(obs.get("topic") or "global")
-                target = topic_cards.get(topic, global_card)
-                target.setdefault("canonical_observations", []).append(obs)
-            # Drop empty cards caused by max-topic card selection when all details
-            # were assigned elsewhere.
-            cards = [c for c in cards if c.get("canonical_observations")]
+    _manifest, cards, index_obs = load_manifest_artifacts(cards_root, bank=bank)
+    if not cards:
+        raise ValueError(f"no cards declared under {cards_root}")
+    if index_obs is not None:
+        # The old SQL publisher discards arbitrary legacy fields and renders text
+        # with inferred suffixes. It cannot safely migrate opaque rows. Keep the
+        # full candidate, but block this route until an authorized lossless DB
+        # migration/publisher is supplied rather than quietly rewriting the seed.
+        if any(obs.get("kind") == "opaque_legacy" for obs in index_obs):
+            raise ValueError("opaque legacy seed requires a lossless publish path; existing V2 publisher is unsafe")
+        topic_cards = {str(c.get("topic") or ""): c for c in cards if c.get("scope") == "topic"}
+        global_card = next((c for c in cards if c.get("scope") == "global"), None)
+        for c in cards:
+            c["compact_card_observation_count"] = len(c.get("canonical_observations") or [])
+            c["canonical_observations"] = []
+        for obs in index_obs:
+            topic = str(obs.get("topic") or "global")
+            target = topic_cards.get(topic) or global_card
+            if target is None:
+                raise ValueError(f"index topic has no declared card: {topic}")
+            target["canonical_observations"].append(
+                publication_observation(obs) if _manifest.get("schema_version") else obs
+            )
+        cards = [c for c in cards if c.get("canonical_observations")]
+        if not cards:
+            raise ValueError("complete observation index is empty; refusing canonical replacement")
     return cards
 
 
@@ -110,7 +104,13 @@ def card_document_id(card: dict[str, Any]) -> str:
     return f"{CANONICAL_PREFIX}{scope}::{slugify(topic, prefix='topic')}::{suffix}"
 
 
-def render_card_document(card: dict[str, Any]) -> str:
+def semantic_memory_unit_id(bank: str, document_id: str, observation_id: str) -> str:
+    """New incremental rows have identity independent of evidence/generation."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
+        ['hindsight-incremental-unit/1', bank, document_id, observation_id], ensure_ascii=False)))
+
+
+def render_card_document(card: dict[str, Any], *, lossless: bool = False) -> str:
     topic = str(card.get("topic") or "global")
     lines: list[str] = []
     lines.append(f"# Offline Hindsight v2 Canonical Card: {topic}")
@@ -146,10 +146,15 @@ def render_card_document(card: dict[str, Any]) -> str:
     lines.append("## Evidence Index")
     for e in card.get("evidence_index") or []:
         lines.append(f"- {e}")
+    if lossless:
+        lines.extend(["", "## Complete Structured Observations", json.dumps(
+            card.get("canonical_observations") or [], ensure_ascii=False, sort_keys=True, allow_nan=False)])
     return "\n".join(lines).strip() + "\n"
 
 
-def observation_text(obs: dict[str, Any], card: dict[str, Any]) -> str:
+def observation_text(obs: dict[str, Any], card: dict[str, Any], *, lossless: bool = False) -> str:
+    if lossless:
+        return json.dumps(obs, ensure_ascii=False, sort_keys=True, allow_nan=False)
     parts = [str(obs.get("insight") or "").strip()]
     typ = str(obs.get("type") or "").strip()
     topic = str(obs.get("topic") or card.get("topic") or "").strip()
@@ -383,24 +388,54 @@ def connect(dsn: str):
     return psycopg2.connect(dsn)
 
 
-def backup_existing(conn, bank: str, backup_dir: Path) -> Path:
+def backup_existing(conn, bank: str, backup_dir: Path, *, document_ids: list[str] | None = None, graph: bool = False) -> Path:
+    closure = {}
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT id, bank_id, original_text, metadata, created_at::text, updated_at::text, tags
-            FROM documents
-            WHERE bank_id=%s AND id LIKE %s
-            ORDER BY id
-        """, (bank, CANONICAL_PREFIX + "%"))
-        docs = cur.fetchall()
-        cur.execute("""
-            SELECT id::text, bank_id, document_id, text, context, fact_type, metadata,
-                   created_at::text, updated_at::text, tags, source_memory_ids::text[]
-            FROM memory_units
-            WHERE bank_id=%s AND document_id LIKE %s
-            ORDER BY document_id, created_at, id
-        """, (bank, CANONICAL_PREFIX + "%"))
-        units = cur.fetchall()
+        if document_ids is None:
+            # Preserve the existing CLI backup schema and default scope.
+            cur.execute("""
+                SELECT id, bank_id, original_text, metadata, created_at::text, updated_at::text, tags
+                FROM documents WHERE bank_id=%s AND id LIKE %s ORDER BY id
+            """, (bank, CANONICAL_PREFIX + "%"))
+            docs = cur.fetchall()
+            cur.execute("""
+                SELECT id::text, bank_id, document_id, text, context, fact_type, metadata,
+                       created_at::text, updated_at::text, tags, source_memory_ids::text[]
+                FROM memory_units WHERE bank_id=%s AND document_id LIKE %s
+                ORDER BY document_id, created_at, id
+            """, (bank, CANONICAL_PREFIX + "%"))
+            units = cur.fetchall()
+        else:
+            # Lossless rollback copy of the exact delta targets, including vectors.
+            cur.execute("""
+                SELECT to_jsonb(d) AS row FROM documents d
+                WHERE bank_id=%s AND id = ANY(%s) ORDER BY id
+            """, (bank, document_ids))
+            docs = [row["row"] for row in cur.fetchall()]
+            cur.execute("""
+                SELECT (to_jsonb(m) - 'embedding') || jsonb_build_object('embedding', embedding::text) AS row
+                FROM memory_units m WHERE bank_id=%s AND document_id = ANY(%s)
+                ORDER BY document_id, created_at, id
+            """, (bank, document_ids))
+            units = [row["row"] for row in cur.fetchall()]
+            if graph:
+                unit_ids = [u['id'] for u in units]
+                queries = {
+                    'chunks': ("SELECT to_jsonb(c) AS row FROM chunks c WHERE bank_id=%s AND document_id=ANY(%s) ORDER BY chunk_id FOR UPDATE", (bank, document_ids)),
+                    'unit_entities': ("SELECT to_jsonb(ue) AS row FROM unit_entities ue WHERE unit_id=ANY(%s::uuid[]) ORDER BY unit_id, entity_id FOR UPDATE", (unit_ids,)),
+                    'memory_links': ("SELECT to_jsonb(ml) AS row FROM memory_links ml WHERE bank_id=%s AND (from_unit_id=ANY(%s::uuid[]) OR to_unit_id=ANY(%s::uuid[])) ORDER BY from_unit_id, to_unit_id FOR UPDATE", (bank, unit_ids, unit_ids)),
+                    'source_references': ("SELECT (to_jsonb(m) - 'embedding') || jsonb_build_object('embedding', embedding::text) AS row FROM memory_units m WHERE bank_id=%s AND source_memory_ids && %s::uuid[] ORDER BY id", (bank, unit_ids)),
+                }
+                for name, (sql, params) in queries.items():
+                    cur.execute(sql, params)
+                    closure[name] = [r['row'] for r in cur.fetchall()]
+                entity_ids = sorted({r['entity_id'] for r in closure['unit_entities']} |
+                    {r['entity_id'] for r in closure['memory_links'] if r.get('entity_id')})
+                cur.execute("SELECT to_jsonb(e) AS row FROM entities e WHERE bank_id=%s AND id=ANY(%s::uuid[]) ORDER BY id", (bank, entity_ids))
+                closure['entities'] = [r['row'] for r in cur.fetchall()]
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(), "bank": bank, "document_count": len(docs), "unit_count": len(units), "documents": docs, "memory_units": units}
+    if graph:
+        payload.update(closure, rollback_policy='in_place_no_cascades; restore existing rows and add-only associations by identity')
     backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     run_dir = backup_dir / f"canonical-backup-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
     run_dir.mkdir(mode=0o700)
@@ -447,6 +482,28 @@ def filter_semantic_rows_to_existing_targets(
     return {"kept": kept, "skipped_missing_targets": skipped}
 
 
+def _upsert_entities(cur, bank, names, rebuild_id, *, incremental=False):
+    identities = {}
+    for name in names:
+        if incremental:
+            # Shared entity metadata/counts stay intact; links are add-only.
+            cur.execute("""INSERT INTO entities (canonical_name, bank_id, metadata, mention_count)
+                VALUES (%s,%s,%s::jsonb,1) ON CONFLICT (bank_id, lower(canonical_name)) DO NOTHING
+            """, (name, bank, json.dumps({"source": "offline_hindsight_v2"})))
+            cur.execute("SELECT id::text FROM entities WHERE bank_id=%s AND lower(canonical_name)=lower(%s)", (bank, name))
+        else:
+            cur.execute("""
+                INSERT INTO entities (canonical_name, bank_id, metadata, mention_count)
+                VALUES (%s, %s, %s::jsonb, 1)
+                ON CONFLICT (bank_id, lower(canonical_name)) DO UPDATE
+                SET mention_count = entities.mention_count + 1,
+                    last_seen = now(), metadata = entities.metadata || EXCLUDED.metadata
+                RETURNING id::text
+            """, (name, bank, json.dumps({"source": "offline_hindsight_v2", "rebuild_id": rebuild_id}, ensure_ascii=False)))
+        identities[name] = cur.fetchone()[0]
+    return identities
+
+
 def publish(
     cards: list[dict[str, Any]],
     *,
@@ -459,14 +516,32 @@ def publish(
     embedding_base_url: str,
     embedding_batch_size: int,
     backup_dir: Path,
+    generation_sha256: str | None = None,
+    lossless: bool = False,
+    backup_document_ids: list[str] | None = None,
+    required_embedding_dimension: int | None = None,
+    connect_fn=None,
+    embedding_fn=None,
+    execute_values_fn=None,
+    prewrite_check=None,
+    precommit_check=None,
+    incremental: bool = False,
+    incremental_unit_ids: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if incremental and (replace or not lossless or not generation_sha256 or backup_document_ids is None
+            or prewrite_check is None or precommit_check is None):
+        raise ValueError('incremental publish requires exact fenced lossless generation')
+    sql_values = execute_values_fn or execute_values
     now = datetime.now(timezone.utc)
     rebuild_id = f"offline-v2-rebuild::{now.strftime('%Y%m%d-%H%M%S')}::{sha1_short(json.dumps([c.get('card_id') for c in cards], ensure_ascii=False), 8)}"
     docs = []
     observations = []
     for card in cards:
         doc_id = card_document_id(card)
-        content = render_card_document(card)
+        if incremental and (not doc_id.startswith(CANONICAL_PREFIX + 'incremental::')
+                or len(card.get('canonical_observations') or []) != 1):
+            raise ValueError('incremental publish requires one semantic node per safe document')
+        content = render_card_document(card, lossless=True) if lossless else render_card_document(card)
         metadata = {
             "schema_version": "offline-hindsight-v2-canonical-publish/0.1",
             "source_card_id": card.get("card_id"),
@@ -479,9 +554,11 @@ def publish(
             "entity_aliases": card.get("entity_aliases") or [],
             "source": "offline_hindsight_v2",
         }
+        if generation_sha256 is not None:
+            metadata["generation_sha256"] = generation_sha256
         docs.append({"id": doc_id, "card": card, "content": content, "metadata": metadata, "chunk_id": f"{doc_id}::chunk::0000"})
         for idx, obs in enumerate(card.get("canonical_observations") or []):
-            text = observation_text(obs, card)
+            text = observation_text(obs, card, lossless=True) if lossless else observation_text(obs, card)
             observations.append({
                 "doc_id": doc_id,
                 "chunk_id": f"{doc_id}::chunk::0000",
@@ -514,11 +591,16 @@ def publish(
         "semantic_links": 0,
         "skipped_semantic_links_missing_targets": 0,
     }
+    if incremental:
+        if sorted(backup_document_ids) != sorted(d['id'] for d in docs):
+            raise ValueError('incremental backup scope differs from exact targets')
+        if set(incremental_unit_ids or {}) - {d['id'] for d in docs}:
+            raise ValueError('incremental unit identity outside target scope')
     if mode == "dry-run":
         return report
 
     texts = [o["text"] for o in observations]
-    embeddings, used_provider = maybe_embeddings(
+    embeddings, used_provider = (embedding_fn or maybe_embeddings)(
         texts,
         embedding_provider,
         embedding_model,
@@ -527,16 +609,24 @@ def publish(
     )
     report["embedding_provider_used"] = used_provider
     embedding_dimension = validate_embeddings(embeddings, len(observations))
+    if required_embedding_dimension is not None and embedding_dimension != required_embedding_dimension:
+        raise RuntimeError(f"embedding dimension mismatch: required {required_embedding_dimension}, got {embedding_dimension}")
     if embedding_dimension is not None:
         report["embedding_dimension"] = embedding_dimension
 
-    conn = connect(dsn)
+    conn = (connect_fn or connect)(dsn)
     try:
         conn.autocommit = False
-        backup_path = backup_existing(conn, bank, backup_dir)
+        if incremental:
+            conn.set_session(isolation_level='READ COMMITTED', readonly=False, autocommit=False)
+        if prewrite_check is not None:
+            prewrite_check(conn)
+        backup_path = backup_existing(conn, bank, backup_dir, document_ids=backup_document_ids, graph=incremental) if backup_document_ids is not None else backup_existing(conn, bank, backup_dir)
         report["backup_path"] = str(backup_path)
         with conn.cursor() as cur:
-            if replace:
+            if incremental:
+                pass  # Existing documents/chunks/units are never deleted.
+            elif replace:
                 cur.execute("DELETE FROM documents WHERE bank_id=%s AND id LIKE %s", (bank, CANONICAL_PREFIX + "%"))
                 report["deleted_canonical_documents"] = cur.rowcount
             else:
@@ -550,14 +640,27 @@ def publish(
                 tags = [t[:100] for t in tags if t]
                 doc_rows.append((d["id"], bank, d["content"], content_hash, json.dumps(d["metadata"], ensure_ascii=False), json.dumps({"source": "offline_v2_publish", "rebuild_id": rebuild_id}, ensure_ascii=False), tags))
                 chunk_rows.append((d["chunk_id"], d["id"], bank, 0, d["content"], content_hash))
-            execute_values(cur, """
+            doc_sql = """
                 INSERT INTO documents (id, bank_id, original_text, content_hash, metadata, retain_params, tags)
                 VALUES %s
-            """, doc_rows, template="(%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)")
-            execute_values(cur, """
+            """
+            if incremental:
+                old_rows = [r for r in doc_rows if r[0] in (incremental_unit_ids or {})]
+                new_rows = [r for r in doc_rows if r[0] not in (incremental_unit_ids or {})]
+                if old_rows:
+                    sql_values(cur, doc_sql + """ ON CONFLICT (id, bank_id) DO UPDATE SET
+                        original_text=EXCLUDED.original_text, content_hash=EXCLUDED.content_hash,
+                        metadata=documents.metadata || EXCLUDED.metadata, updated_at=now()
+                    """, old_rows, template="(%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)")
+                if new_rows:
+                    # Absent-target conflicts fail; never overwrite another writer.
+                    sql_values(cur, doc_sql, new_rows, template="(%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)")
+            else:
+                sql_values(cur, doc_sql, doc_rows, template="(%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)")
+            sql_values(cur, """
                 INSERT INTO chunks (chunk_id, document_id, bank_id, chunk_index, chunk_text, content_hash)
                 VALUES %s
-            """, chunk_rows)
+            """ + (" ON CONFLICT (chunk_id) DO UPDATE SET chunk_text=EXCLUDED.chunk_text, content_hash=EXCLUDED.content_hash" if incremental else ""), chunk_rows)
             report["inserted_documents"] = len(doc_rows)
 
             unit_rows = []
@@ -579,6 +682,13 @@ def publish(
                     "valid_until": obs.get("valid_until"),
                     "source": "offline_hindsight_v2",
                 })
+                if lossless:
+                    from hindsight_incremental_merge import observation_content_hash
+                    metadata.update(memory_fact_metadata({
+                        "structured_observation": obs,
+                        "observation_content_sha256": observation_content_hash(obs),
+                        "generation_sha256": generation_sha256,
+                    }))
                 unit_rows.append((
                     bank,
                     o["text"],
@@ -598,31 +708,43 @@ def publish(
                     [str(x) for x in o["source_memory_ids"]],
                 ))
             # vector literal is nullable; cast text column to vector only when non-null.
-            unit_return = execute_values(cur, """
+            unit_sql = """
                 INSERT INTO memory_units (
                     bank_id, text, embedding, event_date, occurred_start, occurred_end, mentioned_at,
                     context, fact_type, metadata, chunk_id, document_id, tags,
                     observation_scopes, text_signals, source_memory_ids
                 ) VALUES %s
-                RETURNING id::text
-            """, unit_rows, template="(%s,%s,NULLIF(%s, '')::vector,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::uuid[])", fetch=True)
-            unit_ids = [r[0] for r in unit_return]
+            """
+            template = "(%s,%s,NULLIF(%s, '')::vector,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s::jsonb,%s,%s::uuid[])"
+            if incremental:
+                unit_ids = [(incremental_unit_ids or {}).get(o['doc_id']) or semantic_memory_unit_id(bank, o['doc_id'], o['obs']['id']) for o in observations]
+                unit_rows = [(uid, *r) for uid, r in zip(unit_ids, unit_rows)]
+                unit_sql = unit_sql.replace('bank_id, text, embedding', 'id, bank_id, text, embedding', 1)
+                template = '(%s::uuid,' + template[1:]
+                existing = set((incremental_unit_ids or {}).values())
+                for updating in (False, True):
+                    group = [r for r in unit_rows if (r[0] in existing) == updating]
+                    if not group:
+                        continue
+                    suffix = """ ON CONFLICT (id) DO UPDATE SET text=EXCLUDED.text, embedding=EXCLUDED.embedding,
+                        context=EXCLUDED.context, metadata=memory_units.metadata || EXCLUDED.metadata,
+                        tags=ARRAY(SELECT DISTINCT unnest(memory_units.tags || EXCLUDED.tags)),
+                        observation_scopes=EXCLUDED.observation_scopes, text_signals=EXCLUDED.text_signals,
+                        source_memory_ids=ARRAY(SELECT DISTINCT unnest(COALESCE(memory_units.source_memory_ids, '{}'::uuid[]) || EXCLUDED.source_memory_ids)),
+                        updated_at=now()
+                        WHERE memory_units.bank_id=EXCLUDED.bank_id AND memory_units.document_id=EXCLUDED.document_id
+                    """ if updating else ''
+                    returned = sql_values(cur, unit_sql + suffix + ' RETURNING id::text', group, template=template, fetch=True)
+                    if sorted(str(r[0]) for r in returned) != sorted(r[0] for r in group):
+                        raise ValueError('incremental memory identity CAS failed')
+            else:
+                unit_return = sql_values(cur, unit_sql + ' RETURNING id::text', unit_rows, template=template, fetch=True)
+                unit_ids = [r[0] for r in unit_return]
             report["inserted_observations"] = len(unit_ids)
 
             # Upsert normalized entities and link them to observation units.
             entity_names = sorted({e for o in observations for e in o["entities"] if e})
-            entity_id_by_name: dict[str, str] = {}
-            for name in entity_names:
-                cur.execute("""
-                    INSERT INTO entities (canonical_name, bank_id, metadata, mention_count)
-                    VALUES (%s, %s, %s::jsonb, 1)
-                    ON CONFLICT (bank_id, lower(canonical_name)) DO UPDATE
-                    SET mention_count = entities.mention_count + 1,
-                        last_seen = now(),
-                        metadata = entities.metadata || EXCLUDED.metadata
-                    RETURNING id::text
-                """, (name, bank, json.dumps({"source": "offline_hindsight_v2", "rebuild_id": rebuild_id}, ensure_ascii=False)))
-                entity_id_by_name[name] = cur.fetchone()[0]
+            entity_id_by_name = _upsert_entities(cur, bank, entity_names, rebuild_id, incremental=incremental)
             link_rows = []
             for uid, o in zip(unit_ids, observations):
                 for e in o["entities"]:
@@ -630,7 +752,7 @@ def publish(
                     if eid:
                         link_rows.append((uid, eid))
             if link_rows:
-                execute_values(cur, """
+                sql_values(cur, """
                     INSERT INTO unit_entities (unit_id, entity_id)
                     VALUES %s
                     ON CONFLICT DO NOTHING
@@ -657,12 +779,14 @@ def publish(
                 semantic_rows = filtered["kept"]
                 report["skipped_semantic_links_missing_targets"] = filtered["skipped_missing_targets"]
             if semantic_rows:
-                execute_values(cur, """
+                sql_values(cur, """
                     INSERT INTO memory_links (from_unit_id, to_unit_id, link_type, weight, bank_id)
                     VALUES %s
                     ON CONFLICT DO NOTHING
                 """, semantic_rows, template="(%s::uuid,%s::uuid,%s,%s,%s)")
                 report["semantic_links"] = len(semantic_rows)
+        if precommit_check is not None:
+            precommit_check(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -689,7 +813,7 @@ def main() -> None:
     args = ap.parse_args()
 
     cards_root = Path(args.cards_root).expanduser()
-    cards = load_cards(cards_root)
+    cards = load_cards(cards_root, bank=args.bank)
     report = publish(
         cards,
         dsn=args.dsn,

@@ -208,6 +208,12 @@ def query_variants(query: str, mode: str) -> list[str]:
 
 
 def local_observation_result(obs: dict[str, Any], *, card_path: Path | None = None, card: dict[str, Any] | None = None, idx: int = 0) -> dict[str, Any] | None:
+    if obs.get("kind") == "opaque_legacy":
+        raw = obs["legacy_row"]
+        return {"id": raw["id"], "candidate_observation_id": obs["id"], "document_id": raw["document_id"],
+            "type": "opaque_legacy", "text": raw["text"],
+            "metadata": {"opaque_legacy_id": raw["id"], "legacy_sha256": obs["legacy_sha256"]},
+            "source_fact_ids": [], "_local_card": True, "_score_text": raw["text"]}
     text = obs.get("insight") or ""
     if not text:
         return None
@@ -290,6 +296,17 @@ def load_local_cards(cards_root: str | Path | None) -> list[dict[str, Any]]:
     root = Path(cards_root).expanduser()
     if not root.exists():
         return []
+    if (root / "manifest.json").exists():
+        from hindsight_incremental_merge import load_manifest_artifacts, publication_observation
+        manifest, _, rows = load_manifest_artifacts(root)
+        if manifest.get("schema_version") and rows is not None:
+            out = []
+            for row in rows:
+                result = local_observation_result(publication_observation(row))
+                if result is None:
+                    raise ValueError("sealed candidate contains an unparsed observation")
+                out.append(result)
+            return out
     out: list[dict[str, Any]] = []
     index_path = root / "observations_index.jsonl"
     if index_path.exists():

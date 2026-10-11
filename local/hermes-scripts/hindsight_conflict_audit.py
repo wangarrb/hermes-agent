@@ -69,6 +69,22 @@ def load_json(path: Path, default: Any = None) -> Any:
 
 
 def load_observations(cards_root: Path) -> list[dict[str, Any]]:
+    if (cards_root / "manifest.json").exists():
+        from hindsight_incremental_merge import load_manifest_artifacts, publication_observation
+        manifest, _, rows = load_manifest_artifacts(cards_root)
+        if manifest.get("schema_version") and rows is not None:
+            # Read-only view, never parse legacy suffixes into claimed semantics.
+            view = [publication_observation(row) for row in rows]
+            for obs in view:
+                if obs.get("kind") == "opaque_legacy":
+                    obs.pop("applicability", None)
+                    obs['candidate_observation_id'] = obs['id']
+                    obs['id'] = obs['legacy_row']['id']
+                    # The published row is traceable to this exact frozen index,
+                    # not evidence that its unknown historical inputs succeeded.
+                    obs['evidence_ids'] = [obs['legacy_row']['id']]
+                    obs['source_documents'] = [str(cards_root / 'observations_index.jsonl')]
+            return view
     observations: list[dict[str, Any]] = []
     index_path = cards_root / "observations_index.jsonl"
     if index_path.exists():
