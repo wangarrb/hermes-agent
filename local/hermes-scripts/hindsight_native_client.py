@@ -55,15 +55,33 @@ def clean_json_text(text: str) -> str:
     return CONTROL_CHARS.sub("", text or "")
 
 
-def _page_items(data: dict[str, Any], preferred: str) -> list[dict[str, Any]]:
-    items = data.get(preferred)
-    if items is None:
-        items = data.get("items")
-    if items is None and preferred != "operations":
-        items = data.get("operations")
-    if items is None:
-        items = []
-    return [x for x in items if isinstance(x, dict)]
+def _page_items(data: Any, preferred: str, *, offset: int | None = None) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        raise HindsightApiError('malformed paginated API response', error_class='invalid_output')
+    fields = [preferred, 'items'] + (['operations'] if preferred != 'operations' else [])
+    for field in fields:
+        if field in data:
+            items = data[field]
+            break
+    else:
+        raise HindsightApiError('missing paginated API items', error_class='invalid_output')
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        # Filtering malformed entries can turn an unread page into successful EOF.
+        raise HindsightApiError('malformed paginated API items', error_class='invalid_output')
+    total = data.get('total')
+    if 'total' in data and (type(total) is not int or total < 0):
+        raise HindsightApiError('malformed paginated API total', error_class='invalid_output')
+    if offset is not None:
+        if 'offset' in data and (type(data['offset']) is not int or data['offset'] != offset):
+            raise HindsightApiError('mismatched paginated API offset', error_class='invalid_output')
+        if type(total) is int:
+            # Status-filtered operations can finish between pages; source
+            # inventories do not receive this dynamic-list EOF exception.
+            operation_eof = preferred == 'operations' and not items and total <= offset
+            if ((offset + len(items) > total and not operation_eof)
+                    or (not items and offset < total)):
+                raise HindsightApiError('incomplete paginated API inventory', error_class='invalid_output')
+    return items
 
 
 @dataclass
@@ -151,7 +169,7 @@ class HindsightNativeClient:
         yielded = 0
         while True:
             page = self.list_documents(q=q, tags=tags, tags_match=tags_match, limit=limit, offset=offset)
-            items = _page_items(page, "items")
+            items = _page_items(page, "items", offset=offset)
             if not items:
                 break
             for item in items:
@@ -163,7 +181,7 @@ class HindsightNativeClient:
             total = page.get("total")
             if isinstance(total, int) and offset >= total:
                 break
-            if len(items) < limit:
+            if not isinstance(total, int) and len(items) < limit:
                 break
 
     def list_all_documents(self, **kwargs: Any) -> list[dict[str, Any]]:
@@ -195,7 +213,7 @@ class HindsightNativeClient:
             offset = 0
             while True:
                 page = self.list_memories(type=typ, search_query=search_query, limit=limit, offset=offset)
-                items = _page_items(page, "items")
+                items = _page_items(page, "items", offset=offset)
                 if not items:
                     break
                 for item in items:
@@ -212,7 +230,7 @@ class HindsightNativeClient:
                 total = page.get("total")
                 if isinstance(total, int) and offset >= total:
                     break
-                if len(items) < limit:
+                if not isinstance(total, int) and len(items) < limit:
                     break
 
     def list_all_memories(self, **kwargs: Any) -> list[dict[str, Any]]:
@@ -279,7 +297,7 @@ class HindsightNativeClient:
         yielded = 0
         while True:
             page = self.list_operations(status=status, type=type, limit=limit, offset=offset, exclude_parents=exclude_parents)
-            items = _page_items(page, "operations")
+            items = _page_items(page, "operations", offset=offset)
             if not items:
                 break
             for item in items:
@@ -291,7 +309,7 @@ class HindsightNativeClient:
             total = page.get("total")
             if isinstance(total, int) and offset >= total:
                 break
-            if len(items) < limit:
+            if not isinstance(total, int) and len(items) < limit:
                 break
 
     def get_operation(self, operation_id: str, *, include_payload: bool = False, timeout: float | None = None) -> dict[str, Any]:
@@ -386,7 +404,7 @@ class HindsightNativeClient:
         yielded = 0
         while True:
             page = self.list_entities(limit=limit, offset=offset)
-            items = _page_items(page, "items")
+            items = _page_items(page, "items", offset=offset)
             if not items:
                 break
             for item in items:
@@ -398,7 +416,7 @@ class HindsightNativeClient:
             total = page.get("total")
             if isinstance(total, int) and offset >= total:
                 break
-            if len(items) < limit:
+            if not isinstance(total, int) and len(items) < limit:
                 break
 
     def list_all_entities(self, **kwargs: Any) -> list[dict[str, Any]]:
