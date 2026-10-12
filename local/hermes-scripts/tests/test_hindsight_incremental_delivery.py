@@ -487,3 +487,80 @@ def test_real_ledger_strict_wire_generated_crash_ack_loss_and_restart(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_delivery_freeze_and_streamed_reader_preserve_exact_json(tmp_path):
+    import io
+    import hindsight_incremental_merge as merge
+    module = importlib.import_module('hindsight_incremental_delivery')
+    values = [None, -0.0, 1e-20, (1, '中文😀', None),
+              {'items': [{'nested': (None, True, '𐀀'), 'vector': '[0.1,-0.0]'}]}]
+    for i, value in enumerate(values):
+        expected = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                              allow_nan=False).encode('utf-8')
+        path, digest = module._freeze(tmp_path, value, f'golden-{i}')
+        assert Path(path).read_bytes() == expected
+        assert digest == hashlib.sha256(expected).hexdigest()
+        assert Path(path).stat().st_mode & 0o777 == 0o400
+        assert module._read(tmp_path, path, digest) == json.loads(expected)
+        assert module._freeze(tmp_path, value, f'golden-{i}') == (path, digest)
+        for encoding in ('utf-8', 'utf-8-sig', 'utf-16', 'utf-32'):
+            assert merge._load_json(io.BytesIO(expected.decode().encode(encoding))) == json.loads(expected)
+    assert merge._load_json(io.BytesIO(b'{"x":0,"x":1}')) == {'x': 1}
+    for malformed in (b'', b'[1,]', b'{"x":1,}', b'{}[]', b'{1:2}', b'[1e]'):
+        with pytest.raises(ValueError):
+            merge._load_json(io.BytesIO(malformed))
+    # Numeric tokens and escaped/non-BMP strings may straddle a read boundary.
+    for padding in (65530, 65531, 65532, 65533, 65534, 65535):
+        raw = b' ' * padding + b'[1e-20,"\\ud83d\\ude00",{"z":[null,false]}]'
+        assert merge._load_json(io.BytesIO(raw)) == json.loads(raw)
+    with pytest.raises(ValueError):
+        module._freeze(tmp_path, {'invalid': float('nan')}, 'bad')
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('operation', ['freeze', 'read'])
+def test_delivery_large_initial_seed_in_memory_bounded_child(tmp_path, operation):
+    import os
+    import subprocess
+    program = r'''
+import hashlib, json, pathlib, resource, sys
+sys.path.insert(0, sys.argv[1])
+import hindsight_incremental_delivery as delivery
+root, operation = pathlib.Path(sys.argv[2]), sys.argv[3]
+value = [{'id': f'unit-{i}', 'text': f'原样😀 {i}',
+          'vector': '[' + ','.join(['0.12345678901'] * 1024) + ']',
+          'opaque': {'nested': [None, True, '𐀀']}} for i in range(4000)]
+encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+digest, byte_count = hashlib.sha256(), 0
+for part in encoder.iterencode(value):
+    data = part.encode('utf-8'); digest.update(data); byte_count += len(data)
+expected = digest.hexdigest()
+path = root / 'large-seed.json'
+if operation == 'read':
+    with path.open('wb') as stream:
+        for part in encoder.iterencode(value):
+            stream.write(part.encode('utf-8'))
+    path.chmod(0o400)
+size = int(next(line.split()[1] for line in pathlib.Path('/proc/self/status').read_text().splitlines()
+                if line.startswith('VmSize:'))) * 1024
+resource.setrlimit(resource.RLIMIT_AS, (size + 128 * 1024 * 1024,) * 2)
+if operation == 'freeze':
+    path, actual = delivery._freeze(root, value, 'seed')
+    path = pathlib.Path(path)
+    assert actual == expected and path.stat().st_size == byte_count
+    assert path.stat().st_mode & 0o777 == 0o400
+else:
+    recovered = delivery._read(root, path, expected)
+    assert recovered == value and len(recovered) == 4000
+print(json.dumps({'operation': operation, 'rows': len(value), 'bytes': byte_count,
+                  'golden_sha256': expected, 'max_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+'''
+    result = subprocess.run([sys.executable, '-c', program, str(ROOT), str(tmp_path), operation],
+                            capture_output=True, text=True, timeout=120,
+                            env={**os.environ, 'HERMES_HOME': str(tmp_path / 'isolated-home')})
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof = json.loads(result.stdout)
+    assert proof['rows'] == 4000 and proof['operation'] == operation
+    (tmp_path / f'memory-{operation}.json').write_text(result.stdout)
+    print(result.stdout.strip())

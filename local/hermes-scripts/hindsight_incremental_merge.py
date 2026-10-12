@@ -9,6 +9,7 @@ or cleaning any old files. Gates belong outside this immutable tree.
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
@@ -16,7 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 SCHEMA = 'hindsight-incremental-generation/1'
 MAX_ANCESTRY_DEPTH = 128
@@ -35,7 +36,42 @@ def _json(value: Any) -> str:
 
 
 def canonical_hash(value: Any) -> str:
-    return hashlib.sha256(_json(value).encode('utf-8')).hexdigest()
+    return _payload_info(_json_chunks(value))['sha256']
+
+
+def _json_chunks(value: Any) -> Iterator[bytes]:
+    # Never join the whole Unicode document: one non-BMP character otherwise
+    # expands all its ASCII vector text to four bytes per character.
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True,
+                               separators=(',', ':'), allow_nan=False)
+    buffer = bytearray()
+    for part in encoder.iterencode(value):
+        buffer.extend(part.encode('utf-8'))
+        if len(buffer) >= 65536:
+            yield bytes(buffer)
+            buffer.clear()
+    if buffer:
+        yield bytes(buffer)
+
+
+def _payload_info(chunks: Iterable[bytes]) -> dict:
+    digest, size = hashlib.sha256(), 0
+    for chunk in chunks:
+        digest.update(chunk)
+        size += len(chunk)
+    return {'sha256': digest.hexdigest(), 'size': size}
+
+
+def _artifact_chunks(kind: str, value: Any) -> Iterator[bytes]:
+    if kind == 'observations':
+        for row in value:
+            yield from _json_chunks(row)
+            yield b'\n'
+    elif kind == 'card':
+        yield from _json_chunks(value)
+        yield b'\n'
+    else:
+        yield value
 
 
 def _typed(row: dict) -> bool:
@@ -338,7 +374,8 @@ def _absolute(path: Path | str) -> Path:
     return value
 
 
-def _read(path: Path) -> bytes:
+@contextmanager
+def _open_read(path: Path):
     _absolute(path)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -350,10 +387,137 @@ def _read(path: Path) -> bytes:
             raise ValueError(f'artifact must be a regular unaliased file: {path}')
         with os.fdopen(fd, 'rb') as stream:
             fd = -1
-            return stream.read()
+            yield stream
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _file_chunks(stream) -> Iterator[bytes]:
+    while chunk := stream.read(65536):
+        yield chunk
+
+
+def _read(path: Path) -> bytes:
+    with _open_read(path) as stream:
+        return stream.read()
+
+
+def _file_info(path: Path) -> dict:
+    with _open_read(path) as stream:
+        return _payload_info(_file_chunks(stream))
+
+
+def _load_json(stream, *, digest=None) -> Any:
+    """Decode frozen seed arrays/envelopes without a whole-document string.
+
+    Only the outer array and array-valued envelope fields are split; every row
+    still uses the stdlib decoder, preserving arbitrary nested legacy content.
+    """
+    import io
+    prefix = stream.read(4)
+    stream.seek(0)
+    if digest is not None:
+        class HashedReader(io.RawIOBase):
+            def readable(self):
+                return True
+            def readinto(self, target):
+                data = stream.read(len(target))
+                digest.update(data)
+                target[:len(data)] = data
+                return len(data)
+        source = io.BufferedReader(HashedReader())
+    else:
+        source = stream
+    text = io.TextIOWrapper(source, encoding=json.detect_encoding(prefix),
+                            errors='surrogatepass', newline='')
+    decoder = json.JSONDecoder()
+    buffer, position, eof = '', 0, False
+
+    def more():
+        nonlocal buffer, position, eof
+        chunk = text.read(65536)
+        buffer, position, eof = buffer[position:] + chunk, 0, not chunk
+
+    def peek():
+        nonlocal position
+        while True:
+            while position < len(buffer) and buffer[position] in ' \t\r\n':
+                position += 1
+            if position < len(buffer) or eof:
+                return buffer[position:position + 1]
+            more()
+
+    def decoded():
+        nonlocal position
+        peek()
+        while True:
+            try:
+                value, end = decoder.raw_decode(buffer, position)
+            except json.JSONDecodeError:
+                if eof:
+                    raise
+                more()
+                continue
+            # A scalar number may cross a read boundary (1 followed by e-20).
+            if not eof and (end == len(buffer) or buffer[end] not in ' \t\r\n,:]}'):
+                more()
+                continue
+            position = end
+            return value
+
+    def take(token):
+        nonlocal position
+        if peek() != token:
+            raise ValueError('invalid JSON delimiter')
+        position += 1
+
+    def array():
+        values = []
+        take('[')
+        if peek() == ']':
+            take(']')
+            return values
+        while True:
+            values.append(decoded())
+            if peek() == ']':
+                take(']')
+                return values
+            take(',')
+
+    try:
+        if peek() == '[':
+            value = array()
+        elif peek() == '{':
+            value = {}
+            take('{')
+            if peek() != '}':
+                while True:
+                    key = decoded()
+                    if not isinstance(key, str):
+                        raise ValueError('JSON object key must be a string')
+                    take(':')
+                    value[key] = array() if peek() == '[' else decoded()
+                    if peek() == '}':
+                        break
+                    take(',')
+            take('}')
+        else:
+            value = decoded()
+        if peek():
+            raise ValueError('extra JSON data')
+        return value
+    finally:
+        text.detach()
+
+
+def _read_json(path: Path, *, expected_hash: str | None = None) -> Any:
+    with _open_read(path) as stream:
+        digest = hashlib.sha256() if expected_hash is not None else None
+        value = _load_json(stream, digest=digest)
+        if digest is not None and digest.hexdigest() != expected_hash:
+            raise ValueError('artifact hash mismatch')
+        return value
 
 
 def _object(payload: bytes, label: str) -> dict:
@@ -374,9 +538,45 @@ def _object(payload: bytes, label: str) -> dict:
     return value
 
 
-def _index(payload: bytes) -> list[dict]:
+def _index(payload: bytes | Iterable[bytes]) -> list[dict]:
     # A malformed or empty line is an error, never a silently dropped fact.
-    return [_object(line, f'JSONL line {i}') for i, line in enumerate(payload.splitlines(), 1)]
+    # Retain the last line until the next chunk to preserve bytes.splitlines()
+    # semantics, including a CRLF split across chunks and a final lone CR.
+    def lines():
+        pending = b''
+        for chunk in ([payload] if isinstance(payload, bytes) else payload):
+            parts = (pending + chunk).splitlines(keepends=True)
+            pending = parts.pop() if parts else b''
+            yield from parts
+        if pending:
+            yield pending
+    return [_object(line, f'JSONL line {i}') for i, line in enumerate(lines(), 1)]
+
+
+def _read_index(path: Path, expected: dict | None = None) -> tuple[list[dict], dict]:
+    digest, size = hashlib.sha256(), 0
+    with _open_read(path) as stream:
+        def chunks():
+            nonlocal size
+            for chunk in _file_chunks(stream):
+                digest.update(chunk)
+                size += len(chunk)
+                yield chunk
+        blocks, error, rows = chunks(), None, []
+        try:
+            rows = _index(blocks)
+        except ValueError as exc:
+            error = exc
+            # Finish the raw digest even when parsing failed; corrupt artifacts
+            # must still report the original hash/size failure before JSON errors.
+            for _ in blocks:
+                pass
+    info = {'sha256': digest.hexdigest(), 'size': size}
+    if expected is not None and info != expected:
+        raise ValueError(f'artifact hash/size mismatch: {path.name}')
+    if error is not None:
+        raise error
+    return rows, info
 
 
 def _inventory(root: Path, expected: set[str]) -> None:
@@ -477,7 +677,7 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
     batches = manifest.get('consumed_batch_ids')
     if not isinstance(batches, list) or any(not isinstance(b, str) or not b.strip() for b in batches) or batches != sorted(set(batches)):
         raise ValueError('invalid consumed batch ids')
-    payloads = {}
+    paths, card_objects, rows = set(), {}, None
     files = manifest.get('files')
     if not isinstance(files, list) or not files:
         raise ValueError('missing exact artifact manifest')
@@ -485,19 +685,30 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
         if not isinstance(entry, dict):
             raise ValueError('invalid artifact entry')
         name = _relative(entry.get('path'))
-        if name == 'manifest.json' or name in payloads:
+        if name == 'manifest.json' or name in paths:
             raise ValueError('duplicate artifact path')
         if entry.get('kind') not in {'observations', 'card', 'markdown'}:
             raise ValueError('invalid artifact kind')
-        payload = _read(root / name)
-        if hashlib.sha256(payload).hexdigest() != _hash(entry.get('sha256'), 'artifact') or len(payload) != _count(entry.get('size'), 'artifact size'):
+        expected = {'sha256': _hash(entry.get('sha256'), 'artifact'),
+                    'size': _count(entry.get('size'), 'artifact size')}
+        if entry['kind'] == 'observations':
+            rows, info = _read_index(root / name, expected)
+        elif entry['kind'] == 'card':
+            payload = _read(root / name)
+            info = _payload_info([payload])
+        else:
+            info = _file_info(root / name)
+        if info != expected:
             raise ValueError(f'artifact hash/size mismatch: {name}')
-        payloads[name] = payload
-    _inventory(root, set(payloads) | {'manifest.json'})
+        if entry['kind'] == 'card':
+            card_objects[name] = _object(payload, name)
+            del payload
+        paths.add(name)
+    _inventory(root, paths | {'manifest.json'})
     index_files = [e['path'] for e in files if e['kind'] == 'observations']
     if index_files != ['observations_index.jsonl']:
         raise ValueError('exact single observation index required')
-    rows = _index(payloads[index_files[0]])
+    assert rows is not None
     _rows(rows, bank, _ancestors=_ancestors)
     if len(rows) != _count(manifest.get('observation_count'), 'observation') or _state_hash(rows) != _hash(manifest.get('observations_sha256'), 'observations'):
         raise ValueError('observation count/content hash mismatch')
@@ -511,7 +722,7 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
     declared_cards = [e['path'] for e in files if e['kind'] == 'card']
     if len(set(card_paths)) != len(card_paths) or set(card_paths) != set(declared_cards):
         raise ValueError('card paths differ from exact artifact manifest')
-    cards = [_object(payloads[name], name) for name in card_paths]
+    cards = [card_objects[name] for name in card_paths]
     _check_cards(cards, entries, _ancestors=_ancestors)
     expected_cards = _projection(rows)
     if cards != expected_cards:
@@ -530,12 +741,13 @@ def validate_generation(manifest_path: Path) -> dict:
     return _validated(manifest_path)[0]
 
 
-def _write(path: Path, payload: bytes) -> None:
+def _write(path: Path, payload: bytes | Iterable[bytes]) -> None:
     _absolute(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'wb') as stream:
-        stream.write(payload)
+        for chunk in ([payload] if isinstance(payload, bytes) else payload):
+            stream.write(chunk)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -560,12 +772,12 @@ def write_generation(root: Path, *, bank: str, parent: dict, observations: list[
     _absolute(directory)
     # Include the prospective child in the ancestry budget before any writes.
     _parent(parent, bank, _ancestors=(directory / 'manifest.json',))
-    payloads = {'observations_index.jsonl': ('observations', ''.join(_json(r) + '\n' for r in rows).encode('utf-8'))}
+    payloads = {'observations_index.jsonl': ('observations', rows)}
     cards, entries = _projection(rows), []
     for card in cards:
         stem = canonical_hash({'topic': card['topic']})
         name = f'topics/{stem}.json'
-        payloads[name] = ('card', (_json(card) + '\n').encode('utf-8'))
+        payloads[name] = ('card', card)
         # This is a deliberately compact view; detailed evidence stays in JSONL.
         md = '\n'.join([f"# {card['topic']}", f"card_id: {card['card_id']}",
                         *[f"- {o['insight']}\n  applicability: {o['applicability']}" for o in card['canonical_observations']]]) + '\n'
@@ -577,7 +789,7 @@ def write_generation(root: Path, *, bank: str, parent: dict, observations: list[
         'parent': copy.deepcopy(parent), 'parent_sha256': parent_hash,
         'consumed_batch_ids': batches, 'observations_sha256': state_hash,
         'observation_count': len(rows), 'card_count': len(cards), 'cards': entries,
-        'files': [{'path': name, 'kind': kind, 'sha256': hashlib.sha256(payload).hexdigest(), 'size': len(payload)}
+        'files': [{'path': name, 'kind': kind, **_payload_info(_artifact_chunks(kind, payload))}
                   for name, (kind, payload) in sorted(payloads.items())]}
     manifest['manifest_sha256'] = canonical_hash(manifest)
     if directory.exists():
@@ -590,9 +802,9 @@ def write_generation(root: Path, *, bank: str, parent: dict, observations: list[
         directory.mkdir(mode=0o700)
     except FileExistsError as exc:
         raise ValueError('concurrent generation writer; retry after completion') from exc
-    for name, (_, payload) in sorted(payloads.items()):
-        _write(directory / name, payload)
-    _write(directory / 'manifest.json', (_json(manifest) + '\n').encode('utf-8'))
+    for name, (kind, payload) in sorted(payloads.items()):
+        _write(directory / name, _artifact_chunks(kind, payload))
+    _write(directory / 'manifest.json', _artifact_chunks('card', manifest))
     for subdir in (directory / 'topics', directory, directory.parent):
         if subdir.exists():
             fd = os.open(subdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -647,7 +859,7 @@ def load_manifest_artifacts(cards_root: Path, *, bank: str | None = None) -> tup
     index = root / 'observations_index.jsonl'
     rows = None
     if index.exists() or index.is_symlink() or count:
-        rows = _index(_read(index))
+        rows, _ = _read_index(index)
         _rows(rows, bank, legacy=True)
         if len(rows) != count:
             raise ValueError('legacy index count mismatch')

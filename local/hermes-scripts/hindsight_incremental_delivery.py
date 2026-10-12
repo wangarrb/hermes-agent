@@ -15,6 +15,7 @@ import stat
 import uuid
 from pathlib import Path
 
+import hindsight_incremental_merge as merge
 from hindsight_offline_retry import RemoteCallError, RetryDeferred, budget_for, classify_error
 
 TERMINAL_FAILURE = frozenset({'failed', 'cancelled', 'canceled', 'error'})
@@ -49,20 +50,23 @@ def _read(root, path, expected_hash):
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
                 raise RemoteCallError('unsafe_payload_path')
-            raw = stream.read()
+            if not isinstance(expected_hash, str) or merge._payload_info(merge._file_chunks(stream))['sha256'] != expected_hash:
+                raise RemoteCallError('payload_mismatch')
+            stream.seek(0)
+            digest = hashlib.sha256()
+            try:
+                value = merge._load_json(stream, digest=digest)
+            except (ValueError, UnicodeError):
+                raise RemoteCallError('invalid_output') from None
+            if digest.hexdigest() != expected_hash:
+                raise RemoteCallError('payload_mismatch')
+            return value
     except OSError:
         raise RemoteCallError('payload_missing') from None
-    if not isinstance(expected_hash, str) or _digest(raw) != expected_hash:
-        raise RemoteCallError('payload_mismatch')
-    try:
-        return json.loads(raw)
-    except (ValueError, UnicodeError):
-        raise RemoteCallError('invalid_output') from None
 
 
 def _freeze(root, value, suffix):
-    raw = _json_bytes(value)
-    digest = _digest(raw)
+    digest = merge.canonical_hash(value)
     directory = _secure_path(root, Path(root) / 'delivery-artifacts')
     directory.mkdir(mode=0o700, exist_ok=True)
     if directory.stat().st_mode & 0o077:
@@ -74,7 +78,12 @@ def _freeze(root, value, suffix):
         _read(root, path, digest)
     else:
         with os.fdopen(fd, 'wb') as stream:
-            stream.write(raw)
+            written = hashlib.sha256()
+            for chunk in merge._json_chunks(value):
+                stream.write(chunk)
+                written.update(chunk)
+            if written.hexdigest() != digest:
+                raise RemoteCallError('payload_mismatch')
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(path, 0o400)

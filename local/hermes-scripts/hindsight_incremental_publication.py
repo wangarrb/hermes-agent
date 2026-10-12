@@ -34,18 +34,19 @@ def _bytes_hash(payload: bytes) -> str:
 
 
 def _artifact(path: Path) -> dict:
-    return {'path': str(merge._absolute(path)), 'sha256': _bytes_hash(merge._read(path))}
+    return {'path': str(merge._absolute(path)), 'sha256': merge._file_info(path)['sha256']}
 
 
 def _freeze(path: Path, value: dict) -> dict:
-    merge._write(path, (merge._json(value) + '\n').encode('utf-8'))
+    merge.canonical_hash(value)  # Reject invalid data before creating evidence.
+    merge._write(path, merge._artifact_chunks('card', value))
     return _artifact(path)
 
 
 def _rows_from_cursor(cur) -> list[dict]:
     rows = [r['row'] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
     # JSONB conversion in SQL, not default=str, defines the immutable representation.
-    merge._json(rows)
+    merge.canonical_hash(rows)
     return sorted(rows, key=lambda r: str(r['id']))
 
 
@@ -277,10 +278,8 @@ module['main']()
         path = merge._absolute(seed['artifact_path'])
         if not path.is_relative_to(merge._absolute(ledger.root)):
             raise ValueError('seed artifact outside private ledger root')
-        payload = merge._read(path)
-        if _bytes_hash(payload) != seed.get('artifact_hash'):
-            raise ValueError('initial seed artifact hash mismatch')
-        value = json.loads(payload)
+        expected_hash = merge._hash(seed.get('artifact_hash'), 'initial seed artifact')
+        value = merge._read_json(path, expected_hash=expected_hash)
         provenance, remote = seed['provenance'], seed['remote_seed']
         merge._parent(provenance, self.bank)
         if isinstance(value, dict):

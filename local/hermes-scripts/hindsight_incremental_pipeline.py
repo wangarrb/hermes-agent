@@ -14,7 +14,7 @@ from pathlib import Path
 from hindsight_incremental_delivery import deliver_batch, _read, _freeze
 from hindsight_incremental_ledger import IncrementalLedger, PHASES
 from hindsight_incremental_merge import (canonical_hash, load_manifest_artifacts,
-    merge_observations, validate_generation, write_generation)
+    merge_observations, validate_generation, write_generation, _read_json)
 from hindsight_incremental_sources import scan_source_snapshots, digest
 from hindsight_offline_retry import RetryDeferred, RetryPolicy, classify_error
 from hindsight_pipeline_common import load_config
@@ -354,7 +354,7 @@ def initialize(config, *, seed_file, confirm, source_reader=scan_source_snapshot
         raise ValueError('explicit_initialize_confirmation_required')
     knobs = config.get('incremental') or {}
     root = Path(knobs.get('root') or Path(config['hermes_home']) / 'hindsight' / 'incremental')
-    seed = json.loads(Path(seed_file).read_text())
+    seed = _read_json(Path(seed_file))
     if seed.get('bank') != config['bank'] or not isinstance(seed.get('observations'), list):
         raise ValueError('seed_export_invalid')
     if seed.get('export_sha256') != canonical_hash({k: v for k, v in seed.items() if k != 'export_sha256'}):

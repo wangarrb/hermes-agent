@@ -232,6 +232,60 @@ def fake_run(cmd, **_):
                                     'expected_layer_hits_top_k': 2 if use_cards else 1, 'score': 1}}]}
 
 
+def test_remote_cursor_validation_streams_instead_of_serializing_full_list(monkeypatch):
+    module = importlib.import_module('hindsight_incremental_publication')
+    cursor = type('FixtureCursor', (), {'fetchall': lambda _self: [{'row': {'id': 'b', 'text': '原样😀'}}, {'row': {'id': 'a', 'text': '保留'}}]})()
+    monkeypatch.setattr(merge, '_json', lambda *_a: pytest.fail('whole-list JSON validation reached'))
+    assert [row['id'] for row in module._rows_from_cursor(cursor)] == ['a', 'b']
+
+
+@pytest.mark.parametrize('invalid_hash', [None, '', False, 0, 'a' * 63, 'A' * 64])
+def test_initial_seed_requires_literal_sha256_even_for_parseable_unchanged_json(env, invalid_hash):
+    _mod, adapter, fixture_ledger, db, _manifest, _proof, _row = env
+    from hindsight_incremental_ledger import IncrementalLedger
+    with Path(fixture_ledger.seed['artifact_path']).open('ab') as stream:
+        stream.write(b' ' * 70000)
+    root = fixture_ledger.root / 'mandatory-hash-ledger'
+    ledger = IncrementalLedger(root, fixture_ledger.bank, create=True)
+    frozen_path = ledger.root / 'seed.json'
+    frozen_path.write_bytes(Path(fixture_ledger.seed['artifact_path']).read_bytes())
+    frozen_path.chmod(0o600)
+    seed = dict(fixture_ledger.seed, artifact_path=str(frozen_path), artifact_hash=invalid_hash)
+    ledger.initialize_legacy([], seed, [], confirm='initialize-hindsight-incremental')
+    with pytest.raises(ValueError, match='^invalid initial seed artifact hash$'):
+        adapter._initial_seed(ledger)
+    assert db.commits == 0 and db.embeds == []
+
+
+def test_initial_seed_uses_hash_bound_stream_decoder(env, monkeypatch):
+    _mod, adapter, ledger, db, _manifest, _proof, _row = env
+    monkeypatch.setattr(merge, '_read', lambda *_a: pytest.fail('whole-file seed read reached'))
+    rows, provenance, remote = adapter._initial_seed(ledger)
+    assert [row['legacy_row'] for row in rows] == db.data['units']
+    assert provenance == ledger.seed['provenance']
+    assert remote == ledger.seed['remote_seed']
+
+
+def test_initializer_uses_stream_decoder_before_freezing_seed(env, monkeypatch):
+    _mod, adapter, fixture_ledger, db, _manifest, _proof, _row = env
+    import hindsight_incremental_pipeline as pipeline
+    from hindsight_incremental_ledger import IncrementalLedger
+    seed_file = Path(fixture_ledger.seed['artifact_path'])
+    original = Path.read_text
+    def reject_whole_seed(path, *args, **kwargs):
+        if path == seed_file:
+            pytest.fail('whole-file seed text read reached')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', reject_whole_seed)
+    config = dict(adapter.config, bank=fixture_ledger.bank,
+                  incremental={'root': str(fixture_ledger.root / 'stream-ledger')})
+    pipeline.initialize(config, seed_file=seed_file, confirm='initialize-hindsight-incremental',
+                        source_reader=lambda *_a, **_kw: [])
+    ledger = IncrementalLedger(Path(config['incremental']['root']), fixture_ledger.bank)
+    _parent, rows, sequence = pipeline._seed_state(ledger)
+    assert sequence == 0 and [row['legacy_row'] for row in rows] == db.data['units']
+
+
 def test_export_is_authoritative_frozen_native_and_readonly(env):
     mod, adapter, ledger, db, manifest, proof, row = env
     exported = json.loads(Path(ledger.seed['artifact_path']).read_text())
@@ -706,3 +760,72 @@ def test_default_eval_runner_binds_transitive_layered_module_to_script_dir(env):
     result = adapter._run_json([sys.executable, str(scripts / 'hindsight_eval.py'), '--json'])
     assert result == {'loaded': 'configured-fixture', 'path': str(scripts / 'hindsight_recall_layered.py')}
     assert db.embeds == [] and db.commits == 0
+
+
+def test_publication_freeze_exact_bytes_and_invalid_value_has_no_artifact(tmp_path):
+    mod = importlib.import_module('hindsight_incremental_publication')
+    value = {'observations': [{'vector': '[0.1,-0.0]', 'text': '原样😀𐀀',
+                              'nested': (None, 1e-20, False)}], 'float': -0.0}
+    expected = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                           allow_nan=False) + '\n').encode('utf-8')
+    path = tmp_path / 'export.json'
+    receipt = mod._freeze(path, value)
+    assert path.read_bytes() == expected
+    assert receipt == {'path': str(path), 'sha256': hashlib.sha256(expected).hexdigest()}
+    assert path.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        mod._freeze(path, {'changed': True})
+    assert path.read_bytes() == expected
+    invalid = tmp_path / 'invalid.json'
+    with pytest.raises(ValueError):
+        mod._freeze(invalid, {'nonfinite': float('nan')})
+    assert not invalid.exists()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('operation', ['freeze', 'artifact'])
+def test_publication_large_seed_serialization_in_memory_bounded_child(tmp_path, operation):
+    import os
+    import subprocess
+    program = r'''
+import hashlib, json, pathlib, resource, sys
+sys.path.insert(0, sys.argv[1])
+import hindsight_incremental_publication as publication
+root, operation = pathlib.Path(sys.argv[2]), sys.argv[3]
+value = {'observations': [{'id': f'unit-{i}', 'text': f'原样😀 {i}',
+                          'vector': '[' + ','.join(['0.12345678901'] * 1024) + ']',
+                          'opaque': {'nested': [None, True, '𐀀']}}
+                         for i in range(4000)], 'bank': 'synthetic'}
+encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+digest, byte_count = hashlib.sha256(), 0
+for part in encoder.iterencode(value):
+    data = part.encode('utf-8'); digest.update(data); byte_count += len(data)
+digest.update(b'\n'); byte_count += 1
+expected = digest.hexdigest()
+path = root / 'large-seed.json'
+if operation == 'artifact':
+    with path.open('wb') as stream:
+        for part in encoder.iterencode(value):
+            stream.write(part.encode('utf-8'))
+        stream.write(b'\n')
+    path.chmod(0o600)
+size = int(next(line.split()[1] for line in pathlib.Path('/proc/self/status').read_text().splitlines()
+                if line.startswith('VmSize:'))) * 1024
+headroom = 128 if operation == 'freeze' else 16
+resource.setrlimit(resource.RLIMIT_AS, (size + headroom * 1024 * 1024,) * 2)
+receipt = publication._freeze(path, value) if operation == 'freeze' else publication._artifact(path)
+assert receipt == {'path': str(path), 'sha256': expected}
+assert path.stat().st_size == byte_count
+if operation == 'freeze':
+    assert publication.merge._read_json(path, expected_hash=expected) == value
+print(json.dumps({'operation': operation, 'rows': len(value['observations']), 'bytes': byte_count,
+                  'golden_sha256': expected, 'max_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+'''
+    result = subprocess.run([sys.executable, '-c', program, str(ROOT), str(tmp_path), operation],
+                            capture_output=True, text=True, timeout=120,
+                            env={**os.environ, 'HERMES_HOME': str(tmp_path / 'isolated-home')})
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof = json.loads(result.stdout)
+    assert proof['rows'] == 4000 and proof['operation'] == operation
+    (tmp_path / f'memory-{operation}.json').write_text(result.stdout)
+    print(result.stdout.strip())

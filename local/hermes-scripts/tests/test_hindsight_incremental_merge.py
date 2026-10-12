@@ -571,3 +571,121 @@ def test_actual_legacy_reducer_typed_manifests_remain_exactly_loadable(merge, wo
     assert sorted(projected, key=merge.observation_id) == sorted(
         [merge.publication_observation(r) for r in rows], key=merge.observation_id)
     assert calls == []
+
+
+def test_streamed_canonical_bytes_equal_json_dumps_and_reject_nonfinite(merge, work):
+    values = [None, True, -0.0, 1e-20, 1.2345678901234567, (1, '中文😀', None),
+              {'z': ['\n\t\\\"', {'nested': [False, 7]}], 'a': '𐀀', 'float': 1e30}]
+    for i, value in enumerate(values):
+        expected = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                              separators=(',', ':'), allow_nan=False).encode('utf-8')
+        assert merge.canonical_hash(value) == hashlib.sha256(expected).hexdigest()
+        path = work / f'canonical-{i}.json'
+        merge._write(path, merge._json_chunks(value))
+        assert path.read_bytes() == expected
+        assert merge._read_json(path, expected_hash=hashlib.sha256(expected).hexdigest()) == json.loads(expected)
+        with pytest.raises(ValueError, match='artifact hash'):
+            merge._read_json(path, expected_hash='0' * 64)
+    for value in (float('nan'), {'nested': [float('inf')]}, float('-inf')):
+        with pytest.raises(ValueError):
+            merge.canonical_hash(value)
+    with pytest.raises(TypeError):
+        merge.canonical_hash({'invalid': object()})
+    jsonl = b'{"x":1}\r\n{"x":2}\r{"x":3}\n'
+    for cut in range(1, len(jsonl)):
+        assert merge._index([jsonl[:cut], jsonl[cut:]]) == merge._index(jsonl)
+    for malformed in (b'{}\n\n', b'{"x":1,"x":2}\n', b'{"x":NaN}\n', b'[]\n'):
+        with pytest.raises(ValueError):
+            merge._index([malformed])
+
+
+def test_streamed_write_failure_preserves_partial_evidence_without_manifest(merge, work, monkeypatch):
+    original = merge._write
+    def interrupted(path, chunks):
+        def partial():
+            yield next(iter(chunks))
+            raise OSError('isolated injected disk failure')
+        return original(path, partial())
+    monkeypatch.setattr(merge, '_write', interrupted)
+    with pytest.raises(OSError, match='injected disk failure'):
+        generation(merge, work)
+    partial = list((work / 'generations').iterdir())
+    assert len(partial) == 1 and not (partial[0] / 'manifest.json').exists()
+    index = partial[0] / 'observations_index.jsonl'
+    assert index.exists() and index.stat().st_mode & 0o777 == 0o600
+    before = index.read_bytes()
+    monkeypatch.setattr(merge, '_write', original)
+    with pytest.raises(ValueError, match='artifact'):
+        generation(merge, work)
+    assert index.read_bytes() == before and not (partial[0] / 'manifest.json').exists()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('operation', ['hash', 'generation'])
+def test_large_opaque_serialization_under_bounded_address_space(merge, work, operation):
+    """Old whole-object Unicode serialization exceeds the child-only memory cap."""
+    import os
+    import subprocess
+    program = r'''
+import hashlib, json, pathlib, resource, sys
+sys.path.insert(0, sys.argv[1])
+import hindsight_incremental_merge as merge
+root, operation = pathlib.Path(sys.argv[2]), sys.argv[3]
+parent = {'bank': 'synthetic', 'seed_sha256': 'a' * 64}
+raw = [{'id': f'unit-{i:05d}', 'bank_id': 'synthetic', 'text': f'原样😀 {i}',
+        'embedding': '[' + ','.join(['0.12345678901'] * 1024) + ']',
+        'metadata': {'opaque': [None, True, {'tuple_json': [1, '𐀀']}]},
+        'embedding_dimension': 1024, 'document_id': 'synthetic-document'}
+       for i in range(4000)]
+rows = merge.import_legacy_seed(raw, bank='synthetic', provenance=parent)
+encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+def golden(value):
+    digest = hashlib.sha256()
+    for part in encoder.iterencode(value):
+        digest.update(part.encode('utf-8'))
+    return digest.hexdigest()
+expected = golden(rows)
+size = int(next(line.split()[1] for line in pathlib.Path('/proc/self/status').read_text().splitlines()
+                if line.startswith('VmSize:'))) * 1024
+resource.setrlimit(resource.RLIMIT_AS, (size + 128 * 1024 * 1024,) * 2)
+if operation == 'hash':
+    assert merge.canonical_hash(rows) == expected
+else:
+    manifest = merge.write_generation(root, bank='synthetic', parent=parent,
+                                      observations=rows, consumed_batch_ids=['synthetic-batch'])
+    bound, cards, recovered = merge.load_manifest_artifacts(pathlib.Path(manifest['root']), bank='synthetic')
+    assert bound == manifest and len(recovered) == len(rows)
+    assert len(cards[0]['canonical_observations']) == 120
+    assert recovered == sorted(rows, key=merge.observation_id)
+    index = pathlib.Path(manifest['root']) / 'observations_index.jsonl'
+    digest, byte_count = hashlib.sha256(), 0
+    for row in sorted(rows, key=merge.observation_id):
+        data = (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
+        digest.update(data); byte_count += len(data)
+    entry = next(e for e in manifest['files'] if e['kind'] == 'observations')
+    assert entry['sha256'] == digest.hexdigest() and entry['size'] == byte_count
+    del recovered, cards
+    # Reuse is a verification, not an overwrite; corrupt evidence is a blocker.
+    before = index.stat().st_mtime_ns
+    assert merge.write_generation(root, bank='synthetic', parent=parent, observations=rows,
+                                  consumed_batch_ids=['synthetic-batch']) == manifest
+    assert index.stat().st_mtime_ns == before
+    with index.open('ab') as stream:
+        stream.write(b'\n')
+    try:
+        merge.validate_generation(pathlib.Path(manifest['manifest_path']))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('blank JSONL line was silently discarded')
+print(json.dumps({'operation': operation, 'rows': len(rows), 'golden_sha256': expected,
+                  'max_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+'''
+    result = subprocess.run([sys.executable, '-c', program, str(ROOT), str(work), operation],
+                            capture_output=True, text=True, timeout=180,
+                            env={**os.environ, 'HERMES_HOME': str(work / 'isolated-home')})
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof = json.loads(result.stdout)
+    assert proof['rows'] == 4000 and proof['operation'] == operation
+    (work / f'memory-{operation}.json').write_text(result.stdout)
+    print(result.stdout.strip())
