@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import stat
 import time
 from pathlib import Path
 
-from hindsight_incremental_delivery import deliver_batch, _read, _freeze
-from hindsight_incremental_ledger import IncrementalLedger, PHASES
+from hindsight_incremental_delivery import deliver_batch, _read, _freeze, _secure_path
+from hindsight_incremental_ledger import IncrementalLedger, PHASES, _private
 from hindsight_incremental_merge import (canonical_hash, load_manifest_artifacts,
     merge_observations, validate_generation, write_generation, _read_json)
 from hindsight_incremental_sources import scan_source_snapshots, digest
@@ -130,7 +133,20 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                 window = client.resume_window(ledger)
                 if window is not None:
                     report['cleanup'] = 'pending'
-            snapshots = [] if knobs.get('resume_only') else source_reader(Path(config['hermes_home']), profile_mode='all')
+            snapshots = []
+            if not knobs.get('resume_only'):
+                reader_options = {'profile_mode': 'all'}
+                legacy = ledger.initialization_manifest()
+                if 'physical_baseline' in legacy:
+                    reference = ledger.physical_baseline_reference()
+                    if not isinstance(reference, dict):
+                        raise ValueError('physical_baseline_reference_invalid')
+                    value = _read(ledger.root, reference['artifact_path'], reference['artifact_hash'])
+                    from hindsight_incremental_sources import validate_physical_baseline
+                    validate_physical_baseline(value, bank=ledger.bank,
+                                               hermes_home=Path(config['hermes_home']))
+                    reader_options['physical_baseline'] = value
+                snapshots = source_reader(Path(config['hermes_home']), **reader_options)
             if not execute:
                 pending = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
                 report.update(status='plan', captured_pending_units=len(pending),
@@ -349,23 +365,115 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
     return report
 
 
-def initialize(config, *, seed_file, confirm, source_reader=scan_source_snapshots):
+INITIALIZATION_PLAN_SCHEMA = 'hindsight-physical-initialization-plan/1'
+
+
+def _initialization_artifacts(ledger):
+    """Inspect only typed preparation files in this bank's private directory."""
+    directory = _secure_path(ledger.root, ledger.root / 'delivery-artifacts')
+    if not directory.exists():
+        return [], []
+    _private(directory, directory=True)
+    entries = list(directory.iterdir())
+    # Include unfinished/malformed typed names: ignoring them would recapture H.
+    return ([p for p in entries if re.search(r'(?:^|\.)initialization-plan(?:\.|$)', p.name)],
+            [p for p in entries if re.search(r'(?:^|\.)physical-baseline(?:\.|$)', p.name)])
+
+
+def _prepared_physical_baseline(ledger, plans, physical, *, home, seed_hash):
+    """Recover exactly one immutable seed/home/bank scope, never the latest H."""
+    from hindsight_incremental_sources import validate_physical_baseline
+    if not plans:
+        if physical:
+            raise ValueError('physical_initialization_unprepared_orphan')
+        return None
+    if len(plans) != 1:
+        raise ValueError('physical_initialization_ambiguous_preparation')
+    path = _secure_path(ledger.root, plans[0])
+    match = re.fullmatch(r'([0-9a-f]{64})\.initialization-plan\.json', path.name)
+    if match is None:
+        raise ValueError('physical_initialization_invalid_preparation_path')
+    before = _private(path)
+    if stat.S_IMODE(before.st_mode) != 0o400:
+        raise ValueError('physical_initialization_unfinished_preparation')
+    checksum = match.group(1)
+    plan = _read(ledger.root, path, checksum)
+    fields = {'schema_version', 'bank', 'hermes_home', 'seed_export_sha256', 'physical_baseline'}
+    if (not isinstance(plan, dict) or set(plan) != fields or
+            plan.get('schema_version') != INITIALIZATION_PLAN_SCHEMA or
+            plan.get('bank') != ledger.bank or plan.get('hermes_home') != str(home) or
+            plan.get('seed_export_sha256') != seed_hash or canonical_hash(plan) != checksum):
+        raise ValueError('physical_initialization_preparation_binding_mismatch')
+    baseline = plan['physical_baseline']
+    validate_physical_baseline(baseline, bank=ledger.bank, hermes_home=home)
+    expected = ledger.root / 'delivery-artifacts' / (canonical_hash(baseline) + '.physical-baseline.json')
+    if any(p != expected for p in physical):
+        raise ValueError('physical_initialization_ambiguous_physical_artifact')
+    # A killed freeze may have completed chmod but not the directory fsync.
+    # Revalidate immutability first, then complete durability before any commit.
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if ledger._artifact_fence(before) != ledger._artifact_fence(_private(path)):
+        raise ValueError('physical_initialization_preparation_changed')
+    return baseline
+
+
+def initialize(config, *, seed_file, confirm, source_reader=scan_source_snapshots,
+               physical_baseline=False):
     if confirm != 'initialize-hindsight-incremental':
         raise ValueError('explicit_initialize_confirmation_required')
     knobs = config.get('incremental') or {}
     root = Path(knobs.get('root') or Path(config['hermes_home']) / 'hindsight' / 'incremental')
     seed = _read_json(Path(seed_file))
-    if seed.get('bank') != config['bank'] or not isinstance(seed.get('observations'), list):
+    if not isinstance(seed, dict) or seed.get('bank') != config['bank'] or not isinstance(seed.get('observations'), list):
         raise ValueError('seed_export_invalid')
     if seed.get('export_sha256') != canonical_hash({k: v for k, v in seed.items() if k != 'export_sha256'}):
         raise ValueError('seed_export_hash_mismatch')
     ledger = IncrementalLedger(root, config['bank'], create=True)
-    observations = seed['observations']
-    path, checksum = _freeze(ledger.root, observations, 'seed')
-    state = {'bank': config['bank'], 'artifact_path': path, 'artifact_hash': checksum,
-             'provenance': seed['provenance'], 'remote_seed': seed.get('remote_seed')}
-    snapshots = source_reader(Path(config['hermes_home']), profile_mode='all')
-    return ledger.initialize_legacy(snapshots, state, seed.get('legacy_unknown', []), confirm=confirm)
+    with ledger.locked():
+        with ledger._connection(initialized=False) as con:
+            if ledger._read(con, 'meta', 'legacy') is not None:
+                raise ValueError('ledger already initialized')
+        plans, physical = _initialization_artifacts(ledger)
+        baseline = None
+        if physical_baseline:
+            from hindsight_incremental_sources import (capture_physical_baseline, checked_path,
+                validate_physical_baseline, physical_baseline_snapshots)
+            home = checked_path(Path(config['hermes_home']))
+            baseline = _prepared_physical_baseline(ledger, plans, physical, home=home,
+                                                  seed_hash=seed['export_sha256'])
+            if baseline is None:
+                baseline = capture_physical_baseline(home, bank=ledger.bank, profile_mode='all')
+                validate_physical_baseline(baseline, bank=ledger.bank, hermes_home=home)
+                # The FIRST frozen artifact is independently recoverable. Freezing
+                # a descriptor and writing a pointer later leaves a data-loss gap.
+                plan = {'schema_version': INITIALIZATION_PLAN_SCHEMA, 'bank': ledger.bank,
+                        'hermes_home': str(home), 'seed_export_sha256': seed['export_sha256'],
+                        'physical_baseline': baseline}
+                _freeze(ledger.root, plan, 'initialization-plan')
+                plans, physical = _initialization_artifacts(ledger)
+                baseline = _prepared_physical_baseline(ledger, plans, physical, home=home,
+                                                      seed_hash=seed['export_sha256'])
+            if baseline is None:
+                raise ValueError('physical_initialization_missing_preparation')
+            snapshots = physical_baseline_snapshots(baseline)
+        else:
+            if plans or physical:
+                raise ValueError('physical_initialization_preparation_requires_physical_mode')
+            snapshots = source_reader(Path(config['hermes_home']), profile_mode='all')
+        path, checksum = _freeze(ledger.root, seed['observations'], 'seed')
+        state = {'bank': ledger.bank, 'artifact_path': path, 'artifact_hash': checksum,
+                 'provenance': seed['provenance'], 'remote_seed': seed.get('remote_seed')}
+        if baseline is not None:
+            path, checksum = _freeze(ledger.root, baseline, 'physical-baseline')
+            reference = {key: baseline[key] for key in ('schema_version', 'bank', 'hermes_home')}
+            reference.update(artifact_path=path, artifact_hash=checksum)
+            return ledger.initialize_legacy(snapshots, state, seed.get('legacy_unknown', []),
+                                            confirm=confirm, physical_baseline=reference)
+        return ledger.initialize_legacy(snapshots, state, seed.get('legacy_unknown', []), confirm=confirm)
 
 
 def main(argv=None):
@@ -414,7 +522,8 @@ def main(argv=None):
     if args.action == 'initialize':
         if args.seed_file is None:
             parser.error('--seed-file is required for explicit migration')
-        result = initialize(config, seed_file=args.seed_file, confirm=args.confirm)
+        result = initialize(config, seed_file=args.seed_file, confirm=args.confirm,
+                            physical_baseline=True)
     elif args.action == 'status':
         ledger = IncrementalLedger(root, config['bank'])
         result = {'bank': ledger.bank, 'legacy': ledger.initialization_manifest(),

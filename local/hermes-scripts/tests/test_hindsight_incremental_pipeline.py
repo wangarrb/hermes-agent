@@ -1,6 +1,10 @@
 from pathlib import Path
 import importlib.util
 import json
+import multiprocessing
+import os
+import socket
+import sqlite3
 import sys
 import uuid
 
@@ -126,6 +130,318 @@ def setup(tmp_path):
     ledger.initialize_legacy([old], seed, [], confirm='initialize-hindsight-incremental')
     cfg = {'hermes_home': str(tmp_path / 'home'), 'bank': ledger.bank}
     return src, ledger, flow, cfg
+
+
+def test_cli_initialize_explicitly_selects_physical_noncompletion_baseline(setup, monkeypatch):
+    _src, _ledger, flow, cfg = setup
+    monkeypatch.setattr(flow, 'load_config', lambda *_a, **_k: cfg)
+    seen = []
+    monkeypatch.setattr(flow, 'initialize', lambda config, **kwargs: seen.append(kwargs) or {'legacy_status': 'legacy_unknown'})
+    assert flow.main(['initialize', '--seed-file', '/isolated/seed.json', '--confirm', 'initialize-hindsight-incremental']) == 0
+    assert seen[0]['physical_baseline'] is True
+
+
+def test_normal_discovery_loads_exact_physical_receipt_without_paid_work(setup, monkeypatch):
+    src, ledger, flow, cfg = setup
+    from hindsight_incremental_delivery import _freeze
+    descriptor = {'schema_version': 'hindsight-physical-legacy-baseline/1', 'bank': ledger.bank,
+                  'hermes_home': cfg['hermes_home'], 'status': 'legacy_unknown', 'completion_proven': False,
+                  'profiles': []}
+    path, digest = _freeze(ledger.root, descriptor, 'physical-baseline')
+    reference = {k: descriptor[k] for k in ('schema_version', 'bank', 'hermes_home')}
+    reference.update(artifact_path=path, artifact_hash=digest)
+    original = ledger.initialization_manifest()
+    monkeypatch.setattr(ledger, 'initialization_manifest', lambda: dict(original, physical_baseline=reference))
+    monkeypatch.setattr(ledger, 'physical_baseline_reference', lambda: reference, raising=False)
+    monkeypatch.setattr(src, 'validate_physical_baseline', lambda value, **kw: None, raising=False)
+    seen = []
+    def reader(home, **kwargs):
+        seen.append((home, kwargs))
+        return [snapshot(src, 1)]
+    runtime = Runtime(ledger)
+    report = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                  source_reader=reader, execute=True)
+    assert report['status'] == 'no_op', report
+    assert seen[0][1]['physical_baseline'] == descriptor
+    assert runtime.posts == [] and runtime.windows == runtime.generator_calls == 0
+
+
+def test_physical_receipt_hash_failure_never_falls_back_to_old_discovery(setup, monkeypatch):
+    src, ledger, flow, cfg = setup
+    from hindsight_incremental_delivery import _freeze
+    path, _hash = _freeze(ledger.root, {'bank': ledger.bank}, 'physical-baseline')
+    reference = {'schema_version': 'hindsight-physical-legacy-baseline/1', 'bank': ledger.bank,
+                 'hermes_home': cfg['hermes_home'], 'artifact_path': path, 'artifact_hash': 'f' * 64}
+    original = ledger.initialization_manifest()
+    monkeypatch.setattr(ledger, 'initialization_manifest', lambda: dict(original, physical_baseline=reference))
+    monkeypatch.setattr(ledger, 'physical_baseline_reference', lambda: reference, raising=False)
+    runtime = Runtime(ledger)
+    report = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+        source_reader=lambda *_a, **_kw: pytest.fail('old reader reached after a broken physical fence'), execute=True)
+    assert report['status'] == 'blocked' and report['calls'] == report['llm_calls'] == 0
+    assert runtime.posts == [] and ledger.list_batches() == []
+
+
+def test_real_physical_initializer_then_new_origin_full_and_repeat_noop(tmp_path):
+    import sqlite3
+    src, ld, _delivery, flow = modules()
+    home = tmp_path / 'physical-home'
+    home.mkdir()
+    (home / 'sessions').mkdir()
+    db = home / 'state.db'
+    con = sqlite3.connect(db)
+    con.executescript('''
+        CREATE TABLE sessions(id TEXT PRIMARY KEY, started_at REAL, parent_session_id TEXT, end_reason TEXT, source TEXT);
+        CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+            created_at REAL, platform_message_id TEXT, active INTEGER, compacted INTEGER, display_order INTEGER);
+        INSERT INTO sessions VALUES('native-session', 1, 'missing-old-parent', NULL, 'cli');
+        INSERT INTO messages VALUES(1, 'native-session', 'user', 'A malformed legacy source with exact retained content.', NULL, NULL, 1, 0, 0);
+        INSERT INTO messages VALUES(2, 'native-session', 'user', 'A malformed legacy source with exact retained content.', NULL, NULL, 1, 0, 1);
+    ''')
+    con.commit(); con.close()
+    seed = {'bank': 'bank-a', 'observations': [], 'provenance': {'bank': 'bank-a', 'seed_sha256': src.digest([])},
+            'remote_seed': None, 'legacy_unknown': [{'status': 'legacy_unknown', 'reason': 'noncompletion fixture'}]}
+    seed['export_sha256'] = flow.canonical_hash(seed)
+    path = tmp_path / 'external-seed.json'
+    path.write_text(json.dumps(seed))
+    cfg = {'hermes_home': str(home), 'bank': 'bank-a', 'incremental': {'root': str(tmp_path / 'state')}}
+    manifest = flow.initialize(cfg, seed_file=path, confirm='initialize-hindsight-incremental', physical_baseline=True)
+    ledger = ld.IncrementalLedger(Path(cfg['incremental']['root']), 'bank-a')
+    assert manifest['legacy_status'] == 'legacy_unknown' and manifest['completion_proven'] is False
+    assert manifest['excluded_source_events'] == 0 and ledger.list_batches() == []
+    runtime = Runtime(ledger)
+    first = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary, execute=True)
+    assert first['status'] == 'no_op', first
+    assert runtime.posts == [] and runtime.generator_calls == runtime.windows == runtime.publishes == 0
+    con = sqlite3.connect(db)
+    con.execute('INSERT INTO messages VALUES(3, ?, ?, ?, ?, ?, 1, 0, 2)',
+                ('native-session', 'user', 'A malformed legacy source with exact retained content.', 1600000000, 'real-new-native-origin'))
+    con.commit(); con.close()
+    new = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary, execute=True)
+    assert new['status'] == 'completed' and new['published'] is True, new
+    before = (len(runtime.posts), runtime.generator_calls, runtime.windows, runtime.publishes)
+    repeated = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary, execute=True)
+    assert repeated['status'] == 'no_op', repeated
+    assert before == (len(runtime.posts), runtime.generator_calls, runtime.windows, runtime.publishes)
+    assert ledger.initialization_manifest()['completion_proven'] is False
+
+
+@pytest.fixture
+def physical_preparation(tmp_path, monkeypatch):
+    src, ld, delivery, flow = modules()
+    home = tmp_path / 'physical-home'
+    home.mkdir(mode=0o700)
+    db = home / 'state.db'
+    with sqlite3.connect(db) as con:
+        con.executescript('''
+            CREATE TABLE sessions(id TEXT PRIMARY KEY, started_at REAL, parent_session_id TEXT, end_reason TEXT, source TEXT);
+            CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL,
+                content TEXT, active INTEGER, compacted INTEGER, origin_message_id TEXT);
+            INSERT INTO sessions VALUES('native-old', NULL, NULL, NULL, 'cli');
+            INSERT INTO messages VALUES(1, 'native-old', 'user', NULL, 'PRIVATE_LEGACY_BODY', 1, 0, NULL);
+            INSERT INTO messages VALUES(2, 'native-old', 'tool', NULL, 'PRIVATE_LEGACY_TOOL', 1, 0, NULL);
+        ''')
+    seed = {'bank': 'bank-a', 'observations': [],
+            'provenance': {'bank': 'bank-a', 'seed_sha256': src.digest([])},
+            'remote_seed': None, 'legacy_unknown': [{'reason': 'unproven'}]}
+    seed['export_sha256'] = flow.canonical_hash(seed)
+    seed_file = tmp_path / 'external-seed.json'
+    seed_file.write_text(json.dumps(seed))
+    cfg = {'hermes_home': str(home), 'bank': 'bank-a',
+           'incremental': {'root': str(tmp_path / 'ledger')}}
+    calls = []
+    def forbidden_connect(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError('isolated initialization must never connect')
+    monkeypatch.setattr(socket.socket, 'connect', forbidden_connect)
+    yield src, ld, delivery, flow, cfg, db, seed_file
+    assert calls == []
+
+
+def _exit_physical_initialization(cfg, seed_file, boundary):
+    _src, ld, _delivery, flow = modules()
+    original_freeze = flow._freeze
+    def interrupted_freeze(root, value, suffix):
+        result = original_freeze(root, value, suffix)
+        if suffix == boundary:
+            os._exit(74)
+        return result
+    setattr(flow, '_freeze', interrupted_freeze)
+    if boundary in {'plan-before-chmod', 'plan-before-directory-fsync'}:
+        original_chmod = os.chmod
+        def interrupted_chmod(path, mode, *args, **kwargs):
+            if str(path).endswith('.initialization-plan.json') and boundary == 'plan-before-chmod':
+                os._exit(74)
+            result = original_chmod(path, mode, *args, **kwargs)
+            if str(path).endswith('.initialization-plan.json'):
+                os._exit(74)
+            return result
+        os.chmod = interrupted_chmod
+    if boundary in {'transaction', 'committed'}:
+        original_put = ld.IncrementalLedger._put
+        def interrupted_put(self, con, table, key, value):
+            result = original_put(self, con, table, key, value)
+            if boundary == 'transaction' and table == 'meta' and key == 'legacy':
+                os._exit(74)
+            return result
+        ld.IncrementalLedger._put = interrupted_put
+        original_initialize = ld.IncrementalLedger.initialize_legacy
+        def interrupted_initialize(self, *args, **kwargs):
+            result = original_initialize(self, *args, **kwargs)
+            if boundary == 'committed':
+                os._exit(74)
+            return result
+        ld.IncrementalLedger.initialize_legacy = interrupted_initialize
+    flow.initialize(cfg, seed_file=seed_file, confirm='initialize-hindsight-incremental', physical_baseline=True)
+
+
+def _crash_preparation(cfg, seed_file, boundary):
+    process = multiprocessing.get_context('fork').Process(target=_exit_physical_initialization,
+        args=(cfg, seed_file, boundary))
+    process.start()
+    process.join(90)
+    if process.is_alive():
+        process.terminate()
+        process.join(10)
+        pytest.fail('initialization child did not reach its crash boundary')
+    assert process.exitcode == 74
+
+
+@pytest.mark.parametrize('boundary', ['initialization-plan', 'plan-before-directory-fsync',
+                                      'physical-baseline', 'transaction', 'committed'])
+def test_physical_initialization_exit_reuses_frozen_scope_and_keeps_late_origin(physical_preparation, monkeypatch, boundary):
+    src, ld, delivery, flow, cfg, db, seed_file = physical_preparation
+    _crash_preparation(cfg, seed_file, boundary)
+    root = Path(cfg['incremental']['root'])
+    directory = root / cfg['bank'] / 'delivery-artifacts'
+    plans = list(directory.glob('*.initialization-plan.json'))
+    assert len(plans) == 1
+    frozen = plans[0].read_bytes()
+    plan_inode = plans[0].stat().st_ino
+    plan = json.loads(frozen)
+    assert plan['seed_export_sha256'] == json.loads(seed_file.read_text())['export_sha256']
+    assert len(plan['physical_baseline']['profiles'][0]['sqlite']['rows']) == 2
+    assert b'PRIVATE_LEGACY_' not in frozen
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO messages VALUES(3, 'native-old', 'user', 1, 'Late old-date observation', 1, 0, 'late-new-origin')")
+    def no_recapture(*args, **kwargs):
+        pytest.fail('crash retry expanded the frozen exclusion scope')
+    monkeypatch.setattr(src, 'capture_physical_baseline', no_recapture)
+    if boundary == 'committed':
+        with pytest.raises(ValueError, match='already initialized'):
+            flow.initialize(cfg, seed_file=seed_file, confirm='initialize-hindsight-incremental', physical_baseline=True)
+    else:
+        with pytest.raises(ld.LedgerNotInitializedError):
+            ld.IncrementalLedger(root, cfg['bank'])
+        flow.initialize(cfg, seed_file=seed_file, confirm='initialize-hindsight-incremental', physical_baseline=True)
+    ledger = ld.IncrementalLedger(root, cfg['bank'])
+    reference = ledger.physical_baseline_reference()
+    descriptor = delivery._read(ledger.root, reference['artifact_path'], reference['artifact_hash'])
+    assert descriptor == plan['physical_baseline']
+    assert plans[0].read_bytes() == frozen and plans[0].stat().st_ino == plan_inode
+    assert len(list(directory.glob('*.physical-baseline.json'))) == 1
+    manifest = ledger.initialization_manifest()
+    assert manifest['completion_proven'] is False and manifest['excluded_source_events'] == 0
+    assert ledger.list_batches() == []
+    snapshots = src.scan_source_snapshots(Path(cfg['hermes_home']), physical_baseline=descriptor)
+    messages = [m for s in snapshots for m in s['messages']]
+    assert [m['origin'] for m in messages] == ['late-new-origin']
+    assert messages[0]['timestamp'].startswith('1970-01-01')
+    # Only the external Native boundary is fake; source/freeze/ledger/run are real.
+    runtime = Runtime(ledger)
+    runtime.empty_facts = True
+    report = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary, execute=True)
+    assert report['status'] == 'completed', report
+    assert len(runtime.posts) == 1 and runtime.generator_calls == 0
+    assert len(ledger.list_batches()) == 1
+    source = ledger.list_batches()[0]
+    assert source['kind'] == 'source' and source['phase'] == 'published'
+    assert source['source_event_ids'] == [messages[0]['event_id']]
+    counts = (len(runtime.posts), runtime.windows, runtime.publishes)
+    repeat = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary, execute=True)
+    assert repeat['status'] == 'no_op' and repeat['calls'] == repeat['llm_calls'] == 0
+    assert counts == (len(runtime.posts), runtime.windows, runtime.publishes)
+
+
+@pytest.mark.parametrize('damage', ['changed-seed', 'invalid-seed-hash', 'changed-home', 'logical-retry',
+    'wrong-bank', 'wrong-home', 'wrong-seed', 'invalid-descriptor', 'extra-field', 'schema',
+    'duplicate', 'partial-bytes', 'writable', 'hardlink', 'symlink', 'public-directory',
+    'wrong-filename', 'no-hash-name', 'partial-name', 'partial-neighbor', 'orphan-physical',
+    'no-hash-physical', 'other-physical', 'changed-bank', 'crash-before-chmod', 'seed-null'])
+def test_physical_initialization_preparation_binding_rejects_without_recapture(physical_preparation, monkeypatch, damage):
+    src, ld, delivery, flow, cfg, _db, seed_file = physical_preparation
+    if damage == 'crash-before-chmod':
+        _crash_preparation(cfg, seed_file, 'plan-before-chmod')
+    ledger = ld.IncrementalLedger(Path(cfg['incremental']['root']), cfg['bank'], create=True)
+    descriptor = src.capture_physical_baseline(Path(cfg['hermes_home']), bank=cfg['bank'])
+    seed = json.loads(seed_file.read_text())
+    plan = {'schema_version': 'hindsight-physical-initialization-plan/1', 'bank': cfg['bank'],
+            'hermes_home': cfg['hermes_home'], 'seed_export_sha256': seed['export_sha256'],
+            'physical_baseline': descriptor}
+    fields = {'wrong-bank': ('bank', 'different-bank'), 'wrong-home': ('hermes_home', '/wrong-home'),
+              'wrong-seed': ('seed_export_sha256', 'f' * 64), 'invalid-descriptor': ('physical_baseline', None),
+              'extra-field': ('unexpected', True), 'schema': ('schema_version', False)}
+    if damage in fields:
+        key, value = fields[damage]
+        plan[key] = value
+    path, checksum = delivery._freeze(ledger.root, plan, 'initialization-plan')
+    path = Path(path)
+    if damage in {'changed-seed', 'invalid-seed-hash'}:
+        seed['legacy_unknown'].append({'reason': 'changed inventory'})
+        if damage == 'changed-seed':
+            seed['export_sha256'] = flow.canonical_hash({k: v for k, v in seed.items() if k != 'export_sha256'})
+        seed_file.write_text(json.dumps(seed))
+    elif damage == 'changed-home':
+        other = seed_file.parent / 'other-home'
+        other.mkdir(mode=0o700)
+        cfg = dict(cfg, hermes_home=str(other))
+    elif damage == 'duplicate':
+        delivery._freeze(ledger.root, dict(plan, seed_export_sha256='e' * 64), 'initialization-plan')
+    elif damage == 'partial-bytes':
+        path.chmod(0o600); path.write_text('{'); path.chmod(0o400)
+    elif damage == 'writable':
+        path.chmod(0o600)
+    elif damage == 'hardlink':
+        os.link(path, path.parent / 'alias')
+    elif damage == 'symlink':
+        path.rename(path.parent / 'target')
+        path.symlink_to(path.parent / 'target')
+    elif damage == 'public-directory':
+        path.parent.chmod(0o755)
+    elif damage == 'wrong-filename':
+        path.rename(path.parent / ('e' * 64 + '.initialization-plan.json'))
+    elif damage == 'no-hash-name':
+        path.rename(path.parent / 'initialization-plan.json')
+    elif damage == 'partial-name':
+        path.rename(path.with_suffix('.json.partial'))
+    elif damage == 'partial-neighbor':
+        (path.parent / ('f' * 64 + '.initialization-plan.json.partial')).write_text('{')
+    elif damage == 'changed-bank':
+        cfg = dict(cfg, bank='bank-b')
+    elif damage == 'seed-null':
+        seed_file.write_text('null')
+    elif damage == 'other-physical':
+        delivery._freeze(ledger.root, dict(descriptor, bank='bank-b'), 'physical-baseline')
+    elif damage in {'orphan-physical', 'no-hash-physical'}:
+        path.rename(path.parent / 'unrelated-report.json')
+        physical_path, _ = delivery._freeze(ledger.root, descriptor, 'physical-baseline')
+        if damage == 'no-hash-physical':
+            Path(physical_path).rename(path.parent / 'physical-baseline.json')
+    before = ledger.db_path.read_bytes()
+    artifacts = {str(p): p.read_bytes() for p in path.parent.iterdir() if p.is_file()}
+    def forbidden(*args, **kwargs):
+        pytest.fail('invalid preparation must not recapture or fall back to logical discovery')
+    monkeypatch.setattr(src, 'capture_physical_baseline', forbidden)
+    from hindsight_offline_retry import RemoteCallError
+    with pytest.raises((ValueError, RemoteCallError)):
+        flow.initialize(cfg, seed_file=seed_file, confirm='initialize-hindsight-incremental',
+                        physical_baseline=damage != 'logical-retry', source_reader=forbidden)
+    assert ledger.db_path.read_bytes() == before
+    assert {str(p): p.read_bytes() for p in path.parent.iterdir() if p.is_file()} == artifacts
+    with sqlite3.connect(ledger.db_path) as con:
+        assert con.execute("SELECT count(*) FROM meta WHERE key='legacy'").fetchone()[0] == 0
+        assert con.execute('SELECT count(*) FROM sources').fetchone()[0] == 0
+        assert con.execute('SELECT count(*) FROM batches').fetchone()[0] == 0
 
 
 def test_no_new_input_is_zero_delivery_llm_window_or_publish(setup):

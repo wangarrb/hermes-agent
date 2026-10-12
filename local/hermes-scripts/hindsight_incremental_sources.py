@@ -70,6 +70,8 @@ def validate_snapshot(snapshot: dict) -> None:
 
 
 def checked_path(path: Path, *, root: Path | None = None) -> Path:
+    if any(ord(c) < 32 or ord(c) == 127 for c in os.fspath(path)):
+        raise SourceChangedError('source_changed: path controls')
     path = Path(os.path.abspath(path))
     if root is not None and not path.is_relative_to(root):
         raise SourceChangedError('source_changed: path escape')
@@ -100,6 +102,23 @@ def _read_json(path: Path) -> tuple[dict, str]:
     if not isinstance(value, dict) or not isinstance(value.get('messages', []), list):
         raise SourceChangedError('source_changed: invalid session schema')
     return value, hashlib.sha256(before).hexdigest()
+
+
+def _project_artifact(data: dict) -> dict:
+    # Keep the raw fence hash, but not tools, prompts or reasoning metadata
+    # that this adapter never consumes. Holding every full export evicts the
+    # filesystem cache before the SQLite identity scan even starts.
+    fields = ('session_id', 'id', 'session_start', 'started_at', 'parent_session_id',
+              'end_reason', 'parent_end_reason', 'lineage_root', 'platform')
+    message_fields = ('role', 'content', '_compressed_summary', 'timestamp', 'created_at',
+                      'origin_message_id', 'platform_message_id', 'original_id', 'message_id', 'event_id')
+    messages = []
+    for raw in data.get('messages', []):
+        if not isinstance(raw, dict):
+            raise SourceChangedError('source_changed: invalid message schema')
+        if raw.get('role') in {'user', 'assistant'} and not raw.get('_compressed_summary'):
+            messages.append({key: raw[key] for key in message_fields if key in raw})
+    return {**{key: data[key] for key in fields if key in data}, 'messages': messages}
 
 
 def _timestamp(value):
@@ -184,14 +203,35 @@ def _merge_lineage(sessions, artifacts):
     return evidence
 
 
+def _independent_parent_edge(sid, evidence):
+    """Core's stable delegation/branch/reset marker names the direct parent.
+
+    Compression descendants inherit these markers, so presence alone is not
+    enough: only an exact direct-parent match identifies a non-copy edge.
+    """
+    row = evidence.get(sid, {})
+    config = row.get('model_config')
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except (ValueError, TypeError):
+            return False
+    parent = row.get('parent_session_id')
+    return (isinstance(config, dict) and isinstance(parent, str) and bool(parent)
+            and any(config.get(key) == parent for key in
+                    ('_delegate_from', '_branched_from', '_reset_from')))
+
+
 def _lineage_root(sid, evidence):
     current, seen = sid, set()
     while evidence[current].get('parent_session_id'):
         parent = str(evidence[current]['parent_session_id'])
-        if parent not in evidence or not evidence[parent].get('end_reason'):
-            raise SourceChangedError('source_changed: missing lineage parent/end_reason proof')
         if parent in seen or parent == current:
             raise SourceChangedError('source_changed: cyclic compression lineage')
+        if parent in evidence and _independent_parent_edge(current, evidence):
+            break
+        if parent not in evidence or not evidence[parent].get('end_reason'):
+            raise SourceChangedError('source_changed: missing lineage parent/end_reason proof')
         seen.add(current)
         if evidence[parent]['end_reason'] != 'compression':
             break
@@ -206,7 +246,7 @@ def _add_event(view, message):
     view[message['event_id']] = message
 
 
-def _proved_db_clone(left, right, evidence):
+def _proved_db_clone(left, right, evidence, *, cutover_anchors=()):
     physical = {'id', 'session_id', 'active', 'compacted', 'display_order'}
     if {k: v for k, v in left.items() if k not in physical} != {k: v for k, v in right.items() if k not in physical}:
         return False
@@ -216,9 +256,21 @@ def _proved_db_clone(left, right, evidence):
         # insert can have the same body/time. Core carried-tail originals are
         # rewind-only and excluded by the active/compacted visibility query.
         return False
-    current = b
-    while evidence[current].get('parent_session_id'):
-        parent = str(evidence[current]['parent_session_id'])
+    current, seen = b, set()
+    while current not in cutover_anchors:
+        if current in seen:
+            raise SourceChangedError('source_changed: cyclic clone lineage')
+        seen.add(current)
+        if current not in evidence:
+            raise SourceChangedError('source_changed: missing clone lineage proof')
+        if _independent_parent_edge(current, evidence):
+            return False
+        parent = evidence[current].get('parent_session_id')
+        if not parent:
+            break
+        parent = str(parent)
+        if parent not in evidence:
+            raise SourceChangedError('source_changed: missing clone lineage proof')
         if evidence[parent].get('end_reason') != 'compression':
             break
         if parent == a:
@@ -247,6 +299,7 @@ def _read_db(path: Path, artifacts=()) -> tuple[dict, dict, str]:
     for suffix in ('-wal', '-shm', '-journal'):
         checked_path(Path(str(path) + suffix))
     identity = _db_identity(path)
+    roots, grouped, physical_rows = {}, defaultdict(dict), defaultdict(dict)
     try:
         con = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
         con.row_factory = sqlite3.Row
@@ -255,8 +308,37 @@ def _read_db(path: Path, artifacts=()) -> tuple[dict, dict, str]:
             con.execute('BEGIN')
             sessions = {r['id']: dict(r) for r in con.execute('SELECT * FROM sessions')}
             columns = {r[1] for r in con.execute('PRAGMA table_info(messages)')}
-            active = ' WHERE (active = 1 OR compacted = 1)' if {'active', 'compacted'} <= columns else ''
-            rows = [dict(r) for r in con.execute('SELECT * FROM messages' + active + ' ORDER BY id')]
+            active = ' AND (active = 1 OR compacted = 1)' if {'active', 'compacted'} <= columns else ''
+            evidence = _merge_lineage(sessions, artifacts)
+            # Keep the all-role orphan check without loading tool bodies. The
+            # session-ID index covers normal histories; visibility is needed
+            # only for unknown sessions, including hidden legacy rows.
+            for record in con.execute('SELECT DISTINCT session_id FROM messages'):
+                sid = record[0]
+                if sid not in sessions and con.execute(
+                        'SELECT 1 FROM messages WHERE session_id IS ?' + active + ' LIMIT 1',
+                        (sid,)).fetchone() is not None:
+                    raise SourceChangedError('source_changed: missing session for message')
+            # Filter roles before materializing payloads, then iterate inside
+            # the same read-only transaction instead of retaining all history.
+            for record in con.execute("SELECT * FROM messages WHERE role IN ('user','assistant')" + active + ' ORDER BY id'):
+                row = dict(record)
+                sid = row['session_id']
+                if sid not in sessions:
+                    raise SourceChangedError('source_changed: missing session for message')
+                if sessions[sid].get('source') == 'cron':
+                    continue
+                if row.get('role') not in {'user', 'assistant'} or row.get('_compressed_summary'):
+                    continue
+                # Integer row IDs are not message origins: protected tails are cloned.
+                msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
+                if msg:
+                    root = roots.setdefault(sid, _lineage_root(sid, evidence))
+                    previous = physical_rows[root].get(msg['event_id'])
+                    if previous is not None and not msg['origin'] and not _proved_db_clone(previous, row, evidence):
+                        raise SourceChangedError('source_changed: ambiguous identical SQLite rows without clone proof')
+                    _add_event(grouped[root], msg)
+                    physical_rows[root][msg['event_id']] = row
             # Read-only epoch token plus ledger content-coverage detects truncate /
             # reset even when a writer reuses this inode. No write of an epoch key.
             application_id = con.execute('PRAGMA application_id').fetchone()[0]
@@ -267,43 +349,14 @@ def _read_db(path: Path, artifacts=()) -> tuple[dict, dict, str]:
         raise SourceChangedError('source_changed: invalid SQLite source') from exc
     if _db_identity(path) != identity:
         raise SourceChangedError('source_changed: SQLite replaced during snapshot')
-    evidence = _merge_lineage(sessions, artifacts)
-    roots, grouped, physical_rows = {}, defaultdict(dict), defaultdict(dict)
-    for row in rows:
-        sid = row['session_id']
-        if sid not in sessions:
-            raise SourceChangedError('source_changed: missing session for message')
-        if sessions[sid].get('source') == 'cron':
-            continue
-        if row.get('role') not in {'user', 'assistant'} or row.get('_compressed_summary'):
-            continue
-        # Integer row IDs are not message origins: protected tails are cloned.
-        msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
-        if msg:
-            root = roots.setdefault(sid, _lineage_root(sid, evidence))
-            previous = physical_rows[root].get(msg['event_id'])
-            if previous is not None and not msg['origin'] and not _proved_db_clone(previous, row, evidence):
-                raise SourceChangedError('source_changed: ambiguous identical SQLite rows without clone proof')
-            _add_event(grouped[root], msg)
-            physical_rows[root][msg['event_id']] = row
     epoch = 'sqlite:' + digest({'inode': identity, 'application_id': application_id})
     return evidence, {'roots': roots, 'messages': {r: list(view.values()) for r, view in grouped.items()}}, epoch
 
 
-def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all') -> list[dict]:
-    """Observe JSON/Codex current feeds + unsnapshotted persisted SQLite messages.
-
-    This is a local read-only history *identity scan*, never paid processing.
-    Logical views merge duplicate artifacts and compression lineage before
-    capture. Timestamp-less snapshots fail closed rather than using array order.
-    """
+def _discover_sources(home: Path, profile_mode: str) -> list[dict]:
     if profile_mode not in {'all', 'hindsight', 'none'}:
         raise ValueError('invalid profile_mode')
-    home = checked_path(Path(hermes_home))
-    if not home.exists():
-        return []
-    profile_root = home / 'profiles'
-    checked_path(profile_root)
+    profile_root = checked_path(home / 'profiles')
     if profile_root.exists():
         for directory in profile_root.iterdir():
             checked_path(directory, root=home)
@@ -321,6 +374,18 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all') -> li
                 continue
             sources.append({'profile': directory.name, 'sessions_dir': directory / 'sessions',
                             'state_db': directory / 'state.db'})
+    return sources
+
+
+def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
+                          physical_baseline: dict | None = None) -> list[dict]:
+    """Read a finite source view, never infer historical completion or CDC."""
+    if physical_baseline is not None:
+        return _scan_physical_sources(hermes_home, profile_mode, physical_baseline)
+    home = checked_path(Path(hermes_home))
+    if not home.exists():
+        return []
+    sources = _discover_sources(home, profile_mode)
     result = []
     for source in sources:
         profile = source['profile']
@@ -336,7 +401,7 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all') -> li
                 sid = str(data.get('session_id') or data.get('id') or '')
                 if not sid:
                     raise SourceChangedError('source_changed: missing stable session identity')
-                artifacts.append((sid, data, raw_hash))
+                artifacts.append((sid, _project_artifact(data), raw_hash))
         sessions, database, db_epoch = {}, {'roots': {}, 'messages': {}}, None
         if db_path.exists():
             sessions, database, db_epoch = _read_db(db_path, artifacts)
@@ -402,5 +467,564 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all') -> li
                         'source_hash_after': fence_hash}
             snapshot['snapshot_hash'] = snapshot_hash(snapshot)
             validate_snapshot(snapshot)
+            result.append(snapshot)
+    return result
+
+
+PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
+_MUTABLE_ROW_FIELDS = {'active', 'compacted', 'display_order'}
+_NATIVE_ORIGIN_FIELDS = ('origin_message_id', 'platform_message_id', 'original_id', 'message_id', 'event_id')
+
+
+def _native_origin(raw):
+    return next((raw.get(k) for k in _NATIVE_ORIGIN_FIELDS if raw.get(k)), None)
+
+
+def _sql_hash(value):
+    # display_identity is a BLOB in core. Bind its exact bytes without storing
+    # them (or any raw content) in the exclusion artifact.
+    if isinstance(value, bytes):
+        return {'sqlite_blob': value.hex()}
+    if isinstance(value, dict):
+        return {k: _sql_hash(v) for k, v in value.items()}
+    return value
+
+
+def _raw_export_binding(raw, *, sqlite_content=False):
+    if not isinstance(raw, dict):
+        return None
+    content = raw.get('content')
+    if sqlite_content and isinstance(content, str) and content.startswith('\x00json:'):
+        try:
+            content = json.loads(content[len('\x00json:'):])
+        except (ValueError, TypeError):
+            # This is only optional copy evidence, not historical decoding.
+            return None
+    timestamp = raw.get('timestamp') if raw.get('timestamp') is not None else raw.get('created_at')
+    if isinstance(timestamp, (int, float)):
+        timestamp = float(timestamp)
+    origin = _native_origin(raw)
+    return digest(_sql_hash({'role': raw.get('role'), 'timestamp': timestamp, 'content': content,
+                             'origin': str(origin) if origin else None,
+                             '_compressed_summary': bool(raw.get('_compressed_summary'))}))
+
+
+def _physical_record(raw, *, sqlite_row=False):
+    if sqlite_row:
+        # Mutable columns do not enter the emitted hashes, but still require
+        # the same canonical-JSON validity as the former full-row pass.
+        canonical_json(_sql_hash({k: v for k, v in raw.items() if k in _MUTABLE_ROW_FIELDS}))
+        immutable = {k: v for k, v in raw.items() if k not in _MUTABLE_ROW_FIELDS}
+        origin = _native_origin(raw)
+        return {'id': raw['id'], 'session_id': raw['session_id'],
+                'row_hash': digest(_sql_hash(immutable)),
+                'copy_hash': digest(_sql_hash({k: v for k, v in immutable.items() if k not in {'id', 'session_id'}})),
+                'export_hash': _raw_export_binding(raw, sqlite_content=True),
+                'origin_hash': digest(str(origin)) if origin else None}
+    return {'record_hash': digest(_sql_hash(raw)),
+            'export_hash': _raw_export_binding(raw),
+            'origin_hash': digest(str(_native_origin(raw))) if isinstance(raw, dict) and _native_origin(raw) else None}
+
+
+def _location_identity(path: Path, *, directory=False):
+    checked_path(path)
+    try:
+        st = path.stat()
+    except OSError as exc:
+        raise SourceChangedError('source_changed: missing physical source') from exc
+    if not (stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)):
+        raise SourceChangedError('source_changed: invalid physical source type')
+    if not st.st_dev or not st.st_ino:
+        raise SourceChangedError('source_changed: unknown physical source epoch')
+    return [st.st_dev, st.st_ino]
+
+
+def _native_session_binding(row):
+    return digest({k: row.get(k) for k in ('id', 'started_at', 'parent_session_id', 'source')})
+
+
+def _read_physical_db(path: Path, *, consume=None):
+    """Stream all roles in one mode=ro/query_only snapshot; never SessionDB."""
+    identity = _location_identity(path)
+    for suffix in ('-wal', '-shm', '-journal'):
+        checked_path(Path(str(path) + suffix))
+    try:
+        con = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute('PRAGMA query_only=ON')
+            con.execute('BEGIN')
+            session_columns = {r[1] for r in con.execute('PRAGMA table_info(sessions)')}
+            selected = 'id, started_at, parent_session_id, end_reason, source'
+            if 'model_config' in session_columns:
+                selected += ', model_config'
+            sessions = {r['id']: dict(r) for r in con.execute('SELECT ' + selected + ' FROM sessions')}
+            # Carry only Core's stable relation markers into forward proof.
+            # Provider/credential/recipe configuration never enters the
+            # physical descriptor or its returned source evidence.
+            for row in sessions.values():
+                config = row.pop('model_config', None)
+                if isinstance(config, str):
+                    try:
+                        config = json.loads(config)
+                    except (ValueError, TypeError):
+                        config = None
+                if isinstance(config, dict):
+                    row['model_config'] = {key: config[key] for key in
+                        ('_delegate_from', '_branched_from', '_reset_from') if key in config}
+            columns = [r[1] for r in con.execute('PRAGMA table_info(messages)')]
+            application_id = con.execute('PRAGMA application_id').fetchone()[0]
+            schema_version = con.execute('PRAGMA schema_version').fetchone()[0]
+            epoch = 'sqlite:' + digest({'inode': identity, 'application_id': application_id})
+            header = {'path': str(path), 'identity': identity, 'epoch': epoch,
+                      'application_id': application_id, 'schema_version': schema_version, 'message_columns': columns,
+                      'sessions': [{'session_id': sid, 'identity_hash': _native_session_binding(row)}
+                                   for sid, row in sorted(sessions.items())], 'rows': []}
+            if consume is not None:
+                consume(None, sessions, header)
+            for record in con.execute('SELECT * FROM messages ORDER BY id'):
+                row = dict(record)
+                if consume is None:
+                    header['rows'].append(_physical_record(row, sqlite_row=True))
+                else:
+                    consume(row, sessions, header)
+            con.rollback()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise SourceChangedError('source_changed: invalid SQLite physical source') from exc
+    if _location_identity(path) != identity:
+        raise SourceChangedError('source_changed: SQLite replaced during physical snapshot')
+    return header, sessions
+
+
+def _artifact_binding(data):
+    # Mutable counters/model/export metadata are not source identity. Full
+    # raw messages remain prefix-bound separately, including unretained roles.
+    return digest({k: data.get(k) for k in ('session_id', 'id', 'session_start', 'started_at',
+                                           'parent_session_id', 'lineage_root', 'platform')})
+
+
+def _physical_artifact(path: Path):
+    identity = _location_identity(path)
+    data, raw_hash = _read_json(path)
+    if _location_identity(path) != identity:
+        raise SourceChangedError('source_changed: JSON replaced during physical snapshot')
+    sid = data.get('session_id') or data.get('id') or None
+    records = [_physical_record(raw) for raw in data.get('messages', [])]
+    value = {'path': str(path), 'identity': identity, 'session_id': sid,
+             'identity_hash': _artifact_binding(data), 'raw_hash': raw_hash,
+             'prefix_hash': digest([r['record_hash'] for r in records]), 'records': records}
+    return value, data
+
+
+def _feed_epoch(profile):
+    return 'physical:' + digest({'profile': profile['profile'], 'state_db': profile['state_db'],
+        'sqlite_epoch': profile['sqlite']['epoch'] if profile['sqlite'] else None,
+        'sessions_dir': profile['sessions_dir'], 'directory_identity': profile['directory_identity']})
+
+
+def capture_physical_baseline(hermes_home: Path, *, bank: str, profile_mode: str = 'all') -> dict:
+    """Observe finite legacy locations; this proves exclusion, NOT completion."""
+    home = checked_path(Path(hermes_home))
+    profiles = []
+    for source in _discover_sources(home, profile_mode):
+        directory = checked_path(Path(source['sessions_dir']), root=home)
+        db = checked_path(Path(source['state_db']), root=home)
+        profile = {'profile': source['profile'], 'sessions_dir': str(directory), 'state_db': str(db),
+                   'directory_identity': _location_identity(directory, directory=True) if directory.exists() else None,
+                   'sqlite': _read_physical_db(db)[0] if db.exists() else None, 'artifacts': []}
+        if directory.exists():
+            for path in sorted(directory.glob('session_*.json')):
+                checked_path(path, root=home)
+                profile['artifacts'].append(_physical_artifact(path)[0])
+        profile['feed_epoch'] = _feed_epoch(profile)
+        profiles.append(profile)
+    value = {'schema_version': PHYSICAL_BASELINE_SCHEMA, 'bank': bank, 'hermes_home': str(home),
+             'status': 'legacy_unknown', 'completion_proven': False,
+             'profile_mode': profile_mode, 'profiles': profiles}
+    validate_physical_baseline(value, bank=bank, hermes_home=home)
+    return value
+
+
+def _valid_native(value, *, optional=False):
+    return (optional and value is None) or (isinstance(value, str) and bool(value)
+        and not any(ord(c) < 32 or ord(c) == 127 for c in value))
+
+
+def _require_shape(value, keys):
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise ValueError('invalid physical baseline shape')
+
+
+def _require_hash(value, *, optional=False):
+    if optional and value is None:
+        return
+    if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+        raise ValueError('invalid physical baseline hash')
+
+
+def _require_identity(value, *, optional=False):
+    if optional and value is None:
+        return
+    if not isinstance(value, list) or len(value) != 2 or any(type(n) is not int or n <= 0 for n in value):
+        raise ValueError('invalid physical baseline epoch identity')
+
+
+def validate_physical_baseline(baseline: dict, *, bank: str, hermes_home: Path) -> None:
+    """Validate content-free schema and exact bank/home/path/policy binding."""
+    _require_shape(baseline, ('schema_version', 'bank', 'hermes_home', 'status',
+                             'completion_proven', 'profile_mode', 'profiles'))
+    home = checked_path(Path(hermes_home))
+    if (not _valid_native(bank) or baseline['schema_version'] != PHYSICAL_BASELINE_SCHEMA
+            or baseline['bank'] != bank or baseline['hermes_home'] != str(home)
+            or baseline['status'] != 'legacy_unknown' or baseline['completion_proven'] is not False
+            or not isinstance(baseline['profile_mode'], str) or baseline['profile_mode'] not in {'all', 'hindsight', 'none'}
+            or not isinstance(baseline['profiles'], list)):
+        raise ValueError('physical baseline bank/home/policy mismatch')
+    names = set()
+    for profile in baseline['profiles']:
+        _require_shape(profile, ('profile', 'sessions_dir', 'state_db', 'directory_identity', 'sqlite', 'artifacts', 'feed_epoch'))
+        name = profile['profile']
+        if not _valid_native(name) or name in names or '/' in name or name in {'.', '..'}:
+            raise ValueError('invalid physical baseline profile')
+        names.add(name)
+        base = home if name == 'default' else home / 'profiles' / name
+        for key, expected in (('sessions_dir', base / 'sessions'), ('state_db', base / 'state.db')):
+            if not isinstance(profile[key], str) or profile[key] != str(checked_path(expected, root=home)):
+                raise ValueError('physical baseline source path mismatch')
+        _require_identity(profile['directory_identity'], optional=True)
+        db = profile['sqlite']
+        if db is not None:
+            _require_shape(db, ('path', 'identity', 'epoch', 'application_id', 'schema_version', 'message_columns', 'sessions', 'rows'))
+            _require_identity(db['identity'])
+            if (db['path'] != profile['state_db'] or type(db['application_id']) is not int or type(db['schema_version']) is not int
+                    or db['epoch'] != 'sqlite:' + digest({'inode': db['identity'], 'application_id': db['application_id']})
+                    or not isinstance(db['message_columns'], list) or not all(_valid_native(c) for c in db['message_columns'])
+                    or len(set(db['message_columns'])) != len(db['message_columns'])
+                    or not {'id', 'session_id', 'role', 'content'} <= set(db['message_columns'])
+                    or not isinstance(db['sessions'], list) or not isinstance(db['rows'], list)):
+                raise ValueError('invalid physical SQLite descriptor')
+            session_ids, row_ids = set(), set()
+            for session in db['sessions']:
+                _require_shape(session, ('session_id', 'identity_hash'))
+                if not _valid_native(session['session_id']) or session['session_id'] in session_ids:
+                    raise ValueError('invalid physical session association')
+                session_ids.add(session['session_id'])
+                _require_hash(session['identity_hash'])
+            for row in db['rows']:
+                _require_shape(row, ('id', 'session_id', 'row_hash', 'copy_hash', 'export_hash', 'origin_hash'))
+                if type(row['id']) is not int or row['id'] in row_ids or not _valid_native(row['session_id'], optional=True):
+                    raise ValueError('invalid physical row location')
+                row_ids.add(row['id'])
+                for key in ('row_hash', 'copy_hash', 'export_hash', 'origin_hash'):
+                    _require_hash(row[key], optional=key in {'export_hash', 'origin_hash'})
+        if not isinstance(profile['artifacts'], list):
+            raise ValueError('invalid physical artifact list')
+        paths = set()
+        for artifact in profile['artifacts']:
+            _require_shape(artifact, ('path', 'identity', 'session_id', 'identity_hash', 'raw_hash', 'prefix_hash', 'records'))
+            if not isinstance(artifact['path'], str):
+                raise ValueError('invalid physical artifact path')
+            path = checked_path(Path(artifact['path']), root=Path(profile['sessions_dir']))
+            if (str(path) != artifact['path'] or path.parent != Path(profile['sessions_dir'])
+                    or not path.match('session_*.json') or str(path) in paths
+                    or not _valid_native(artifact['session_id'], optional=True)
+                    or not isinstance(artifact['records'], list)):
+                raise ValueError('invalid physical artifact location')
+            paths.add(str(path))
+            _require_identity(artifact['identity'])
+            for key in ('identity_hash', 'raw_hash', 'prefix_hash'):
+                _require_hash(artifact[key])
+            for record in artifact['records']:
+                _require_shape(record, ('record_hash', 'export_hash', 'origin_hash'))
+                for key in record:
+                    _require_hash(record[key], optional=key != 'record_hash')
+            if artifact['prefix_hash'] != digest([r['record_hash'] for r in artifact['records']]):
+                raise ValueError('physical artifact prefix hash mismatch')
+        if profile['feed_epoch'] != _feed_epoch(profile):
+            raise ValueError('physical feed epoch mismatch')
+    if 'default' not in names:
+        raise ValueError('physical baseline default profile missing')
+
+
+def _profile_anchors(profile):
+    sids = {a['session_id'] for a in profile['artifacts'] if a['session_id']}
+    if profile['sqlite']:
+        sids.update(s['session_id'] for s in profile['sqlite']['sessions'])
+        sids.update(r['session_id'] for r in profile['sqlite']['rows'] if r['session_id'])
+    return sids
+
+
+def _physical_snapshots(profile, views=None, *, fence_hash=None):
+    views = {} if views is None else views
+    anchors = _profile_anchors(profile)
+    keys = {sid: f"{profile['profile']}:cutover-session:{sid}" for sid in anchors}
+    keys.update({sid: f"{profile['profile']}:hermes:{sid}" for sid in views if sid not in anchors})
+    if not anchors:
+        keys[None] = f"{profile['profile']}:physical:empty"
+    scope = sorted(keys.values())
+    # The content-free descriptor fence is sufficient for empty anchors; future
+    # payloads bind their own cleaned logical identities in snapshot_hash.
+    fence = digest(profile) if fence_hash is None else fence_hash
+    snapshots = []
+    for sid, key in sorted(keys.items(), key=lambda item: item[1]):
+        snapshot = {'source_key': key, 'source_epoch': profile['feed_epoch'],
+            'epoch_scope': f"{profile['profile']}:physical-feed", 'scope_source_keys': scope,
+            'profile': profile['profile'], 'kind': 'source', 'cleaning_version': CLEANING_VERSION,
+            'messages': list(views.get(sid, {}).values()),
+            'source_hash_before': fence, 'source_hash_after': fence}
+        snapshot['snapshot_hash'] = snapshot_hash(snapshot)
+        validate_snapshot(snapshot)
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def physical_baseline_snapshots(baseline: dict) -> list[dict]:
+    if not isinstance(baseline, dict) or not isinstance(baseline.get('hermes_home'), str):
+        raise ValueError('invalid physical baseline header')
+    validate_physical_baseline(baseline, bank=baseline.get('bank', ''), hermes_home=Path(baseline['hermes_home']))
+    return [snapshot for profile in baseline['profiles'] for snapshot in _physical_snapshots(profile)]
+
+
+def _physical_lineage(sessions, artifacts, anchors):
+    # Historical exports can disagree with native parents. Exact old exclusion
+    # must not require reconstructing that history. Surface conflicts only when
+    # they are used as forward compression proof; new SID evidence stays strict.
+    evidence = {sid: dict(row) for sid, row in sessions.items()}
+    for sid, data, raw_hash in artifacts:
+        if sid not in anchors:
+            evidence = _merge_lineage(evidence, [(sid, data, raw_hash)])
+            continue
+        current = evidence.setdefault(sid, {})
+        for field in ('parent_session_id', 'end_reason'):
+            value = data.get(field)
+            if value in (None, ''):
+                continue
+            if current.get(field) not in (None, '', value):
+                if field == 'end_reason':
+                    current['_forward_conflict'] = True
+            else:
+                current[field] = value
+    return evidence
+
+
+def _cutover_root(sid, evidence, anchors):
+    """Old native SID is a policy anchor, never a guessed historical root."""
+    current, seen = sid, set()
+    while current not in anchors and evidence.get(current, {}).get('parent_session_id'):
+        if current in seen:
+            raise SourceChangedError('source_changed: cyclic forward lineage')
+        seen.add(current)
+        parent = str(evidence[current]['parent_session_id'])
+        if parent == current or parent in seen:
+            raise SourceChangedError('source_changed: cyclic forward lineage')
+        if parent in evidence and _independent_parent_edge(current, evidence):
+            break
+        if evidence[current].get('_forward_conflict') or evidence.get(parent, {}).get('_forward_conflict'):
+            raise SourceChangedError('source_changed: conflicting forward lineage proof')
+        if parent not in evidence or not evidence[parent].get('end_reason'):
+            raise SourceChangedError('source_changed: missing forward lineage parent/end_reason proof')
+        if evidence[parent]['end_reason'] != 'compression':
+            break
+        current = parent
+    return current
+
+
+def _compression_copy(old_sid, new_sid, evidence, *, cutover_anchors):
+    if old_sid == new_sid:
+        return False
+    current, seen = new_sid, set()
+    while current not in seen and current not in cutover_anchors:
+        seen.add(current)
+        if _independent_parent_edge(current, evidence):
+            return False
+        parent = evidence.get(current, {}).get('parent_session_id')
+        if not parent or parent not in evidence or evidence[parent].get('end_reason') != 'compression':
+            return False
+        if parent == old_sid:
+            return True
+        current = parent
+    return False
+
+
+def _exclude_old_copy(record, sid, old_index, evidence, *, cutover_anchors,
+                      sqlite_row=False, copy_index=None):
+    candidates = ((copy_index or {}).get(record['copy_hash'], []) if sqlite_row
+                  else old_index.get(record['export_hash'], []) if record['export_hash'] else [])
+    for old_sid, old in candidates:
+        if not sqlite_row and not record['origin_hash'] and 'record_hash' in old and old['record_hash'] != record['record_hash']:
+            continue
+        if ((record['origin_hash'] and old['origin_hash'] == record['origin_hash'] and old_sid == sid)
+                or _compression_copy(old_sid, sid, evidence, cutover_anchors=cutover_anchors)):
+            return True
+    if candidates or (sqlite_row and record['export_hash'] and old_index.get(record['export_hash'])):
+        raise SourceChangedError('source_changed: ambiguous legacy copy without native binding')
+    return False
+
+
+def _scan_physical_profile(profile, home):
+    directory, db = Path(profile['sessions_dir']), Path(profile['state_db'])
+    if profile['directory_identity'] is not None:
+        if _location_identity(directory, directory=True) != profile['directory_identity']:
+            raise SourceChangedError('source_changed: JSON directory epoch changed')
+    frozen_files = {a['path']: a for a in profile['artifacts']}
+    present = {str(p) for p in directory.glob('session_*.json')} if directory.exists() else set()
+    if not set(frozen_files) <= present:
+        raise SourceChangedError('source_changed: legacy JSON membership lost')
+    artifacts, old_index = [], defaultdict(list)
+    copy_index, changes, current_db_exports = defaultdict(list), [], set()
+    old_origins = defaultdict(list)
+    for artifact in profile['artifacts']:
+        for record in artifact['records']:
+            old_index[record['export_hash']].append((artifact['session_id'], record))
+            if record['origin_hash']:
+                old_origins[record['origin_hash']].append((artifact['session_id'], record))
+    old_db = profile['sqlite']
+    expected_rows = {r['id']: r for r in old_db['rows']} if old_db else {}
+    for record in expected_rows.values():
+        copy_index[record['copy_hash']].append((record['session_id'], record))
+        old_index[record['export_hash']].append((record['session_id'], record))
+        if record['origin_hash']:
+            old_origins[record['origin_hash']].append((record['session_id'], record))
+    for path_text in sorted(present):
+        path = checked_path(Path(path_text), root=home)
+        current, data = _physical_artifact(path)
+        old = frozen_files.get(path_text)
+        if old is None or current['raw_hash'] != old['raw_hash']:
+            changes.append({'path': path_text, 'raw_hash': current['raw_hash']})
+        count = 0
+        if old:
+            count = len(old['records'])
+            if (current['identity'] != old['identity'] or current['identity_hash'] != old['identity_hash']
+                    or len(current['records']) < count
+                    or digest([r['record_hash'] for r in current['records'][:count]]) != old['prefix_hash']):
+                raise SourceChangedError('source_changed: legacy JSON prefix/location rewritten')
+        elif any(current['raw_hash'] == a['raw_hash'] and current['session_id'] == a['session_id'] for a in profile['artifacts']):
+            count = len(current['records'])
+        # Excluded old roles need no logical schema parsing. Future projection
+        # still validates every message before discarding unretained roles.
+        projected = _project_artifact({**data, 'messages': data.get('messages', [])[count:]})
+        records = [record for raw, record in zip(data.get('messages', [])[count:], current['records'][count:])
+                   if isinstance(raw, dict) and raw.get('role') in {'user', 'assistant'} and not raw.get('_compressed_summary')]
+        del current['records']
+        artifacts.append((current['session_id'], projected, current, records))
+    lineage_artifacts = [(sid, data, current['raw_hash']) for sid, data, current, _ in artifacts if sid]
+    anchors, views, physical = _profile_anchors(profile), defaultdict(dict), defaultdict(dict)
+    seen_old = set()
+    evidence = _physical_lineage({}, lineage_artifacts, anchors)
+
+    def check_origin(record, sid):
+        for old_sid, old in old_origins.get(record['origin_hash'], []) if record['origin_hash'] else ():
+            if (old_sid == sid or _compression_copy(old_sid, sid, evidence,
+                    cutover_anchors=anchors)) and old['export_hash'] != record['export_hash']:
+                raise SourceChangedError('source_changed: conflicting legacy stable origin')
+
+    def consume(row, sessions, header):
+        nonlocal evidence
+        if row is None:
+            if old_db:
+                if (header['epoch'] != old_db['epoch'] or header['schema_version'] != old_db['schema_version']
+                        or header['message_columns'] != old_db['message_columns']
+                        or not set(s['session_id'] for s in old_db['sessions']) <= set(sessions)):
+                    raise SourceChangedError('source_changed: SQLite physical epoch/schema/session loss')
+                for old in old_db['sessions']:
+                    if _native_session_binding(sessions[old['session_id']]) != old['identity_hash']:
+                        raise SourceChangedError('source_changed: legacy native session rewritten')
+            evidence = _physical_lineage(sessions, lineage_artifacts, anchors)
+            return
+        record = _physical_record(row, sqlite_row=True)
+        old = expected_rows.get(row['id'])
+        if old:
+            if record['row_hash'] != old['row_hash']:
+                raise SourceChangedError('source_changed: immutable legacy SQLite row rewritten')
+            seen_old.add(row['id'])
+            return
+        changes.append({'id': row['id'], 'row_hash': record['row_hash']})
+        sid = row['session_id']
+        if sid not in sessions:
+            raise SourceChangedError('source_changed: missing session for future message')
+        if sessions[sid].get('source') == 'cron':
+            return
+        if row.get('role') not in {'user', 'assistant'} or row.get('_compressed_summary'):
+            return
+        root = _cutover_root(sid, evidence, anchors)
+        check_origin(record, sid)
+        if _exclude_old_copy(record, sid, old_index, evidence, cutover_anchors=anchors,
+                             sqlite_row=True, copy_index=copy_index):
+            return
+        if ('active' in row and 'compacted' in row and not (row['active'] or row['compacted'])):
+            return
+        msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
+        if msg:
+            current_db_exports.add((sid, record['export_hash']))
+            previous = physical[root].get(msg['event_id'])
+            if previous is not None and not msg['origin'] and not _proved_db_clone(
+                    previous, row, evidence, cutover_anchors=anchors):
+                raise SourceChangedError('source_changed: ambiguous identical future SQLite rows')
+            _add_event(views[root], msg)
+            physical[root][msg['event_id']] = row
+
+    if old_db and not db.exists():
+        raise SourceChangedError('source_changed: legacy SQLite missing')
+    if db.exists():
+        if not old_db:
+            raise SourceChangedError('source_changed: new SQLite feed needs explicit epoch binding')
+        _read_physical_db(db, consume=consume)
+    if seen_old != set(expected_rows):
+        raise SourceChangedError('source_changed: legacy SQLite row coverage lost')
+    for sid, data, current, records in artifacts:
+        messages = data['messages']
+        if not messages:
+            continue
+        if not _valid_native(sid):
+            raise SourceChangedError('source_changed: missing future native session identity')
+        if data.get('platform') == 'cron' or Path(current['path']).name.startswith('session_cron_'):
+            continue
+        root = _cutover_root(sid, evidence, anchors)
+        if data.get('lineage_root') and sid not in anchors and data['lineage_root'] != root:
+            raise SourceChangedError('source_changed: unproved future lineage root')
+        parent = data.get('parent_session_id')
+        if parent and data.get('parent_end_reason') and evidence.get(str(parent), {}).get('end_reason') != data['parent_end_reason']:
+            raise SourceChangedError('source_changed: conflicting forward parent proof')
+        events = set()
+        for raw, record in zip(messages, records):
+            check_origin(record, sid)
+            if _exclude_old_copy(record, sid, old_index, evidence, cutover_anchors=anchors):
+                continue
+            if (current['path'] not in frozen_files and sid in anchors and not record['origin_hash']
+                    and (sid, record['export_hash']) not in current_db_exports):
+                raise SourceChangedError('source_changed: new late export lacks native/exact copy binding')
+            msg = _message(raw, codex=data.get('platform') == 'backfill-codex' or sid.startswith('codex-'))
+            if msg:
+                if msg['event_id'] in events:
+                    raise SourceChangedError('source_changed: ambiguous identical future JSON events')
+                events.add(msg['event_id'])
+                _add_event(views[root], msg)
+    fence = digest({'baseline': digest(profile), 'changes': changes}) if changes else digest(profile)
+    return _physical_snapshots(profile, views, fence_hash=fence)
+
+
+def _scan_physical_sources(hermes_home, profile_mode, baseline):
+    home = checked_path(Path(hermes_home))
+    if not isinstance(baseline, dict):
+        raise ValueError('invalid physical baseline header')
+    validate_physical_baseline(baseline, bank=baseline.get('bank', ''), hermes_home=home)
+    if profile_mode != baseline['profile_mode']:
+        raise ValueError('physical baseline profile coverage mode mismatch')
+    current = {s['profile']: s for s in _discover_sources(home, profile_mode)}
+    old_profiles = {p['profile']: p for p in baseline['profiles']}
+    if not set(old_profiles) <= set(current):
+        raise SourceChangedError('source_changed: legacy profile coverage lost')
+    result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(profile, home)]
+    for name in sorted(set(current) - set(old_profiles)):
+        # A genuinely new profile is strict, not silently turned into legacy.
+        profile_home = Path(current[name]['state_db']).parent
+        for snapshot in scan_source_snapshots(profile_home, profile_mode='none'):
+            for key in ('source_key', 'epoch_scope'):
+                snapshot[key] = name + snapshot[key][len('default'):]
+            snapshot['scope_source_keys'] = [name + k[len('default'):] for k in snapshot['scope_source_keys']]
+            snapshot['profile'] = name
+            snapshot['snapshot_hash'] = snapshot_hash(snapshot)
             result.append(snapshot)
     return result

@@ -612,3 +612,381 @@ def test_bootstrap_reinitialization_is_not_a_now_watermark(tmp_path):
     with pytest.raises(ValueError, match='already'):
         ledger.initialize_legacy([snap('old', 'new')], {}, [], confirm='initialize-hindsight-incremental')
     assert ledger.capture_snapshot(snap('old', 'new'))[0]['source_event_ids'] == ['new']
+
+
+PHYSICAL_SCHEMA = 'hindsight-physical-legacy-baseline/1'
+
+
+def physical_fixture(tmp_path, *, descriptor_changes=None):
+    """Only temporary private JSON; per-feed descriptor internals stay opaque."""
+    from hindsight_incremental_delivery import _freeze
+    home = tmp_path / 'fixture-home'
+    home.mkdir(mode=0o700, exist_ok=True)
+    ledger = api().IncrementalLedger(tmp_path / 'ledger', 'A', create=True)
+    sources = importlib.import_module('hindsight_incremental_sources')
+    descriptor = sources.capture_physical_baseline(home, bank='A')
+    descriptor.update(descriptor_changes or {})
+    path, checksum = _freeze(ledger.root, descriptor, 'physical-baseline')
+    reference = {'schema_version': PHYSICAL_SCHEMA, 'bank': 'A', 'hermes_home': str(home),
+                 'artifact_path': path, 'artifact_hash': checksum}
+    return ledger, reference, descriptor
+
+
+def fixture_anchors(ledger):
+    sources = importlib.import_module('hindsight_incremental_sources')
+    descriptor = sources.capture_physical_baseline(ledger.storage_root.parent / 'fixture-home', bank=ledger.bank)
+    return sources.physical_baseline_snapshots(descriptor)
+
+
+def initialize_physical(ledger, reference, snapshots=None):
+    snapshots = fixture_anchors(ledger) if snapshots is None else list(snapshots)
+    return ledger.initialize_legacy(snapshots, {'seed_hash': 'b' * 64},
+        [{'reason': 'coverage_unproven'}], confirm='initialize-hindsight-incremental',
+        physical_baseline=reference)
+
+
+def assert_no_initialization(ledger):
+    with sqlite3.connect(ledger.db_path) as con:
+        assert con.execute("SELECT key FROM meta ORDER BY key").fetchall() == [('identity',)]
+        assert con.execute('SELECT count(*) FROM sources').fetchone()[0] == 0
+        assert con.execute('SELECT count(*) FROM batches').fetchone()[0] == 0
+    with pytest.raises(api().LedgerNotInitializedError):
+        ledger.initialization_manifest()
+
+
+def test_physical_binding_is_exact_noncompletion_and_readonly_metadata(tmp_path, monkeypatch):
+    ledger, reference, descriptor = physical_fixture(tmp_path)
+    frozen = Path(reference['artifact_path'])
+    before = (frozen.stat().st_ino, frozen.read_bytes())
+    manifest = initialize_physical(ledger, reference)
+    assert manifest['physical_baseline'] == reference
+    assert manifest['legacy_status'] == 'legacy_unknown'
+    assert manifest['completion_proven'] is False
+    assert manifest['excluded_source_events'] == 0
+    anchors = fixture_anchors(ledger)
+    assert manifest['source_snapshots'] == [{k: s[k] for k in ('source_key', 'source_epoch', 'snapshot_hash')}
+                                           for s in anchors]
+    assert manifest['seed_identity_hash'] == importlib.import_module('hindsight_incremental_sources').digest(manifest['seed'])
+    reference['artifact_hash'] = '0' * 64
+    recovered = api().IncrementalLedger(tmp_path / 'ledger', 'A')
+    # The small getter validates reference metadata/permissions, not all profiles.
+    delivery = importlib.import_module('hindsight_incremental_delivery')
+    monkeypatch.setattr(delivery, '_read', lambda *a, **k: pytest.fail('accessor loaded descriptor body'))
+    db_before = recovered.db_path.read_bytes()
+    result = recovered.physical_baseline_reference()
+    assert result == manifest['physical_baseline']
+    result['bank'] = 'B'
+    assert recovered.physical_baseline_reference() == manifest['physical_baseline']
+    assert recovered.initialization_manifest() == manifest
+    assert recovered.list_batches() == []
+    assert recovered.pending_batches(now=0) == []
+    assert recovered.db_path.read_bytes() == db_before
+    assert (frozen.stat().st_ino, frozen.read_bytes()) == before
+    with sqlite3.connect(recovered.db_path) as con:
+        states = [json.loads(row[0]) for row in con.execute('SELECT state FROM meta')]
+    assert not any('receipts' in state or 'last_successful_phase' in state for state in states)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('schema_version', True), ('schema_version', ''), ('schema_version', 'unknown/2'),
+    ('bank', True), ('bank', ''), ('bank', 'B'),
+    ('hermes_home', True), ('hermes_home', ''), ('hermes_home', 'relative-home'),
+    ('artifact_path', True), ('artifact_path', ''), ('artifact_path', 'relative.json'),
+    ('artifact_hash', True), ('artifact_hash', None), ('artifact_hash', 123), ('artifact_hash', ''),
+    ('artifact_hash', 'a' * 63), ('artifact_hash', 'a' * 65), ('artifact_hash', 'g' * 64),
+    ('artifact_hash', 'A' * 64),
+    ('artifact_hash', '0' * 64), ('status', 'completed'),
+])
+def test_physical_reference_bad_literals_cannot_commit(tmp_path, field, value):
+    ledger, reference, _ = physical_fixture(tmp_path)
+    reference[field] = value
+    before = ledger.db_path.read_bytes()
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, reference)
+    assert ledger.db_path.read_bytes() == before
+    assert_no_initialization(ledger)
+
+
+@pytest.mark.parametrize('bad_reference', [True, False, [], {}, 'reference'])
+def test_physical_reference_requires_typed_complete_object(tmp_path, bad_reference):
+    ledger, _, _ = physical_fixture(tmp_path)
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, bad_reference)
+    assert_no_initialization(ledger)
+
+
+@pytest.mark.parametrize('field', ['schema_version', 'bank', 'hermes_home', 'artifact_path', 'artifact_hash'])
+def test_physical_reference_missing_mandatory_field_cannot_commit(tmp_path, field):
+    ledger, reference, _ = physical_fixture(tmp_path)
+    reference.pop(field)
+    before = ledger.db_path.read_bytes()
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, reference)
+    assert ledger.db_path.read_bytes() == before
+    assert_no_initialization(ledger)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('schema_version', True), ('schema_version', ''), ('schema_version', 'unknown/2'),
+    ('bank', 'B'), ('hermes_home', '/wrong-fixture-home'),
+    ('status', 'completed'), ('status', 'unknown'), ('completion_proven', True),
+    ('completion_proven', 0), ('completion_proven', None), ('profiles', {}),
+])
+def test_physical_descriptor_bad_header_cannot_commit(tmp_path, field, value):
+    ledger, reference, _ = physical_fixture(tmp_path, descriptor_changes={field: value})
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, reference)
+    assert_no_initialization(ledger)
+
+
+@pytest.mark.parametrize('damage', [
+    'outside-root', 'other-bank', 'dot-alias', 'parent-escape', 'wrong-home', 'home-alias',
+    'symlink-file', 'symlink-parent', 'hardlink', 'public-file', 'writable-file',
+    'public-parent', 'missing', 'partial', 'bytes-tamper', 'malformed-json', 'noncanonical-json',
+    'duplicate-key', 'nonfinite', 'wrong-type',
+])
+def test_physical_artifact_path_bytes_and_private_mode_fences(tmp_path, damage):
+    ledger, reference, descriptor = physical_fixture(tmp_path)
+    path = Path(reference['artifact_path'])
+    if damage in {'outside-root', 'other-bank'}:
+        folder = tmp_path / 'outside' if damage == 'outside-root' else ledger.storage_root / 'B'
+        folder.mkdir(mode=0o700)
+        outside = folder / path.name
+        outside.write_bytes(path.read_bytes())
+        outside.chmod(0o400)
+        reference['artifact_path'] = str(outside)
+    elif damage == 'dot-alias':
+        reference['artifact_path'] = str(path.parent) + '/./' + path.name
+    elif damage == 'parent-escape':
+        reference['artifact_path'] = str(path.parent) + '/../delivery-artifacts/' + path.name
+    elif damage == 'wrong-home':
+        other = tmp_path / 'other-home'
+        other.mkdir(mode=0o700)
+        reference['hermes_home'] = str(other)
+    elif damage == 'home-alias':
+        reference['hermes_home'] += '/.'
+    elif damage == 'symlink-file':
+        raw = path.read_bytes()
+        path.unlink()
+        outside = tmp_path / 'outside.json'
+        outside.write_bytes(raw)
+        outside.chmod(0o400)
+        path.symlink_to(outside)
+    elif damage == 'symlink-parent':
+        alias = ledger.root / 'alias'
+        alias.symlink_to(path.parent, target_is_directory=True)
+        reference['artifact_path'] = str(alias / path.name)
+    elif damage == 'hardlink':
+        os.link(path, tmp_path / 'external-alias.json')
+    elif damage == 'public-file':
+        path.chmod(0o444)
+    elif damage == 'writable-file':
+        path.chmod(0o600)
+    elif damage == 'public-parent':
+        path.parent.chmod(0o755)
+    elif damage == 'missing':
+        path.unlink()
+    else:
+        raw = {'partial': b'{', 'bytes-tamper': b'{}', 'malformed-json': b'{not-json}',
+               'noncanonical-json': json.dumps(descriptor, indent=2).encode(),
+               'duplicate-key': (json.dumps(descriptor)[:-1] + ',"completion_proven":false}').encode(),
+               'nonfinite': b'{"completion_proven":false,"profiles":[],"extra":NaN}',
+               'wrong-type': b'[]'}[damage]
+        path.chmod(0o600)
+        path.write_bytes(raw)
+        if damage != 'partial':
+            path.chmod(0o400)
+        if damage not in {'partial', 'bytes-tamper'}:
+            reference['artifact_hash'] = hashlib.sha256(raw).hexdigest()
+            target = path.with_name(reference['artifact_hash'] + '.physical-baseline.json')
+            path.rename(target)
+            reference['artifact_path'] = str(target)
+    before = ledger.db_path.read_bytes()
+    with pytest.raises(api().LedgerIntegrityError) as error:
+        initialize_physical(ledger, reference)
+    assert str(path) not in str(error.value)
+    assert reference['artifact_hash'] not in str(error.value)
+    assert ledger.db_path.read_bytes() == before
+    assert_no_initialization(ledger)
+
+
+@pytest.mark.parametrize('mutation', ['null', 'schema', 'bank', 'home', 'hash', 'path',
+                                    'remove', 'completed', 'policy', 'seed-hash', 'seed-type'])
+def test_physical_accessor_never_falls_back_on_malformed_present_binding(tmp_path, mutation):
+    ledger, reference, _ = physical_fixture(tmp_path)
+    initialize_physical(ledger, reference)
+    with sqlite3.connect(ledger.db_path) as con:
+        manifest = json.loads(con.execute("SELECT state FROM meta WHERE key='legacy'").fetchone()[0])
+        if mutation == 'null':
+            manifest['physical_baseline'] = None
+        elif mutation == 'remove':
+            manifest.pop('physical_baseline')
+        elif mutation == 'completed':
+            manifest['completion_proven'] = True
+        elif mutation == 'policy':
+            manifest['policy'] = 'replay'
+        elif mutation == 'seed-hash':
+            manifest['seed_identity_hash'] = '0' * 64
+        elif mutation == 'seed-type':
+            manifest['seed'] = None
+            manifest['seed_identity_hash'] = importlib.import_module('hindsight_incremental_sources').digest(None)
+        else:
+            field = {'schema': 'schema_version', 'home': 'hermes_home',
+                     'hash': 'artifact_hash', 'path': 'artifact_path'}.get(mutation, mutation)
+            manifest['physical_baseline'][field] = {'bank': 'B', 'home': str(tmp_path / 'another-home'),
+                'schema': 'unknown/2', 'hash': True, 'path': '/outside.json'}[mutation]
+        raw = json.dumps(manifest, sort_keys=True, separators=(',', ':'))
+        con.execute("UPDATE meta SET state=?,state_hash=? WHERE key='legacy'",
+                    (raw, hashlib.sha256(raw.encode()).hexdigest()))
+    with pytest.raises(api().LedgerIntegrityError):
+        ledger.physical_baseline_reference()
+
+
+def test_logical_legacy_accessor_remains_none_and_cannot_be_rebaselined(tmp_path):
+    ledger = initialized(tmp_path, snap('old'))
+    assert ledger.physical_baseline_reference() is None
+    _, reference, _ = physical_fixture(tmp_path)
+    before = ledger.db_path.read_bytes()
+    with pytest.raises(ValueError, match='already'):
+        initialize_physical(ledger, reference)
+    assert ledger.db_path.read_bytes() == before
+    assert ledger.physical_baseline_reference() is None
+
+
+def test_physical_initializer_rejects_logical_historical_events(tmp_path):
+    ledger, reference, _ = physical_fixture(tmp_path)
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, reference, [snap('historical-event')])
+    assert_no_initialization(ledger)
+
+
+def _abort_physical_initialization(root, reference):
+    ledger = api().IncrementalLedger(Path(root), 'A', create=True)
+    original = ledger._put
+    def abort(con, table, key, value):
+        original(con, table, key, value)
+        if table == 'meta' and key == 'legacy':
+            os._exit(52)
+    ledger._put = abort
+    initialize_physical(ledger, reference)
+
+
+def test_physical_frozen_orphan_and_abrupt_commit_crash_are_retryable_without_paid_batches(tmp_path):
+    from hindsight_incremental_delivery import _freeze
+    ledger, reference, descriptor = physical_fixture(tmp_path)
+    frozen = Path(reference['artifact_path'])
+    inode = frozen.stat().st_ino
+    assert_no_initialization(ledger)  # artifact freeze is not initialization
+    child = multiprocessing.get_context('fork').Process(target=_abort_physical_initialization,
+        args=(str(ledger.storage_root), reference))
+    child.start()
+    child.join(10)
+    assert child.exitcode == 52
+    recovered = api().IncrementalLedger(ledger.storage_root, 'A', create=True)
+    assert_no_initialization(recovered)
+    path, checksum = _freeze(recovered.root, descriptor, 'physical-baseline')
+    assert (path, checksum) == (reference['artifact_path'], reference['artifact_hash'])
+    assert frozen.stat().st_ino == inode
+    manifest = initialize_physical(recovered, reference)
+    assert manifest['excluded_source_events'] == 0
+    assert recovered.physical_baseline_reference() == reference
+    assert recovered.list_batches() == []
+    anchors = fixture_anchors(recovered)
+    assert all(recovered.capture_snapshot(s) == [] for s in anchors)
+    changed = {**anchors[0], 'source_epoch': 'replacement-epoch'}
+    changed['snapshot_hash'] = importlib.import_module('hindsight_incremental_sources').snapshot_hash(changed)
+    with pytest.raises(api().SourceChangedError):
+        recovered.capture_snapshot(changed)
+    other_path, other_hash = _freeze(recovered.root, {**descriptor, 'audit_note': 'different'}, 'physical-baseline')
+    before = recovered.db_path.read_bytes()
+    for candidate in (reference, {**reference, 'artifact_path': other_path, 'artifact_hash': other_hash}):
+        with pytest.raises(ValueError, match='already'):
+            initialize_physical(recovered, candidate)
+    assert recovered.db_path.read_bytes() == before
+    assert recovered.physical_baseline_reference() == reference
+
+
+@pytest.mark.parametrize('damage', ['omit', 'different-epoch', 'different-scope', 'duplicate'])
+def test_physical_initialization_requires_exact_source_owned_empty_anchor_coverage(tmp_path, damage):
+    ledger, reference, _ = physical_fixture(tmp_path)
+    anchors = fixture_anchors(ledger)
+    if damage == 'omit':
+        anchors = []
+    elif damage == 'duplicate':
+        anchors += anchors
+    else:
+        anchors[0]['source_epoch' if damage == 'different-epoch' else 'epoch_scope'] = 'fabricated'
+        anchors[0]['snapshot_hash'] = importlib.import_module('hindsight_incremental_sources').snapshot_hash(anchors[0])
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, reference, anchors)
+    assert_no_initialization(ledger)
+
+
+def _abort_physical_freeze(root, descriptor):
+    import stat
+    from hindsight_incremental_delivery import _freeze
+    original = os.fsync
+    def abort(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            os._exit(53)  # already chmod 0400, not yet directory-fsynced
+        return original(fd)
+    os.fsync = abort
+    _freeze(Path(root), descriptor, 'physical-baseline')
+
+
+def test_physical_frozen_orphan_finishes_directory_durability_before_ledger_commit(tmp_path, monkeypatch):
+    import stat
+    ledger, reference, descriptor = physical_fixture(tmp_path)
+    path = Path(reference['artifact_path'])
+    path.unlink()  # dispose only this test's file to exercise the real freeze window
+    child = multiprocessing.get_context('fork').Process(target=_abort_physical_freeze,
+        args=(str(ledger.root), descriptor))
+    child.start()
+    child.join(10)
+    assert child.exitcode == 53
+    assert path.stat().st_mode & 0o777 == 0o400
+    assert path.stat().st_nlink == 1
+    assert_no_initialization(ledger)
+    synced = []
+    original_sync, original_put = os.fsync, ledger._put
+    def sync(fd):
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            synced.append(info.st_ino)
+        return original_sync(fd)
+    def put(con, table, key, value):
+        if table == 'meta' and key == 'legacy':
+            assert path.parent.stat().st_ino in synced
+        return original_put(con, table, key, value)
+    monkeypatch.setattr(os, 'fsync', sync)
+    monkeypatch.setattr(ledger, '_put', put)
+    initialize_physical(ledger, reference)
+    assert ledger.physical_baseline_reference() == reference
+    assert ledger.list_batches() == []
+
+
+@pytest.mark.parametrize('damage', ['bytes', 'replace', 'writable', 'hardlink'])
+def test_physical_artifact_change_after_validation_rolls_back_entire_initialization(tmp_path, monkeypatch, damage):
+    ledger, reference, _ = physical_fixture(tmp_path)
+    path = Path(reference['artifact_path'])
+    original = ledger._put
+    def put(con, table, key, value):
+        original(con, table, key, value)
+        if table == 'meta' and key == 'legacy':
+            if damage == 'bytes':
+                path.chmod(0o600)
+                path.write_bytes(b'{}')
+                path.chmod(0o400)
+            elif damage == 'replace':
+                replacement = path.with_suffix('.replacement')
+                replacement.write_bytes(path.read_bytes())
+                replacement.chmod(0o400)
+                replacement.replace(path)
+            elif damage == 'writable':
+                path.chmod(0o600)
+            else:
+                os.link(path, path.with_suffix('.alias'))
+    monkeypatch.setattr(ledger, '_put', put)
+    with pytest.raises(api().LedgerIntegrityError):
+        initialize_physical(ledger, reference)
+    assert_no_initialization(ledger)

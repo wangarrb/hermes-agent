@@ -30,6 +30,7 @@ PHASES = ('captured', 'generated', 'submitted', 'unknown', 'retained', 'consolid
           'locally_merged', 'gated', 'published')
 SUCCESS_PHASES = ('captured', 'generated', 'retained', 'consolidated', 'locally_merged', 'gated', 'published')
 CONFIRM_INITIALIZE = 'initialize-hindsight-incremental'
+PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
 _SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, state TEXT NOT NULL, state_hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sources (source_key TEXT PRIMARY KEY, state TEXT NOT NULL, state_hash TEXT NOT NULL);
@@ -192,21 +193,105 @@ class IncrementalLedger:
         except json.JSONDecodeError as exc:
             raise LedgerIntegrityError('invalid ledger state JSON') from exc
 
+    def _physical_reference(self, reference):
+        """Validate the literal private pointer without loading profile material."""
+        fields = {'schema_version', 'bank', 'hermes_home', 'artifact_path', 'artifact_hash'}
+        try:
+            if (not isinstance(reference, dict) or set(reference) != fields or
+                    any(not isinstance(v, str) or not v or any(ord(c) < 32 or ord(c) == 127 for c in v)
+                        for v in reference.values()) or
+                    reference['schema_version'] != PHYSICAL_BASELINE_SCHEMA or reference['bank'] != self.bank):
+                raise ValueError('invalid reference')
+            home = _safe_path(Path(reference['hermes_home']))
+            if str(home) != reference['hermes_home']:
+                raise ValueError('nonliteral home')
+            path = self._artifact_pointer(reference['artifact_path'], reference['artifact_hash'])
+            expected = self.root / 'delivery-artifacts' / (reference['artifact_hash'] + '.physical-baseline.json')
+            if path != expected:
+                raise ValueError('nonliteral frozen path')
+            _private(path.parent, directory=True)
+            info = _private(path)
+            if stat.S_IMODE(info.st_mode) != 0o400:
+                raise ValueError('unfinished or writable artifact')
+            return dict(reference), info
+        except (OSError, ValueError, TypeError):
+            raise LedgerIntegrityError('invalid physical baseline reference') from None
+
+    def _bound_physical_reference(self, manifest):
+        reference, _ = self._physical_reference(manifest.get('physical_baseline'))
+        try:
+            if (manifest.get('baseline_kind') != 'physical' or
+                    manifest.get('hermes_home') != reference['hermes_home'] or
+                    manifest.get('legacy_status') != 'legacy_unknown' or
+                    manifest.get('completion_proven') is not False or
+                    type(manifest.get('excluded_source_events')) is not int or manifest['excluded_source_events'] != 0 or
+                    not isinstance(manifest.get('seed'), dict) or
+                    manifest.get('seed_identity_hash') != digest(manifest.get('seed'))):
+                raise ValueError('invalid noncompletion binding')
+        except (ValueError, TypeError):
+            raise LedgerIntegrityError('invalid physical baseline metadata binding') from None
+        return reference
+
+    @staticmethod
+    def _artifact_fence(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def _validate_physical_artifact(self, reference, source_snapshots):
+        from hindsight_incremental_delivery import _read
+        from hindsight_incremental_merge import canonical_hash
+        from hindsight_offline_retry import RemoteCallError
+        import hindsight_incremental_sources as sources
+
+        reference, before = self._physical_reference(reference)
+        try:
+            descriptor = _read(self.root, reference['artifact_path'], reference['artifact_hash'])
+            if (not isinstance(descriptor, dict) or
+                    any(descriptor.get(k) != reference[k] for k in ('schema_version', 'bank', 'hermes_home')) or
+                    descriptor.get('status') != 'legacy_unknown' or descriptor.get('completion_proven') is not False or
+                    not isinstance(descriptor.get('profiles'), list) or
+                    canonical_hash(descriptor) != reference['artifact_hash']):
+                raise ValueError('invalid descriptor binding')
+            # The source adapter owns all per-feed fields; never invent a second DSL.
+            sources.validate_physical_baseline(descriptor, bank=self.bank, hermes_home=Path(reference['hermes_home']))
+            anchors = sources.physical_baseline_snapshots(descriptor)
+            order = lambda s: s['source_key']
+            if sorted(source_snapshots, key=order) != sorted(anchors, key=order):
+                raise ValueError('source anchor coverage differs from physical descriptor')
+            # Complete the freeze window if its owner exited after chmod but
+            # before the directory fsync. No DB reference precedes durability.
+            directory = os.open(Path(reference['artifact_path']).parent,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            _, after = self._physical_reference(reference)
+            if self._artifact_fence(before) != self._artifact_fence(after):
+                raise ValueError('artifact changed during validation')
+        except (OSError, ValueError, TypeError, KeyError, RemoteCallError):
+            raise LedgerIntegrityError('invalid physical baseline artifact binding') from None
+        return reference, self._artifact_fence(after)
+
     def _require_initialized(self, con):
         value = self._read(con, 'meta', 'legacy')
         if value is None:
             raise LedgerNotInitializedError('explicit initialize required; no implicit now baseline')
-        if value.get('bank') != self.bank or value.get('policy') != 'preserve-no-replay':
+        if not isinstance(value, dict) or value.get('bank') != self.bank or value.get('policy') != 'preserve-no-replay':
             raise LedgerIntegrityError('legacy bank/policy mismatch')
+        if any(k in value for k in ('physical_baseline', 'baseline_kind', 'hermes_home')):
+            self._bound_physical_reference(value)
         return value
 
-    def initialize_legacy(self, source_snapshots: list[dict], seed: dict, unknown: list[dict], *, confirm: str) -> dict:
+    def initialize_legacy(self, source_snapshots: list[dict], seed: dict, unknown: list[dict], *,
+                          confirm: str, physical_baseline: dict | None = None) -> dict:
         if confirm != CONFIRM_INITIALIZE:
             raise ValueError('confirm must be initialize-hindsight-incremental')
         if not isinstance(seed, dict) or not isinstance(unknown, list):
             raise ValueError('invalid legacy seed/inventory')
         for snapshot in source_snapshots:
             validate_snapshot(snapshot)
+        if physical_baseline is not None and any(s['messages'] for s in source_snapshots):
+            raise LedgerIntegrityError('physical baseline requires empty logical source anchors')
         manifest = {'bank': self.bank, 'policy': 'preserve-no-replay', 'legacy_status': 'legacy_unknown',
                     'seed': seed, 'seed_identity_hash': digest(seed), 'unknown': unknown,
                     'excluded_source_events': sum(len(s['messages']) for s in source_snapshots),
@@ -215,6 +300,11 @@ class IncrementalLedger:
         with self.locked(), self._connection(write=True, initialized=False) as con:
             if self._read(con, 'meta', 'legacy') is not None:
                 raise ValueError('ledger already initialized')
+            reference, artifact_fence = None, None
+            if physical_baseline is not None:
+                reference, artifact_fence = self._validate_physical_artifact(physical_baseline, source_snapshots)
+                manifest.update(physical_baseline=reference, hermes_home=reference['hermes_home'],
+                                baseline_kind='physical', completion_proven=False)
             seen = set()
             for snapshot in source_snapshots:
                 key = snapshot['source_key']
@@ -226,7 +316,23 @@ class IncrementalLedger:
                 state['legacy_event_ids'] = list(state['events'])
                 self._put(con, 'sources', key, state)
             self._put(con, 'meta', 'legacy', manifest)
+            if physical_baseline is not None:
+                _, final = self._physical_reference(reference)
+                if self._artifact_fence(final) != artifact_fence:
+                    raise LedgerIntegrityError('physical baseline artifact changed before initialization commit')
         return manifest
+
+    def physical_baseline_reference(self) -> dict | None:
+        """Return only the exact bound pointer; the normal reader validates bytes.
+
+        Absence is compatible only with the original logical legacy mode. A
+        malformed or missing pointer on a physical ledger is never a fallback.
+        """
+        with self._connection() as con:
+            manifest = self._require_initialized(con)
+            if 'physical_baseline' not in manifest:
+                return None
+            return dict(manifest['physical_baseline'])
 
     def initialization_manifest(self) -> dict:
         """Read-only audit of the non-success baseline/seed inventory."""
