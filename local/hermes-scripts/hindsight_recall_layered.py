@@ -18,8 +18,11 @@ import re
 import sys
 import urllib.request
 from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 DEFAULT_API = "http://127.0.0.1:8888"
@@ -290,7 +293,7 @@ def repair_observation_result(obs: dict[str, Any], *, sidecar_path: Path | None 
     }
 
 
-def load_local_cards(cards_root: str | Path | None) -> list[dict[str, Any]]:
+def load_local_cards(cards_root: str | Path | None, *, bank: str | None = None) -> list[dict[str, Any]]:
     if not cards_root:
         return []
     root = Path(cards_root).expanduser()
@@ -298,7 +301,7 @@ def load_local_cards(cards_root: str | Path | None) -> list[dict[str, Any]]:
         return []
     if (root / "manifest.json").exists():
         from hindsight_incremental_merge import load_manifest_artifacts, publication_observation
-        manifest, _, rows = load_manifest_artifacts(root)
+        manifest, _, rows = load_manifest_artifacts(root, **({'bank': bank} if bank is not None else {}))
         if manifest.get("schema_version") and rows is not None:
             out = []
             for row in rows:
@@ -335,6 +338,118 @@ def load_local_cards(cards_root: str | Path | None) -> list[dict[str, Any]]:
             if r:
                 out.append(r)
     return out
+
+
+def _freeze_projection(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({k: _freeze_projection(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_projection(v) for v in value)
+    return value
+
+
+def _copy_projection(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {k: _copy_projection(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_copy_projection(v) for v in value]
+    return value
+
+
+def _snapshot_roots(root: Path) -> tuple[Path, ...]:
+    """Manifest-only ancestry (not the strict validator's dependency closure).
+
+    Kept as a diagnostic for the original manifest-only fence precondition;
+    prepared recall uses actual validation reads, including off-chain rows.
+    """
+    from hindsight_incremental_merge import SCHEMA, _absolute, _object, _read
+    roots = {root}
+    path = root / 'manifest.json'
+    if path.exists():
+        def visit(value):
+            if isinstance(value, dict):
+                if value.get('schema_version') == SCHEMA:
+                    roots.add(_absolute(value['root']))
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+        visit(_object(_read(path), 'manifest'))
+    return tuple(sorted(roots))
+
+
+def _snapshot_fence(roots: tuple[Path, ...]) -> dict:
+    from hindsight_incremental_merge import _absolute
+    fence = {}
+    def fail(error):
+        raise error
+    for root in roots:
+        _absolute(root)  # Recheck path components, including ancestor symlinks.
+        paths = [root]
+        if root.is_dir():
+            for directory, dirs, files in _os.walk(root, followlinks=False, onerror=fail):
+                paths.extend(Path(directory) / name for name in dirs + files)
+        for path in paths:
+            _absolute(path)
+            try:
+                info = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                fence[path] = None
+                continue
+            # ctime/inode catch same-size writes with restored mtime and replacements.
+            # No content is trusted based on this fence: the strict loader hashes it.
+            fence[path] = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+                           info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    return fence
+
+
+class _PreparedLocalCards:
+    """Internal capability: only construction via real validation supplies rows.
+
+    The immutable projection contains every observation, but no raw vectors. It
+    is bank/root/lifetime bound; returned ranked results own their nested data.
+    This is not a publication proof: the parent gate still revalidates artifacts.
+    """
+    def __init__(self, root: str | Path, bank: str):
+        from hindsight_incremental_merge import _absolute, _validation_read_scope
+        self._root = _absolute(Path(root).expanduser())
+        self._bank = bank
+        # The candidate-tree fence also retains the permissive unmanifested /
+        # missing-root behavior. Strict dependency roots are traced before their
+        # first reads, never inferred after validation from a partial manifest.
+        self._roots = (self._root,)
+        with _validation_read_scope() as self._read_fence:
+            self._fence = _snapshot_fence(self._roots)
+            self._cards = _freeze_projection(load_local_cards(self._root, bank=bank))
+        self._active = True
+        self.check(root, bank)
+
+    def check(self, root: str | Path | None, bank: str) -> None:
+        from hindsight_incremental_merge import _absolute
+        if (not self._active or not root or bank != self._bank
+                or _absolute(Path(root).expanduser()) != self._root):
+            raise ValueError('local-card snapshot scope or lifetime mismatch')
+        if _snapshot_fence(self._roots) != self._fence:
+            raise ValueError('local-card snapshot artifacts changed during evaluation')
+        self._read_fence.check()
+
+    def candidates(self, query: str, mode: str, limit: int) -> list[dict[str, Any]]:
+        scored = score_sidecar_candidates(self._cards, query, mode, limit,
+                                         base_score=36.0, strict=False)
+        return [_copy_projection(row) for row in scored]
+
+
+@contextmanager
+def prepare_local_cards(cards_root: str | Path, *, bank: str):
+    """One strict load for one invocation; mutation never produces a mixed report."""
+    snapshot = _PreparedLocalCards(cards_root, bank)
+    try:
+        yield snapshot
+        snapshot.check(cards_root, bank)
+    finally:
+        snapshot._active = False
+        snapshot._cards = ()
 
 
 def load_repair_sidecar(repair_sidecar_root: str | Path | None) -> list[dict[str, Any]]:
@@ -385,7 +500,7 @@ def repair_sidecar_candidates(repair_sidecar_root: str | Path | None, query: str
     return score_sidecar_candidates(cards, query, mode, limit, base_score=28.0, strict=True)
 
 
-def score_sidecar_candidates(cards: list[dict[str, Any]], query: str, mode: str, limit: int, *, base_score: float, strict: bool) -> list[dict[str, Any]]:
+def score_sidecar_candidates(cards: Sequence[Mapping[str, Any]], query: str, mode: str, limit: int, *, base_score: float, strict: bool) -> list[dict[str, Any]]:
     scored = []
     q_tokens = tokenize(query)
     q_sig_tokens = significant_tokens(query)
@@ -585,8 +700,13 @@ def layered_recall(
     repair_sidecar_root: str | Path | None = None,
     repair_sidecar_limit: int | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    _local_cards_snapshot: _PreparedLocalCards | None = None,
 ) -> list[dict[str, Any]]:
     request_timeout = positive_request_timeout(request_timeout)
+    if _local_cards_snapshot is not None:
+        if not isinstance(_local_cards_snapshot, _PreparedLocalCards):
+            raise TypeError('validated local-card snapshot required')
+        _local_cards_snapshot.check(cards_root, bank)
     recall_options: dict[str, Any] = {"include_observations": include_observations}
     # Preserve the default call shape for existing recall substitutes. Native
     # recall and http_json share the same default; overrides are always forwarded.
@@ -625,7 +745,10 @@ def layered_recall(
         if local_sidecar_limit:
             seen = {result_key(r) for r in result}
             added = 0
-            for item in local_card_candidates(cards_root, query, mode, raw_limit):
+            candidates = (_local_cards_snapshot.candidates(query, mode, raw_limit)
+                          if _local_cards_snapshot is not None
+                          else local_card_candidates(cards_root, query, mode, raw_limit))
+            for item in candidates:
                 key = result_key(item)
                 if key in seen:
                     continue

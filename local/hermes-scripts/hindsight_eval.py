@@ -14,6 +14,7 @@ import importlib.util
 import json
 import re
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -156,26 +157,32 @@ def run_eval(cases: list[dict[str, Any]], *, api: str, bank: str, top_k: int, ra
         "direct_expected_layer_hits": 0,
         "layered_expected_layer_hits": 0,
     }
-    for case in cases:
-        q = case["query"]
-        mode = case.get("mode") or "mixed"
-        direct = direct_recall(mod, api, bank, q, raw_limit, include_observations=include_observations)
-        layered = mod.layered_recall(api, bank, q, mode, raw_limit, limit, cards_root=cards_root, include_observations=include_observations, local_sidecar_limit=local_sidecar_limit)
-        direct_eval = evaluate_results(case, direct, top_k)
-        layered_eval = evaluate_results(case, layered, top_k)
-        aggregate["direct_score_sum"] += direct_eval["score"]
-        aggregate["layered_score_sum"] += layered_eval["score"]
-        aggregate["direct_term_recall_sum"] += direct_eval["term_recall"]
-        aggregate["layered_term_recall_sum"] += layered_eval["term_recall"]
-        aggregate["direct_expected_layer_hits"] += direct_eval["expected_layer_hits_top_k"]
-        aggregate["layered_expected_layer_hits"] += layered_eval["expected_layer_hits_top_k"]
-        results.append({
-            "id": case.get("id"),
-            "query": q,
-            "mode": mode,
-            "direct": direct_eval,
-            "layered": layered_eval,
-        })
+    use_snapshot = (cards_root and any((c.get("mode") or "mixed") in ("high-level", "mixed") for c in cases)
+                    and (local_sidecar_limit is None or int(local_sidecar_limit) > 0))
+    context = mod.prepare_local_cards(cards_root, bank=bank) if use_snapshot else nullcontext(None)
+    with context as snapshot:
+        # No new keyword on disabled/unused paths or default standalone recall.
+        local_options = {"_local_cards_snapshot": snapshot} if snapshot is not None else {}
+        for case in cases:
+            q = case["query"]
+            mode = case.get("mode") or "mixed"
+            direct = direct_recall(mod, api, bank, q, raw_limit, include_observations=include_observations)
+            layered = mod.layered_recall(api, bank, q, mode, raw_limit, limit, cards_root=cards_root, include_observations=include_observations, local_sidecar_limit=local_sidecar_limit, **local_options)
+            direct_eval = evaluate_results(case, direct, top_k)
+            layered_eval = evaluate_results(case, layered, top_k)
+            aggregate["direct_score_sum"] += direct_eval["score"]
+            aggregate["layered_score_sum"] += layered_eval["score"]
+            aggregate["direct_term_recall_sum"] += direct_eval["term_recall"]
+            aggregate["layered_term_recall_sum"] += layered_eval["term_recall"]
+            aggregate["direct_expected_layer_hits"] += direct_eval["expected_layer_hits_top_k"]
+            aggregate["layered_expected_layer_hits"] += layered_eval["expected_layer_hits_top_k"]
+            results.append({
+                "id": case.get("id"),
+                "query": q,
+                "mode": mode,
+                "direct": direct_eval,
+                "layered": layered_eval,
+            })
     n = max(len(cases), 1)
     summary = {
         "case_count": len(cases),

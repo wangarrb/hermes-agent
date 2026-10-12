@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 import copy
 import hashlib
 import json
@@ -374,9 +375,96 @@ def _absolute(path: Path | str) -> Path:
     return value
 
 
+_validation_read_fences: ContextVar[tuple] = ContextVar('validation_read_fences', default=())
+
+
+def _stat_signature(info) -> tuple:
+    # Hashes prove initial bytes; ctime/inode also catch later same-size writes
+    # with restored mtime and replacements. Atime is intentionally irrelevant.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _path_signature(path: Path) -> tuple:
+    _absolute(path)  # Recheck every component, not just the final inode/mtime.
+    try:
+        return _stat_signature(path.stat(follow_symlinks=False))
+    except OSError as exc:
+        raise ValueError(f'validation snapshot artifact missing or unsafe: {path}') from exc
+
+
+def _inventory_fence(root: Path) -> dict:
+    # Only the validator's inventory root is immutable. Never fence its upper
+    # ledger directories: gates, DBs and monitors may legitimately write there.
+    fence = {root: _path_signature(root)}
+    def fail(error):
+        raise ValueError(f'validation snapshot inventory unavailable: {root}') from error
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=fail):
+        for name in dirs + files:
+            path = Path(directory) / name
+            fence[path] = _path_signature(path)
+    return fence
+
+
+class _ValidationReadFence:
+    """Invocation-local record of actual strict reads and inventory scans."""
+    def __init__(self):
+        self._files: dict[Path, tuple] = {}
+        self._inventories: dict[Path, dict] = {}
+
+    def watch_file(self, path: Path) -> None:
+        signature = _path_signature(path)
+        if self._files.setdefault(path, signature) != signature:
+            raise ValueError('validation snapshot artifacts changed during evaluation')
+
+    def check_file(self, path: Path, info=None) -> None:
+        expected = self._files[path]
+        if (_path_signature(path) != expected
+                or (info is not None and _stat_signature(info) != expected)):
+            raise ValueError('validation snapshot artifacts changed during evaluation')
+
+    def watch_inventory(self, root: Path) -> None:
+        if root not in self._inventories:
+            self._inventories[root] = _inventory_fence(root)
+
+    def check_inventory(self, root: Path) -> None:
+        if _inventory_fence(root) != self._inventories[root]:
+            raise ValueError('validation snapshot inventory changed during evaluation')
+
+    def check(self) -> None:
+        for root in self._inventories:
+            self.check_inventory(root)
+        for path in self._files:
+            self.check_file(path)
+
+
+@contextmanager
+def _validation_read_scope():
+    """Trace before reads, verify after, restore the caller on every exit.
+
+    Nested validation belongs to both scopes; no monkeypatch or process cache
+    is involved. A returned fence keeps metadata only, never file bytes/vectors.
+    """
+    fence = _ValidationReadFence()
+    token = _validation_read_fences.set((*_validation_read_fences.get(), fence))
+    try:
+        yield fence
+        fence.check()
+    finally:
+        _validation_read_fences.reset(token)
+
+
+def _watch_validation_inventory(root: Path) -> None:
+    for fence in _validation_read_fences.get():
+        fence.watch_inventory(root)
+
+
 @contextmanager
 def _open_read(path: Path):
-    _absolute(path)
+    path = _absolute(path)
+    fences = _validation_read_fences.get()
+    for fence in fences:
+        fence.watch_file(path)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
@@ -385,9 +473,13 @@ def _open_read(path: Path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError(f'artifact must be a regular unaliased file: {path}')
+        for fence in fences:
+            fence.check_file(path, info)
         with os.fdopen(fd, 'rb') as stream:
             fd = -1
             yield stream
+            for fence in fences:
+                fence.check_file(path, os.fstat(stream.fileno()))
     finally:
         if fd >= 0:
             os.close(fd)
@@ -601,6 +693,7 @@ def _read_index(path: Path, expected: dict | None = None) -> tuple[list[dict], d
 
 
 def _inventory(root: Path, expected: set[str]) -> None:
+    _watch_validation_inventory(root)
     actual = set()
     expected_dirs = {str(p) for name in expected for p in Path(name).parents if str(p) != '.'}
     for directory, dirs, files in os.walk(root, followlinks=False):
@@ -614,6 +707,8 @@ def _inventory(root: Path, expected: set[str]) -> None:
                 actual.add(relative)
     if actual != expected:
         raise ValueError(f'extra or missing undeclared artifacts: {sorted(actual ^ expected)}')
+    for fence in _validation_read_fences.get():
+        fence.check_inventory(root)
 
 
 def _projection(rows: list[dict], *, max_obs: int = 120) -> list[dict]:
@@ -682,6 +777,7 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
     if len(_ancestors) >= MAX_ANCESTRY_DEPTH:
         raise ValueError('generation ancestry depth limit exceeded')
     _ancestors = (*_ancestors, path)
+    _watch_validation_inventory(path.parent)
     manifest = _object(_read(path), 'manifest')
     root = path.parent
     if manifest.get('schema_version') != SCHEMA:
@@ -844,6 +940,7 @@ def load_manifest_artifacts(cards_root: Path, *, bank: str | None = None) -> tup
     Unknown/newer schemas never fall back to legacy directory discovery.
     """
     root = _absolute(cards_root)
+    _watch_validation_inventory(root)
     manifest = _object(_read(root / 'manifest.json'), 'manifest')
     if manifest.get('schema_version') == SCHEMA:
         manifest, cards, rows = _validated(root / 'manifest.json')
