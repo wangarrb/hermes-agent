@@ -170,11 +170,17 @@ def _validate_eval(report: dict, ids: list[str]) -> None:
             if not isinstance(metrics, dict) or any(not finite(metrics.get(k)) for k in
                     ('term_recall', 'expected_layer_hits_top_k', 'score')):
                 raise ValueError('eval case has missing or nonfinite metrics')
-    # Use the existing evaluator's rounding/denominator, not a new quality rule.
+    # Reproduce run_eval's ordered +=, not sum(): Python's compensated sum
+    # can land on the other side of a rounding tie for the same case metrics.
+    term_total, score_total, layer_hits = 0.0, 0.0, 0
+    for result in results:
+        term_total += result['layered']['term_recall']
+        score_total += result['layered']['score']
+        layer_hits += result['layered']['expected_layer_hits_top_k']
     aggregate = {
-        'layered_avg_term_recall': round(sum(r['layered']['term_recall'] for r in results) / len(ids), 3),
-        'layered_avg_score': round(sum(r['layered']['score'] for r in results) / len(ids), 2),
-        'layered_expected_layer_hits': sum(r['layered']['expected_layer_hits_top_k'] for r in results),
+        'layered_avg_term_recall': round(term_total / len(ids), 3),
+        'layered_avg_score': round(score_total / len(ids), 2),
+        'layered_expected_layer_hits': layer_hits,
     }
     if any(summary[k] != value for k, value in aggregate.items()):
         raise ValueError('eval aggregate differs from exhaustive per-case metrics')
