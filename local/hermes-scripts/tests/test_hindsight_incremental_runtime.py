@@ -619,7 +619,8 @@ def test_real_engine_runtime_reflect_and_publication_callbacks_are_incremental(t
                   'generic_benchmark': str(tmp_path / 'generic.jsonl'),
                   'local_benchmark': str(tmp_path / 'local.jsonl'),
                   'incremental': {'root': str(tmp_path / 'state'),
-                                  'retry': {'max_calls': 100, 'poll_s': 0, 'base_delay': 0, 'max_delay': 0}}}
+                                  'retry': {'max_calls': 100, 'max_llm_calls': None,
+                                            'poll_s': 0, 'base_delay': 0, 'max_delay': 0}}}
         for label in ('generic', 'local'):
             (tmp_path / f'{label}.jsonl').write_text('{"id":"case"}\n')
         adapter = PublicationAdapter(config, 'bank-a', connect=db.connect,
@@ -850,20 +851,25 @@ def test_runtime_accepts_actual_09_list_fact_type_contract(tmp_path):
     assert all(f['created_at'] == rest.document['created_at'] for f in facts)
 
 
-def test_exhausted_request_cap_does_not_create_unknown_unattempted_trigger(tmp_path):
+@pytest.mark.parametrize('llm_calls', [0, 20])
+def test_exhausted_request_cap_does_not_create_unknown_unattempted_trigger(tmp_path, llm_calls):
     from hindsight_offline_retry import RetryPolicy
     runtime, rest, ledger = make_runtime(tmp_path)
-    policy = RetryPolicy(base_delay=0, max_delay=0, poll_s=0)
+    policy = RetryPolicy(base_delay=0, max_delay=0, poll_s=0, max_llm_calls=None)
     runtime.begin_run(policy)
     runtime.open_window(ledger)
     runtime.facts_for_batch(batch())
+    from hindsight_offline_retry import RetryBudget
+    for _ in range(llm_calls):
+        RetryBudget(policy).charge(kind='llm')
     # Leave capacity for only the three pre-trigger reads. This boundary can
     # occur with any finite cap, including the separately capped API policy.
-    policy.calls_used = policy.max_calls - 3
+    policy.calls_used = policy.llm_calls_used + policy.max_calls - 3
     from hindsight_offline_retry import RetryDeferred
     with pytest.raises(RetryDeferred, match='call_cap'):
         runtime.consolidate_batch(batch(), policy)
     assert not any(c[1].endswith('/consolidate') for c in rest.calls)
+    assert policy.api_calls_used == policy.max_calls and policy.llm_calls_used == llm_calls
     lease = json.loads((ledger.root / 'runtime-window.json').read_text())
     assert lease['scopes'][rest.scope[0]]['trigger_unknown'] is False, (
         'No request was attempted, but recovery would now require finding an impossible active operation')

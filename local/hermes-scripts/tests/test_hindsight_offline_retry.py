@@ -88,17 +88,18 @@ def test_retry_after_beyond_deadline_defers_without_sleep(llm, monkeypatch):
     assert not sleeps
 
 
-def test_continuous_502_and_format_retry_share_actual_call_cap(llm, monkeypatch):
+def test_continuous_502_and_format_retry_share_explicit_llm_call_cap(llm, monkeypatch):
     retry = importlib.import_module('hindsight_offline_retry')
     calls = []
     def post(*args, **kwargs):
         calls.append(kwargs)
         return Response(400, 'response_format unsupported') if len(calls) == 1 else Response(502, 'upstream secret')
     monkeypatch.setattr(llm.requests, 'post', post)
-    p, _ = make_policy(max_calls=3)
+    p, _ = make_policy(max_calls=1, max_llm_calls=3)
     with pytest.raises(retry.RetryDeferred):
         invoke(llm, retry_policy=p)
     assert p.calls_used == len(calls) == 3
+    assert p.llm_calls_used == 3 and p.api_calls_used == 0
     assert 'response_format' not in calls[-1]['json']
 
 
@@ -125,3 +126,69 @@ def test_valid_async_pending_waits_past_error_retry_count_within_unchanged_caps(
         budget.wait('operation_pending', attempt, retry_after=policy.poll_s)
     assert policy.calls_used == 5 and len(sleeps) == 5
     assert policy.llm_calls_used == 0
+
+
+def test_unlimited_llm_requests_and_retries_do_not_spend_api_capacity(llm, monkeypatch):
+    retry = importlib.import_module('hindsight_offline_retry')
+    p, sleeps = make_policy(max_calls=1, max_llm_calls=None)
+    budget = retry.RetryBudget(p)
+    budget.charge()
+    with pytest.raises(retry.RetryDeferred, match='operation_pending'):
+        budget.wait('operation_pending', 1, retry_after=1)
+    assert not sleeps
+    calls = []
+    def post(*args, **kwargs):
+        calls.append(kwargs)
+        assert p.calls_used == len(calls) + 1
+        assert p.llm_calls_used == len(calls) and p.api_calls_used == 1
+        return Response(429, headers={'Retry-After': '1'}) if len(calls) % 2 else Response(200)
+    monkeypatch.setattr(llm.requests, 'post', post)
+    for _ in range(20):
+        assert invoke(llm, retry_policy=p)[0]['summary'] == ['ok']
+    assert p.calls_used == 41 and p.llm_calls_used == len(calls) == 40
+    assert p.api_calls_used == p.max_calls == 1 and sleeps == [1] * 20
+    with pytest.raises(retry.RetryDeferred, match='call_cap'):
+        budget.charge()
+    assert p.calls_used == 41 and budget.calls == 1
+
+
+@pytest.mark.parametrize('boundary', ['attempts', 'deadline', 'default_limit'])
+def test_llm_limits_still_stop_before_extra_io(llm, monkeypatch, boundary):
+    retry = importlib.import_module('hindsight_offline_retry')
+    settings = {} if boundary == 'default_limit' else {'max_llm_calls': None}
+    if boundary == 'deadline':
+        settings['unit_deadline_s'] = 5
+    p, sleeps = make_policy(max_calls=1, **settings)
+    retry.RetryBudget(p).charge()
+    calls = []
+    def post(*args, **kwargs):
+        calls.append(kwargs)
+        if boundary == 'default_limit':
+            return Response(200)
+        return Response(502, headers={'Retry-After': '5'})
+    monkeypatch.setattr(llm.requests, 'post', post)
+    if boundary == 'default_limit':
+        for _ in range(16):
+            invoke(llm, retry_policy=p)
+    with pytest.raises(retry.RetryDeferred) as caught:
+        invoke(llm, retry_policy=p)
+    expected = {'attempts': 4, 'deadline': 1, 'default_limit': 16}[boundary]
+    assert p.calls_used == len(calls) + 1 == expected + 1
+    assert p.llm_calls_used == expected and p.api_calls_used == 1
+    assert len(sleeps) == (3 if boundary == 'attempts' else 0)
+    assert caught.value.error_class == ('llm_call_cap' if boundary == 'default_limit' else 'http_502')
+    assert all(c['timeout'] <= min(p.request_timeout, p.unit_deadline_s) for c in calls)
+
+
+@pytest.mark.parametrize('field', ['max_calls', 'max_llm_calls', 'max_attempts'])
+@pytest.mark.parametrize('value', [True, False, 0, -1, 1.5, float('inf'), float('nan'), '16'])
+def test_call_limits_require_positive_integers(llm, field, value):
+    with pytest.raises(ValueError):
+        make_policy(**{field: value})
+
+
+def test_only_llm_call_limit_can_be_null(llm):
+    with pytest.raises(ValueError):
+        make_policy(max_calls=None)
+    with pytest.raises(ValueError):
+        make_policy(max_attempts=None)

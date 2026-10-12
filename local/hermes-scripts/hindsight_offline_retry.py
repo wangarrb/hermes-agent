@@ -77,8 +77,8 @@ class RetryPolicy:
     max_attempts: int = 4
     request_timeout: float = 300
     unit_deadline_s: float = 900
-    max_calls: int = 128
-    max_llm_calls: int = 16
+    max_calls: int = 128  # Native API requests/polls, not LLM requests.
+    max_llm_calls: int | None = 16  # None disables only the LLM count limit.
     base_delay: float = 10
     max_delay: float = 60
     defer_delay: float = 60
@@ -91,20 +91,34 @@ class RetryPolicy:
     llm_calls_used: int = field(default=0, init=False)
 
     def __post_init__(self):
-        if not 1 <= self.max_attempts <= 4 or self.max_calls < 1 or self.max_llm_calls < 1:
+        if (type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 4
+                or type(self.max_calls) is not int or self.max_calls < 1
+                or (self.max_llm_calls is not None
+                    and (type(self.max_llm_calls) is not int or self.max_llm_calls < 1))):
             raise ValueError('retry attempts/call cap invalid')
         if not 0 < self.request_timeout <= 300 or not 0 < self.unit_deadline_s <= 900:
             raise ValueError('retry timeout/deadline invalid')
         if any(not math.isfinite(v) or v < 0 for v in (self.base_delay, self.max_delay, self.defer_delay, self.poll_s)):
             raise ValueError('retry delays invalid')
 
+    @property
+    def api_calls_used(self):
+        return self.calls_used - self.llm_calls_used
+
 
 class RetryBudget:
-    """One unit deadline; policy.calls_used is shared across a whole run."""
+    """One unit deadline; actual counts and kind-specific caps span the run."""
     def __init__(self, policy: RetryPolicy):
         self.policy = policy
         self.deadline = policy.clock() + policy.unit_deadline_s
         self.calls = 0
+        self._last_kind = 'api'
+
+    def _at_call_cap(self, kind):
+        if kind == 'api':
+            return self.policy.api_calls_used >= self.policy.max_calls
+        return (self.policy.max_llm_calls is not None
+                and self.policy.llm_calls_used >= self.policy.max_llm_calls)
 
     def defer(self, category, *, delay=None, attempts=0):
         delay = self.policy.defer_delay if delay is None else delay
@@ -116,14 +130,13 @@ class RetryBudget:
         remaining = self.deadline - self.policy.clock()
         if remaining <= 0:
             self.defer('deadline')
-        if self.policy.calls_used >= self.policy.max_calls:
-            self.defer('call_cap')
-        if kind == 'llm' and self.policy.llm_calls_used >= self.policy.max_llm_calls:
-            self.defer('llm_call_cap')
+        if self._at_call_cap(kind):
+            self.defer('llm_call_cap' if kind == 'llm' else 'call_cap')
         self.policy.calls_used += 1
         if kind == 'llm':
             self.policy.llm_calls_used += 1
         self.calls += 1
+        self._last_kind = kind
         return min(self.policy.request_timeout, remaining)
 
     def wait(self, category, attempt, *, retry_after=None):
@@ -132,10 +145,10 @@ class RetryBudget:
             base = min(self.policy.max_delay, self.policy.base_delay * 2 ** max(0, attempt - 1))
             delay = base * (1 + 0.5 * self.policy.jitter())
         # A valid async pending response is progress waiting, not a failed
-        # HTTP attempt. Its polling still obeys the same call cap/deadline.
+        # HTTP attempt. Its polling still obeys the API cap/deadline.
         if category != 'operation_pending' and attempt >= self.policy.max_attempts:
             self.defer(category, delay=max(self.policy.defer_delay, delay), attempts=attempt)
-        if self.policy.calls_used >= self.policy.max_calls:
+        if self._at_call_cap(self._last_kind):
             self.defer(category, delay=max(self.policy.defer_delay, delay), attempts=attempt)
         if self.policy.clock() + delay >= self.deadline:
             self.defer(category, delay=delay, attempts=attempt)
