@@ -193,34 +193,39 @@ def known_local_lineage_ids(offline_root: Path, *, limit: int = 20000) -> tuple[
     return _expand_document_aliases(document_ids), memory_ids
 
 
+def _source_fact_contamination_case(row: dict[str, Any], hits: list[dict[str, str]]) -> dict[str, Any] | None:
+    if not hits:
+        return None
+    severity = core.max_severity(hits, "P2")
+    if not core.severity_at_least(severity, "P2"):
+        return None
+    target = {
+        "id": str(row.get("id") or ""),
+        "document_id": str(row.get("document_id") or ""),
+        "type": str(row.get("type") or row.get("fact_type") or ""),
+        "preview": core.redact(str(row.get("text") or ""), 260),
+    }
+    evidence = {"contamination_hits": hits, "layer": "memory_units", "source": "official_api_memories_list"}
+    return core._case(  # type: ignore[attr-defined]
+        "source_fact_contamination",
+        severity,
+        "Retained source fact contains obvious raw/tool/log contamination",
+        target,
+        evidence,
+        repair_class="official_delete_or_retain_reprocess",
+    )
+
+
 def db_contamination_cases(bank: str, *, api: str = DEFAULT_API, client: HindsightNativeClient | None = None, max_cases: int = 50) -> list[dict[str, Any]]:
     """Find obvious contamination already retained in source facts/docs via public API."""
     cases: list[dict[str, Any]] = []
     try:
         rows = _client(bank, api, client).iter_memories(types=["world", "experience", "observation"], max_items=200000)
         for row in rows:
-            text = str(row.get("text") or "")
-            hits = core.detect_contamination(text)
-            if not hits:
+            case = _source_fact_contamination_case(row, core.detect_contamination(str(row.get("text") or "")))
+            if case is None:
                 continue
-            severity = core.max_severity(hits, "P2")
-            if not core.severity_at_least(severity, "P2"):
-                continue
-            target = {
-                "id": str(row.get("id") or ""),
-                "document_id": str(row.get("document_id") or ""),
-                "type": str(row.get("type") or row.get("fact_type") or ""),
-                "preview": core.redact(text, 260),
-            }
-            evidence = {"contamination_hits": hits, "layer": "memory_units", "source": "official_api_memories_list"}
-            cases.append(core._case(  # type: ignore[attr-defined]
-                "source_fact_contamination",
-                severity,
-                "Retained source fact contains obvious raw/tool/log contamination",
-                target,
-                evidence,
-                repair_class="official_delete_or_retain_reprocess",
-            ))
+            cases.append(case)
             if len(cases) >= max_cases:
                 break
     except Exception as e:
@@ -247,6 +252,10 @@ def fact_outlier_cases(bank: str, *, api: str = DEFAULT_API, client: HindsightNa
             pollutants[doc_id] += 1
             if any(core.severity_at_least(h.get("severity", "OK"), "P1") for h in hits):
                 high_pollutants[doc_id] += 1
+    return _source_document_fact_outlier_cases(counts, pollutants, high_pollutants, threshold=threshold, max_cases=max_cases)
+
+
+def _source_document_fact_outlier_cases(counts: Counter[str], pollutants: Counter[str], high_pollutants: Counter[str], *, threshold: int = 1000, max_cases: int = 20) -> list[dict[str, Any]]:
     candidates = [
         (doc_id, facts, pollutants.get(doc_id, 0))
         for doc_id, facts in counts.items()
@@ -265,6 +274,45 @@ def fact_outlier_cases(bank: str, *, api: str = DEFAULT_API, client: HindsightNa
             repair_class="source_document_audit_required",
         ))
     return cases
+
+
+def scan_memory_inventory(bank: str, *, api: str = DEFAULT_API, client: HindsightNativeClient | None = None, max_items: int = 200000, include_source_cases: bool = True) -> tuple[set[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Share one bounded official stream; do not retain source bodies.
+
+    The first 50 contamination cases do not end the inventory: later IDs and
+    every document's pollutant/fact counts still matter. An interrupted stream
+    invalidates its IDs and aggregates, just as the old initial ID scan did.
+    Iterator exhaustion alone is not a whole-bank coverage certificate.
+    """
+    memory_ids: set[str] = set()
+    contamination_cases: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    pollutants: Counter[str] = Counter()
+    high_pollutants: Counter[str] = Counter()
+    try:
+        rows = _client(bank, api, client).iter_memories(types=["world", "experience", "observation"], max_items=max_items)
+        for row in rows:
+            if row.get("id"):
+                memory_ids.add(str(row["id"]).lower())
+            if not include_source_cases:
+                continue
+            hits = core.detect_contamination(str(row.get("text") or ""))
+            if len(contamination_cases) < 50:
+                case = _source_fact_contamination_case(row, hits)
+                if case is not None:
+                    contamination_cases.append(case)
+            doc_id = str(row.get("document_id") or "")
+            if doc_id:
+                counts[doc_id] += 1
+                if hits:
+                    pollutants[doc_id] += 1
+                    if any(core.severity_at_least(h.get("severity", "OK"), "P1") for h in hits):
+                        high_pollutants[doc_id] += 1
+    except Exception as e:
+        API_SCAN_ERRORS.append(f"memories API scan failed: {core.redact(repr(e), 500)}")
+        return set(), [], []
+    outlier_cases = _source_document_fact_outlier_cases(counts, pollutants, high_pollutants) if include_source_cases else []
+    return memory_ids, contamination_cases, outlier_cases
 
 
 def dedupe_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -353,7 +401,11 @@ def main() -> None:
 
     observations = load_observations(cards_root)
     api_docs = known_document_ids(args.bank, api=args.api, client=client) if not args.manual_only else set()
-    api_mems = known_memory_ids(args.bank, api=args.api, client=client) if not args.manual_only else set()
+    source_cases_enabled = not (args.skip_source_scan or args.skip_db_scan)
+    api_mems, contamination_cases, outlier_cases = scan_memory_inventory(
+        args.bank, api=args.api, client=client,
+        include_source_cases=source_cases_enabled and not API_SCAN_ERRORS,
+    ) if not args.manual_only else (set(), [], [])
     local_docs, local_mems = known_local_lineage_ids(offline_root) if not args.manual_only else (set(), set())
     docs = api_docs | local_docs
     mems = api_mems | local_mems
@@ -370,10 +422,9 @@ def main() -> None:
             known_file_paths=files,
             max_cases=500,
         ))
-        if not (args.skip_source_scan or args.skip_db_scan):
-            if not API_SCAN_ERRORS:
-                cases.extend(db_contamination_cases(args.bank, api=args.api, client=client))
-                cases.extend(fact_outlier_cases(args.bank, api=args.api, client=client))
+        if source_cases_enabled:
+            cases.extend(contamination_cases)
+            cases.extend(outlier_cases)
             cases.extend(source_scan_unavailable_cases())
     cases.extend(manual_cases)
     cases = dedupe_cases(cases)
