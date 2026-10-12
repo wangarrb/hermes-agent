@@ -409,10 +409,10 @@ def _file_info(path: Path) -> dict:
 
 
 def _load_json(stream, *, digest=None) -> Any:
-    """Decode frozen seed arrays/envelopes without a whole-document string.
+    """Decode nested frozen JSON without re-decoding growing containers.
 
-    Only the outer array and array-valued envelope fields are split; every row
-    still uses the stdlib decoder, preserving arbitrary nested legacy content.
+    A container stack consumes delimiters once; scalar leaves retain stdlib
+    number/string semantics. Decoded values remain resident, not the full text.
     """
     import io
     prefix = stream.read(4)
@@ -472,38 +472,59 @@ def _load_json(stream, *, digest=None) -> Any:
             raise ValueError('invalid JSON delimiter')
         position += 1
 
-    def array():
-        values = []
-        take('[')
-        if peek() == ']':
-            take(']')
-            return values
+    def key():
+        if peek() != '"':
+            raise ValueError('JSON object key must be a string')
+        name = decoded()
+        take(':')
+        return name
+
+    def check_depth(depth):
+        # The stack avoids an artificially lower Python-recursion limit. A
+        # single depth-only stdlib probe retains the installed decoder's own
+        # recursion policy without re-decoding any actual input container.
+        getattr(decoder, 'scan_once')('[' * depth + '0' + ']' * depth, 0)
+
+    def parsed():
+        stack, depth = [], 0
         while True:
-            values.append(decoded())
-            if peek() == ']':
-                take(']')
-                return values
-            take(',')
+            token = peek()
+            if token in ('[', '{'):
+                depth = max(depth, len(stack) + 1)
+                take(token)
+                value = [] if token == '[' else {}
+                close = ']' if token == '[' else '}'
+                if peek() == close:
+                    take(close)
+                else:
+                    stack.append((value, key() if token == '{' else None))
+                    continue
+            else:
+                value = decoded()
+            # Attach a completed scalar/container and unwind closed parents.
+            while stack:
+                parent, name = stack[-1]
+                if isinstance(parent, list):
+                    parent.append(value)
+                    close = ']'
+                else:
+                    parent[name] = value  # Last duplicate wins; order stays.
+                    close = '}'
+                if peek() == close:
+                    take(close)
+                    value = parent
+                    stack.pop()
+                    continue
+                take(',')
+                if isinstance(parent, dict):
+                    stack[-1] = (parent, key())
+                break
+            else:
+                check_depth(depth)
+                return value
 
     try:
-        if peek() == '[':
-            value = array()
-        elif peek() == '{':
-            value = {}
-            take('{')
-            if peek() != '}':
-                while True:
-                    key = decoded()
-                    if not isinstance(key, str):
-                        raise ValueError('JSON object key must be a string')
-                    take(':')
-                    value[key] = array() if peek() == '[' else decoded()
-                    if peek() == '}':
-                        break
-                    take(',')
-            take('}')
-        else:
-            value = decoded()
+        value = parsed()
         if peek():
             raise ValueError('extra JSON data')
         return value

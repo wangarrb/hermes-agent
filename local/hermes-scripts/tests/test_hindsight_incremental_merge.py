@@ -689,3 +689,131 @@ print(json.dumps({'operation': operation, 'rows': len(rows), 'golden_sha256': ex
     assert proof['rows'] == 4000 and proof['operation'] == operation
     (work / f'memory-{operation}.json').write_text(result.stdout)
     print(result.stdout.strip())
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('envelope', ['physical_baseline', 'initialization_plan'])
+def test_nested_json_containers_are_not_redecoded_under_bounded_memory(merge, work, envelope):
+    """Count reparsed container characters, not noisy wall-clock timing."""
+    import os
+    import subprocess
+    program = r'''
+import hashlib, json, pathlib, resource, sys, time
+sys.path.insert(0, sys.argv[1])
+import hindsight_incremental_merge as merge
+root, envelope = pathlib.Path(sys.argv[2]), sys.argv[3]
+proofs = []
+original_decoder = json.JSONDecoder
+# This child alone gets 128 MiB headroom, including all decoded row values.
+size = int(next(line.split()[1] for line in pathlib.Path('/proc/self/status').read_text().splitlines()
+                if line.startswith('VmSize:'))) * 1024
+resource.setrlimit(resource.RLIMIT_AS, (size + 128 * 1024 * 1024,) * 2)
+for count in (5000, 25000):
+    rows = [{'id': i, 'row_hash': f'{i:064x}'} for i in range(count)]
+    baseline = {'profiles': [{'profile': 'synthetic😀', 'sqlite': {'rows': rows},
+                             'artifacts': [{'records': [{'record_hash': 'a' * 64}]}]}]}
+    value = baseline if envelope == 'physical_baseline' else {
+        'initialize': {'physical_baseline': baseline}, 'seed': {'observations': []}}
+    path = root / f'{envelope}-{count}.json'
+    digest = hashlib.sha256()
+    with path.open('wb') as stream:
+        for chunk in merge._json_chunks(value):
+            stream.write(chunk); digest.update(chunk)
+        tail = b'\r\n' + b' ' * 70000
+        stream.write(tail); digest.update(tail)
+    path.chmod(0o400)
+    before = path.stat().st_mtime_ns
+    # No extra whole nested-container string: decoded values stay resident.
+    stats = {'container_attempts': 0, 'container_input_chars': 0, 'scalar_attempts': 0}
+    class CountingDecoder(original_decoder):
+        def raw_decode(self, text, idx=0):
+            if text[idx:idx + 1] in ('[', '{'):
+                stats['container_attempts'] += 1
+                stats['container_input_chars'] += len(text) - idx
+            else:
+                stats['scalar_attempts'] += 1
+            return super().raw_decode(text, idx)
+    json.JSONDecoder = CountingDecoder
+    start = time.monotonic()
+    actual = merge._read_json(path, expected_hash=digest.hexdigest())
+    elapsed = time.monotonic() - start
+    json.JSONDecoder = original_decoder
+    assert actual == value
+    assert path.stat().st_mtime_ns == before
+    proof = {'envelope': envelope, 'rows': count, 'bytes': path.stat().st_size,
+             'elapsed_seconds': elapsed, **stats}
+    print(json.dumps(proof), flush=True)
+    assert stats['container_attempts'] == 0, proof
+    assert stats['container_input_chars'] <= path.stat().st_size, proof
+    with path.open('rb') as stream:
+        assert merge._load_json(stream) == value
+    proofs.append(proof)
+print(json.dumps({'proofs': proofs, 'max_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+'''
+    result = subprocess.run([sys.executable, '-c', program, str(ROOT), str(work), envelope],
+                            capture_output=True, text=True, timeout=90,
+                            env={**os.environ, 'HERMES_HOME': str(work / 'isolated-home')})
+    (work / f'nested-{envelope}.log').write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof = json.loads(result.stdout.splitlines()[-1])
+    assert [p['rows'] for p in proof['proofs']] == [5000, 25000]
+    assert all(p['envelope'] == envelope for p in proof['proofs'])
+    print(result.stdout.strip())
+
+
+def test_nested_json_matches_stdlib_values_grammar_and_hash_precedence(merge, work):
+    import io
+    examples = [
+        b'{"profiles":[{"rows":[{"x":0,"x":1}],"rows":[-0.0,1e-20,NaN,Infinity,-Infinity]}],"profiles":[]}',
+        b'{"initialize":{"physical":{"profiles":[{"rows":[{"z":0,"a":[true,null,false],"z":2}]}]}}}',
+        b'[{"k":[{"surrogate":"\\ud800","pair":"\\ud83d\\ude00"},-0.0,1e400]}]',
+        b'{"z":0,"a":1,"z":{"a":[],"b":{}},"c":2}',
+    ]
+    encodings = ('utf-8', 'utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be',
+                 'utf-32', 'utf-32-le', 'utf-32-be')
+    for i, example in enumerate(examples):
+        for encoding in encodings:
+            raw = (example.decode() + '\r\n' + ' ' * 70000).encode(encoding)
+            path = work / f'nested-values-{i}-{encoding}.json'
+            path.write_bytes(raw)
+            expected = json.loads(raw)
+            assert repr(merge._load_json(io.BytesIO(raw))) == repr(expected)
+            assert repr(merge._read_json(path, expected_hash=hashlib.sha256(raw).hexdigest())) == repr(expected)
+            with pytest.raises(ValueError, match='artifact hash mismatch'):
+                merge._read_json(path, expected_hash=hashlib.sha256(raw[:-4]).hexdigest())
+    malformed = (b'[{"x":[1,]}]', b'{"x":{"a":1,}}', b'{"x":{[]:0}}',
+                 b'{"x":{"a" 0}}', b'[{"x":1} {"x":2}]', b'{"x":[1e]}',
+                 b'{"x":[01]}', b'{"x":[truefalse]}', b'{"x":[{}]',
+                 b'{"x":{"a":[]}} trailing', b'{"x":{"a":[]}}\x00')
+    for i, raw in enumerate(malformed):
+        with pytest.raises(ValueError):
+            json.loads(raw)
+        path = work / f'nested-invalid-{i}.json'
+        path.write_bytes(raw)
+        # JSON errors precede optional raw-hash mismatch, as before. Strict
+        # JSONL is intentionally separate from this permissive legacy reader.
+        with pytest.raises(ValueError) as error:
+            merge._read_json(path, expected_hash='0' * 64)
+        assert str(error.value) != 'artifact hash mismatch'
+    for raw in (b'{"x":{"same":1,"same":2}}\n', b'{"x":{"nonfinite":NaN}}\n'):
+        with pytest.raises(ValueError):
+            merge._index(raw)
+    for token in (b'1e-20', b'-0.0', b'12345678901234567890', b'false', b'Infinity',
+                  b'"\\ud83d\\ude00"', '"😀𐀀"'.encode()):
+        for padding in range(65520, 65542):
+            raw = b' ' * padding + b'{"k":[{"leaf":' + token + b'}]}'
+            assert repr(merge._load_json(io.BytesIO(raw))) == repr(json.loads(raw))
+    # An explicit stack must not introduce a lower Python-recursion nesting
+    # limit than the installed stdlib decoder (notably on Python 3.13).
+    depth = sys.getrecursionlimit() + 100
+    raw = b'[{"k":' * depth + b'0' + b'}]' * depth
+    try:
+        json.loads(raw)
+    except RecursionError:
+        with pytest.raises(RecursionError):
+            merge._load_json(io.BytesIO(raw))
+    else:
+        actual = merge._load_json(io.BytesIO(raw))
+        for _ in range(depth):
+            actual = actual[0]['k']
+        assert actual == 0
