@@ -67,6 +67,11 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def eval_environment(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Share the established recall deadline across legacy and arrival evals."""
+    return {**(os.environ if env is None else env), "HINDSIGHT_EVAL_REQUEST_TIMEOUT": "600"}
+
+
 def eval_pair(label: str, bench: Path, cards_root: Path, out_dir: Path, *, api: str, bank: str, raw_limit: int, limit: int, top_k: int, include_hindsight_observations: bool) -> tuple[dict[str, Any], dict[str, Any]]:
     common = [
         sys.executable,
@@ -98,7 +103,7 @@ def eval_pair(label: str, bench: Path, cards_root: Path, out_dir: Path, *, api: 
     # rebuild. Retry each eval once after a cool-down; per-request timeout is
     # raised via HINDSIGHT_EVAL_REQUEST_TIMEOUT (set below) so a slow recall
     # response no longer aborts the benchmark mid-run.
-    eval_env = {**os.environ, "HINDSIGHT_EVAL_REQUEST_TIMEOUT": "600"}
+    eval_env = eval_environment()
     eval_timeout = 3600
     attempts = 2
     last_err: Exception | None = None

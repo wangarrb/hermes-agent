@@ -21,7 +21,7 @@ import uuid
 
 import hindsight_incremental_merge as merge
 from hindsight_offline_v2_gate import evaluate_pair, evaluate_conflict_audit
-from hindsight_offline_v2_rebuild import run_json as default_run_json
+from hindsight_offline_v2_rebuild import eval_environment, run_json as default_run_json
 
 INCREMENTAL_PREFIX = 'hermes-offline-canonical::incremental::'
 CHECKS = ('schema', 'coverage', 'conflict', 'generic_eval', 'local_eval', 'scoped_drain')
@@ -212,6 +212,9 @@ class PublicationAdapter:
 
     def _run_json(self, command: list[str], **kwargs) -> dict:
         if Path(command[1]).name == 'hindsight_eval.py':
+            # Arrival publication must retain the legacy eval transport policy;
+            # the default recall deadline is shorter than legitimate graph search.
+            kwargs['env'] = eval_environment(kwargs.get('env'))
             # The legacy evaluator hardcodes ~/.hermes/scripts for its layered
             # module. Bind its real globals to the configured adjacent module;
             # executing a worktree eval must not silently import installed code.
