@@ -193,7 +193,22 @@ def env(tmp_path):
               'generic_benchmark': str(tmp_path / 'generic.jsonl'), 'local_benchmark': str(tmp_path / 'local.jsonl')}
     for label in ('generic', 'local'):
         (tmp_path / f'{label}.jsonl').write_text('{"id":"case"}\n')
-    adapter = mod.PublicationAdapter(config, 'bank-a', connect=db.connect,
+    class ReportAdapter(mod.PublicationAdapter):
+        # TestRunner's I/O boundary models the real children's exact named disk
+        # reports after any injected corruption, not stdout-only fake success.
+        @property
+        def run_json(self):
+            return self._test_runner
+
+        @run_json.setter
+        def run_json(self, runner):
+            def with_disk(command, **kwargs):
+                result = runner(command, **kwargs)
+                if isinstance(result, dict):
+                    return disk_report(command, result)
+                return result
+            self._test_runner = with_disk
+    adapter = ReportAdapter(config, 'bank-a', connect=db.connect,
         embeddings=db.encode, execute_values=db.values, run_json=fake_run)
     ledger = Ledger(tmp_path)
     export = adapter.export_seed(tmp_path / 'seed.json')
@@ -212,7 +227,20 @@ def env(tmp_path):
     return mod, adapter, ledger, db, candidate, proof, row
 
 
-def fake_run(cmd, **_):
+def disk_report(command, report) -> dict:
+    output = Path(command[command.index('--output-dir') + 1])
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / ('named-fixture-' + uuid.uuid4().hex + '.json')
+    report = {k: v for k, v in report.items() if k not in {'json_path', 'markdown_path'}}
+    path.write_text(json.dumps(report))
+    return dict(report, json_path=str(path))
+
+
+def fake_run(cmd, **kwargs):
+    return disk_report(cmd, fake_report(cmd, **kwargs))
+
+
+def fake_report(cmd, **_):
     name = Path(cmd[1]).name
     arg = lambda k: cmd[cmd.index(k) + 1]
     if name == 'hindsight_conflict_audit.py':
@@ -225,7 +253,9 @@ def fake_run(cmd, **_):
     return {'cards_root': arg('--cards-root') if use_cards else None,
             'candidate_parse_proof': candidate_parse_proof(arg('--cards-root')) if use_cards else None,
             'invocation': {'bank': arg('--bank'), 'api': arg('--api'), 'benchmark': arg('--benchmark')},
-            'summary': {'case_count': 1, 'layered_avg_term_recall': 0.6 if use_cards else 0.5,
+            'include_hindsight_observations': '--no-hindsight-observations' not in cmd,
+            'summary': {'case_count': 1, 'top_k': int(arg('--top-k')) if '--top-k' in cmd else 5,
+                        'layered_avg_term_recall': 0.6 if use_cards else 0.5,
                         'layered_expected_layer_hits': 2 if use_cards else 1, 'layered_avg_score': 1},
             'results': [{'id': 'case', 'direct': {'term_recall': 0.5, 'expected_layer_hits_top_k': 1, 'score': 1},
                         'layered': {'term_recall': 0.6 if use_cards else 0.5,
@@ -413,7 +443,11 @@ def test_gate_runs_fresh_generic_local_pairs_with_exact_scripts_and_root(env):
     conflict = calls[0]
     assert conflict[conflict.index('--offline-root') + 1] == manifest['root']
     assert all('--no-hindsight-observations' not in c for c in calls[1:])
-    assert {c[c.index('--benchmark') + 1] for c in calls[1:]} == {adapter.config['generic_benchmark'], adapter.config['local_benchmark']}
+    binding = merge._object(merge._read(Path(gate['input_binding']['path'])), 'gate inputs')
+    assert {c[c.index('--benchmark') + 1] for c in calls[1:]} == {
+        b['snapshot']['path'] for b in binding['benchmarks'].values()}
+    assert {b['source']['path'] for b in binding['benchmarks'].values()} == {
+        adapter.config['generic_benchmark'], adapter.config['local_benchmark']}
     assert not Path(gate['gate_path']).is_relative_to(Path(manifest['root']))
     assert len(gate['artifacts']) >= 7
 
@@ -428,6 +462,10 @@ def test_gate_wrong_root_or_missing_pair_or_no_gain_blocks(env):
     adapter.run_json = stale
     with pytest.raises(ValueError):
         adapter.gate(manifest, ledger=ledger, scoped_proof=proof)
+
+
+def test_gate_no_gain_blocks_on_its_own_frozen_attempt(env):
+    mod, adapter, ledger, db, manifest, proof, row = env
     def no_gain(cmd, **kw):
         r = fake_run(cmd, **kw)
         if 'summary' in r and 'layered_avg_term_recall' in r['summary']:

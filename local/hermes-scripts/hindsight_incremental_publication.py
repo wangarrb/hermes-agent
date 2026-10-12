@@ -186,6 +186,31 @@ def _validate_eval(report: dict, ids: list[str]) -> None:
         raise ValueError('eval aggregate differs from exhaustive per-case metrics')
 
 
+def _validate_eval_options(report: dict, top_k) -> None:
+    # These fields are emitted by the real evaluator. Command provenance alone
+    # does not establish that the report used observations or the requested k.
+    summary = report.get('summary')
+    if (report.get('include_hindsight_observations') is not True
+            or not isinstance(summary, dict) or type(summary.get('top_k')) is not int
+            or summary['top_k'] != int(top_k)):
+        raise ValueError('eval report options contradict bound observations/top-k command')
+
+
+def _validate_conflict_report(report: dict, bank: str, root: str, api: str, proof: dict) -> None:
+    if (report.get('bank') != bank or report.get('cards_root') != root
+            or report.get('offline_root') != root or not isinstance(report.get('cases'), list)
+            or not isinstance(report.get('summary'), dict)
+            or type(report.get('summary', {}).get('blocking_cases')) is not int
+            or report['summary']['blocking_cases'] < 0
+            or type(report.get('observation_count')) is not int
+            or report.get('observation_count') != proof['observation_count']
+            or report.get('api') != api
+            or report.get('decision') not in {'pass', 'blocked_conflict_review_required'}
+            or any(not isinstance(c, dict) or c.get('severity') not in {'OK', 'P0', 'P1', 'P2', 'P3'}
+                   for c in report['cases']) or report.get('source_scan_errors')):
+        raise ValueError('conflict report incomplete or candidate/bank mismatch')
+
+
 class PublicationAdapter:
     """Concrete runtime adapter. Injection replaces only I/O in isolated tests.
 
@@ -443,7 +468,9 @@ module['main']()
         return result
 
     def gate(self, manifest: dict, *, ledger, scoped_proof: dict) -> dict:
-        manifest, _, _, cards, _ = self._candidate(manifest, ledger)
+        with merge._validation_read_scope() as candidate_fence:
+            manifest, _, _, cards, _ = self._candidate(manifest, ledger)
+            parse_proof = candidate_parse_proof(manifest['root'], self.script_dir)
         if not cards:
             raise ValueError('unchanged candidate requires parent no-op, not a fabricated gate')
         self._proof(manifest, scoped_proof)
@@ -451,63 +478,50 @@ module['main']()
         if 'batches' in scoped_proof and scoped_proof['batches'] != [
                 b['consolidated'].get('scoped_proof') for b in coverage['batches']]:
             raise ValueError('scoped proof differs from exact ledger native receipts')
-        benchmarks = {label: merge._absolute(self.config[f'{label}_benchmark'])
-                      for label in ('generic', 'local')}
-        benchmark_artifacts = [_artifact(p) for p in benchmarks.values()]
-        benchmark_ids = {label: _benchmark_ids(path) for label, path in benchmarks.items()}
-        parse_proof = candidate_parse_proof(manifest['root'], self.script_dir)
-        script_artifacts = [_artifact(self.script_dir / name) for name in (
-            'hindsight_conflict_audit.py', 'hindsight_conflict_core.py',
-            'hindsight_eval.py', 'hindsight_recall_layered.py')]
-        directory = merge._absolute(ledger.root) / 'publication' / manifest['manifest_sha256'] / uuid.uuid4().hex
-        directory.mkdir(parents=True, mode=0o700)
-        artifacts = [_freeze(directory / 'coverage.json', coverage),
-                     _freeze(directory / 'candidate-parse-proof.json', parse_proof),
-                     _freeze(directory / 'scoped-proof.json', scoped_proof), *benchmark_artifacts, *script_artifacts]
-        root = manifest['root']
-        api = str(self.config.get('api') or self.config.get('api_url') or 'http://127.0.0.1:8888')
-        conflict = self._run_report([self.python, str(self.script_dir / 'hindsight_conflict_audit.py'),
-            '--cards-root', root, '--offline-root', root, '--output-dir', str(directory / 'conflict'),
-            '--api', api, '--bank', self.bank, '--json'], directory / 'conflict.json', artifacts)
-        if (conflict.get('bank') != self.bank or conflict.get('cards_root') != root
-                or conflict.get('offline_root') != root or not isinstance(conflict.get('cases'), list)
-                or not isinstance(conflict.get('summary'), dict)
-                or type(conflict.get('summary', {}).get('blocking_cases')) is not int
-                or conflict['summary']['blocking_cases'] < 0
-                or type(conflict.get('observation_count')) is not int
-                or conflict.get('observation_count') != parse_proof['observation_count']
-                or conflict.get('api') != api
-                or conflict.get('decision') not in {'pass', 'blocked_conflict_review_required'}
-                or any(not isinstance(c, dict) or c.get('severity') not in {'OK', 'P0', 'P1', 'P2', 'P3'}
-                       for c in conflict['cases']) or conflict.get('source_scan_errors')):
-            raise ValueError('conflict report incomplete or candidate/bank mismatch')
+        from hindsight_incremental_gate_attempts import GateAttempt
+        attempt = GateAttempt(self, manifest, ledger, coverage, scoped_proof, parse_proof, THRESHOLDS,
+                              candidate_fence=candidate_fence)
+        directory, artifacts = attempt.directory, attempt.artifacts
+        benchmarks = {label: Path(value['snapshot']['path']) for label, value in attempt.binding['benchmarks'].items()}
+        benchmark_ids = {label: value['ids'] for label, value in attempt.binding['benchmarks'].items()}
+        root, api = manifest['root'], attempt.binding['recipe']['api']
+        conflict = attempt.run('conflict')
+        _validate_conflict_report(conflict, self.bank, root, api, parse_proof)
         conflict_check = evaluate_conflict_audit(directory / 'conflict.json', required=True)
         pairs = []
         for label in ('generic', 'local'):
             bench = benchmarks[label]
-            common = [self.python, str(self.script_dir / 'hindsight_eval.py'), '--benchmark', str(bench),
-                '--api', api, '--bank', self.bank, '--raw-limit', str(self.config.get('raw_limit', 40)),
-                '--limit', str(self.config.get('limit', 10)), '--top-k', str(self.config.get('top_k', 5)),
-                '--cards-root', root, '--json']
             paths = []
             for mode in ('baseline', 'cards'):
                 path = directory / f'{label}-{mode}.json'
-                report = self._run_report(common + [
-                    '--no-local-cards' if mode == 'baseline' else '--use-local-cards',
-                    '--output-dir', str(directory / f'{label}-{mode}')], path, artifacts)
+                report = attempt.run(f'{label}-{mode}')
                 expected = None if mode == 'baseline' else root
                 if report.get('cards_root') != expected:
                     raise ValueError('eval report does not match exact candidate root')
                 _validate_eval(report, benchmark_ids[label])
+                _validate_eval_options(report, attempt.binding['recipe']['top_k'])
                 if (report.get('invocation') != {'bank': self.bank, 'api': api, 'benchmark': str(bench)}
                         or report.get('candidate_parse_proof') != (parse_proof if mode == 'cards' else None)):
                     raise ValueError('eval invocation or exhaustive parse proof mismatch')
                 paths.append(path)
             pairs.append(evaluate_pair(label, *paths, **THRESHOLDS))
         # Detect mutation during eval, including source receipts/benchmark files.
-        self._candidate(manifest, ledger)
+        attempt.check()
+        with merge._validation_read_scope() as final_fence:
+            self._candidate(manifest, ledger)
+            final_parse = candidate_parse_proof(manifest['root'], self.script_dir)
         if coverage != self._coverage(manifest, ledger):
             raise ValueError('source coverage changed during gate')
+        self._proof(manifest, scoped_proof)
+        if parse_proof != final_parse:
+            raise ValueError('candidate parse proof changed during gate')
+        # Rebuild the recipe/source/coverage binding, not merely the remembered
+        # in-memory hashes. This is also used independently before publication.
+        final_attempt = GateAttempt(self, manifest, ledger, self._coverage(manifest, ledger),
+                                    scoped_proof, parse_proof, THRESHOLDS, recover=False,
+                                    candidate_fence=final_fence)
+        if final_attempt.binding_artifact != attempt.binding_artifact:
+            raise ValueError('gate attempt input binding changed during eval')
         for item in artifacts:
             if _artifact(Path(item['path'])) != item:
                 raise ValueError('gate input/report changed during eval')
@@ -519,10 +533,18 @@ module['main']()
             'scoped_proof': copy.deepcopy(scoped_proof), 'artifacts': artifacts,
             'pairs': pairs, 'thresholds': copy.deepcopy(THRESHOLDS), 'conflict_check': conflict_check,
             'candidate_parse_proof': parse_proof, 'benchmark_ids': benchmark_ids,
+            'input_binding': attempt.binding_artifact, 'attempt_reference': attempt.reference_artifact,
             'checks': checks, 'decision': 'eligible_for_local_proposal' if all(checks.values()) else 'blocked_keep_local_only',
             'gate_path': str(directory / 'gate.json')}
         receipt['gate_sha256'] = merge.canonical_hash(receipt)
-        _freeze(directory / 'gate.json', receipt)
+        if Path(receipt['gate_path']).exists():
+            if merge._object(merge._read(Path(receipt['gate_path'])), 'frozen gate') != receipt:
+                raise ValueError('existing immutable gate differs from recovered evidence')
+        else:
+            from hindsight_incremental_gate_attempts import freeze
+            freeze(Path(receipt['gate_path']), receipt)
+        if receipt['decision'] == 'eligible_for_local_proposal':
+            self._validate_gate(manifest, receipt, ledger)
         return receipt
 
     def _validate_gate(self, manifest: dict, gate: dict, ledger) -> None:
@@ -533,12 +555,13 @@ module['main']()
                 or gate.get('thresholds') != THRESHOLDS
                 or gate.get('gate_sha256') != merge.canonical_hash({k: v for k, v in gate.items() if k != 'gate_sha256'})):
             raise ValueError('gate is blocked, forged, stale or bound to another candidate')
+        from hindsight_incremental_gate_attempts import GateAttempt, STEPS, requires_binding, unique_artifacts, validate_legacy_closure
         path = merge._absolute(gate['gate_path'])
-        if (not path.is_relative_to(merge._absolute(ledger.root) / 'publication')
+        if (not path.is_relative_to(merge._absolute(ledger.root) / 'publication' / manifest['manifest_sha256'])
                 or path.is_relative_to(Path(manifest['root']))
                 or merge._object(merge._read(path), 'frozen gate') != gate):
             raise ValueError('frozen gate artifact mismatch')
-        for item in gate['artifacts']:
+        for item in unique_artifacts(gate['artifacts']):
             if _artifact(Path(item['path'])) != item:
                 raise ValueError('frozen gate dependency hash mismatch')
         if gate['coverage'] != self._coverage(manifest, ledger):
@@ -549,26 +572,59 @@ module['main']()
             raise ValueError('frozen native proofs differ from ledger receipts')
         if [p.get('label') for p in gate['pairs']] != ['generic', 'local']:
             raise ValueError('fresh generic/local eval pairs both required')
-        proof = candidate_parse_proof(manifest['root'], self.script_dir)
+        with merge._validation_read_scope() as candidate_fence:
+            self._candidate(manifest, ledger)
+            proof = candidate_parse_proof(manifest['root'], self.script_dir)
         if gate.get('candidate_parse_proof') != proof:
             raise ValueError('frozen candidate parse proof mismatch')
+        benchmarks = {label: merge._absolute(self.config[label + '_benchmark']) for label in ('generic', 'local')}
+        top_k = self.config.get('top_k', 5)
+        if requires_binding(path, gate, ledger, manifest):
+            attempt = GateAttempt(self, manifest, ledger, self._coverage(manifest, ledger),
+                                  gate['scoped_proof'], proof, THRESHOLDS, recover=False,
+                                  candidate_fence=candidate_fence)
+            if (gate.get('input_binding') != attempt.binding_artifact
+                    or gate.get('attempt_reference') != attempt.reference_artifact
+                    or path != attempt.directory / 'gate.json'
+                    or set(attempt.completed) != set(STEPS) or gate['artifacts'] != attempt.artifacts):
+                raise ValueError('frozen gate attempt completion/input binding mismatch')
+            benchmarks = {label: Path(value['snapshot']['path']) for label, value in attempt.binding['benchmarks'].items()}
+            top_k = attempt.binding['recipe']['top_k']
+        else:
+            # Genuine completed legacy gates keep their original hash-bound
+            # paths; never reconstruct missing provenance from current reports.
+            validate_legacy_closure(self, gate, path.parent, benchmarks)
+        api = str(self.config.get('api') or self.config.get('api_url') or 'http://127.0.0.1:8888')
         for pair in gate['pairs']:
-            ids = _benchmark_ids(merge._absolute(self.config[pair['label'] + '_benchmark']))
+            ids = _benchmark_ids(benchmarks[pair['label']])
             if gate.get('benchmark_ids', {}).get(pair['label']) != ids:
                 raise ValueError('frozen benchmark case IDs mismatch')
-            for path in (pair['baseline_eval'], pair['cards_eval']):
-                report = merge._object(merge._read(Path(path)), 'frozen eval')
+            for mode in ('baseline', 'cards'):
+                eval_path = pair[mode + '_eval']
+                if eval_path != str(path.parent / (pair['label'] + '-' + mode + '.json')):
+                    raise ValueError('frozen eval path differs from exact attempt output')
+                report = merge._object(merge._read(Path(eval_path)), 'frozen eval')
                 _validate_eval(report, ids)
-                api = str(self.config.get('api') or self.config.get('api_url') or 'http://127.0.0.1:8888')
-                benchmark = str(merge._absolute(self.config[pair['label'] + '_benchmark']))
-                if (report.get('invocation') != {'bank': self.bank, 'api': api, 'benchmark': benchmark}
-                        or report.get('candidate_parse_proof') != (proof if path == pair['cards_eval'] else None)):
+                _validate_eval_options(report, top_k)
+                benchmark = str(benchmarks[pair['label']])
+                if (report.get('cards_root') != (manifest['root'] if mode == 'cards' else None)
+                        or report.get('invocation') != {'bank': self.bank, 'api': api, 'benchmark': benchmark}
+                        or report.get('candidate_parse_proof') != (proof if mode == 'cards' else None)):
                     raise ValueError('frozen eval invocation/parse proof mismatch')
             actual = evaluate_pair(pair['label'], Path(pair['baseline_eval']), Path(pair['cards_eval']), **THRESHOLDS)
             if actual != pair or actual['passed'] is not True or actual['cards_root'] != manifest['root']:
                 raise ValueError('frozen eval pair no longer passes original thresholds')
-        if evaluate_conflict_audit(Path(gate['conflict_check']['audit_path']), required=True) != gate['conflict_check']:
+        conflict_path = path.parent / 'conflict.json'
+        if gate['conflict_check']['audit_path'] != str(conflict_path):
+            raise ValueError('frozen conflict path differs from exact attempt output')
+        _validate_conflict_report(merge._object(merge._read(conflict_path), 'frozen conflict'),
+                                  self.bank, manifest['root'], api, proof)
+        if evaluate_conflict_audit(conflict_path, required=True) != gate['conflict_check']:
             raise ValueError('frozen conflict audit mismatch')
+        candidate_fence.check()
+        for item in unique_artifacts(gate['artifacts']):
+            if _artifact(Path(item['path'])) != item:
+                raise ValueError('frozen gate dependency hash mismatch')
 
     def _seed_preserved(self, conn, remote: dict, *, for_update=False) -> bool:
         docs, units = _read_remote(conn, self.bank, remote['document_ids'], for_update=for_update)
