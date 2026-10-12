@@ -61,6 +61,67 @@ def test_daily_wrapper_normal_path_does_not_preclean_or_generate_digest(monkeypa
     assert len(calls) == 1 and '--resume-only' in calls[0]
 
 
+def test_configured_supported_interpreter_is_explicit_not_import_fallback(monkeypatch, tmp_path):
+    calls = stub_arrival(monkeypatch)
+    module = load('hindsight_incremental_entrypoint')
+    import hindsight_pipeline_common as common
+    target = tmp_path / 'explicit-python'
+    target.write_text('fixture interpreter path')
+    monkeypatch.setattr(common, 'load_config', lambda *_a, **_k: {'publication': {'publisher_python': str(target)}})
+    seen = []
+    import subprocess
+    monkeypatch.setattr(subprocess, 'run', lambda argv, **kwargs: seen.append((argv, kwargs)) or types.SimpleNamespace(returncode=2))
+    rc = module.run_alias(mode='full', execute=True, confirm='run-hindsight-pipeline', config=tmp_path / 'explicit.json')
+    assert rc == 2 and calls == []
+    assert seen[0][0][:3] == [str(target), '-u', str(ROOT / 'hindsight_incremental_pipeline.py')]
+    assert seen[0][0][3:6] == ['run', '--mode', 'full']
+    assert seen[0][1] == {'check': False}
+
+
+@pytest.mark.parametrize('invalid', ['', None, 'relative-python', 'bad\npython'])
+def test_explicit_bad_interpreter_blocks_without_hidden_reexec(monkeypatch, invalid):
+    calls = stub_arrival(monkeypatch)
+    module = load('hindsight_incremental_entrypoint')
+    import hindsight_pipeline_common as common
+    monkeypatch.setattr(common, 'load_config', lambda *_a, **_k: {'publication': {'publisher_python': invalid}})
+    with pytest.raises(ValueError, match='runtime_interpreter'):
+        module.run_alias(mode='daily', execute=True, confirm='run-hindsight-pipeline')
+    assert calls == []
+
+
+@pytest.mark.parametrize('scope', ['publication', 'incremental.publication'])
+@pytest.mark.parametrize('invalid', [None, '', False, 0, [], [['publisher_python', sys.executable]], 'private-config-value'])
+def test_explicit_invalid_publication_scopes_block_both_paths_with_real_config(monkeypatch, tmp_path, scope, invalid):
+    import json
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
+    calls = stub_arrival(monkeypatch)
+    module = load('hindsight_incremental_entrypoint')
+    cfg = {'publication': {'publisher_python': sys.executable}, 'incremental': {'publication': {}}}
+    if scope == 'publication':
+        cfg['publication'] = invalid
+    else:
+        cfg['incremental']['publication'] = invalid
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(cfg))
+    monkeypatch.setattr(module.subprocess, 'run', lambda *_a, **_k: pytest.fail('invalid configuration reached subprocess'))
+    with pytest.raises(ValueError, match='^invalid_publication_configuration$'):
+        module.run_alias(mode='full', execute=True, confirm='run-hindsight-pipeline', config=path)
+    assert calls == []
+
+
+@pytest.mark.parametrize('invalid', [None, '', False, 0, []])
+def test_invalid_incremental_scope_cannot_hide_publication(monkeypatch, tmp_path, invalid):
+    import json
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
+    calls = stub_arrival(monkeypatch)
+    module = load('hindsight_incremental_entrypoint')
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps({'incremental': invalid}))
+    with pytest.raises(ValueError, match='^invalid_incremental_configuration$'):
+        module.run_alias(mode='daily', execute=False, config=path)
+    assert calls == []
+
+
 def test_weekly_wrapper_uses_its_own_verified_sibling_not_live_main_path():
     module = load('hindsight_weekly_wrapper')
     command = module.build_command('/existing/python')

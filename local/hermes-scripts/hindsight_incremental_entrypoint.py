@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import sys
 
 
 def alias_arguments(*, mode, execute, config=None, confirm=None, include_wiki=False,
@@ -39,10 +41,33 @@ def alias_arguments(*, mode, execute, config=None, confirm=None, include_wiki=Fa
 def run_alias(*, mode, execute, config=None, confirm=None, include_wiki=False,
               resume_only=False, bank=None, llm_profile=None, llm_overrides=None,
               max_units=None, max_chars=None):
-    from hindsight_incremental_pipeline import main
-    return main(alias_arguments(mode=mode, execute=execute, config=config, confirm=confirm,
+    argv = alias_arguments(mode=mode, execute=execute, config=config, confirm=confirm,
         include_wiki=include_wiki, resume_only=resume_only, bank=bank, llm_profile=llm_profile,
-        llm_overrides=llm_overrides, max_units=max_units, max_chars=max_chars))
+        llm_overrides=llm_overrides, max_units=max_units, max_chars=max_chars)
+    from hindsight_pipeline_common import load_config
+    cfg = load_config(config)
+    incremental = cfg.get('incremental', {})
+    if not isinstance(incremental, dict):
+        raise ValueError('invalid_incremental_configuration')
+    nested_publication = incremental.get('publication', {})
+    top_publication = cfg.get('publication', {})
+    if not isinstance(nested_publication, dict) or not isinstance(top_publication, dict):
+        raise ValueError('invalid_publication_configuration')
+    publication = dict(nested_publication)
+    publication.update(top_publication)
+    if 'publisher_python' in publication:
+        target = publication['publisher_python']
+        if (not isinstance(target, str) or not target.strip()
+                or any(ord(c) < 32 or ord(c) == 127 for c in target)
+                or not Path(target).is_absolute() or not Path(target).is_file()):
+            raise ValueError('invalid_runtime_interpreter')
+        if Path(target).resolve() != Path(sys.executable).resolve():
+            # Cron ignores Python shebangs. This is an explicitly configured
+            # whole-pipeline interpreter, not an import/provider fallback.
+            return subprocess.run([target, '-u', str(script_path('hindsight_incremental_pipeline.py')),
+                                   *argv], check=False).returncode
+    from hindsight_incremental_pipeline import main
+    return main(argv)
 
 
 def script_path(name):
