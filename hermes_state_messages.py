@@ -16,6 +16,7 @@ from agent.context_compressor import (
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
+from hermes_state_copy_provenance import append_copy_operation, copy_source
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
     _legacy_reset_child_sql, _placeholders, _sql_json_extract)
@@ -504,7 +505,8 @@ class SessionMessagesMixin:
         row = self._read_one("SELECT role FROM messages WHERE id = ? AND session_id = ? AND active = 1", (int(row_id), session_id))
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]],
+                             *, inserted_row_ids: Optional[List[int]] = None) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows."""
         now_ts = time.time()
@@ -515,6 +517,8 @@ class SessionMessagesMixin:
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
             cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
                 session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
+            if cur.rowcount != 1 or type(cur.lastrowid) is not int or cur.lastrowid <= 0:
+                raise ValueError("Native message insert did not create a new target")
             # Keep the caller's live row aligned with the durable identity. Rows created without an explicit
             # timestamp (notably mid-turn steers) may be carried through several compaction generations; if
             # the generated timestamp exists only in SQLite, every copy receives a new identity and renders
@@ -522,6 +526,8 @@ class SessionMessagesMixin:
             msg["timestamp"] = message_timestamp
             if cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                if inserted_row_ids is not None:
+                    inserted_row_ids.append(cur.lastrowid)
             inserted += 1
             tool_calls_total += _tool_calls_count(tool_calls)
             now_ts = max(now_ts, message_timestamp) + 1e-6
@@ -647,7 +653,8 @@ class SessionMessagesMixin:
         rows = conn.execute(sql, params).fetchall()
         return [int(r["id"]) for r in rows], sum(_tool_calls_len(r["tool_calls"]) for r in rows)
 
-    def _clone_message_rows(self, conn, tail_ids: List[int], *, session_id: Optional[str] = None) -> None:
+    def _clone_message_rows(self, conn, tail_ids: List[int], *, session_id: Optional[str] = None,
+                            copy_pairs: Optional[list] = None) -> None:
         """Pure-SQL clone of *tail_ids* as fresh live rows (new id/display order, active=1, compacted=0;
         message payload columns stay byte-exact and FTS triggers index the clones), into *session_id* when given."""
         retarget = session_id is not None
@@ -656,6 +663,20 @@ class SessionMessagesMixin:
         # still display-visible (the source may just have become rewind-only).
         skip = ("id", "active", "compacted", "display_order") + (("session_id",) if retarget else ())
         col_list = ", ".join(c for c in self._message_column_names(conn) if c not in skip)
+        if copy_pairs is not None and not retarget:
+            # Each INSERT owns its exact old→new mapping. Never pair a bulk
+            # RETURNING result by inferred ID ranges or unspecified row order.
+            for old_id in tail_ids:
+                source = conn.execute("SELECT * FROM messages WHERE id = ?", (old_id,)).fetchone()
+                if source is None:
+                    raise ValueError("Missing native message copy source")
+                cur = conn.execute(
+                    f"INSERT INTO messages ({col_list}, active, compacted) "
+                    f"SELECT {col_list}, 1, 0 FROM messages WHERE id = ?", (old_id,))
+                if cur.rowcount != 1 or type(cur.lastrowid) is not int or cur.lastrowid <= 0:
+                    raise ValueError("Native message clone insert did not create a new target")
+                copy_pairs.append((dict(source), cur.lastrowid))
+            return
         conn.execute(
             f"INSERT INTO messages ({col_list}, {'session_id, ' if retarget else ''}active, compacted) "
             f"SELECT {col_list}, {'?, ' if retarget else ''}1, 0 FROM messages "
@@ -684,16 +705,31 @@ class SessionMessagesMixin:
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
         """
         from hermes_state import SessionCompressionInProgressError
+        # Capture explicit causal references before _insert_message_rows stamps
+        # fresh identities. Keep retry/rollback from turning rolled-back IDs
+        # into purported parents, and return the caller's original refs on failure.
+        missing = object()
+        original_refs = [(m.get("_row_id", missing), m.get("timestamp", missing)) for m in compacted_messages]
+
+        def restore_refs():
+            for msg, values in zip(compacted_messages, original_refs):
+                for key, value in zip(("_row_id", "timestamp"), values):
+                    if value is missing:
+                        msg.pop(key, None)
+                    else:
+                        msg[key] = value
+
         def _do(conn):
+            restore_refs()
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
-            patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
-                conn, session_id, model_config_patch, on_missing="raise") if patch else None
+                conn, session_id, model_config_patch or {}, on_missing="raise")
+            copy_sources = [copy_source(conn, session_id, row_id) for row_id, _ in original_refs]
             tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
@@ -714,15 +750,24 @@ class SessionMessagesMixin:
                 conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
             else:
                 conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
-            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+            inserted_ids: List[int] = []
+            inserted, tool_calls_total = self._insert_message_rows(
+                conn, session_id, compacted_messages, inserted_row_ids=inserted_ids)
+            copy_pairs = list(zip(copy_sources, inserted_ids))
             if tail_ids:
-                self._clone_message_rows(conn, tail_ids)
+                self._clone_message_rows(conn, tail_ids, copy_pairs=copy_pairs)
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
+            receipt_config = append_copy_operation(conn, session_id, patched_model_config, copy_pairs)
+            patch = model_config_patch is not None or receipt_config != patched_model_config
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
-                (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
+                (inserted, tool_calls_total, *((receipt_config,) if patch else ()), session_id))
             return inserted
-        return self._execute_write(_do)
+        try:
+            return self._execute_write(_do)
+        except BaseException:
+            restore_refs()
+            raise
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

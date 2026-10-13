@@ -15,6 +15,7 @@ from agent.session_activity import (
     ActivityProvenance, bound_activity_description, normalize_activity_provenance,
 )
 from hermes_startup_watchdog import report_startup_progress
+from hermes_state_copy_provenance import COPY_RECEIPTS_KEY, checked_config, inherited_child_config, protect_config_update
 from hermes_state_common import (
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
@@ -334,6 +335,9 @@ class SessionSessionsMixin:
         if not (profile_name or "").strip():
             profile_name = self._own_profile_name()
         def _do(conn):
+            current = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            incoming_config = inherited_child_config(conn, parent_session_id, session_id, model_config)
+            protected_config = protect_config_update(conn, session_id, current[0] if current else None, incoming_config)
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
                 """INSERT INTO sessions (
@@ -356,7 +360,8 @@ class SessionSessionsMixin:
                                     sessions.model_config, '$._reset_from'
                                 ) IS NOT NULL
                                 AND json_remove(
-                                    sessions.model_config, '$._reset_from'
+                                    sessions.model_config, '$._reset_from',
+                                    '$._message_copy_receipts_v1'
                                 ) = '{}'
                            THEN json_set(
                                excluded.model_config,
@@ -382,7 +387,7 @@ class SessionSessionsMixin:
 """ + _UPSERT_KEEP_EXISTING_SQL,
                 (
                     session_id, source, user_id, session_key, chat_id, chat_type, thread_id, model,
-                    json.dumps(model_config) if model_config else None, system_prompt_hash,
+                    json.dumps(protected_config) if protected_config else None, system_prompt_hash,
                     parent_session_id, cwd, profile_name, transport_profile, git_repo_root, origin_json,
                     display_name, time.time(),
                 ),
@@ -646,10 +651,17 @@ class SessionSessionsMixin:
     ) -> None:
         """Update model_config and (COALESCE) optionally model."""
         self.flush_token_counts()  # barrier against queued token deltas — see update_session_model
-        self._write_sql(
-            "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-            (model_config_json, model, session_id),
-        )
+        def _do(conn):
+            row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                return
+            config = protect_config_update(conn, session_id, row[0], model_config_json)
+            payload = json.dumps(config) if COPY_RECEIPTS_KEY in config else model_config_json
+            conn.execute(
+                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
+                (payload, model, session_id),
+            )
+        self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
@@ -718,7 +730,10 @@ class SessionSessionsMixin:
             if on_missing == "raise":
                 raise ValueError(f"Session not found: {session_id}")
             return _MODEL_CONFIG_ROW_MISSING
-        config = _parse_model_config(row[0])
+        config = checked_config(conn, session_id, row[0])
+        # The private copy history may be echoed by a resume, never installed,
+        # cleared or replaced through an ordinary provider/runtime patch.
+        protect_config_update(conn, session_id, config, patch)
         for key, value in patch.items():
             if value is None:
                 config.pop(key, None)

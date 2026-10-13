@@ -11,6 +11,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_state_copy_provenance import inherited_child_config, protect_config_update
 from hermes_state_common import (
     _BOUNDARY_END_REASONS, _COMPRESSION_LOCK_ROW_SQL as _LOCK_ROW_SQL, _ENDED_ROW_SQL, _ended_by_compression,
     _RESET_CHILD_SQL, _sql_json_extract, _sql_session_last_active, is_automatic_end_reason)
@@ -207,6 +208,9 @@ class SessionCompressionMixin:
         """INSERT the compression child's ``sessions`` row copied from *parent*. Same contract as
         _insert_session_row's compression-fork backfill: the child stays on the parent's profile and keeps
         gateway routing/origin columns; no owner on either side -> this store's profile."""
+        inherited = inherited_child_config(conn, parent_session_id, child_session_id, model_config,
+                                            compression_parent=True)
+        model_config = protect_config_update(conn, child_session_id, None, inherited)
         system_prompt_hash = self._store_system_prompt(conn, system_prompt)
         conn.execute(
             """INSERT INTO sessions (
