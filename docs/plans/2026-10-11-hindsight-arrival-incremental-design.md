@@ -175,8 +175,24 @@ gate失败：保留旧production和新candidate，标blocked；不能自动旧�
 
 测试命令必须使用仓库 `scripts/run_tests.sh`。当前venv均缺pytest，已验证 `HERMES_PYTHON=/home/wyr/miniconda/bin/python` 可通过项目runner运行；测试临时目录应配置到Hermes scratch，不能安装依赖或改生产venv来绕开。
 
-## 12. 当前交付阶段
+## 12. 当前交付阶段与生产验收
 
-源码已在隔离 worktree 实施并完成组件、真实文件/SQLite、loopback API 及 disposable PostgreSQL 验收；最终独立审查为有条件通过。已补齐 network namespace serving-association 的 P2 缺口，正常 host/service namespace 与实际 private namespace 拒绝均已验证。生产仅支持已审计 native、同 namespace 且整个 observations 窗口排他 producer 的部署边界；本地 flock/初始 empty queue 不是 server fence。
+核心 arrival-incremental Full 已在真实生产完成，不再仅是隔离验收：正常入口冻结续跑的实际退出码为 0，`core_status=completed`、`published=true`、`remaining_batches=0`、`errors=[]`、`history_replay=false`。3 个 source 与 3 个 daily_summary 批次均已发布；新到达输入与已成功阶段没有历史重放。
 
-生产尚未切换：需用户授权物理脚本路径/现有受支持解释器配置、preserve-no-replay 迁移与排他最小真实运行。日/周 writer 保持暂停，56 条 inherited pending 不回补也不冒充完成；wiki 明确 degraded。旧 retain 8 项兼容基线失败和 standalone core/PG skips 单列。隔离证据不能代替生产 native workers/embedding/gate/readback 和零付费 no-op 验收，因此 full 尚未完成。
+- 冻结 generation：`gen:245f39db2e060d122b1e80d4041f493aeb7e08aa8c1751c1564920252a4de1c4`；manifest SHA：`3bb0f98cecb554b05d99ad780246788aee8221d05dfd83917ee1f067bdda28d4`。
+- 正式门禁六项检查全部为 true。真实 generic 6/6：term 0.656→0.744、score 86.39→95.28；local 10/10：term 0.731→0.748、score 93.14→94.81；冲突审计 blocking=0。原阈值未降低、报告未重写。缺原 benchmark 字节绑定的早期报告保留为非 gated 质量证据，没有补签。
+- 同一候选已提交 13 个 canonical 文档与 13 个 observation；完整 native readback 验证 `published/readback_verified/legacy_seed_preserved/typed_parent_preserved=true`。向量维度均 1024、NULL=0；既有 74,369 opaque seed 行、未知字段和向量保留检查通过。
+- 本轮精确 6 个 owned 文档的待 consolidation/failed source facts 为 0；bank 恢复原 `enable_observations=false`、`enable_auto_consolidation=true`，操作队列为 0。历史及后续 outside-scope backlog 不自动回补或排空；总量或创建时段不作为同一库存证明。
+- 真实 normal CLI 对同一已发布冻结集合的 resume-only 复跑退出 0、`no_op`；audit/profile 观测外部网络、原生 SQL 连接、subprocess 及 producer 调用均 0，offline LLM/native-network counters 为 0。默认 `native_paid_calls=null` 原样保留，不伪装成服务器计费实数；本项不声称活会话没有新到达消息。
+- 原日/周 writer 已恢复并读回 scheduled/enabled；旧已暂停 Wiki/Mental Models 没有顺手恢复，模型/provider/预算单位上限未更改。readonly 监控继续本地归档。
+
+可核验产物（当前生产根目录 `/home/wyr/.hermes/hindsight/incremental/hermes/`）：
+
+- `delivery-artifacts/5548e0515bf50e4a152559089a6a0f840dadb5ec86b5c8a1d1ad3110593d89ae.run-report.json`：真实 completed/publish 结果。
+- `delivery-artifacts/a5944c0028b96cb9e2d2a3efcc6bdd779ba171fad6f969d9af2a0d18bc7fc855.run-report.json`：真实冻结复跑 no-op。
+- `publication/<manifest-sha>/gate-attempt-v1/gate.json`：正式 gate 与 before-child binding/completion 引用。
+- `publication/<manifest-sha>/readback-2cf18d63ff4b41f19c53831be841de63.json`：实际 native readback 与 publish report。
+- 日志：`/home/wyr/.hermes/logs/hindsight-offline-pipeline/20261013-arrival-native-full-resume5.log`。
+- 零调用观测：`/home/wyr/.hermes/cache/scratch/hindsight-frozen-full-noop-acceptance-20261013.json`。
+
+边界仍明确保留：生产仅支持已审计 native、同 network namespace 且整个 producing observations 窗口的排他部署；local flock/empty queue 不能冒充 server fence。可选 Wiki bounded tail 未实现，真实报告为 degraded，不声称 Full+Wiki 完成。旧 retain 8 项兼容基线失败与 standalone core/PG skips 继续单列。追加的结构化发布日志是独立交付：诊断 queue backpressure 修复已通过隔离和独立复核，须核对当前生产者安全边界后再切换源码，不能热注入或重跑成功付费阶段。
