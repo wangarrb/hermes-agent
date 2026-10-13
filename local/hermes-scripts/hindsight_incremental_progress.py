@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from functools import wraps
 import json
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -86,10 +87,13 @@ class Counts:
 
 
 class ProgressReporter:
-    def __init__(self, owner, *, interval=60.0, clock=time.monotonic, sink=None):
+    def __init__(self, owner, *, interval=60.0, clock=time.monotonic, sink=None, queue_size=256):
+        if type(queue_size) is not int or queue_size < 1:
+            raise ValueError('diagnostic queue must have a finite positive capacity')
         self.owner, self.interval, self.clock = owner, interval, clock
         self.sink = sys.stderr if sink is None else sink
-        self.lock, self.sink_lock = threading.RLock(), threading.Lock()
+        self.lock = threading.RLock()
+        self.pending = queue.Queue(maxsize=queue_size)
         self.stopped = threading.Event()
         self.disabled = False
         self.error_type = None
@@ -107,44 +111,66 @@ class ProgressReporter:
             record['error_type'] = error_type
         if metrics:
             record.update(_process_metrics())
-        with self.sink_lock:
-            if self.disabled:
-                return
-            try:
-                self.sink.write(json.dumps(record, allow_nan=False, sort_keys=True) + '\n')
-                self.sink.flush()
-            except (OSError, ValueError):
-                # Closed / broken diagnostic streams must not change gate results.
-                self.disabled = True
+        if self.disabled or self.stopped.is_set():
+            return
+        try:
+            self.pending.put_nowait(json.dumps(record, allow_nan=False, sort_keys=True) + '\n')
+        except queue.Full:
+            # Diagnostics may be dropped; backpressure must never delay business.
+            self.disabled = True
 
     def fail(self, error):
         self.error_type = type(error).__name__
 
     def _heartbeat(self):
-        while not self.stopped.wait(self.interval):
-            with self.lock:
-                frame = self.stack[-1]
-            self.emit('heartbeat', frame, metrics=True)
+        # This is the only thread allowed to touch the sink. It consumes the
+        # bounded queue and schedules heartbeats; callers never wait for I/O.
+        next_beat = time.monotonic() + self.interval
+        while not (self.stopped.is_set() and self.pending.empty()):
+            try:
+                item = self.pending.get(timeout=max(0.0, next_beat - time.monotonic()))
+            except queue.Empty:
+                item = None
+            else:
+                try:
+                    if item is not None and not self.disabled:
+                        try:
+                            self.sink.write(item)
+                            self.sink.flush()
+                        except (OSError, ValueError):
+                            self.disabled = True
+                finally:
+                    self.pending.task_done()
+            if not self.stopped.is_set() and time.monotonic() >= next_beat:
+                if not self.disabled:
+                    with self.lock:
+                        frame = self.stack[-1]
+                    self.emit('heartbeat', frame, metrics=True)
+                next_beat = time.monotonic() + self.interval
 
     def start(self):
         self.emit('start', self.stack[0])
         self.thread.start()
 
     def close(self):
+        self.emit('error' if self.error_type else 'done', self.stack[0], error_type=self.error_type)
         self.stopped.set()
+        try:
+            self.pending.put_nowait(None)  # Wake an idle consumer even when disabled.
+        except queue.Full:
+            # A full queue already wakes the consumer; it will drain or discard it.
+            self.disabled = True
         self.thread.join(timeout=1.0)
-        # Do not wait again on a pathological blocked diagnostic sink.
-        if not self.thread.is_alive():
-            self.emit('error' if self.error_type else 'done', self.stack[0], error_type=self.error_type)
+        # A pathological sink may still hold the daemon; business cleanup is bounded.
 
 
 @contextmanager
-def reporting_run(owner, *, interval=60.0, clock=time.monotonic, sink=None):
+def reporting_run(owner, *, interval=60.0, clock=time.monotonic, sink=None, queue_size=256):
     previous = active_reporter()
     if previous is not None and previous.owner is owner:
         yield previous
         return
-    reporter = ProgressReporter(owner, interval=interval, clock=clock, sink=sink)
+    reporter = ProgressReporter(owner, interval=interval, clock=clock, sink=sink, queue_size=queue_size)
     token = _ACTIVE.set(reporter)
     try:
         reporter.start()

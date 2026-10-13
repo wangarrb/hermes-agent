@@ -259,11 +259,10 @@ def test_unready_pipeline_noop_is_silent_and_restores_parent_reporter(setup):
     runtime = Runtime(ledger)
     stream = io.StringIO()
     with p.reporting_run(object(), sink=stream) as parent:
-        before = stream.getvalue()
         report = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
                                      source_reader=lambda *_a, **_kw: [snapshot(src, 1)], execute=True)
-        assert report['status'] == 'no_op'
-        assert stream.getvalue() == before and p.active_reporter() is parent
+        assert report['status'] == 'no_op' and p.active_reporter() is parent
+    assert [(e['operation'], e['event']) for e in events(stream)] == [('pipeline', 'start'), ('pipeline', 'done')]
 
 
 def test_callback_without_owner_does_not_borrow_unrelated_run():
@@ -274,9 +273,8 @@ def test_callback_without_owner_does_not_borrow_unrelated_run():
         return value
     value = object()
     with p.reporting_run(object(), sink=stream) as parent:
-        before = stream.getvalue()
-        assert callback(value) is value
-        assert stream.getvalue() == before and p.active_reporter() is parent
+        assert callback(value) is value and p.active_reporter() is parent
+    assert [(e['operation'], e['event']) for e in events(stream)] == [('pipeline', 'start'), ('pipeline', 'done')]
 
 
 def test_final_report_failure_preserves_exception_stops_thread_and_emits_error(setup, monkeypatch, capsys):
@@ -334,15 +332,22 @@ def test_readonly_span_covers_generator_use_not_creation(env):
     p = progress()
     _mod, adapter, _ledger, db, _manifest, _proof, _row = env
     stream = io.StringIO()
-    with p.reporting_run(adapter, sink=stream):
-        before = stream.getvalue()
+    started, ended = threading.Event(), threading.Event()
+    class Sink:
+        def write(self, line):
+            stream.write(line)
+            event = json.loads(line)
+            if event['operation'] == 'readonly_transaction':
+                (started if event['event'] == 'start' else ended).set()
+        def flush(self):
+            pass
+    with p.reporting_run(adapter, sink=Sink()):
         context = adapter._readonly()
-        assert stream.getvalue() == before
+        assert not started.is_set()
         with context:
-            active = events(stream)
-            assert any(e['operation'] == 'readonly_transaction' and e['event'] == 'start' for e in active)
-            assert not any(e['operation'] == 'readonly_transaction' and e['event'] == 'done' for e in active)
-        assert any(e['operation'] == 'readonly_transaction' and e['event'] == 'done' for e in events(stream))
+            assert started.wait(5)
+            assert not ended.is_set()
+        assert ended.wait(5)
     assert db.commits == 0
 
 
@@ -398,3 +403,92 @@ def test_source_parent_receipt_finalization_has_safe_phase_timings(setup, capsys
         assert any(e['operation'] == operation and e['event'] == 'start' for e in recorded)
         assert any(e['operation'] == operation and e['event'] == 'done' for e in recorded)
     assert all(b['phase'] == 'published' for b in ledger.list_batches())
+
+
+@pytest.mark.parametrize('block_at', ['write', 'flush'])
+def test_blocked_diagnostic_sink_never_stalls_business_error_or_cleanup(block_at):
+    p = progress()
+    blocked, release, completed = threading.Event(), threading.Event(), threading.Event()
+    original = RuntimeError('PRIVATE_ORIGINAL_GATE_FAILURE')
+    errors, reporters = [], []
+    class Sink:
+        heartbeat = False
+        def write(self, line):
+            self.heartbeat = json.loads(line)['event'] == 'heartbeat'
+            if block_at == 'write' and self.heartbeat:
+                blocked.set()
+                assert release.wait(8)
+        def flush(self):
+            if block_at == 'flush' and self.heartbeat:
+                blocked.set()
+                assert release.wait(8)
+    def business():
+        try:
+            with p.reporting_run(object(), interval=0.01, sink=Sink()) as reporter:
+                reporters.append(reporter)
+                assert blocked.wait(5)
+                with p.span('validate_gate'):
+                    raise original
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+    worker = threading.Thread(target=business)
+    worker.start()
+    try:
+        assert blocked.wait(5)
+        assert completed.wait(2), 'diagnostic I/O must not hold the business thread'
+        assert errors == [original]
+    finally:
+        release.set()
+        worker.join(5)
+        for reporter in reporters:
+            reporter.thread.join(5)
+    assert not worker.is_alive() and all(not r.thread.is_alive() for r in reporters)
+
+
+def test_bounded_diagnostic_queue_disables_on_congestion_without_delaying_result():
+    p = progress()
+    blocked, release, completed = threading.Event(), threading.Event(), threading.Event()
+    reporters, results, errors = [], [], []
+    sentinel = object()
+    class Sink:
+        def write(self, _line):
+            blocked.set()
+            assert release.wait(8)
+        def flush(self):
+            pass
+    def business():
+        try:
+            with p.reporting_run(object(), sink=Sink(), queue_size=2) as reporter:
+                reporters.append(reporter)
+                assert blocked.wait(5)
+                for _ in range(20):
+                    with p.span('candidate'):
+                        pass
+                assert reporter.disabled
+                assert reporter.pending.qsize() <= 2
+                results.append(sentinel)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+    worker = threading.Thread(target=business)
+    worker.start()
+    try:
+        assert blocked.wait(5) and completed.wait(2)
+        assert results == [sentinel] and errors == []
+    finally:
+        release.set()
+        worker.join(5)
+        for reporter in reporters:
+            reporter.thread.join(5)
+    assert not worker.is_alive() and all(not r.thread.is_alive() for r in reporters)
+
+
+@pytest.mark.parametrize('capacity', [0, -1, True, None, '2'])
+def test_diagnostic_queue_rejects_unbounded_or_nonliteral_capacity(capacity):
+    p = progress()
+    with pytest.raises(ValueError, match='finite positive capacity'):
+        with p.reporting_run(object(), sink=io.StringIO(), queue_size=capacity):
+            pytest.fail('invalid diagnostic capacity accepted')
