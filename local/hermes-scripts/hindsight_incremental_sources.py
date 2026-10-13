@@ -10,11 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 from hindsight_session_manifest import (
     CLEANING_VERSION, SECRET_MATERIAL_RE, discover_session_sources,
@@ -307,6 +310,11 @@ def _read_db(path: Path, artifacts=()) -> tuple[dict, dict, str]:
             con.execute('PRAGMA query_only=ON')
             con.execute('BEGIN')
             sessions = {r['id']: dict(r) for r in con.execute('SELECT * FROM sessions')}
+            for session in sessions.values():
+                session['model_config'] = _native_config_projection(session.pop('model_config', None))
+            application_id = con.execute('PRAGMA application_id').fetchone()[0]
+            epoch = 'sqlite:' + digest({'inode': identity, 'application_id': application_id})
+            copy_roots, copy_sources, receipt_hash = _native_copy_bindings(con, sessions, epoch)
             columns = {r[1] for r in con.execute('PRAGMA table_info(messages)')}
             active = ' AND (active = 1 OR compacted = 1)' if {'active', 'compacted'} <= columns else ''
             evidence = _merge_lineage(sessions, artifacts)
@@ -321,24 +329,80 @@ def _read_db(path: Path, artifacts=()) -> tuple[dict, dict, str]:
                     raise SourceChangedError('source_changed: missing session for message')
             # Filter roles before materializing payloads, then iterate inside
             # the same read-only transaction instead of retaining all history.
-            for record in con.execute("SELECT * FROM messages WHERE role IN ('user','assistant')" + active + ' ORDER BY id'):
+            # Hidden unproven rows still falsify a receipt-delete downgrade: a
+            # visible row whose complete identity repeats a hidden unmatched
+            # row cannot be proven a new occurrence. Collect the cheap identity
+            # tuple of every yieldable row first, decode only hidden rows that
+            # share such a tuple, and fail closed on a full identity match.
+            cheap_columns = [c for c in ('id', 'session_id', 'role', 'active', 'compacted', 'timestamp',
+                'created_at', 'tool_call_id', 'tool_calls', 'tool_name', '_compressed_summary')
+                if c in columns]
+            cheap_columns += [c for c in _NATIVE_ORIGIN_FIELDS if c in columns]
+            cheap_columns = sorted(set(cheap_columns))
+            cheap_select = ', '.join(cheap_columns)
+            # Prefilter only: mutable visibility/display fields and the row id
+            # are excluded; the full event identity is confirmed after decode.
+            tuple_columns = [c for c in cheap_columns if c not in {'id', 'active', 'compacted', 'display_order'}]
+
+            def identity_tuple(row):
+                return tuple(row.get(column) for column in tuple_columns)
+
+            yieldable_tuples, hidden_candidates = set(), []
+            for record in con.execute('SELECT ' + cheap_select + ' FROM messages ORDER BY id'):
                 row = dict(record)
+                if row.get('role') not in {'user', 'assistant'} or row.get('_compressed_summary'):
+                    continue
+                if row.get('id') in copy_roots:
+                    continue
+                sid = row.get('session_id')
+                if sid not in sessions or sessions[sid].get('source') == 'cron':
+                    continue
+                visible = not active or row.get('active') == 1 or row.get('compacted') == 1
+                if visible or row.get('id') in copy_sources:
+                    yieldable_tuples.add(identity_tuple(row))
+                else:
+                    hidden_candidates.append((row.get('id'), identity_tuple(row)))
+
+            hidden_events = defaultdict(set)
+            candidate_ids = [row_id for row_id, value in hidden_candidates if value in yieldable_tuples]
+            for start in range(0, len(candidate_ids), 250):
+                chunk = candidate_ids[start:start + 250]
+                for record in con.execute('SELECT * FROM messages WHERE id IN ('
+                                          + ','.join('?' for _ in chunk) + ')', chunk):
+                    row = dict(record)
+                    sid = row['session_id']
+                    if sid not in sessions or sessions[sid].get('source') == 'cron':
+                        continue
+                    msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
+                    if msg and not msg['origin']:
+                        hidden_events[roots.setdefault(sid, _lineage_root(sid, evidence))].add(msg['event_id'])
+
+            for record in con.execute("SELECT * FROM messages WHERE role IN ('user','assistant') ORDER BY id"):
+                row = dict(record)
+                if row['id'] in copy_roots:
+                    continue
+                visible = not active or row['active'] == 1 or row['compacted'] == 1
+                if not (visible or row['id'] in copy_sources):
+                    continue
                 sid = row['session_id']
                 if sid not in sessions:
                     raise SourceChangedError('source_changed: missing session for message')
                 if sessions[sid].get('source') == 'cron':
                     continue
-                if row.get('role') not in {'user', 'assistant'} or row.get('_compressed_summary'):
+                if row.get('_compressed_summary'):
                     continue
                 # Integer row IDs are not message origins: protected tails are cloned.
                 msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
                 if msg:
+                    binding = _clone_binding(_physical_record(row, sqlite_row=True))
                     root = roots.setdefault(sid, _lineage_root(sid, evidence))
                     previous = physical_rows[root].get(msg['event_id'])
-                    if previous is not None and not msg['origin'] and not _proved_db_clone(previous, row, evidence):
+                    if previous is not None and not msg['origin'] and not _proved_db_clone(previous, binding, evidence):
                         raise SourceChangedError('source_changed: ambiguous identical SQLite rows without clone proof')
+                    if not msg['origin'] and msg['event_id'] in hidden_events.get(root, ()):
+                        raise SourceChangedError('source_changed: ambiguous hidden SQLite twin without copy proof')
                     _add_event(grouped[root], msg)
-                    physical_rows[root][msg['event_id']] = row
+                    physical_rows[root][msg['event_id']] = binding
             # Read-only epoch token plus ledger content-coverage detects truncate /
             # reset even when a writer reuses this inode. No write of an epoch key.
             application_id = con.execute('PRAGMA application_id').fetchone()[0]
@@ -350,7 +414,8 @@ def _read_db(path: Path, artifacts=()) -> tuple[dict, dict, str]:
     if _db_identity(path) != identity:
         raise SourceChangedError('source_changed: SQLite replaced during snapshot')
     epoch = 'sqlite:' + digest({'inode': identity, 'application_id': application_id})
-    return evidence, {'roots': roots, 'messages': {r: list(view.values()) for r, view in grouped.items()}}, epoch
+    return evidence, {'roots': roots, 'messages': {r: list(view.values()) for r, view in grouped.items()},
+                      'copy_receipts_sha256': receipt_hash}, epoch
 
 
 def _discover_sources(home: Path, profile_mode: str) -> list[dict]:
@@ -377,11 +442,18 @@ def _discover_sources(home: Path, profile_mode: str) -> list[dict]:
     return sources
 
 
+_NO_SOURCE_UNKNOWN_POLICY = object()
+
+
 def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
-                          physical_baseline: dict | None = None) -> list[dict]:
+                          physical_baseline: dict | None = None,
+                          source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY) -> list[dict]:
     """Read a finite source view, never infer historical completion or CDC."""
     if physical_baseline is not None:
-        return _scan_physical_sources(hermes_home, profile_mode, physical_baseline)
+        return _scan_physical_sources(hermes_home, profile_mode, physical_baseline,
+                                      source_unknown_policy=source_unknown_policy)
+    if source_unknown_policy is not _NO_SOURCE_UNKNOWN_POLICY:
+        raise ValueError('source unknown policy requires original physical baseline')
     home = checked_path(Path(hermes_home))
     if not home.exists():
         return []
@@ -413,6 +485,8 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
                 _add_event(views[root], msg)
             epochs[root] = db_epoch
             hashes[root].append(digest(messages))
+            if database.get('copy_receipts_sha256') is not None:
+                hashes[root].append(database['copy_receipts_sha256'])
         for sid, data, raw_hash in artifacts:
             root = _lineage_root(sid, sessions)
             claimed = data.get('lineage_root')
@@ -472,6 +546,7 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
 
 
 PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
+SOURCE_UNKNOWN_POLICY_SCHEMA = 'hindsight-source-approved-unknown/1'
 _MUTABLE_ROW_FIELDS = {'active', 'compacted', 'display_order'}
 _NATIVE_ORIGIN_FIELDS = ('origin_message_id', 'platform_message_id', 'original_id', 'message_id', 'event_id')
 
@@ -526,6 +601,11 @@ def _physical_record(raw, *, sqlite_row=False):
             'origin_hash': digest(str(_native_origin(raw))) if isinstance(raw, dict) and _native_origin(raw) else None}
 
 
+def _clone_binding(record):
+    # Duplicate/lineage checks need complete copy hashes, not retained bodies.
+    return {k: record[k] for k in ('id', 'session_id', 'copy_hash')}
+
+
 def _location_identity(path: Path, *, directory=False):
     checked_path(path)
     try:
@@ -537,6 +617,136 @@ def _location_identity(path: Path, *, directory=False):
     if not st.st_dev or not st.st_ino:
         raise SourceChangedError('source_changed: unknown physical source epoch')
     return [st.st_dev, st.st_ino]
+
+
+_COPY_RECEIPTS_KEY = '_message_copy_receipts_v1'
+_COPY_RECEIPTS_SCHEMA = 'hermes-message-copy-receipts/1'
+_COPY_HASH_RE = re.compile(r'[0-9a-f]{64}\Z')
+
+
+def _invalid_copy_receipts() -> NoReturn:
+    # Fixed metadata only: never surface configuration, row values or bodies.
+    raise SourceChangedError('source_changed: invalid native message copy receipts') from None
+
+
+def _raw_mentions_copy_receipts(raw):
+    """True when raw may carry the protected key in any JSON-escaped form.
+
+    Malformed or aliased config is only tolerated for legacy keys; any encoded
+    spelling of the owned key (\u005F escapes, BLOBs) must fail closed instead
+    of silently projecting to an empty dict.
+    """
+    if isinstance(raw, bytes):
+        if _COPY_RECEIPTS_KEY.encode('utf-8') in raw:
+            return True
+        try:
+            raw = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return False
+    if not isinstance(raw, str):
+        return False
+    if _COPY_RECEIPTS_KEY in raw:
+        return True
+    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda match: chr(int(match.group(1), 16)), raw)
+    return _COPY_RECEIPTS_KEY in decoded
+
+
+def _native_config_projection(raw):
+    if isinstance(raw, str):
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate metadata key')
+                result[key] = value
+            return result
+        try:
+            config = json.loads(raw, object_pairs_hook=unique_object) if raw.strip() else {}
+        except (ValueError, TypeError):
+            if _raw_mentions_copy_receipts(raw):
+                _invalid_copy_receipts()
+            config = None
+    else:
+        config = raw
+    if type(config) is not dict:
+        if _raw_mentions_copy_receipts(raw):
+            _invalid_copy_receipts()
+        return {}
+    return {key: config[key] for key in
+            ('_delegate_from', '_branched_from', '_reset_from', _COPY_RECEIPTS_KEY) if key in config}
+
+
+def _native_copy_bindings(con, sessions, epoch):
+    """Verify only receipt-referenced rows in this same ro/query_only snapshot.
+
+    Standalone scripts cannot import Core's writer helper. Hash complete rows
+    immediately, retaining only content-free bindings; query in bounded chunks.
+    Native AUTOINCREMENT edges must point forward, so no cycle is admissible.
+    """
+    edges, operation_ids, targets, receipts = [], set(), set(), {}
+
+    def shape(value, keys):
+        if type(value) is not dict or set(value) != set(keys):
+            _invalid_copy_receipts()
+
+    def checksum(value):
+        if type(value) is not str or not _COPY_HASH_RE.fullmatch(value):
+            _invalid_copy_receipts()
+
+    for sid, session in sessions.items():
+        config = session.get('model_config', {})
+        if _COPY_RECEIPTS_KEY not in config:
+            continue
+        value = config[_COPY_RECEIPTS_KEY]
+        shape(value, ('schema_version', 'session_id', 'source_epoch', 'operations'))
+        if (value['schema_version'] != _COPY_RECEIPTS_SCHEMA
+                or type(value['session_id']) is not str or value['session_id'] != sid
+                or type(value['source_epoch']) is not str or value['source_epoch'] != epoch
+                or type(value['operations']) is not list):
+            _invalid_copy_receipts()
+        receipts[sid] = value
+        for operation in value['operations']:
+            shape(operation, ('operation_id', 'kind', 'copies', 'receipt_sha256'))
+            op_id = operation['operation_id']
+            try:
+                parsed = uuid.UUID(op_id) if type(op_id) is str else None
+            except (ValueError, AttributeError):
+                _invalid_copy_receipts()
+            if (parsed is None or not parsed.int or str(parsed) != op_id or op_id in operation_ids
+                    or operation['kind'] != 'inplace_compaction'
+                    or type(operation['copies']) is not list or not operation['copies']):
+                _invalid_copy_receipts()
+            operation_ids.add(op_id)
+            checksum(operation['receipt_sha256'])
+            for edge in operation['copies']:
+                shape(edge, ('source_row_id', 'target_row_id', 'source_row_hash', 'target_row_hash', 'copy_hash'))
+                old, new = edge['source_row_id'], edge['target_row_id']
+                if type(old) is not int or type(new) is not int or not 0 < old < new or new in targets:
+                    _invalid_copy_receipts()
+                targets.add(new)
+                for key in ('source_row_hash', 'target_row_hash', 'copy_hash'):
+                    checksum(edge[key])
+                edges.append((sid, edge))
+            if operation['receipt_sha256'] != digest({k: v for k, v in operation.items() if k != 'receipt_sha256'}):
+                _invalid_copy_receipts()
+    referenced = sorted({edge[key] for _, edge in edges for key in ('source_row_id', 'target_row_id')})
+    records = {}
+    for start in range(0, len(referenced), 250):
+        chunk = referenced[start:start + 250]
+        for row in con.execute('SELECT * FROM messages WHERE id IN (' + ','.join('?' for _ in chunk) + ')', chunk):
+            records[row['id']] = _physical_record(dict(row), sqlite_row=True)
+    if set(records) != set(referenced):
+        _invalid_copy_receipts()
+    roots = {}
+    for sid, edge in sorted(edges, key=lambda pair: pair[1]['target_row_id']):
+        old, new = edge['source_row_id'], edge['target_row_id']
+        left, right = records[old], records[new]
+        if (left['session_id'] != sid or right['session_id'] != sid
+                or left['row_hash'] != edge['source_row_hash'] or right['row_hash'] != edge['target_row_hash']
+                or left['copy_hash'] != right['copy_hash'] or left['copy_hash'] != edge['copy_hash']):
+            _invalid_copy_receipts()
+        roots[new] = roots.get(old, old)
+    return roots, set(roots.values()), digest(receipts) if receipts else None
 
 
 def _native_session_binding(row):
@@ -559,29 +769,23 @@ def _read_physical_db(path: Path, *, consume=None):
             if 'model_config' in session_columns:
                 selected += ', model_config'
             sessions = {r['id']: dict(r) for r in con.execute('SELECT ' + selected + ' FROM sessions')}
-            # Carry only Core's stable relation markers into forward proof.
+            # Carry only stable relation markers and fixed-schema owned receipts.
             # Provider/credential/recipe configuration never enters the
             # physical descriptor or its returned source evidence.
             for row in sessions.values():
-                config = row.pop('model_config', None)
-                if isinstance(config, str):
-                    try:
-                        config = json.loads(config)
-                    except (ValueError, TypeError):
-                        config = None
-                if isinstance(config, dict):
-                    row['model_config'] = {key: config[key] for key in
-                        ('_delegate_from', '_branched_from', '_reset_from') if key in config}
+                row['model_config'] = _native_config_projection(row.pop('model_config', None))
             columns = [r[1] for r in con.execute('PRAGMA table_info(messages)')]
             application_id = con.execute('PRAGMA application_id').fetchone()[0]
             schema_version = con.execute('PRAGMA schema_version').fetchone()[0]
             epoch = 'sqlite:' + digest({'inode': identity, 'application_id': application_id})
+            copy_roots, copy_sources, receipt_hash = _native_copy_bindings(con, sessions, epoch)
             header = {'path': str(path), 'identity': identity, 'epoch': epoch,
                       'application_id': application_id, 'schema_version': schema_version, 'message_columns': columns,
                       'sessions': [{'session_id': sid, 'identity_hash': _native_session_binding(row)}
                                    for sid, row in sorted(sessions.items())], 'rows': []}
             if consume is not None:
-                consume(None, sessions, header)
+                consume(None, sessions, {**header, 'copy_roots': copy_roots,
+                        'copy_sources': copy_sources, 'copy_receipts_sha256': receipt_hash})
             for record in con.execute('SELECT * FROM messages ORDER BY id'):
                 row = dict(record)
                 if consume is None:
@@ -748,6 +952,54 @@ def validate_physical_baseline(baseline: dict, *, bank: str, hermes_home: Path) 
         raise ValueError('physical baseline default profile missing')
 
 
+def validate_source_unknown_policy(policy, *, physical_baseline, bank, hermes_home):
+    """Only literal finite SQL bindings; this proves authorization, not copying.
+
+    Deployment chooses the approved exact rows explicitly. No site IDs, ranges,
+    time filters, or inferred completion enter this generic artifact schema.
+    """
+    from hindsight_incremental_merge import canonical_hash
+
+    validate_physical_baseline(physical_baseline, bank=bank, hermes_home=hermes_home)
+    _require_shape(policy, ('schema_version', 'bank', 'hermes_home', 'physical_baseline_sha256',
+                           'authorization', 'status', 'completion_proven', 'scopes'))
+    if (policy['schema_version'] != SOURCE_UNKNOWN_POLICY_SCHEMA or policy['bank'] != bank
+            or policy['hermes_home'] != physical_baseline['hermes_home']
+            or policy['physical_baseline_sha256'] != canonical_hash(physical_baseline)
+            or policy['authorization'] != 'explicit-finite-source-row-exclusion'
+            or policy['status'] != 'unknown' or policy['completion_proven'] is not False
+            or not isinstance(policy['scopes'], list) or not policy['scopes']):
+        raise ValueError('source unknown policy baseline/bank/home/authorization mismatch')
+    profiles = {p['profile']: p for p in physical_baseline['profiles']}
+    scopes, row_ids = set(), set()
+    for scope in policy['scopes']:
+        _require_shape(scope, ('profile', 'feed_epoch', 'source_epoch', 'session_id', 'rows'))
+        name, sid = scope['profile'], scope['session_id']
+        if not _valid_native(name) or not _valid_native(sid) or (name, sid) in scopes:
+            raise ValueError('invalid source unknown policy scope')
+        scopes.add((name, sid))
+        profile = profiles.get(name)
+        if (profile is None or profile['sqlite'] is None
+                or scope['feed_epoch'] != profile['feed_epoch']
+                or scope['source_epoch'] != profile['sqlite']['epoch']
+                or sid not in {s['session_id'] for s in profile['sqlite']['sessions']}
+                or not isinstance(scope['rows'], list) or not scope['rows']):
+            raise ValueError('source unknown policy feed/epoch/session mismatch')
+        old_ids = {r['id'] for r in profile['sqlite']['rows']}
+        ids = []
+        for row in scope['rows']:
+            _require_shape(row, ('id', 'session_id', 'row_hash', 'copy_hash', 'export_hash', 'origin_hash'))
+            if (type(row['id']) is not int or row['id'] <= 0 or row['id'] in old_ids
+                    or (name, row['id']) in row_ids or row['session_id'] != sid):
+                raise ValueError('invalid source unknown policy row location')
+            row_ids.add((name, row['id']))
+            ids.append(row['id'])
+            for key in ('row_hash', 'copy_hash', 'export_hash', 'origin_hash'):
+                _require_hash(row[key], optional=key in {'export_hash', 'origin_hash'})
+        if ids != sorted(ids):
+            raise ValueError('source unknown policy rows must have canonical order')
+
+
 def _profile_anchors(profile):
     sids = {a['session_id'] for a in profile['artifacts'] if a['session_id']}
     if profile['sqlite']:
@@ -863,7 +1115,7 @@ def _exclude_old_copy(record, sid, old_index, evidence, *, cutover_anchors,
     return False
 
 
-def _scan_physical_profile(profile, home):
+def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
     directory, db = Path(profile['sessions_dir']), Path(profile['state_db'])
     if profile['directory_identity'] is not None:
         if _location_identity(directory, directory=True) != profile['directory_identity']:
@@ -911,7 +1163,9 @@ def _scan_physical_profile(profile, home):
         artifacts.append((current['session_id'], projected, current, records))
     lineage_artifacts = [(sid, data, current['raw_hash']) for sid, data, current, _ in artifacts if sid]
     anchors, views, physical = _profile_anchors(profile), defaultdict(dict), defaultdict(dict)
-    seen_old = set()
+    seen_old, seen_unknown = set(), set()
+    expected_unknown = {r['id']: r for r in unknown_rows}
+    copy_roots, copy_sources = {}, set()
     evidence = _physical_lineage({}, lineage_artifacts, anchors)
 
     def check_origin(record, sid):
@@ -921,7 +1175,7 @@ def _scan_physical_profile(profile, home):
                 raise SourceChangedError('source_changed: conflicting legacy stable origin')
 
     def consume(row, sessions, header):
-        nonlocal evidence
+        nonlocal evidence, copy_roots, copy_sources
         if row is None:
             if old_db:
                 if (header['epoch'] != old_db['epoch'] or header['schema_version'] != old_db['schema_version']
@@ -932,6 +1186,9 @@ def _scan_physical_profile(profile, home):
                     if _native_session_binding(sessions[old['session_id']]) != old['identity_hash']:
                         raise SourceChangedError('source_changed: legacy native session rewritten')
             evidence = _physical_lineage(sessions, lineage_artifacts, anchors)
+            copy_roots, copy_sources = header['copy_roots'], header['copy_sources']
+            if header['copy_receipts_sha256'] is not None:
+                changes.append({'native_copy_receipts_sha256': header['copy_receipts_sha256']})
             return
         record = _physical_record(row, sqlite_row=True)
         old = expected_rows.get(row['id'])
@@ -944,6 +1201,18 @@ def _scan_physical_profile(profile, home):
         sid = row['session_id']
         if sid not in sessions:
             raise SourceChangedError('source_changed: missing session for future message')
+        if row['id'] in expected_unknown:
+            if record != expected_unknown[row['id']]:
+                raise SourceChangedError('source_changed: approved unknown SQLite binding drift')
+            seen_unknown.add(row['id'])
+            # Noncompletion exclusion only: never decode/capture its payload or
+            # add it to clone evidence/export matching for other records.
+            return
+        if row['id'] in copy_roots:
+            # Exact native ancestry was checked against both complete current
+            # rows before streaming. Keep the original future event, or the
+            # finite legacy/unknown exclusion, never a new copied occurrence.
+            return
         if sessions[sid].get('source') == 'cron':
             return
         if row.get('role') not in {'user', 'assistant'} or row.get('_compressed_summary'):
@@ -953,17 +1222,21 @@ def _scan_physical_profile(profile, home):
         if _exclude_old_copy(record, sid, old_index, evidence, cutover_anchors=anchors,
                              sqlite_row=True, copy_index=copy_index):
             return
-        if ('active' in row and 'compacted' in row and not (row['active'] or row['compacted'])):
-            return
         msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
         if msg:
-            current_db_exports.add((sid, record['export_hash']))
+            binding = _clone_binding(record)
             previous = physical[root].get(msg['event_id'])
             if previous is not None and not msg['origin'] and not _proved_db_clone(
-                    previous, row, evidence, cutover_anchors=anchors):
+                    previous, binding, evidence, cutover_anchors=anchors):
                 raise SourceChangedError('source_changed: ambiguous identical future SQLite rows')
+            physical[root][msg['event_id']] = binding
+            if (row['id'] not in copy_sources and 'active' in row and 'compacted' in row
+                    and not (row['active'] or row['compacted'])):
+                # Hidden future rows still falsify a receipt-delete downgrade;
+                # they are not independently admitted or stored as bodies.
+                return
+            current_db_exports.add((sid, record['export_hash']))
             _add_event(views[root], msg)
-            physical[root][msg['event_id']] = row
 
     if old_db and not db.exists():
         raise SourceChangedError('source_changed: legacy SQLite missing')
@@ -973,6 +1246,8 @@ def _scan_physical_profile(profile, home):
         _read_physical_db(db, consume=consume)
     if seen_old != set(expected_rows):
         raise SourceChangedError('source_changed: legacy SQLite row coverage lost')
+    if seen_unknown != set(expected_unknown):
+        raise SourceChangedError('source_changed: approved unknown SQLite row coverage lost')
     for sid, data, current, records in artifacts:
         messages = data['messages']
         if not messages:
@@ -1002,21 +1277,33 @@ def _scan_physical_profile(profile, home):
                 events.add(msg['event_id'])
                 _add_event(views[root], msg)
     fence = digest({'baseline': digest(profile), 'changes': changes}) if changes else digest(profile)
+    if policy_hash is not None:
+        fence = digest({'source': fence, 'source_unknown_policy': policy_hash,
+                        'unknown_rows': list(unknown_rows)})
     return _physical_snapshots(profile, views, fence_hash=fence)
 
 
-def _scan_physical_sources(hermes_home, profile_mode, baseline):
+def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
+                           source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY):
     home = checked_path(Path(hermes_home))
     if not isinstance(baseline, dict):
         raise ValueError('invalid physical baseline header')
     validate_physical_baseline(baseline, bank=baseline.get('bank', ''), hermes_home=home)
     if profile_mode != baseline['profile_mode']:
         raise ValueError('physical baseline profile coverage mode mismatch')
+    unknown_rows, policy_hash = defaultdict(list), None
+    if source_unknown_policy is not _NO_SOURCE_UNKNOWN_POLICY:
+        validate_source_unknown_policy(source_unknown_policy, physical_baseline=baseline,
+                                       bank=baseline['bank'], hermes_home=home)
+        policy_hash = digest(source_unknown_policy)
+        for scope in source_unknown_policy['scopes']:
+            unknown_rows[scope['profile']].extend(scope['rows'])
     current = {s['profile']: s for s in _discover_sources(home, profile_mode)}
     old_profiles = {p['profile']: p for p in baseline['profiles']}
     if not set(old_profiles) <= set(current):
         raise SourceChangedError('source_changed: legacy profile coverage lost')
-    result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(profile, home)]
+    result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(
+        profile, home, unknown_rows=unknown_rows[profile['profile']], policy_hash=policy_hash)]
     for name in sorted(set(current) - set(old_profiles)):
         # A genuinely new profile is strict, not silently turned into legacy.
         profile_home = Path(current[name]['state_db']).parent

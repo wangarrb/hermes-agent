@@ -368,12 +368,37 @@ def test_real_core_compaction_keeps_observed_input_noop(tmp_path):
         old = sources.scan_source_snapshots(home)
         ledger = ledger_module.IncrementalLedger(tmp_path / 'ledger', 'A', create=True)
         ledger.initialize_legacy(old, {}, [], confirm=ledger_module.CONFIRM_INITIALIZE)
-        carried = db.get_messages_as_conversation('s')
+        # Real callers preserve the explicit native row reference, so the
+        # compacted copy carries a durable causal receipt and stays a noop.
+        carried = [dict(row) for row in db.get_messages('s')]
+        for row in carried:
+            row['_row_id'] = row['id']
         db.archive_and_compact('s', [{'role': 'assistant', 'content': 'Compressed context',
             '_compressed_summary': True, 'timestamp': 101}, *carried], tail_count=len(carried))
         current = sources.scan_source_snapshots(home)
         assert current[0]['messages'] == old[0]['messages']
         assert ledger.capture_snapshot(current[0]) == []
+    finally:
+        db.close()
+
+
+def test_uncaused_real_core_compaction_copy_fails_closed(tmp_path):
+    """Without an explicit native reference no receipt exists; an unprovable
+    hidden clone must block instead of silently keeping or losing the input."""
+    SessionDB = pytest.importorskip('hermes_state', reason='real Hermes core E2E lane requires SessionDB').SessionDB
+    sources = api()
+    home = tmp_path / 'home'
+    home.mkdir()
+    db = SessionDB(db_path=home / 'state.db')
+    try:
+        db.create_session('s', 'cli')
+        db.append_message('s', 'user', content='Useful real core fact', timestamp=100)
+        sources.scan_source_snapshots(home)
+        carried = db.get_messages_as_conversation('s')
+        db.archive_and_compact('s', [{'role': 'assistant', 'content': 'Compressed context',
+            '_compressed_summary': True, 'timestamp': 101}, *carried], tail_count=len(carried))
+        with pytest.raises(sources.SourceChangedError, match='ambiguous'):
+            sources.scan_source_snapshots(home)
     finally:
         db.close()
 

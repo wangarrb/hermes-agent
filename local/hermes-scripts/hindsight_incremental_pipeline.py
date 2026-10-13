@@ -150,6 +150,7 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
             if not knobs.get('resume_only'):
                 reader_options = {'profile_mode': 'all'}
                 legacy = ledger.initialization_manifest()
+                unknown_reference = ledger.source_unknown_policy_reference()
                 if 'physical_baseline' in legacy:
                     reference = ledger.physical_baseline_reference()
                     if not isinstance(reference, dict):
@@ -159,6 +160,17 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     validate_physical_baseline(value, bank=ledger.bank,
                                                hermes_home=Path(config['hermes_home']))
                     reader_options['physical_baseline'] = value
+                if unknown_reference is not None:
+                    if 'physical_baseline' not in reader_options:
+                        raise ValueError('source_unknown_policy_requires_physical_baseline')
+                    unknown = _read(ledger.root, unknown_reference['artifact_path'], unknown_reference['artifact_hash'])
+                    from hindsight_incremental_sources import validate_source_unknown_policy
+                    validate_source_unknown_policy(unknown, physical_baseline=reader_options['physical_baseline'],
+                                                   bank=ledger.bank, hermes_home=Path(config['hermes_home']))
+                    reader_options['source_unknown_policy'] = unknown
+                    report['source_unknown_policy'] = {'artifact_hash': unknown_reference['artifact_hash'],
+                        'status': 'unknown', 'completion_proven': False,
+                        'excluded_sql_rows': sum(len(scope['rows']) for scope in unknown['scopes'])}
                 snapshots = source_reader(Path(config['hermes_home']), **reader_options)
             if not execute:
                 pending = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)

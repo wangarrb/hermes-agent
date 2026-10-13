@@ -30,6 +30,7 @@ PHASES = ('captured', 'generated', 'submitted', 'unknown', 'retained', 'consolid
           'locally_merged', 'gated', 'published')
 SUCCESS_PHASES = ('captured', 'generated', 'retained', 'consolidated', 'locally_merged', 'gated', 'published')
 CONFIRM_INITIALIZE = 'initialize-hindsight-incremental'
+CONFIRM_APPROVE_SOURCE_UNKNOWN = 'approve-hindsight-source-unknown'
 PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
 _SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, state TEXT NOT NULL, state_hash TEXT NOT NULL);
@@ -193,20 +194,20 @@ class IncrementalLedger:
         except json.JSONDecodeError as exc:
             raise LedgerIntegrityError('invalid ledger state JSON') from exc
 
-    def _physical_reference(self, reference):
+    def _frozen_reference(self, reference, *, schema, suffix, extra_fields=()):
         """Validate the literal private pointer without loading profile material."""
-        fields = {'schema_version', 'bank', 'hermes_home', 'artifact_path', 'artifact_hash'}
+        fields = {'schema_version', 'bank', 'hermes_home', 'artifact_path', 'artifact_hash', *extra_fields}
         try:
             if (not isinstance(reference, dict) or set(reference) != fields or
                     any(not isinstance(v, str) or not v or any(ord(c) < 32 or ord(c) == 127 for c in v)
                         for v in reference.values()) or
-                    reference['schema_version'] != PHYSICAL_BASELINE_SCHEMA or reference['bank'] != self.bank):
+                    reference['schema_version'] != schema or reference['bank'] != self.bank):
                 raise ValueError('invalid reference')
             home = _safe_path(Path(reference['hermes_home']))
             if str(home) != reference['hermes_home']:
                 raise ValueError('nonliteral home')
             path = self._artifact_pointer(reference['artifact_path'], reference['artifact_hash'])
-            expected = self.root / 'delivery-artifacts' / (reference['artifact_hash'] + '.physical-baseline.json')
+            expected = self.root / 'delivery-artifacts' / (reference['artifact_hash'] + '.' + suffix + '.json')
             if path != expected:
                 raise ValueError('nonliteral frozen path')
             _private(path.parent, directory=True)
@@ -215,7 +216,10 @@ class IncrementalLedger:
                 raise ValueError('unfinished or writable artifact')
             return dict(reference), info
         except (OSError, ValueError, TypeError):
-            raise LedgerIntegrityError('invalid physical baseline reference') from None
+            raise LedgerIntegrityError('invalid ' + suffix + ' reference') from None
+
+    def _physical_reference(self, reference):
+        return self._frozen_reference(reference, schema=PHYSICAL_BASELINE_SCHEMA, suffix='physical-baseline')
 
     def _bound_physical_reference(self, manifest):
         reference, _ = self._physical_reference(manifest.get('physical_baseline'))
@@ -333,6 +337,92 @@ class IncrementalLedger:
             if 'physical_baseline' not in manifest:
                 return None
             return dict(manifest['physical_baseline'])
+
+    def _source_unknown_artifact(self, reference, physical_reference):
+        from hindsight_incremental_delivery import _read
+        from hindsight_offline_retry import RemoteCallError
+        import hindsight_incremental_sources as sources
+
+        try:
+            physical_reference, baseline_before = self._physical_reference(physical_reference)
+            reference, before = self._frozen_reference(reference,
+                schema=sources.SOURCE_UNKNOWN_POLICY_SCHEMA, suffix='source-unknown-policy',
+                extra_fields=('physical_baseline_sha256',))
+            if (reference['physical_baseline_sha256'] != physical_reference['artifact_hash']
+                    or reference['hermes_home'] != physical_reference['hermes_home']):
+                raise ValueError('different original baseline')
+            baseline = _read(self.root, physical_reference['artifact_path'], physical_reference['artifact_hash'])
+            policy = _read(self.root, reference['artifact_path'], reference['artifact_hash'])
+            sources.validate_source_unknown_policy(policy, physical_baseline=baseline, bank=self.bank,
+                                                    hermes_home=Path(reference['hermes_home']))
+            _, after = self._frozen_reference(reference,
+                schema=sources.SOURCE_UNKNOWN_POLICY_SCHEMA, suffix='source-unknown-policy',
+                extra_fields=('physical_baseline_sha256',))
+            _, baseline_after = self._physical_reference(physical_reference)
+            if (self._artifact_fence(before) != self._artifact_fence(after)
+                    or self._artifact_fence(baseline_before) != self._artifact_fence(baseline_after)):
+                raise ValueError('artifact changed during validation')
+            return reference
+        except (OSError, ValueError, TypeError, KeyError, RemoteCallError):
+            raise LedgerIntegrityError('invalid source unknown policy artifact binding') from None
+
+    def source_unknown_policy_reference(self) -> dict | None:
+        """Absent is not JSON null. Paired hashed metadata prevents lost-pointer downgrade."""
+        with self._connection() as con:
+            keys = {r[0] for r in con.execute("SELECT key FROM meta WHERE key IN "
+                "('source-unknown-policy','source-unknown-policy-required')")}
+            if not keys:
+                return None
+            if keys != {'source-unknown-policy', 'source-unknown-policy-required'}:
+                raise LedgerIntegrityError('missing source unknown policy reference')
+            reference = self._read(con, 'meta', 'source-unknown-policy')
+            required = self._read(con, 'meta', 'source-unknown-policy-required')
+            legacy = self._require_initialized(con)
+            reference = self._source_unknown_artifact(reference, legacy.get('physical_baseline'))
+            if required != {'bank': self.bank, 'artifact_hash': reference['artifact_hash'],
+                            'physical_baseline_sha256': reference['physical_baseline_sha256']}:
+                raise LedgerIntegrityError('invalid source unknown policy required binding')
+            return reference
+
+    def register_source_unknown_policy(self, policy: dict, *, confirm: str) -> dict:
+        """Explicit finite approval, under bank lock, after native read-only coverage.
+
+        Never alters the baseline, seed, arrival cursor, batches, or completion.
+        Re-registration may read back identical bytes but cannot widen the policy.
+        """
+        from hindsight_incremental_delivery import _read, _freeze
+        import hindsight_incremental_sources as sources
+
+        if confirm != CONFIRM_APPROVE_SOURCE_UNKNOWN:
+            raise ValueError('confirm must be approve-hindsight-source-unknown')
+        with self.locked():
+            legacy = self.initialization_manifest()
+            if 'physical_baseline' not in legacy:
+                raise LedgerIntegrityError('source unknown policy requires original physical baseline')
+            baseline_ref = self.physical_baseline_reference()
+            baseline = _read(self.root, baseline_ref['artifact_path'], baseline_ref['artifact_hash'])
+            sources.validate_source_unknown_policy(policy, physical_baseline=baseline, bank=self.bank,
+                                                    hermes_home=Path(baseline_ref['hermes_home']))
+            prior = self.source_unknown_policy_reference()
+            if prior is not None and _read(self.root, prior['artifact_path'], prior['artifact_hash']) != policy:
+                raise LedgerIntegrityError('source unknown policy is immutable')
+            # The normal adapter verifies every baseline and approved row in
+            # mode=ro/query_only transactions; no Core writer or native client.
+            sources.scan_source_snapshots(Path(baseline_ref['hermes_home']),
+                profile_mode=baseline['profile_mode'], physical_baseline=baseline, source_unknown_policy=policy)
+            path, checksum = _freeze(self.root, policy, 'source-unknown-policy')
+            reference = {'schema_version': sources.SOURCE_UNKNOWN_POLICY_SCHEMA, 'bank': self.bank,
+                'hermes_home': baseline_ref['hermes_home'], 'artifact_path': path, 'artifact_hash': checksum,
+                'physical_baseline_sha256': baseline_ref['artifact_hash']}
+            self._source_unknown_artifact(reference, baseline_ref)
+            with self._connection(write=True) as con:
+                if prior is None:
+                    self._put(con, 'meta', 'source-unknown-policy', reference)
+                    self._put(con, 'meta', 'source-unknown-policy-required', {'bank': self.bank,
+                        'artifact_hash': checksum, 'physical_baseline_sha256': baseline_ref['artifact_hash']})
+            if self.source_unknown_policy_reference() != reference:
+                raise LedgerIntegrityError('source unknown policy readback mismatch')
+            return reference
 
     def initialization_manifest(self) -> dict:
         """Read-only audit of the non-success baseline/seed inventory."""
