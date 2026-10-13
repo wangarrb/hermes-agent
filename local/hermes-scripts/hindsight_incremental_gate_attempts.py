@@ -60,6 +60,22 @@ def requires_binding(path: Path, gate: dict, ledger, manifest: dict) -> bool:
         for name in trace_names) for child in root.iterdir())
 
 
+def report_outputs_match(stdout: dict, disk: dict) -> bool:
+    """Accept the two real writers' optional transport paths, never contradictions.
+
+    Audit persists its self-references; eval adds them only to stdout. If the
+    disk includes either key, require its literal value to match stdout before
+    comparing the complete payload. Exact raw hashes remain independently bound.
+    """
+    paths = {'json_path', 'markdown_path'}
+    if any(key in disk and (type(disk[key]) is not str or disk[key] != stdout.get(key))
+           for key in paths):
+        return False
+    payload = lambda value: {key: item for key, item in value.items() if key not in paths}
+    # Preserve invalid NaN evidence for the separate finite-quality validator.
+    return json.dumps(payload(disk), sort_keys=True) == json.dumps(payload(stdout), sort_keys=True)
+
+
 def validate_legacy_closure(adapter, gate: dict, directory: Path, benchmarks: dict) -> None:
     """Require the original pre-query closure, not a self-authored passing flag."""
     required = [artifact(path) for path in benchmarks.values()]
@@ -88,7 +104,7 @@ def validate_legacy_closure(adapter, gate: dict, directory: Path, benchmarks: di
                     or produced == path or produced.name == 'latest.json'):
                 raise ValueError('legacy report requires exact named disk path in its attempt')
             disk = merge._object(merge._read(produced), 'legacy named disk report')
-            if disk != {k: v for k, v in report.items() if k not in {'json_path', 'markdown_path'}}:
+            if not report_outputs_match(report, disk):
                 raise ValueError('legacy command stdout/report artifact mismatch')
             required.append(artifact(produced))
     expected = {a['path']: a for a in unique_artifacts(required)}
@@ -361,10 +377,7 @@ class GateAttempt:
                 or artifact(Path(disk['path'])) != disk):
             raise ValueError('provenance_missing: exact named child disk report mismatch')
         report = merge._object(merge._read(Path(disk['path'])), 'completed child disk report')
-        stdout_report = {k: v for k, v in result.items() if k not in {'json_path', 'markdown_path'}}
-        # JSON comparison also preserves invalid NaN outputs as blocked evidence;
-        # the independent finite/exact coverage validator must still reject them.
-        if json.dumps(report, sort_keys=True) != json.dumps(stdout_report, sort_keys=True):
+        if not report_outputs_match(result, report):
             raise ValueError('command stdout/report artifact mismatch')
         stdout = Path(value['stdout']['path'])
         if not stdout.exists():
