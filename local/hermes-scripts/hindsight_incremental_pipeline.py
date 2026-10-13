@@ -7,10 +7,12 @@ paid all-history weekly branch is reachable from this entrypoint.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
 import os
 import re
 import stat
+import sys
 import time
 from pathlib import Path
 
@@ -19,6 +21,8 @@ from hindsight_incremental_ledger import IncrementalLedger, PHASES, _private
 from hindsight_incremental_merge import (canonical_hash, load_manifest_artifacts,
     merge_observations, validate_generation, write_generation, _read_json)
 from hindsight_incremental_sources import scan_source_snapshots, digest
+from hindsight_incremental_progress import (active_reporter, record_stage,
+    reporter_context, reporting_run, span, timed)
 from hindsight_offline_retry import RetryDeferred, RetryPolicy, classify_error
 from hindsight_pipeline_common import load_config
 
@@ -36,11 +40,15 @@ def _advance(ledger, batch_id, phase, receipt):
     return ledger.set_phase(batch_id, phase, receipt=_binding(current, **receipt))
 
 
+@timed('seed_state')
 def _seed_state(ledger):
     seed = ledger.initialization_manifest()['seed']
     if seed.get('bank') != ledger.bank:
         raise ValueError('seed_bank_mismatch')
-    rows = _read(ledger.root, seed['artifact_path'], seed['artifact_hash'])
+    with span('seed_read') as counts:
+        rows = _read(ledger.root, seed['artifact_path'], seed['artifact_hash'])
+        if isinstance(rows, list):
+            counts.update(row_count=len(rows))
     if not isinstance(rows, list):
         raise ValueError('seed_state_invalid')
     parent = seed['provenance']
@@ -95,6 +103,7 @@ def _record(report, stage, **values):
     report['stages'].append({'stage': stage, **values})
     print(json.dumps({'stage': stage, **{k: v for k, v in values.items()
           if k not in {'receipt', 'artifact', 'facts'}}}, ensure_ascii=False), flush=True)
+    record_stage(stage, values)
 
 
 def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=False,
@@ -125,6 +134,10 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
     active_batch_id = None
     deferred = False
     used_units = used_chars = 0
+    progress_scope = ExitStack()
+    reporter = None
+    inherited_reporter = active_reporter()
+    progress_scope.enter_context(reporter_context(None))
     try:
         with ledger.locked():
             if hasattr(client, 'begin_run'):
@@ -171,6 +184,12 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                         and b['batch_id'] not in parents_with_children) for b in initial)
                 client.preflight(require_llm=require_llm)
                 _record(report, 'preflight', status='ready')
+            if inherited_reporter is not None and inherited_reporter.owner is ledger:
+                progress_scope.enter_context(reporter_context(inherited_reporter))
+            reporter = progress_scope.enter_context(reporting_run(ledger))
+            record_stage('capture', {'new_batches': len(captured), 'sources': len(snapshots)})
+            if hasattr(client, 'preflight'):
+                record_stage('preflight', {})
             # Open lazily: a frozen publish retry must not open a retain window.
             seen = set()
             while used_units < max_units:
@@ -261,13 +280,16 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
             saved = [b['receipts']['locally_merged']['manifest'] for b in ready
                      if b['receipts'].get('locally_merged')]
             if saved:
-                manifest = validate_generation(Path(saved[0]['manifest_path']))
+                with span('saved_manifest_validate'):
+                    manifest = validate_generation(Path(saved[0]['manifest_path']))
                 ready = [b for b in ready if b['batch_id'] in manifest['consumed_batch_ids']]
             elif ready:
                 parent, seed, _seq = _seed_state(ledger)
-                merged = merge_observations(seed, _typed_delta(ready, ledger))
-                manifest = write_generation(ledger.root / 'canonical', bank=ledger.bank,
-                    parent=parent, observations=merged, consumed_batch_ids=[b['batch_id'] for b in ready])
+                with span('merge', row_count=len(seed)) as counts:
+                    merged = merge_observations(seed, _typed_delta(ready, ledger))
+                    manifest = write_generation(ledger.root / 'canonical', bank=ledger.bank,
+                        parent=parent, observations=merged, consumed_batch_ids=[b['batch_id'] for b in ready])
+                    counts.update(row_count=len(merged))
                 for batch in ready:
                     _advance(ledger, batch['batch_id'], 'locally_merged', {'manifest': manifest})
                 _record(report, 'merge', status='completed', generation_id=manifest['generation_id'])
@@ -277,7 +299,8 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                 first = ledger.get_batch(ready[0]['batch_id'])
                 gate = first['receipts'].get('gated', {}).get('gate')
                 if gate is None:
-                    gate = client.gate(manifest)
+                    with span('gate'):
+                        gate = client.gate(manifest)
                 if not _gate_valid(gate, manifest, ledger.bank):
                     for batch in ready:
                         ledger.defer(batch['batch_id'], error_class='quality_gate',
@@ -288,10 +311,13 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     for batch in ready:
                         _advance(ledger, batch['batch_id'], 'gated', {'gate': gate, 'manifest': manifest})
                     _record(report, 'gate', status='passed')
-                    publication = client.readback_generation(manifest)
-                    if not _published_valid(publication, manifest, ledger.bank):
-                        client.publish_generation(manifest, gate)
+                    with span('readback_generation'):
                         publication = client.readback_generation(manifest)
+                    if not _published_valid(publication, manifest, ledger.bank):
+                        with span('publish_generation'):
+                            client.publish_generation(manifest, gate)
+                        with span('readback_generation'):
+                            publication = client.readback_generation(manifest)
                     if not _published_valid(publication, manifest, ledger.bank):
                         raise ValueError('publish_readback_unverified')
                     _parent, _rows, sequence = _seed_state(ledger)
@@ -307,7 +333,11 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                                                 ('gated', {'gate': gate, 'manifest': manifest}),
                                                 ('published', {'manifest': manifest, 'publication': publication,
                                                                'sequence': sequence + 1})]:
-                                _advance(ledger, parent_id, phase, proof)
+                                operation = {'locally_merged': 'source_parent_merge',
+                                             'gated': 'source_parent_gate',
+                                             'published': 'source_parent_publish'}[phase]
+                                with span(operation, unit_count=1):
+                                    _advance(ledger, parent_id, phase, proof)
                     report['published'] = True
                     _record(report, 'publish', status='readback_verified', generation_id=manifest['generation_id'])
             remaining = [b for b in ledger.list_batches() if b['phase'] != 'published']
@@ -315,6 +345,8 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                           remaining_batches=len(remaining), used_units=used_units, used_chars=used_chars)
     except RetryDeferred as error:
         if active_batch_id is not None and execute:
+            if reporter is not None:
+                reporter.fail(error)
             current = ledger.get_batch(active_batch_id)
             ledger.defer(active_batch_id, error_class=error.error_class,
                 next_retry_at=error.next_retry_at, attempts=current['attempts'] + error.attempts)
@@ -322,46 +354,53 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
         report['status'] = 'deferred'
     except Exception as error:
         category, _transient = classify_error(error)
+        if reporter is not None:
+            reporter.fail(error)
         report['errors'].append({'class': category, 'type': type(error).__name__})
         report['status'] = 'blocked'
     finally:
-        report['core_status'] = report['status']
-        report['calls'] = policy.calls_used
-        report['offline_llm_calls'] = policy.llm_calls_used
-        report['native_paid_calls'] = getattr(client, 'native_paid_calls', None)
-        report['llm_calls'] = getattr(client, 'llm_calls', 0)
-        # PATCH can succeed before its readback raises; the assignment to
-        # window never executes then. The adapter persists ownership first.
-        # Do not reclaim a restored previous run or mutate a read-only plan.
-        opened = getattr(client, '_window', None)
-        if (execute and window is None and isinstance(opened, dict)
-                and opened.get('status') in {'opening', 'active', 'cleanup_pending', 'restoring'}):
-            window = opened
-        if window is not None:
-            try:
-                with ledger.locked():
-                    report['cleanup'] = client.cleanup_window(ledger, window)
-                if report['cleanup'] != 'restored':
+        try:
+            report['core_status'] = report['status']
+            report['calls'] = policy.calls_used
+            report['offline_llm_calls'] = policy.llm_calls_used
+            report['native_paid_calls'] = getattr(client, 'native_paid_calls', None)
+            report['llm_calls'] = getattr(client, 'llm_calls', 0)
+            # PATCH can succeed before its readback raises; the assignment to
+            # window never executes then. The adapter persists ownership first.
+            # Do not reclaim a restored previous run or mutate a read-only plan.
+            opened = getattr(client, '_window', None)
+            if (execute and window is None and isinstance(opened, dict)
+                    and opened.get('status') in {'opening', 'active', 'cleanup_pending', 'restoring'}):
+                window = opened
+            if window is not None:
+                try:
+                    with ledger.locked(), span('cleanup'):
+                        report['cleanup'] = client.cleanup_window(ledger, window)
+                    if report['cleanup'] != 'restored':
+                        report['status'] = 'cleanup_pending'
+                except Exception as error:
+                    if reporter is not None:
+                        reporter.fail(error)
+                    report['cleanup'] = 'pending'
                     report['status'] = 'cleanup_pending'
-            except Exception as error:
-                report['cleanup'] = 'pending'
-                report['status'] = 'cleanup_pending'
-                report['errors'].append({'class': 'cleanup', 'type': type(error).__name__})
-        report['finished_at'] = clock()
-        report['network_calls'] = getattr(client, 'network_calls', policy.calls_used)
-        report['network_calls_scope'] = 'native_only_excludes_eval_and_embeddings'
-        report['end_to_end_network_calls'] = None
-        if report['optional_tails']['wiki']['requested']:
-            # The old tail scans/re-extracts history. Until a bounded replacement
-            # is verified, report it explicitly rather than silently ignore the
-            # flag or claim a wiki completion from core success.
-            tail = report['optional_tails']['wiki']
-            tail.update(status='degraded' if report['status'] in {'completed', 'no_op', 'plan'}
-                        else 'not_run_core_incomplete', reason='bounded_tail_not_implemented')
-            _record(report, 'optional_tail', name='wiki', status=tail['status'], reason=tail['reason'])
-        if execute:
-            path, checksum = _freeze(ledger.root, report, 'run-report')
-            report['report_path'], report['report_sha256'] = path, checksum
+                    report['errors'].append({'class': 'cleanup', 'type': type(error).__name__})
+            report['finished_at'] = clock()
+            report['network_calls'] = getattr(client, 'network_calls', policy.calls_used)
+            report['network_calls_scope'] = 'native_only_excludes_eval_and_embeddings'
+            report['end_to_end_network_calls'] = None
+            if report['optional_tails']['wiki']['requested']:
+                # The old tail scans/re-extracts history. Until a bounded replacement
+                # is verified, report it explicitly rather than silently ignore the
+                # flag or claim a wiki completion from core success.
+                tail = report['optional_tails']['wiki']
+                tail.update(status='degraded' if report['status'] in {'completed', 'no_op', 'plan'}
+                            else 'not_run_core_incomplete', reason='bounded_tail_not_implemented')
+                _record(report, 'optional_tail', name='wiki', status=tail['status'], reason=tail['reason'])
+            if execute:
+                path, checksum = _freeze(ledger.root, report, 'run-report')
+                report['report_path'], report['report_sha256'] = path, checksum
+        finally:
+            progress_scope.__exit__(*sys.exc_info())
     return report
 
 

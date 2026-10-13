@@ -20,6 +20,7 @@ import sys
 import uuid
 
 import hindsight_incremental_merge as merge
+from hindsight_incremental_progress import active_reporter, reporter_context, span, timed
 from hindsight_offline_v2_gate import evaluate_pair, evaluate_conflict_audit
 from hindsight_offline_v2_rebuild import eval_environment, run_json as default_run_json
 
@@ -44,12 +45,16 @@ def _freeze(path: Path, value: dict) -> dict:
 
 
 def _rows_from_cursor(cur) -> list[dict]:
-    rows = [r['row'] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
+    with span('rows_fetch') as counts:
+        rows = [r['row'] if isinstance(r, dict) else r[0] for r in cur.fetchall()]
+        counts.update(row_count=len(rows))
     # JSONB conversion in SQL, not default=str, defines the immutable representation.
-    merge.canonical_hash(rows)
+    with span('rows_hash', row_count=len(rows)):
+        merge.canonical_hash(rows)
     return sorted(rows, key=lambda r: str(r['id']))
 
 
+@timed('read_remote')
 def _read_remote(conn, bank: str, document_ids: list[str] | None = None, *, for_update=False) -> tuple[list, list]:
     # NULL embeddings stay explicit. to_jsonb preserves arbitrary future columns,
     # arrays, timestamps, unknown metadata and complete vector text without parsing.
@@ -62,16 +67,21 @@ def _read_remote(conn, bank: str, document_ids: list[str] | None = None, *, for_
         params = (bank, document_ids)
     lock = ' FOR UPDATE' if for_update else ''
     with conn.cursor() as cur:
-        cur.execute(f'SELECT to_jsonb(d) AS row FROM documents d '
-                    f'WHERE bank_id=%s AND {doc_where} ORDER BY id{lock}', params)
-        docs = _rows_from_cursor(cur)
-        cur.execute("SELECT (to_jsonb(m) - 'embedding') || jsonb_build_object("
-                    "'embedding', embedding::text, 'embedding_dimension', vector_dims(embedding)) AS row "
-                    f'FROM memory_units m WHERE bank_id=%s AND {unit_where} ORDER BY id{lock}', params)
-        units = _rows_from_cursor(cur)
+        with span('remote_documents_fetch') as counts:
+            cur.execute(f'SELECT to_jsonb(d) AS row FROM documents d '
+                        f'WHERE bank_id=%s AND {doc_where} ORDER BY id{lock}', params)
+            docs = _rows_from_cursor(cur)
+            counts.update(document_count=len(docs))
+        with span('remote_units_fetch') as counts:
+            cur.execute("SELECT (to_jsonb(m) - 'embedding') || jsonb_build_object("
+                        "'embedding', embedding::text, 'embedding_dimension', vector_dims(embedding)) AS row "
+                        f'FROM memory_units m WHERE bank_id=%s AND {unit_where} ORDER BY id{lock}', params)
+            units = _rows_from_cursor(cur)
+            counts.update(unit_count=len(units))
     return docs, units
 
 
+@timed('remote_identity')
 def _remote_identity(bank: str, docs: list, units: list) -> dict:
     ids = [d['id'] for d in docs]
     if len(set(ids)) != len(ids) or len({u['id'] for u in units}) != len(units):
@@ -87,10 +97,15 @@ def _remote_identity(bank: str, docs: list, units: list) -> dict:
         raise ValueError('authoritative seed document content hash mismatch')
     if any(not isinstance(u.get('text'), str) or u.get('fact_type') != 'observation' or not _valid_vector(u) for u in units):
         raise ValueError('seed requires non-NULL 1024-dimensional observations')
+    with span('remote_documents_hash', document_count=len(docs)):
+        documents_hash = merge.canonical_hash(docs)
+    with span('remote_units_hash', unit_count=len(units)):
+        units_hash = merge.canonical_hash(units)
+    with span('remote_combined_hash', document_count=len(docs), unit_count=len(units)):
+        combined_hash = merge.canonical_hash({'documents': docs, 'memory_units': units})
     return {'bank': bank, 'document_ids': ids, 'document_count': len(docs),
-            'observation_count': len(units), 'documents_sha256': merge.canonical_hash(docs),
-            'observations_sha256': merge.canonical_hash(units),
-            'row_fingerprint_sha256': merge.canonical_hash({'documents': docs, 'memory_units': units})}
+            'observation_count': len(units), 'documents_sha256': documents_hash,
+            'observations_sha256': units_hash, 'row_fingerprint_sha256': combined_hash}
 
 
 def _valid_vector(row: dict) -> bool:
@@ -274,13 +289,15 @@ module['main']()
     @contextmanager
     def _readonly(self):
         # Never include a DSN or potentially secret driver exception in reports.
+        with span('readonly_connect'):
+            try:
+                conn = self.connect(self.dsn)
+            except Exception:
+                raise RuntimeError('canonical SQL connection unavailable') from None
         try:
-            conn = self.connect(self.dsn)
-        except Exception:
-            raise RuntimeError('canonical SQL connection unavailable') from None
-        try:
-            conn.set_session(readonly=True, isolation_level='REPEATABLE READ', autocommit=False)
-            yield conn
+            with span('readonly_transaction'):
+                conn.set_session(readonly=True, isolation_level='REPEATABLE READ', autocommit=False)
+                yield conn
         finally:
             conn.rollback()
             conn.close()
@@ -303,6 +320,7 @@ module['main']()
         _freeze(path, payload)
         return payload
 
+    @timed('initial_seed')
     def _initial_seed(self, ledger) -> tuple[list[dict], dict, dict]:
         if ledger.bank != self.bank:
             raise ValueError('publication ledger bank mismatch')
@@ -313,7 +331,12 @@ module['main']()
         if not path.is_relative_to(merge._absolute(ledger.root)):
             raise ValueError('seed artifact outside private ledger root')
         expected_hash = merge._hash(seed.get('artifact_hash'), 'initial seed artifact')
-        value = merge._read_json(path, expected_hash=expected_hash)
+        with span('seed_read') as counts:
+            value = merge._read_json(path, expected_hash=expected_hash)
+            if isinstance(value, list):
+                counts.update(row_count=len(value))
+            elif isinstance(value, dict) and isinstance(value.get('observations'), list):
+                counts.update(row_count=len(value['observations']))
         provenance, remote = seed['provenance'], seed['remote_seed']
         merge._parent(provenance, self.bank)
         if isinstance(value, dict):
@@ -342,12 +365,16 @@ module['main']()
             raise ValueError('authoritative seed provenance hash mismatch')
         return rows, provenance, remote
 
+    @timed('candidate')
     def _candidate(self, manifest: dict, ledger) -> tuple[dict, list, list, list, dict]:
         seed, provenance, remote = self._initial_seed(ledger)
         root = merge._absolute(manifest['root'])
         if not root.is_relative_to(merge._absolute(ledger.root)):
             raise ValueError('candidate outside private ledger root')
-        bound, _cards, rows = merge.load_manifest_artifacts(root, bank=self.bank)
+        with span('candidate_load') as counts:
+            bound, _cards, rows = merge.load_manifest_artifacts(root, bank=self.bank)
+            if rows is not None:
+                counts.update(row_count=len(rows))
         if bound != manifest or rows is None:
             raise ValueError('candidate differs from exact frozen manifest')
         parent = manifest['parent']
@@ -355,7 +382,10 @@ module['main']()
             parent_root = merge._absolute(parent['root'])
             if not parent_root.is_relative_to(merge._absolute(ledger.root)):
                 raise ValueError('parent outside private ledger root')
-            parent_bound, _, previous = merge.load_manifest_artifacts(parent_root, bank=self.bank)
+            with span('parent_load') as counts:
+                parent_bound, _, previous = merge.load_manifest_artifacts(parent_root, bank=self.bank)
+                if previous is not None:
+                    counts.update(row_count=len(previous))
             if parent_bound != parent or previous is None:
                 raise ValueError('parent state mismatch')
             # Bind every ancestor to this ledger's authoritative initial export.
@@ -547,6 +577,7 @@ module['main']()
             self._validate_gate(manifest, receipt, ledger)
         return receipt
 
+    @timed('validate_gate')
     def _validate_gate(self, manifest: dict, gate: dict, ledger) -> None:
         if (gate.get('bank') != self.bank or gate.get('manifest_sha256') != manifest['manifest_sha256']
                 or gate.get('root') != manifest['root'] or gate.get('parent_sha256') != manifest['parent_sha256']
@@ -626,6 +657,7 @@ module['main']()
             if _artifact(Path(item['path'])) != item:
                 raise ValueError('frozen gate dependency hash mismatch')
 
+    @timed('seed_preserved')
     def _seed_preserved(self, conn, remote: dict, *, for_update=False) -> bool:
         docs, units = _read_remote(conn, self.bank, remote['document_ids'], for_update=for_update)
         try:
@@ -658,6 +690,7 @@ module['main']()
             and unit.get('text') == self.publisher.observation_text(obs, card, lossless=True)
             and all((unit.get('metadata') or {}).get(k) == v for k, v in expected.items()))
 
+    @timed('readback')
     def _readback(self, conn, manifest, ledger, *, for_update=False):
         _, rows, previous, delta, remote = self._candidate(manifest, ledger)
         all_cards = _delta_cards([r for r in rows if r.get('kind') != 'opaque_legacy'], self.publisher)
@@ -701,7 +734,8 @@ module['main']()
                 verified = verified and matches_candidate
                 ready = ready and (matches_candidate or matches_parent or (prior is None and not doc and not group))
         state = {'bank': self.bank, 'manifest_sha256': manifest['manifest_sha256'], 'documents': docs, 'memory_units': units}
-        state['state_sha256'] = merge.canonical_hash(state)
+        with span('remote_state_hash', document_count=len(docs), unit_count=len(units)):
+            state['state_sha256'] = merge.canonical_hash(state)
         # A generation already frozen after commit may not be silently repaired or
         # used as a new baseline after an unrelated writer changed any field/vector.
         if self._state_path(manifest, ledger).exists() and self._load_state(manifest, ledger) != state:
@@ -714,6 +748,7 @@ module['main']()
             'full_typed_document_count': len(ids), 'remote_document_count': len(docs), 'remote_observation_count': len(units),
             'incremental_unit_ids': unit_ids, 'remote_state_sha256': state['state_sha256']}, state
 
+    @timed('readback_generation')
     def readback_generation(self, manifest: dict, *, ledger) -> dict:
         with self._readonly() as conn:
             receipt, state = self._readback(conn, manifest, ledger)
@@ -721,6 +756,7 @@ module['main']()
             _freeze(self._state_path(manifest, ledger), state)
         return receipt
 
+    @timed('publish_generation')
     def publish_generation(self, manifest: dict, gate: dict, *, ledger) -> dict:
         manifest, _, _, cards, remote = self._candidate(manifest, ledger)
         self._validate_gate(manifest, gate, ledger)
@@ -735,6 +771,8 @@ module['main']()
             raise ValueError('authoritative legacy seed changed; publication blocked')
         if not readback['write_ready']:
             raise ValueError('frozen typed parent changed or removed; publication blocked')
+        reporter = active_reporter()
+        @timed('prewrite_check', reporter=reporter)
         def prewrite(conn):
             # FOR UPDATE on every declared document also fences new child rows
             # through PostgreSQL's document FK KEY SHARE lock; units are locked
@@ -744,20 +782,30 @@ module['main']()
                 raise ValueError('seed or typed parent changed before transaction')
             self._candidate(manifest, ledger)
             self._validate_gate(manifest, gate, ledger)
+        @timed('precommit_check', reporter=reporter)
         def precommit(conn):
             current, _ = self._readback(conn, manifest, ledger)
             if not current['readback_verified']:
                 raise ValueError('seed or full candidate drift before commit')
             self._validate_gate(manifest, gate, ledger)
+        def embeddings(texts, *args, **kwargs):
+            with reporter_context(reporter), span('embeddings', requested_count=len(texts)) as counts:
+                result = self.embeddings(texts, *args, **kwargs)
+                # The native API returns (vectors, provider). Count only the
+                # outer list; never traverse/log vector values or change errors.
+                if isinstance(result, tuple) and result and isinstance(result[0], list):
+                    counts.update(received_count=len(result[0]))
+                return result
         try:
-            report = self.publisher.publish(cards, dsn=self.dsn, bank=self.bank, mode='publish', replace=False,
+            with span('publisher_publish', document_count=len(cards)):
+                report = self.publisher.publish(cards, dsn=self.dsn, bank=self.bank, mode='publish', replace=False,
                 embedding_provider='ollama', embedding_model=str(self.config.get('embedding_model') or 'bge-m3'),
                 embedding_base_url=str(self.config.get('embedding_base_url') or self.publisher.DEFAULT_EMBEDDING_BASE_URL),
                 embedding_batch_size=int(self.config.get('embedding_batch_size', 128)),
                 backup_dir=merge._absolute(ledger.root) / 'publication-backups',
                 generation_sha256=manifest['manifest_sha256'], lossless=True,
                 backup_document_ids=readback['target_document_ids'], required_embedding_dimension=1024,
-                connect_fn=self.connect, embedding_fn=self.embeddings, execute_values_fn=self.execute_values,
+                connect_fn=self.connect, embedding_fn=embeddings, execute_values_fn=self.execute_values,
                 prewrite_check=prewrite, precommit_check=precommit, incremental=True,
                 incremental_unit_ids={k: v for k, v in readback['incremental_unit_ids'].items()
                                       if k in readback['target_document_ids']})
