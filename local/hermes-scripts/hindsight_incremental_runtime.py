@@ -674,6 +674,8 @@ class ArrivalRuntime:
         content = ('Only the following frozen new-document facts are evidence. Do not retrieve or infer history. '
                    'Each canonical_observations row MUST include nonempty id, topic, insight, type, applicability, '
                    'evidence_ids (exact input fact/document IDs), confidence, valid_from and valid_until. '
+                   'type MUST be one of: ' + ', '.join(sorted(OBS_TYPES)) + '. '
+                   'confidence MUST be one of: high, medium, low. '
                    'Keep source/evidence identifiers exactly; do not replace them with source indexes.\n' +
                    json.dumps(facts, ensure_ascii=False, sort_keys=True))
         unit = reflect.ReflectUnit(scope='daily', period='arrival-incremental', topic='new-arrival-facts',
@@ -681,39 +683,56 @@ class ArrivalRuntime:
             date_range_start=min(f['created_at'] for f in facts), date_range_end=max(f['created_at'] for f in facts))
         budget = budget_for(retry_policy)
         before = budget.calls
+        attempts = max(1, budget.policy.max_attempts)
         try:
-            obj, _raw = reflect.call_llm(unit, model=profile['model'], base_url=profile['base_url'],
-                api_key_env=profile['api_key_env'], label=profile['label'],
-                response_format=profile.get('response_format', True), emit_observations=True,
-                output_language=self.config.get('output_language', 'auto'), retry_policy=budget)
-        except SystemExit:
-            raise RemoteCallError('llm_configuration') from None
+            for attempt in range(attempts):
+                try:
+                    obj, _raw = reflect.call_llm(unit, model=profile['model'], base_url=profile['base_url'],
+                        api_key_env=profile['api_key_env'], label=profile['label'],
+                        response_format=profile.get('response_format', True), emit_observations=True,
+                        output_language=self.config.get('output_language', 'auto'), retry_policy=budget)
+                except SystemExit:
+                    raise RemoteCallError('llm_configuration') from None
+                try:
+                    observations = self._summary_observations(facts, obj)
+                    artifact = {'bank': self.bank, 'canonical_observations': observations,
+                                'source_facts': facts, 'source_ids': [f['id'] for f in facts],
+                                'source_documents': sorted({f['document_id'] for f in facts}), 'llm_json': obj}
+                    self.validate_summary(artifact)
+                except RemoteCallError as error:
+                    # A local schema failure consumed no remote write: re-sample.
+                    # Only a repeated failure blocks the batch for review.
+                    if error.error_class == 'invalid_output' and attempt + 1 < attempts:
+                        continue
+                    raise
+                return {'items': [{'document_id': items[0]['document_id'],
+                                   'content': json.dumps(artifact, ensure_ascii=False, sort_keys=True),
+                                   'timestamp': facts[0]['created_at'], 'metadata': {'bank': self.bank, 'kind': 'daily_summary'}}],
+                        'artifact': artifact}
         finally:
             self.llm_calls += budget.calls - before
+
+    def _summary_observations(self, facts, obj):
+        """Rows with our-derived identity fields overwritten; the evidence
+        binding is the one gate kept: every cited id must exist in the frozen
+        facts.  A model-invented bank/source_* value is replaced, not trusted."""
         if not isinstance(obj, dict) or not isinstance(obj.get('canonical_observations'), list):
             raise RemoteCallError('invalid_output')
-        observations = copy.deepcopy(obj['canonical_observations'])
         fact_ids = {f['id'] for f in facts}
         docs = {f['document_id'] for f in facts}
+        observations = copy.deepcopy(obj['canonical_observations'])
         for row in observations:
-            if not isinstance(row, dict) or row.get('bank', self.bank) != self.bank:
+            if not isinstance(row, dict):
                 raise RemoteCallError('invalid_output')
             row['bank'] = self.bank
             evidence = row.get('evidence_ids')
             if not isinstance(evidence, list) or not evidence or any(e not in fact_ids | docs for e in evidence):
                 raise RemoteCallError('invalid_output')
             used = [f for f in facts if f['id'] in evidence or f['document_id'] in evidence]
-            row.setdefault('source_documents', sorted({f['document_id'] for f in used}))
-            row.setdefault('source_ids', list(evidence))
-            row.setdefault('source_facts', copy.deepcopy(used))
-        artifact = {'bank': self.bank, 'canonical_observations': observations,
-                    'source_facts': facts, 'source_ids': [f['id'] for f in facts],
-                    'source_documents': sorted(docs), 'llm_json': obj}
-        self.validate_summary(artifact)
-        return {'items': [{'document_id': items[0]['document_id'],
-                           'content': json.dumps(artifact, ensure_ascii=False, sort_keys=True),
-                           'timestamp': facts[0]['created_at'], 'metadata': {'bank': self.bank, 'kind': 'daily_summary'}}],
-                'artifact': artifact}
+            row['source_documents'] = sorted({f['document_id'] for f in used})
+            row['source_ids'] = list(evidence)
+            row['source_facts'] = copy.deepcopy(used)
+        return observations
 
     def validate_summary(self, artifact):
         if not isinstance(artifact, dict) or artifact.get('bank') != self.bank:

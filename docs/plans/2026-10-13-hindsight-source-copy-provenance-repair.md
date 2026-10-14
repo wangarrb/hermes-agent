@@ -85,3 +85,18 @@ identical native call counts (40 calls, 8 POSTs). The run status is
 `completed` when nothing remains; deferrals resolved in-run no longer force
 `deferred`.
 
+## 18. Generation resampling and identity-field overwrite (user-directed)
+
+A schema-invalid LLM sample for a daily_summary child is a local failure that
+consumed no remote write: it must not permanently block the batch. Changes in
+`ArrivalRuntime.generate_summary`:
+- up to `retry.max_attempts` samples per generation; only a repeated
+  `invalid_output` blocks the batch for review (previously the first bad
+  sample blocked it; 25 children parked in one night before this fix);
+- model-invented `bank` / `source_ids` / `source_documents` row values are
+  OVERWRITTEN with our derived identity (bank is ours; source ids are the
+  exact evidence list); previously a wrong value was rejected outright;
+- the prompt lists the allowed `type` enum and the confidence enum;
+- the evidence binding is unchanged and remains the one gate: every cited id
+  must exist in the frozen facts.
+

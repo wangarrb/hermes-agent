@@ -873,3 +873,56 @@ def test_exhausted_request_cap_does_not_create_unknown_unattempted_trigger(tmp_p
     lease = json.loads((ledger.root / 'runtime-window.json').read_text())
     assert lease['scopes'][rest.scope[0]]['trigger_unknown'] is False, (
         'No request was attempted, but recovery would now require finding an impossible active operation')
+
+
+def test_summary_generation_resamples_invalid_output_then_succeeds(tmp_path, monkeypatch):
+    runtime, _, _ = make_runtime(tmp_path)
+    import hindsight_minimax_import as profiles
+    import offline_hindsight_reflect_consolidate as reflect
+    monkeypatch.setattr(profiles, 'get_llm_profile', lambda name: {'model': 'M', 'base_url': 'http://fake/v1',
+                                                                 'label': 'L', 'api_key_env': 'FAKE'})
+    bad = {'canonical_observations': [observation() | {'confidence': 'moderate'}]}
+    good = {'canonical_observations': [observation()]}
+    calls = []
+    def llm(unit, **kwargs):
+        kwargs['retry_policy'].charge()
+        calls.append(1)
+        return (bad if len(calls) == 1 else good), 'raw'
+    monkeypatch.setattr(reflect, 'call_llm', llm)
+    out = runtime.generate_summary(frozen_input(), retry_policy=policy())
+    assert len(calls) == 2
+    assert runtime.validate_summary(out['artifact']) is True
+
+
+def test_summary_generation_exhausts_resamples_then_raises(tmp_path, monkeypatch):
+    runtime, _, _ = make_runtime(tmp_path)
+    import hindsight_minimax_import as profiles
+    import offline_hindsight_reflect_consolidate as reflect
+    monkeypatch.setattr(profiles, 'get_llm_profile', lambda name: {'model': 'M', 'base_url': 'http://fake/v1',
+                                                                 'label': 'L', 'api_key_env': 'FAKE'})
+    calls = []
+    def llm(unit, **kwargs):
+        kwargs['retry_policy'].charge()
+        calls.append(1)
+        return {'canonical_observations': [observation() | {'confidence': 'moderate'}]}, 'raw'
+    monkeypatch.setattr(reflect, 'call_llm', llm)
+    from hindsight_offline_retry import RemoteCallError
+    with pytest.raises(RemoteCallError, match='invalid_output'):
+        runtime.generate_summary(frozen_input(), retry_policy=policy(max_attempts=2))
+    assert len(calls) == 2
+
+
+def test_summary_identity_fields_are_overwritten_not_trusted(tmp_path, monkeypatch):
+    runtime, _, _ = make_runtime(tmp_path)
+    import hindsight_minimax_import as profiles
+    import offline_hindsight_reflect_consolidate as reflect
+    monkeypatch.setattr(profiles, 'get_llm_profile', lambda name: {'model': 'M', 'base_url': 'http://fake/v1',
+                                                                 'label': 'L', 'api_key_env': 'FAKE'})
+    obj = {'canonical_observations': [observation() | {'bank': 'wrong-bank', 'source_ids': ['bogus'],
+                                                        'source_documents': ['bogus-doc']}]}
+    monkeypatch.setattr(reflect, 'call_llm', lambda *a, **k: (obj, 'raw'))
+    out = runtime.generate_summary(frozen_input(), retry_policy=policy())
+    row = out['artifact']['canonical_observations'][0]
+    assert row['bank'] == 'bank-A'
+    assert row['source_ids'] == ['fact-a']
+    assert row['source_documents'] == [batch()['document_id']]
