@@ -957,6 +957,9 @@ def validate_source_unknown_policy(policy, *, physical_baseline, bank, hermes_ho
 
     Deployment chooses the approved exact rows explicitly. No site IDs, ranges,
     time filters, or inferred completion enter this generic artifact schema.
+    Sessions created after the descriptor stay admissible as future sessions;
+    the exact row binding, drift and coverage checks at scan time remain the
+    only consumption path, and baseline rows stay forbidden.
     """
     from hindsight_incremental_merge import canonical_hash
 
@@ -982,7 +985,6 @@ def validate_source_unknown_policy(policy, *, physical_baseline, bank, hermes_ho
         if (profile is None or profile['sqlite'] is None
                 or scope['feed_epoch'] != profile['feed_epoch']
                 or scope['source_epoch'] != profile['sqlite']['epoch']
-                or sid not in {s['session_id'] for s in profile['sqlite']['sessions']}
                 or not isinstance(scope['rows'], list) or not scope['rows']):
             raise ValueError('source unknown policy feed/epoch/session mismatch')
         old_ids = {r['id'] for r in profile['sqlite']['rows']}

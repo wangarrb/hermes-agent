@@ -98,6 +98,37 @@ def test_exact_three_unknown_bindings_are_not_input_or_completion(tmp_path):
         next(s for s in src.physical_baseline_snapshots(baseline) if s['profile'] == 'planner')['source_hash_before'])
 
 
+def test_post_baseline_session_rows_admissible_only_by_exact_exclusion(tmp_path):
+    """A session created after the descriptor is future; its exact ambiguous
+    rows may be explicitly excluded, and the kept visible twin is captured once."""
+    src, ld, delivery, flow, home, db, baseline, ledger, policy = fixture(tmp_path)
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO sessions VALUES ('new-session',200,NULL,NULL,'cli')")
+        con.execute("INSERT INTO messages VALUES (21,'new-session','user',201.0,'New measured result',0,0,21,NULL)")
+        con.execute('INSERT INTO messages SELECT 31,session_id,role,timestamp,content,1,0,31,display_identity'
+                    ' FROM messages WHERE id=21')
+        con.row_factory = sqlite3.Row
+        record = src._physical_record(dict(con.execute('SELECT * FROM messages WHERE id=21').fetchone()), sqlite_row=True)
+    with pytest.raises(src.SourceChangedError, match='ambiguous'):
+        src.scan_source_snapshots(home, physical_baseline=baseline)
+    profile = next(p for p in baseline['profiles'] if p['profile'] == 'planner')
+    scope = {'profile': 'planner', 'feed_epoch': profile['feed_epoch'],
+             'source_epoch': profile['sqlite']['epoch'], 'session_id': 'new-session', 'rows': [record]}
+    combined = copy.deepcopy(policy)
+    combined['scopes'].append(scope)
+    register(ledger, combined)
+    snapshots = scan(src, home, baseline, combined)
+    messages = flatten(snapshots)
+    assert len(messages) == 1 and messages[0]['content'] == 'New measured result'
+    assert len([b for s in snapshots for b in ledger.capture_snapshot(s)]) == 1
+    assert [b for s in snapshots for b in ledger.capture_snapshot(s)] == []
+    # Live drift of the excluded row still blocks.
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE messages SET content='Changed' WHERE id=21")
+    with pytest.raises(src.SourceChangedError, match='binding drift'):
+        scan(src, home, baseline, combined)
+
+
 def test_registration_is_explicit_private_immutable_and_readback_bound(tmp_path):
     src, ld, delivery, flow, home, db, baseline, ledger, policy = fixture(tmp_path)
     original = ledger.initialization_manifest()
