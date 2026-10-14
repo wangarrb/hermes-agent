@@ -990,3 +990,38 @@ def test_physical_artifact_change_after_validation_rolls_back_entire_initializat
     with pytest.raises(api().LedgerIntegrityError):
         initialize_physical(ledger, reference)
     assert_no_initialization(ledger)
+
+def test_ledger_write_waits_for_transient_reader_and_succeeds(tmp_path):
+    """A short-lived readonly reader (monitor) must not fail a producer commit."""
+    import threading
+    ledger_mod = importlib.import_module('hindsight_incremental_ledger')
+    ledger = ledger_mod.IncrementalLedger(tmp_path / 'ledger', 'A', create=True)
+    ready = threading.Event()
+    release = threading.Event()
+
+    def reader():
+        con = sqlite3.connect(ledger.db_path.as_uri() + '?mode=ro', uri=True, timeout=1)
+        try:
+            con.execute('BEGIN')
+            con.execute('SELECT 1 FROM meta').fetchone()
+            ready.set()
+            release.wait(30)
+        finally:
+            con.rollback()
+            con.close()
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    assert ready.wait(10)
+    timer = threading.Timer(1.5, release.set)
+    timer.start()
+    try:
+        with ledger.locked(), ledger._connection(write=True, initialized=False) as con:
+            ledger._put(con, 'meta', 'probe', {'ok': True})
+    finally:
+        release.set()
+        timer.cancel()
+        thread.join(10)
+    assert not thread.is_alive()
+    with ledger._connection(initialized=False) as con:
+        assert ledger._read(con, 'meta', 'probe') == {'ok': True}

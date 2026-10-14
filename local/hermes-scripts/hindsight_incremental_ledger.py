@@ -159,7 +159,10 @@ class IncrementalLedger:
     def _connection(self, *, write=False, initialized=True):
         self._check_paths()
         mode = 'rw' if write else 'ro'
-        con = sqlite3.connect(self.db_path.as_uri() + '?mode=' + mode, uri=True, timeout=0)
+        # Bounded busy wait: a transient readonly reader (the five-minute
+        # monitor) must not fail a producer commit; producer exclusivity is
+        # still enforced by the flock, never by an instant SQLite timeout.
+        con = sqlite3.connect(self.db_path.as_uri() + '?mode=' + mode, uri=True, timeout=60)
         try:
             con.execute('PRAGMA synchronous=FULL')
             if not write:
