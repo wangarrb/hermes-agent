@@ -43,12 +43,18 @@ def _fail(code) -> NoReturn:
     raise RemoteCallError(code)
 
 
+def _stat_key(info):
+    # Content-relevant identity only: atime is access metadata that relatime
+    # updates on a plain read and must not be reported as a source change.
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def _file_bytes(path, started):
     before = path.stat()
     if path.is_symlink() or max(before.st_mtime, before.st_ctime) > started:
         _fail('native_source_changed_since_start')
     raw = path.read_bytes()
-    if path.stat() != before:
+    if _stat_key(path.stat()) != _stat_key(before):
         _fail('native_source_changed_during_probe')
     return raw
 

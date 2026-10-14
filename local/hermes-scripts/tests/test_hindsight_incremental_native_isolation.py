@@ -282,6 +282,20 @@ def test_source_changed_after_boot_is_never_a_loaded_code_attestation(tmp_path):
         mod._file_bytes(source, started)
 
 
+def test_relatime_access_bump_is_not_a_source_change(tmp_path):
+    """Reading the file may update atime under relatime; that is access
+    metadata, not a content change, and must not fail the probe."""
+    import os
+    import time
+    mod = isolation_module()
+    source = tmp_path / 'audited_relatime.py'
+    source.write_text('trusted fixture')
+    now = time.time()
+    os.utime(source, (now - 2 * 86400, now - 3 * 86400))
+    started = now + 1
+    assert mod._file_bytes(source, started) == b'trusted fixture'
+
+
 def test_real_runtime_noop_never_invokes_any_native_gate_or_network(tmp_path, monkeypatch):
     from test_hindsight_incremental_pipeline import modules, snapshot
     src, ld, delivery, flow = modules()
