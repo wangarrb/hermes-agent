@@ -81,7 +81,7 @@ class Runtime:
                  'document_id': batch['document_id'], 'text': 'A verified new collision avoidance fact.',
                  'type': 'world', 'created_at': '2026-10-11T13:00:00+00:00'}]
 
-    def consolidate_batch(self, batch, policy):
+    def consolidate_batch(self, batch, policy, *, single_poll=False):
         return {'bank': self.bank, 'scope': [f'arrival-batch:{batch["batch_id"]}'],
                 'pending_in_scope': 0, 'failed_in_scope': 0, 'operation_ids': [],
                 'legacy_pending': 56, 'ready': True}
@@ -581,10 +581,10 @@ def test_native_deferral_persists_exact_retry_and_blocks_unfinished_parent_publi
     from hindsight_offline_retry import RetryDeferred
     runtime = Runtime(ledger)
     original = runtime.consolidate_batch
-    def postpone_source(batch, policy):
+    def postpone_source(batch, policy, *, single_poll=False):
         if batch['kind'] == 'source':
             raise RetryDeferred('call_cap', next_retry_at=99999999999)
-        return original(batch, policy)
+        return original(batch, policy, single_poll=single_poll)
     runtime.consolidate_batch = postpone_source
     out = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
         source_reader=lambda *_a, **_k: [snapshot(src, 2)], execute=True)
@@ -667,3 +667,87 @@ def test_real_cli_records_requested_mode_and_wiki_lane(setup, monkeypatch, capsy
     assert rc == 0 and out['mode'] == 'full'
     assert out['optional_tails']['wiki']['requested'] is True
     assert out['optional_tails']['wiki']['status'] != 'completed'
+
+
+class FakeClock:
+    def __init__(self):
+        self.value = 1000.0
+    def now(self):
+        return self.value
+    def sleep(self, seconds):
+        self.value += seconds
+
+
+def snapshot_keyed(src, key, count=1):
+    messages = []
+    for i in range(count):
+        row = {'role': 'user', 'timestamp': f'2026-10-11T12:{i:02d}:00+00:00',
+               'origin': f'message-{key}-{i}',
+               'content': f'New collision avoidance finding {key}-{i}: keep the measured evidence.'}
+        row['event_id'] = src.digest(row)
+        messages.append(row)
+    value = {'source_key': f'default:session-{key}', 'source_epoch': f'epoch-{key}', 'profile': 'default',
+             'messages': messages, 'source_hash_before': src.digest(messages), 'source_hash_after': src.digest(messages)}
+    value['snapshot_hash'] = src.snapshot_hash(value)
+    return value
+
+
+class PipelinedRuntime(Runtime):
+    """Operations complete after N polls; records the exact call order."""
+    def __init__(self, ledger, *, polls_to_complete=1, **kw):
+        super().__init__(ledger, **kw)
+        self.polls_to_complete = polls_to_complete
+        self.operation_polls = {}
+        self.call_log = []
+
+    def retain_items(self, items, *, async_mode=True, operation_id=None, timeout=None):
+        ack = super().retain_items(items, async_mode=async_mode, operation_id=operation_id, timeout=timeout)
+        self.operation_polls.setdefault(operation_id, 0)
+        self.call_log.append(('post', operation_id))
+        return ack
+
+    def get_operation(self, operation_id, timeout=None):
+        if operation_id not in self.operations:
+            self.call_log.append(('poll', operation_id))
+            return {'operation_id': operation_id, 'status': 'not_found'}
+        self.operation_polls[operation_id] += 1
+        done = self.operation_polls[operation_id] >= self.polls_to_complete
+        self.call_log.append(('complete' if done else 'poll', operation_id))
+        if done:
+            return self.operations[operation_id]
+        return {'operation_id': operation_id, 'bank_id': self.bank, 'status': 'pending'}
+
+    def consolidate_batch(self, batch, policy, *, single_poll=False):
+        return {'bank': self.bank, 'scope': [f'arrival-batch:{batch["batch_id"]}'],
+                'pending_in_scope': 0, 'failed_in_scope': 0, 'operation_ids': [],
+                'legacy_pending': 56, 'ready': True}
+
+
+def test_heavy_load_posts_batches_before_earlier_operations_complete(setup):
+    src, ledger, flow, cfg = setup
+    runtime = PipelinedRuntime(ledger, polls_to_complete=3)
+    cfg = dict(cfg, incremental={'max_inflight_units': 3})
+    reader = lambda *_a, **_k: [snapshot_keyed(src, k) for k in ('a', 'b', 'c')]
+    report = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                  source_reader=reader, execute=True)
+    assert report['status'] == 'completed', report
+    log = runtime.call_log
+    posts = [i for i, entry in enumerate(log) if entry[0] == 'post']
+    first_complete = next(i for i, entry in enumerate(log) if entry[0] == 'complete')
+    assert posts[2] < first_complete, log
+
+
+def test_deferred_operation_is_retried_within_the_same_run(setup):
+    src, ledger, flow, cfg = setup
+    clock = FakeClock()
+    runtime = PipelinedRuntime(ledger, polls_to_complete=4)
+    retry = flow.RetryPolicy(unit_deadline_s=15, poll_s=5, defer_delay=10, max_calls=1000,
+                             clock=clock.now, wall_clock=clock.now, sleep=clock.sleep, jitter=lambda: 0)
+    cfg = dict(cfg, incremental={'max_inflight_units': 2})
+    reader = lambda *_a, **_k: [snapshot_keyed(src, 'a')]
+    report = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                  source_reader=reader, execute=True, clock=clock.now, retry_policy=retry)
+    assert report['status'] == 'completed', report
+    assert report['remaining_batches'] == 0
+    assert any(s['stage'] == 'native_stage' and s.get('status') == 'deferred'
+               for s in report['stages']), report['stages']

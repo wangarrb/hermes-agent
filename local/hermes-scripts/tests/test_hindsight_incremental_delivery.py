@@ -564,3 +564,23 @@ print(json.dumps({'operation': operation, 'rows': len(value), 'bytes': byte_coun
     assert proof['rows'] == 4000 and proof['operation'] == operation
     (tmp_path / f'memory-{operation}.json').write_text(result.stdout)
     print(result.stdout.strip())
+
+
+def test_single_poll_returns_pending_without_sleeping_or_deferring(tmp_path):
+    """Rotation step: one poll, no wait, no deferral; the scheduler paces."""
+    ledger = Ledger(tmp_path)
+    client = Client()
+    client.status = 'pending'
+    p = policy()
+    first = deliver(ledger, client, retry_policy=p, single_poll=True)
+    assert first['status'] == 'pending'
+    assert first['phase'] in {'submitted', 'unknown'}
+    assert ledger.batch['phase'] in {'submitted', 'unknown'}
+    assert len(client.posts) == 1 and len(client.gets) == 1
+    assert ledger.batch.get('last_error_class') is None
+    assert ledger.batch.get('next_retry_at') is None
+    assert p.clock() == 1000.0  # never slept while pending
+    client.status = 'completed'
+    second = deliver(ledger, client, retry_policy=policy(), single_poll=True)
+    assert second['status'] == 'completed' and second['phase'] == 'retained'
+    assert len(client.posts) == 1 and len(client.gets) == 2

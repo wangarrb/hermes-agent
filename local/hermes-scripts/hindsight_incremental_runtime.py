@@ -464,7 +464,10 @@ class ArrivalRuntime:
         state['trigger_unknown'] = False
         self._save_lease(self.ledger, lease)
 
-    def consolidate_batch(self, batch, retry_policy):
+    def consolidate_batch(self, batch, retry_policy, *, single_poll=False):
+        """single_poll: one pass; None while the scope still drains (the run
+        scheduler re-polls), the proof dict when ready.  Without it the call
+        waits in place, exactly as before."""
         batch = self._batch(batch)
         budget = budget_for(retry_policy)
         with self.ledger.locked():
@@ -530,6 +533,8 @@ class ArrivalRuntime:
                     category, transient = classify_error(error)
                     if not transient:
                         raise
+                    if single_poll:
+                        return None
                     budget.wait(category, attempt, retry_after=budget.policy.poll_s)
                     if category == 'operation_pending':
                         attempt = 0

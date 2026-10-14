@@ -208,80 +208,192 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
             if hasattr(client, 'preflight'):
                 record_stage('preflight', {})
             # Open lazily: a frozen publish retry must not open a retain window.
+            # Bounded-concurrency rotation (user-directed): up to
+            # max_inflight_units batches hold in-flight native operations and
+            # each cycle advances every in-flight batch by one single-poll
+            # step, so native work overlaps instead of serializing run wall
+            # time. Receipts, phases and deferral stay unchanged; deferred
+            # batches are retried in-run (bounded) so a heavy load can drain
+            # in one run instead of spilling to the next night.
+            max_inflight = int(knobs.get('max_inflight_units', 4))
+            if not 1 <= max_inflight <= 32:
+                raise ValueError('invalid max_inflight_units')
+            retryable = {'captured', 'generated', 'submitted', 'unknown', 'retained'}
+            in_run_cap = max(1, policy.max_attempts)
+            in_flight = {}
             seen = set()
-            while used_units < max_units:
-                selected = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
-                selected = [b for b in selected if b['batch_id'] not in seen
-                            and b['phase'] in {'captured', 'generated', 'submitted', 'unknown', 'retained'}]
-                if not selected:
+            in_run_attempts = {}
+            while True:
+                # Fill: enter batches until the in-flight budget is full.
+                while len(in_flight) < max_inflight:
+                    selected = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
+                    candidate = None
+                    for b in selected:
+                        bid = b['batch_id']
+                        if bid in in_flight or b['phase'] not in retryable:
+                            continue
+                        if bid in seen:
+                            if (in_run_attempts.get(bid, 0) >= in_run_cap
+                                    or (b.get('last_error_class') or '') in {'call_cap', 'llm_call_cap'}):
+                                # Run-level caps cannot recover inside this run.
+                                continue
+                        elif used_units >= max_units or used_chars + b['input_chars'] > max_chars:
+                            continue
+                        candidate = b
+                        break
+                    if candidate is None:
+                        break
+                    bid = candidate['batch_id']
+                    if bid not in seen:
+                        seen.add(bid)
+                        used_units += 1
+                        used_chars += candidate['input_chars']
+                    active_batch_id = bid
+                    # A recovered lease owns cleanup but may have crashed before
+                    # PATCH. Reopen once, only when an actual producer is selected.
+                    if not producer_ready:
+                        window = client.open_window(ledger)
+                        producer_ready = True
+                        report['cleanup'] = 'pending'
+                        _record(report, 'window', status='opened_scoped_manual_only')
+                    current = ledger.get_batch(bid)
+                    stage = 'deliver'
+                    if PHASES.index(current['phase']) >= PHASES.index('retained'):
+                        stage = 'facts' if current['kind'] == 'source' else 'consolidate'
+                    in_flight[bid] = {'stage': stage, 'entered': policy.clock(), 'calls': 0}
+                if not in_flight:
+                    # Wait toward the soonest in-run retry rather than spilling
+                    # it to the next run; blocked batches (far-future) never wait.
+                    soonest = None
+                    horizon = clock() + policy.defer_delay + policy.poll_s
+                    for b in ledger.list_batches():
+                        bid = b['batch_id']
+                        if b['phase'] not in retryable or bid in in_flight:
+                            continue
+                        if bid in seen and (in_run_attempts.get(bid, 0) >= in_run_cap
+                                or (b.get('last_error_class') or '') in {'call_cap', 'llm_call_cap'}):
+                            continue
+                        next_at = b.get('next_retry_at')
+                        if next_at is None or next_at > 1e29 or next_at <= clock() or next_at > horizon:
+                            continue
+                        soonest = next_at if soonest is None else min(soonest, next_at)
+                    if soonest is not None:
+                        policy.sleep(min(policy.poll_s, max(0.0, soonest - clock())))
+                        continue
                     break
-                batch = selected[0]
-                active_batch_id = batch['batch_id']
-                seen.add(batch['batch_id'])
-                if used_chars + batch['input_chars'] > max_chars:
-                    deferred = True
-                    continue
-                used_units += 1
-                used_chars += batch['input_chars']
-                # A recovered lease owns cleanup but may have crashed before
-                # PATCH. Reopen once, only when an actual producer is selected.
-                if not producer_ready:
-                    window = client.open_window(ledger)
-                    producer_ready = True
-                    report['cleanup'] = 'pending'
-                    _record(report, 'window', status='opened_scoped_manual_only')
-                generator = llm if batch['kind'] == 'daily_summary' else None
-                outcome = deliver_batch(ledger, batch, client=client, generate=generator,
-                    validate=client.validate_summary if generator else None, retry_policy=policy)
-                _record(report, 'delivery', kind=batch['kind'], batch_id=batch['batch_id'],
-                        status=outcome['status'], phase=outcome['phase'], calls=outcome['calls'],
-                        error_class=outcome.get('error_class'))
-                current = ledger.get_batch(batch['batch_id'])
-                if PHASES.index(current['phase']) < PHASES.index('retained'):
-                    deferred = True
-                    continue
-                stage_start = policy.calls_used
-                try:
-                    if current['phase'] == 'retained':
-                        if current['kind'] == 'source':
+                progressed = False
+                for bid in list(in_flight):
+                    item = in_flight[bid]
+                    batch = ledger.get_batch(bid)
+                    attempts_so_far = int(batch.get('attempts') or 0) + item['calls']
+                    if policy.clock() - item['entered'] >= policy.unit_deadline_s:
+                        next_at = policy.wall_clock() + policy.defer_delay
+                        ledger.defer(bid, error_class='operation_pending', next_retry_at=next_at,
+                                     attempts=attempts_so_far)
+                        in_run_attempts[bid] = in_run_attempts.get(bid, 0) + 1
+                        del in_flight[bid]
+                        deferred = True
+                        _record(report, 'native_stage', batch_id=bid, status='deferred',
+                                error_class='operation_pending', next_retry_at=next_at)
+                        continue
+                    try:
+                        if item['stage'] == 'deliver':
+                            generator = llm if batch['kind'] == 'daily_summary' else None
+                            outcome = deliver_batch(ledger, batch, client=client, generate=generator,
+                                validate=client.validate_summary if generator else None,
+                                retry_policy=policy, single_poll=True)
+                            item['calls'] += outcome['calls']
+                            if outcome['status'] == 'pending':
+                                continue
+                            _record(report, 'delivery', kind=batch['kind'], batch_id=bid,
+                                    status=outcome['status'], phase=outcome['phase'],
+                                    calls=item['calls'], error_class=outcome.get('error_class'))
+                            current = ledger.get_batch(bid)
+                            if outcome['status'] in {'deferred', 'blocked'}:
+                                del in_flight[bid]
+                                deferred = True
+                                progressed = True
+                                continue
+                            if PHASES.index(current['phase']) < PHASES.index('retained'):
+                                del in_flight[bid]
+                                deferred = True
+                                progressed = True
+                                continue
+                            item['stage'] = 'facts' if current['kind'] == 'source' else 'consolidate'
+                            item['entered'] = policy.clock()
+                            progressed = True
+                            continue
+                        if item['stage'] == 'facts':
+                            current = ledger.get_batch(bid)
                             children = [b for b in ledger.list_batches()
-                                        if b['kind'] == 'daily_summary' and current['batch_id'] in b['parent_batch_ids']]
+                                        if b['kind'] == 'daily_summary' and bid in b['parent_batch_ids']]
                             if not children:
                                 facts = client.facts_for_batch(current)
                                 messages = [{'event_id': digest({'fact': f}), 'role': 'user',
                                     'timestamp': f.get('created_at'), 'origin': f['id'],
                                     'content': json.dumps(f, ensure_ascii=False, sort_keys=True)} for f in facts]
                                 if messages:
-                                    children = ledger.capture_derived([current['batch_id']], messages)
+                                    children = ledger.capture_derived([bid], messages)
                                 else:
-                                    _record(report, 'facts', batch_id=current['batch_id'], status='zero_facts')
-                        proof = client.consolidate_batch(current, policy)
-                        expected_scope = [f"arrival-batch:{current['batch_id']}"]
+                                    _record(report, 'facts', batch_id=bid, status='zero_facts')
+                            item['stage'] = 'consolidate'
+                            item['entered'] = policy.clock()
+                            progressed = True
+                            continue
+                        current = ledger.get_batch(bid)
+                        proof = client.consolidate_batch(current, policy, single_poll=True)
+                        if proof is None:
+                            continue
+                        expected_scope = [f"arrival-batch:{bid}"]
                         if (not isinstance(proof, dict) or proof.get('bank') != ledger.bank
                                 or proof.get('scope') != expected_scope or proof.get('pending_in_scope') != 0
                                 or proof.get('ready') is not True):
                             raise ValueError('scoped_drain_unverified')
-                        current = _advance(ledger, current['batch_id'], 'consolidated', {'scoped_proof': proof})
-                        _record(report, 'scoped_drain', batch_id=current['batch_id'], status='completed')
+                        current = _advance(ledger, bid, 'consolidated', {'scoped_proof': proof})
+                        _record(report, 'scoped_drain', batch_id=bid, status='completed')
                         if current['kind'] == 'source':
                             children = [b for b in ledger.list_batches()
-                                        if current['batch_id'] in b['parent_batch_ids']]
+                                        if bid in b['parent_batch_ids']]
                             if not children:
                                 # A genuinely completed retain can extract zero facts.
                                 # Record no-canonical-delta, not a fictitious publish.
                                 receipt = {'no_canonical_delta': True, 'retained_receipt_hash':
                                            canonical_hash(current['receipts']['retained'])}
                                 for phase in ('locally_merged', 'gated', 'published'):
-                                    current = _advance(ledger, current['batch_id'], phase, receipt)
-                                _record(report, 'canonical', batch_id=current['batch_id'], status='no_canonical_delta')
-                except RetryDeferred as error:
-                    ledger.defer(current['batch_id'], error_class=error.error_class,
-                        next_retry_at=error.next_retry_at,
-                        attempts=outcome['attempts'] + policy.calls_used - stage_start)
-                    deferred = True
-                    _record(report, 'native_stage', batch_id=current['batch_id'], status='deferred',
-                            error_class=error.error_class, next_retry_at=error.next_retry_at)
-                    continue
+                                    current = _advance(ledger, bid, phase, receipt)
+                                _record(report, 'canonical', batch_id=bid, status='no_canonical_delta')
+                        del in_flight[bid]
+                        progressed = True
+                    except RetryDeferred as error:
+                        ledger.defer(bid, error_class=error.error_class,
+                                     next_retry_at=error.next_retry_at,
+                                     attempts=attempts_so_far + error.attempts)
+                        in_run_attempts[bid] = in_run_attempts.get(bid, 0) + 1
+                        del in_flight[bid]
+                        deferred = True
+                        _record(report, 'native_stage', batch_id=bid, status='deferred',
+                                error_class=error.error_class, next_retry_at=error.next_retry_at)
+                    except Exception as error:
+                        category, transient = classify_error(error)
+                        if transient:
+                            next_at = policy.wall_clock() + policy.defer_delay
+                            ledger.defer(bid, error_class=category, next_retry_at=next_at,
+                                         attempts=attempts_so_far)
+                            in_run_attempts[bid] = in_run_attempts.get(bid, 0) + 1
+                            del in_flight[bid]
+                            deferred = True
+                            _record(report, 'native_stage', batch_id=bid, status='deferred',
+                                    error_class=category, next_retry_at=next_at)
+                        else:
+                            ledger.defer(bid, error_class=category, next_retry_at=1e30,
+                                         attempts=attempts_so_far)
+                            del in_flight[bid]
+                            deferred = True
+                            report['errors'].append({'class': category, 'type': type(error).__name__})
+                            _record(report, 'native_stage', batch_id=bid, status='blocked',
+                                    error_class=category)
+                if not progressed and in_flight:
+                    policy.sleep(policy.poll_s)
             all_batches = ledger.list_batches()
             summaries = [b for b in all_batches if b['kind'] == 'daily_summary'
                          and b['phase'] in {'consolidated', 'locally_merged', 'gated'}
@@ -358,7 +470,7 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     report['published'] = True
                     _record(report, 'publish', status='readback_verified', generation_id=manifest['generation_id'])
             remaining = [b for b in ledger.list_batches() if b['phase'] != 'published']
-            report.update(status='deferred' if deferred or remaining else 'completed',
+            report.update(status='deferred' if remaining else 'completed',
                           remaining_batches=len(remaining), used_units=used_units, used_chars=used_chars)
     except RetryDeferred as error:
         if active_batch_id is not None and execute:

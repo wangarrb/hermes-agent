@@ -22,6 +22,9 @@ def stub_arrival(monkeypatch):
     calls = []
     module = types.ModuleType('hindsight_incremental_pipeline')
     setattr(module, 'main', lambda argv: calls.append(argv) or 2)
+    # The wrapper late-imports the safety ceilings from the pipeline module.
+    setattr(module, 'MAX_PENDING_UNITS_CEILING', 200)
+    setattr(module, 'MAX_PENDING_CHARS_CEILING', 20_000_000)
     monkeypatch.setitem(sys.modules, 'hindsight_incremental_pipeline', module)
     return calls
 

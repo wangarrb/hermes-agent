@@ -246,8 +246,45 @@ def _exact_operation(client, operation_id, bank, budget):
                 attempt = 0
 
 
-def deliver_batch(ledger, batch: dict, *, client, generate=None, validate=None, retry_policy=None) -> dict:
-    """Return status/phase/receipt/attempts/calls/error_class; never content."""
+_PENDING = object()
+
+
+def _exact_operation_step(client, operation_id, bank, budget):
+    """One poll: the receipt when complete, None when absent, ``_PENDING``
+    while the operation still runs.  Never sleeps; the run scheduler paces
+    polls so in-flight operations overlap instead of serializing wall time."""
+    timeout = budget.charge()
+    try:
+        op = client.get_operation(operation_id, timeout=timeout)
+    except Exception as error:
+        if classify_error(error)[0] == 'http_404':
+            return None
+        raise
+    if isinstance(op, dict) and op.get('status') == 'not_found':
+        if (op.get('operation_id') or op.get('id')) != operation_id:
+            raise RemoteCallError('operation_mismatch')
+        if op.get('bank_id', op.get('bank', bank)) != bank:
+            raise RemoteCallError('bank_mismatch')
+        return None
+    if isinstance(op, dict) and op.get('child_operation_ids') and not op.get('child_operations'):
+        op = dict(op)
+        op['child_operations'] = [client.get_operation(child_id, timeout=budget.charge())
+                                  for child_id in op['child_operation_ids']]
+    try:
+        return operation_receipt(op, operation_id, bank)
+    except RemoteCallError as error:
+        if error.error_class == 'operation_pending':
+            return _PENDING
+        raise
+
+
+def deliver_batch(ledger, batch: dict, *, client, generate=None, validate=None,
+                  retry_policy=None, single_poll=False) -> dict:
+    """Return status/phase/receipt/attempts/calls/error_class; never content.
+
+    ``single_poll`` advances one poll step at most and returns status
+    ``pending`` instead of waiting or deferring; the caller's rotation
+    scheduler owns pacing and per-attempt deadlines."""
     budget = budget_for(retry_policy)
     batch_id = batch['batch_id']
     current = ledger.get_batch(batch_id)
@@ -325,7 +362,14 @@ def deliver_batch(ledger, batch: dict, *, client, generate=None, validate=None, 
                 raise RemoteCallError('payload_mismatch')
         receipt = None
         if current['phase'] in {'submitted', 'unknown'}:
-            receipt = _exact_operation(client, operation_id, current['bank'], budget)
+            if single_poll:
+                receipt = _exact_operation_step(client, operation_id, current['bank'], budget)
+                if receipt is _PENDING:
+                    result.update(status='pending', phase=current['phase'],
+                                  calls=budget.calls, attempts=starting_attempts + budget.calls)
+                    return result
+            else:
+                receipt = _exact_operation(client, operation_id, current['bank'], budget)
         post_attempts = 0
         while receipt is None:
             post_attempts += 1
@@ -349,11 +393,27 @@ def deliver_batch(ledger, batch: dict, *, client, generate=None, validate=None, 
                     # generated artifact; manual intervention may repair auth.
                     raise RemoteCallError(category) from None
                 current = ledger.set_phase(batch_id, 'unknown', receipt=binding)
+                if single_poll:
+                    receipt = _exact_operation_step(client, operation_id, current['bank'], budget)
+                    if receipt is _PENDING:
+                        result.update(status='pending', phase=current['phase'],
+                                      calls=budget.calls, attempts=starting_attempts + budget.calls)
+                        return result
+                    if receipt is None:
+                        budget.defer('operation_unknown')
+                    continue
                 receipt = _exact_operation(client, operation_id, current['bank'], budget)
                 if receipt is None:
                     budget.wait(category, post_attempts, retry_after=getattr(error, 'retry_after', None))
                 continue
-            receipt = _exact_operation(client, operation_id, current['bank'], budget)
+            if single_poll:
+                receipt = _exact_operation_step(client, operation_id, current['bank'], budget)
+                if receipt is _PENDING:
+                    result.update(status='pending', phase=current['phase'],
+                                  calls=budget.calls, attempts=starting_attempts + budget.calls)
+                    return result
+            else:
+                receipt = _exact_operation(client, operation_id, current['bank'], budget)
             if receipt is None:
                 budget.defer('operation_unknown')
         receipt.update(batch_id=batch_id, input_hash=source_hash, payload_hash=generated['payload_hash'],
