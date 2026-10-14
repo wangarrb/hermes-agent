@@ -27,6 +27,11 @@ from hindsight_offline_retry import RetryDeferred, RetryPolicy, classify_error
 from hindsight_pipeline_common import load_config
 
 CONFIRM_RUN = 'run-hindsight-pipeline'
+# Safety ceilings, not small budgets: heavy loads must drain in a single run
+# (user-directed). Per-unit deadlines, attempt caps and the call budget remain
+# the real guards; the deferral machinery stays as the fallback net.
+MAX_PENDING_UNITS_CEILING = 200
+MAX_PENDING_CHARS_CEILING = 20_000_000
 
 
 def _binding(batch, **values):
@@ -120,7 +125,7 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
     if mode not in {'daily', 'weekly', 'full'}:
         raise ValueError('invalid_incremental_mode')
     max_chars = int(knobs.get('max_pending_chars', 500000))
-    if not 1 <= max_units <= 12 or not 1 <= max_chars <= 500000:
+    if not 1 <= max_units <= MAX_PENDING_UNITS_CEILING or not 1 <= max_chars <= MAX_PENDING_CHARS_CEILING:
         raise ValueError('normal_incremental_budget_exceeded')
     report = {'schema_version': 'hindsight-arrival-run/1', 'bank': ledger.bank,
               'started_at': clock(), 'execute': execute, 'status': 'running',
@@ -557,11 +562,11 @@ def main(argv=None):
         config['incremental']['include_wiki'] = True
     if args.resume_only:
         config['incremental']['resume_only'] = True
-    for value, key, ceiling in [(args.max_units, 'max_pending_units', 12),
-                                 (args.max_chars, 'max_pending_chars', 500000)]:
+    for value, key, ceiling in [(args.max_units, 'max_pending_units', MAX_PENDING_UNITS_CEILING),
+                                 (args.max_chars, 'max_pending_chars', MAX_PENDING_CHARS_CEILING)]:
         if value is not None:
             if not 1 <= value <= ceiling:
-                parser.error('normal incremental budget cannot be unlimited or exceed regular caps')
+                parser.error('normal incremental budget cannot be unlimited or exceed safety ceilings')
             config['incremental'][key] = value
     overrides = {key: value for key, value in {'model': args.llm_model,
         'base_url': args.llm_base_url, 'api_key_env': args.llm_api_key_env,

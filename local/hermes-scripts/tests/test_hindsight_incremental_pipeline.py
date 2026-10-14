@@ -514,6 +514,29 @@ def test_new_input_budget_does_not_reconstruct_existing_history(setup):
     assert ledger.initialization_manifest()['legacy_status'] == 'legacy_unknown'
 
 
+@pytest.mark.parametrize('knobs,accepted', [
+    ({'max_pending_units': 200, 'max_pending_chars': 20_000_000}, True),
+    ({'max_pending_units': 48, 'max_pending_chars': 2_000_000}, True),
+    ({'max_pending_units': 201, 'max_pending_chars': 500000}, False),
+    ({'max_pending_units': 12, 'max_pending_chars': 20_000_001}, False),
+    ({'max_pending_units': 0, 'max_pending_chars': 500000}, False),
+])
+def test_normal_incremental_budget_uses_safety_ceilings(setup, knobs, accepted):
+    """Heavy loads must be able to drain in one run: the caps are safety
+    ceilings, while per-unit deadlines and attempt limits stay the guards."""
+    src, ledger, flow, cfg = setup
+    cfg['incremental'] = dict(knobs)
+    runtime = Runtime(ledger)
+    if accepted:
+        out = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                   source_reader=lambda *_a, **_k: [], execute=False)
+        assert out['status'] == 'plan'
+    else:
+        with pytest.raises(ValueError, match='normal_incremental_budget_exceeded'):
+            flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                 source_reader=lambda *_a, **_k: [], execute=False)
+
+
 def test_plan_does_not_capture_or_mutate_ledger(setup):
     src, ledger, flow, cfg = setup
     runtime = Runtime(ledger)
