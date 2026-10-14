@@ -926,3 +926,41 @@ def test_summary_identity_fields_are_overwritten_not_trusted(tmp_path, monkeypat
     assert row['bank'] == 'bank-A'
     assert row['source_ids'] == ['fact-a']
     assert row['source_documents'] == [batch()['document_id']]
+
+
+def test_summary_generation_resamples_extraction_failures_too(tmp_path, monkeypatch):
+    runtime, _, _ = make_runtime(tmp_path)
+    import hindsight_minimax_import as profiles
+    import offline_hindsight_reflect_consolidate as reflect
+    monkeypatch.setattr(profiles, 'get_llm_profile', lambda name: {'model': 'M', 'base_url': 'http://fake/v1',
+                                                                 'label': 'L', 'api_key_env': 'FAKE'})
+    from hindsight_offline_retry import RemoteCallError
+    calls = []
+    def llm(unit, **kwargs):
+        kwargs['retry_policy'].charge()
+        calls.append(1)
+        if len(calls) == 1:
+            raise RemoteCallError('invalid_output')
+        return {'canonical_observations': [observation()]}, 'raw'
+    monkeypatch.setattr(reflect, 'call_llm', llm)
+    out = runtime.generate_summary(frozen_input(), retry_policy=policy())
+    assert len(calls) == 2
+    assert runtime.validate_summary(out['artifact']) is True
+
+
+def test_summary_extraction_failure_exhausts_resamples(tmp_path, monkeypatch):
+    runtime, _, _ = make_runtime(tmp_path)
+    import hindsight_minimax_import as profiles
+    import offline_hindsight_reflect_consolidate as reflect
+    monkeypatch.setattr(profiles, 'get_llm_profile', lambda name: {'model': 'M', 'base_url': 'http://fake/v1',
+                                                                 'label': 'L', 'api_key_env': 'FAKE'})
+    from hindsight_offline_retry import RemoteCallError
+    calls = []
+    def llm(unit, **kwargs):
+        kwargs['retry_policy'].charge()
+        calls.append(1)
+        raise RemoteCallError('invalid_output')
+    monkeypatch.setattr(reflect, 'call_llm', llm)
+    with pytest.raises(RemoteCallError, match='invalid_output'):
+        runtime.generate_summary(frozen_input(), retry_policy=policy(max_attempts=3))
+    assert len(calls) == 3

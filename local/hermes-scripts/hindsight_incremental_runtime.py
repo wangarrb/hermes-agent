@@ -687,21 +687,22 @@ class ArrivalRuntime:
         try:
             for attempt in range(attempts):
                 try:
-                    obj, _raw = reflect.call_llm(unit, model=profile['model'], base_url=profile['base_url'],
-                        api_key_env=profile['api_key_env'], label=profile['label'],
-                        response_format=profile.get('response_format', True), emit_observations=True,
-                        output_language=self.config.get('output_language', 'auto'), retry_policy=budget)
-                except SystemExit:
-                    raise RemoteCallError('llm_configuration') from None
-                try:
+                    try:
+                        obj, _raw = reflect.call_llm(unit, model=profile['model'], base_url=profile['base_url'],
+                            api_key_env=profile['api_key_env'], label=profile['label'],
+                            response_format=profile.get('response_format', True), emit_observations=True,
+                            output_language=self.config.get('output_language', 'auto'), retry_policy=budget)
+                    except SystemExit:
+                        raise RemoteCallError('llm_configuration') from None
                     observations = self._summary_observations(facts, obj)
                     artifact = {'bank': self.bank, 'canonical_observations': observations,
                                 'source_facts': facts, 'source_ids': [f['id'] for f in facts],
                                 'source_documents': sorted({f['document_id'] for f in facts}), 'llm_json': obj}
                     self.validate_summary(artifact)
                 except RemoteCallError as error:
-                    # A local schema failure consumed no remote write: re-sample.
-                    # Only a repeated failure blocks the batch for review.
+                    # A local failure (JSON extraction or schema) consumed no
+                    # remote write: re-sample.  Only a repeated invalid_output
+                    # blocks the batch for review.
                     if error.error_class == 'invalid_output' and attempt + 1 < attempts:
                         continue
                     raise
