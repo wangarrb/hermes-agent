@@ -1150,7 +1150,12 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
         count = 0
         if old:
             count = len(old['records'])
-            if (current['identity'] != old['identity'] or current['identity_hash'] != old['identity_hash']
+            # Writers refresh overwritable session views via same-directory
+            # tmp+rename, so a replacement (new inode) alone is not content
+            # corruption; the stability contract is metadata identity, no
+            # shrink, and an exact unchanged prefix. Replacement cannot bypass
+            # any of those checks.
+            if (current['identity_hash'] != old['identity_hash']
                     or len(current['records']) < count
                     or digest([r['record_hash'] for r in current['records'][:count]]) != old['prefix_hash']):
                 raise SourceChangedError('source_changed: legacy JSON prefix/location rewritten')

@@ -700,7 +700,7 @@ def test_physical_profiles_and_home_A_B_A_do_not_discard_db_only_or_legacy_roles
 
 
 @pytest.mark.parametrize('change', ['body', 'timestamp', 'association', 'delete', 'reset', 'replace',
-    'json-prefix', 'json-truncate', 'json-delete', 'json-replace', 'json-sid'])
+    'json-prefix', 'json-truncate', 'json-delete', 'json-sid'])
 def test_physical_exact_old_bindings_reject_rewrite_reset_truncation_and_epoch(tmp_path, change):
     sources = api()
     home, db, path = malformed_physical_home(tmp_path)
@@ -717,10 +717,6 @@ def test_physical_exact_old_bindings_reject_rewrite_reset_truncation_and_epoch(t
         create_db(home)
     elif change == 'json-delete':
         path.rename(path.with_suffix('.old'))
-    elif change == 'json-replace':
-        old = path.read_bytes()
-        path.rename(path.with_suffix('.old'))
-        path.write_bytes(old)
     else:
         value = json.loads(path.read_text())
         if change == 'json-prefix':
@@ -730,6 +726,49 @@ def test_physical_exact_old_bindings_reject_rewrite_reset_truncation_and_epoch(t
         else:
             value['session_id'] = 'other'
         path.write_text(json.dumps(value))
+    with pytest.raises(sources.SourceChangedError):
+        sources.scan_source_snapshots(home, physical_baseline=baseline)
+
+
+def test_physical_json_atomic_replace_with_appended_records_is_admitted(tmp_path):
+    sources = api()
+    home, db, path = malformed_physical_home(tmp_path)
+    baseline = sources.capture_physical_baseline(home, bank='A')
+    value = json.loads(path.read_text())
+    value['messages'].append({'role': 'user', 'content': 'Appended late finding', 'timestamp': 202.0})
+    path.rename(path.with_suffix('.old'))
+    path.write_text(json.dumps(value))
+    current = sources.scan_source_snapshots(home, physical_baseline=baseline)
+    assert [m['content'] for m in flattened(current)] == ['Appended late finding']
+    assert sources.scan_source_snapshots(home, physical_baseline=baseline) == current
+
+
+def test_physical_json_identical_bytes_replace_preserves_view(tmp_path):
+    sources = api()
+    home, db, path = malformed_physical_home(tmp_path)
+    baseline = sources.capture_physical_baseline(home, bank='A')
+    old = path.read_bytes()
+    path.rename(path.with_suffix('.old'))
+    path.write_bytes(old)
+    current = sources.scan_source_snapshots(home, physical_baseline=baseline)
+    assert flattened(current) == []
+    assert sources.scan_source_snapshots(home, physical_baseline=baseline) == current
+
+
+@pytest.mark.parametrize('mode', ['replacement-prefix', 'replacement-shrink', 'replacement-sid'])
+def test_physical_json_replacement_cannot_bypass_content_instability(tmp_path, mode):
+    sources = api()
+    home, db, path = malformed_physical_home(tmp_path)
+    baseline = sources.capture_physical_baseline(home, bank='A')
+    value = json.loads(path.read_text())
+    if mode == 'replacement-prefix':
+        value['messages'][0]['content'] = 'Changed'
+    elif mode == 'replacement-shrink':
+        value['messages'].pop()
+    else:
+        value['session_id'] = 'other'
+    path.rename(path.with_suffix('.old'))
+    path.write_text(json.dumps(value))
     with pytest.raises(sources.SourceChangedError):
         sources.scan_source_snapshots(home, physical_baseline=baseline)
 
