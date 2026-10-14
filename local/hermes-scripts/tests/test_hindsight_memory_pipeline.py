@@ -15,6 +15,30 @@ def load_module(name='hindsight_memory_pipeline'):
     return mod
 
 
+def test_wrapper_budget_clamp_matches_safety_ceilings(monkeypatch):
+    """Wrapper must accept explicit budgets up to the safety ceilings and reject
+    anything beyond them, matching the incremental pipeline constants."""
+    import types
+    mp = load_module()
+    calls = {}
+    stub = types.ModuleType('hindsight_incremental_entrypoint')
+    def fake_alias(**kw):
+        calls.update(kw)
+        return 0
+    stub.run_alias = fake_alias
+    monkeypatch.setitem(sys.modules, 'hindsight_incremental_entrypoint', stub)
+    assert mp.main(['daily', '--weekly-budget-max-pending-units', '200',
+                    '--weekly-budget-max-pending-chars', '20000000']) == 0
+    assert calls['max_units'] == 200 and calls['max_chars'] == 20000000
+    import pytest as _pytest
+    for bad in (['--weekly-budget-max-pending-units', '201'],
+                ['--weekly-budget-max-pending-chars', '20000001'],
+                ['--weekly-budget-max-pending-units', '0']):
+        with _pytest.raises(SystemExit) as err:
+            mp.main(['daily'] + bad)
+        assert err.value.code == 2
+
+
 def ns(**kw):
     defaults = dict(
         mode='daily',

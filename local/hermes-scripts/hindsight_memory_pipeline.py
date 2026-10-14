@@ -874,8 +874,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("normal arrival mode forbids historical replay/manual-review promotion; use a separately authorized repair workflow")
         if args.date_mode != "auto" or args.week_mode != "current":
             parser.error("arrival consumption is not selected by event dates or week labels")
-        if not 1 <= args.weekly_budget_max_pending_units <= 12 or not 1 <= args.weekly_budget_max_pending_chars <= 500000:
-            parser.error("normal incremental limits remain 12 units / 500000 chars")
+        from hindsight_incremental_pipeline import (MAX_PENDING_CHARS_CEILING,
+                                                     MAX_PENDING_UNITS_CEILING)
+        if (not 1 <= args.weekly_budget_max_pending_units <= MAX_PENDING_UNITS_CEILING
+                or not 1 <= args.weekly_budget_max_pending_chars <= MAX_PENDING_CHARS_CEILING):
+            parser.error("normal incremental limits cannot exceed the safety ceilings "
+                         f"({MAX_PENDING_UNITS_CEILING} units / {MAX_PENDING_CHARS_CEILING} chars)")
         supplied = list(argv) if argv is not None else sys.argv[1:]
         explicit = {token.partition('=')[0] for token in supplied}
         from hindsight_incremental_entrypoint import run_alias
