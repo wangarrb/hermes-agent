@@ -103,24 +103,40 @@ with a private backup. Today's sidecar stays `.partial.md`; no future canonical
 report is invented. CLI-overlap rows are explicitly non-additive. Source item
 references permit checking totals without publishing private conversation bodies.
 
-**Automatic App discovery/history fetch is not deployed.** The existing 23:00
-script now first consumes App exports locally and then syncs CLI rollouts;
-00:01 runs the existing memory pipeline. The deployed consumer was exercised
-against a real supported-API export and added zero messages/documents on replay.
-A
-same-user official local app-server transport was read-only verified, but that
-store returned only 52 CLI/VScode threads and excluded the known App samples.
-It cannot be presented as a full App collector. A supported App-native task
-context/schedule must supply list/read capability and private staging for actual
-daily App collection. No new schedule, service, credentials, permissions, proxy
-or exporter was created. The daily shows unknown/stale coverage when collection
-has not been proved current. A report reader alone is not a daily collector.
+The parent created exactly one App-native daily task via
+`automations.create_for_aeon`, confirmed enabled by its tool result: Asia/Shanghai,
+flexible execution around22:00, dispatch into the existing thread. No heartbeat,
+system cron, service, credential, permission or proxy change was created here.
+The first timed dispatch has not yet been observed. The existing23:00 script
+consumes App exports locally before CLI sync;00:01 retains its existing production
+scope. App local capture does not enter that production extraction feed.
+
+A real manual acceptance run read51 scoped sources in54 pages, persisted private
+page SHA256 and per-source receipts, then consumed70 new completed messages into
+4 captured local documents. All51 incremental intervals completed:27 met prior
+completed-turn checkpoints and24 reached actual EOF. No API errors or pending
+cursors remained. The strict final producer also passed a separate real one-page
+head read. Consumer replay added zero messages and zero documents.
+The actual daily entry point was exercised with literal `--date 2026-10-15` and
+read-only `--date 2026-10-16` preview of the current partial day: all70 new item
+references appeared. No future canonical report was created. The original three
+production JSON files and production ledger remained byte-identical throughout.
+
+The producer always refetches heads and saves an entire page before a known
+same-session completed-turn checkpoint. InProgress turns cannot become anchors.
+Nonboolean/missing `hasMore` is rejected before saving or declaring EOF. Per-source
+failures retain explicit error/continuation receipts. Current listing remains
+bounded to50 nonpinned entries without a cursor; ordinary ChatGPT archives were
+refused in this task and are not accessed by another path. Scheduled collection
+is enabled; account completeness and precise message/request telemetry remain
+unknown. Details and private acceptance receipts are under task/evidence.
 
 ## Formal Hindsight processing and approval boundary
 
 External processing was approved for **only three frozen SeqScale conversations,
-447 cleaned public messages**. `hindsight_app_approved_run.py` validates their
-exact proof, refuses unrelated pending work, writes only these three snapshots
+447 cleaned public messages**. `hindsight_app_approved_run.py` pins each original
+file’s raw-byte SHA256 in code, reads once, verifies before parsing those same
+bytes, then validates their exact proof, refuses unrelated pending work, writes only these three snapshots
 to `~/.hermes/sessions`, and invokes the existing native arrival pipeline with
 its original integrity guards and publication gates. Its first execution was
 blocked by `SourceChangedError` **before capture**: zero batches, network calls
@@ -136,14 +152,18 @@ passed; the real certificate remains DRAFT pending the parent's independent pin.
 No baseline, gate or source unknown policy is weakened. Local archives are not memory
 extraction, and retained/submitted/published are separate receipt states.
 
-The accessible archive currently contains 50 sessions (47 Codex,3 ordinary
-ChatGPT), 10366 cleaned source occurrences /7602 unique App items and154 captured
+The accessible archive currently contains51 sessions (48 Codex,3 ordinary
+ChatGPT),10436 cleaned source occurrences /7672 unique App items and158 captured
 local documents. All pagination/coverage limitations remain explicit. Re-running
 the whole archive adds zero messages/documents. A single newest-turn refresh in
 an existing session added5 completed messages, then zero on replay; those5 are
-local-only and do not expand the frozen447 external scope. The real source-level
-raw view has10799 occurrences /7800 unique items, with2999 shared occurrences;
-cleaning/deferred-turn selection explains the different normalized counts.
+local-only and do not expand the frozen447 external scope. The earlier raw historical capture had10799 occurrences /7800 unique items, with
+2999 shared occurrences; these raw counts are not refreshed by summing overlapping
+new export copies. Current normalized totals above come from sealed snapshots.
+The new70 items are local-only, including22 new items in two original sessions.
+The external runner’s four new focused tests reject same-count content replacement
+and prove hash/parse use the same single read. Its hash guard is a review candidate;
+it has not been deployed or executed for external work.
 
 Fresh safe-field attestation proved native retain/consolidate/reflect/default
 and offline summary use `auto_cheep_model` via `http://127.0.0.1:3000/v1`.

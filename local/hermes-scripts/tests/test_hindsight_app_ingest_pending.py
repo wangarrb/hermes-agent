@@ -50,7 +50,7 @@ def test_existing_snapshot_grows_once_with_real_local_ledger_and_dry_run_is_read
     assert repeated["new_messages"] == repeated["new_local_documents"] == 0
     status = json.loads((archive / "collection-status.json").read_text())
     assert {k: status[k] for k in original_status} == original_status
-    assert status["consumer"]["api_discovery_automated"] is False
+    assert status["consumer"]["consumer_performs_api_discovery"] is False
     assert repeated["production_feed_written"] is False and repeated["hindsight_api_calls"] == 0
     assert not (home / "sessions").exists()
     assert list((archive / "daily/app-sessions").glob("*.md"))

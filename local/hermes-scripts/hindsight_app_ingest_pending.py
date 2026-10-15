@@ -44,7 +44,7 @@ def consume_pending(archive, hermes_home, *, write=False):
     result = {
         "status": "collector_missing" if not files else "dry_run",
         "write": write, "export_pages": len(files), "historical_start": SINCE,
-        "api_discovery_automated": False, "producer_required": "supported_app_list_read_tools",
+        "consumer_performs_api_discovery": False, "producer_required": "supported_app_list_read_tools",
         "production_feed_written": False, "hindsight_api_calls": 0,
         "summary_llm_calls": 0, "embedding_calls": 0,
     }
