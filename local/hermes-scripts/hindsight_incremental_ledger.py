@@ -459,9 +459,8 @@ class IncrementalLedger:
     def source_compaction_successors_reference(self) -> dict | None:
         """Absent is not JSON null. A hashed reference prevents lost-pointer downgrade."""
         with self._connection() as con:
-            keys = {r[0] for r in con.execute("SELECT key FROM meta WHERE key IN "
-                "('source-compaction-successors',)")}
-            if not keys:
+            row = con.execute("SELECT key FROM meta WHERE key='source-compaction-successors'").fetchone()
+            if row is None:
                 return None
             reference = self._read(con, 'meta', 'source-compaction-successors')
             legacy = self._require_initialized(con)
