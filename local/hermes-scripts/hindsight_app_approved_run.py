@@ -17,7 +17,7 @@ from hindsight_app_sessions import sync_sessions
 from hindsight_incremental_ledger import IncrementalLedger
 from hindsight_incremental_pipeline import run_incremental
 from hindsight_incremental_runtime import ArrivalRuntime
-from hindsight_incremental_sources import scan_source_snapshots, _message, digest
+from hindsight_incremental_sources import scan_source_snapshots, _message, digest, message_hash
 from hindsight_pipeline_common import load_config
 
 # Pinned to the original 447-message freeze, independently checked against the
@@ -53,27 +53,110 @@ def _load_approved_sessions():
     return sessions
 
 
+def _app_needs_summary(input_plan, batches):
+    if input_plan['new_messages']:
+        return True
+    parents_with_children = {p for b in batches if b['kind'] == 'daily_summary'
+                             for p in b['parent_batch_ids']}
+    related = {b['batch_id'] for b in input_plan['related_batches']}
+    return any(b['batch_id'] in related and (
+        (b['kind'] == 'daily_summary' and b['phase'] == 'captured')
+        or (b['kind'] == 'source' and b['phase'] in {'captured', 'generated', 'submitted', 'unknown', 'retained'}
+            and b['batch_id'] not in parents_with_children)) for b in batches)
+
+
+def _execute_app(sessions, ledger, input_plan):
+    """Called only after frozen input admission, while holding this bank lock."""
+    from hindsight_app_source_adapter import build_app_snapshots
+
+    cfg = dict(load_config())
+    if (cfg['bank'] != 'hermes' or cfg['api_url'] != 'http://127.0.0.1:8888'
+            or Path(cfg['hermes_home']).resolve() != APP_HERMES_HOME.resolve()
+            or Path((cfg.get('incremental') or {}).get('root', '')).resolve() != APP_LEDGER_ROOT.resolve()):
+        raise ValueError('approved App production target changed')
+    cfg['incremental'] = dict(cfg.get('incremental') or {})
+    cfg['incremental'].update(mode='daily', include_wiki=False, resume_only=False)
+    expected = {f"default:hermes:{s['session_id']}": {
+                    message['event_id']: message_hash(message)
+                    for message in (_message(raw, codex=True) for raw in s['messages'])}
+                for s in sessions}
+    admitted = {s['source_key']: s for s in input_plan['sources']}
+
+    def app_reader(home, **_reader_options):
+        if Path(home).resolve() != APP_HERMES_HOME.resolve():
+            raise ValueError('approved App reader home changed')
+        snapshots = build_app_snapshots(sessions, ledger=ledger, hermes_home=APP_HERMES_HOME,
+            approved_session_ids=APPROVED, approved_source_sha256=APPROVED_SOURCE_SHA256)
+        if {s['source_key'] for s in snapshots} != set(expected):
+            raise ValueError('approved App source scope changed')
+        for snapshot in snapshots:
+            key = snapshot['source_key']
+            if (snapshot['source_epoch'] != admitted[key]['source_epoch']
+                    or snapshot['snapshot_hash'] != admitted[key]['snapshot_hash']
+                    or snapshot.get('epoch_scope', key) != key
+                    or snapshot.get('scope_source_keys', [key]) != [key]
+                    or {m['event_id']: message_hash(m) for m in snapshot['messages']} != expected[key]):
+                raise ValueError('approved App source input changed')
+        return snapshots
+
+    runtime = ArrivalRuntime(cfg)
+    runtime.ledger = ledger
+    if _app_needs_summary(input_plan, ledger.list_batches()):
+        profile = runtime._summary_profile()
+        if (profile.get('base_url'), profile.get('model')) != ('http://127.0.0.1:3000/v1', 'auto_cheep_model'):
+            raise ValueError('approved summary destination changed')
+    report = run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                             execute=True, source_reader=app_reader)
+    batches = ledger.list_batches()
+    own = {b['batch_id'] for b in batches if b['source_key'] in expected}
+    while True:
+        expanded = own | {b['batch_id'] for b in batches if b['parent_batch_ids']
+                          and set(b['parent_batch_ids']) <= own}
+        if expanded == own:
+            break
+        own = expanded
+    approved_batches = [b for b in batches if b['batch_id'] in own]
+    result = {'source_mode': 'app', 'scope': sorted(APPROVED), 'approved_messages': 447,
+              'input_plan': input_plan, 'runtime_report': report,
+              'batches': [{k: b.get(k) for k in ('batch_id', 'document_id', 'operation_id', 'source_key',
+                  'kind', 'phase', 'last_successful_phase', 'attempts', 'last_error_class', 'parent_batch_ids')}
+                  for b in approved_batches], 'native_llm_attempts': None,
+              'native_llm_attempts_coverage': 'server-side telemetry not yet correlated'}
+    tmp = REPORT.with_suffix('.tmp')
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+    tmp.chmod(0o600)
+    tmp.replace(REPORT)
+    print(json.dumps({'stage': 'approved_run_result', 'source_mode': 'app', 'status': report.get('status'),
+                      'batches': len(approved_batches), 'report': str(REPORT)}, ensure_ascii=False), flush=True)
+    return 0 if report.get('status') in {'completed', 'no_op'} else 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-mode', choices=('physical', 'app'), default='physical')
-    parser.add_argument('--plan-only', action='store_true', help='App candidate only; capture/execution stays disabled')
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--plan-only', action='store_true', help='Inspect frozen App inputs without capture')
+    action.add_argument('--execute', action='store_true', help='Execute the explicitly selected approved App inputs')
     parser.add_argument('--transition-certificate', type=Path)
     parser.add_argument('--approved-transition-sha256', help='Canonical SHA pinned independently after parent review')
     args = parser.parse_args(argv)
     if args.source_mode == 'app':
-        if not args.plan_only:
-            parser.error('App candidate requires --plan-only; execution remains disabled')
+        if not (args.plan_only or args.execute):
+            parser.error('App source mode requires --plan-only or explicit --execute')
         if args.transition_certificate or args.approved_transition_sha256:
             parser.error('physical transition options cannot authorize the App candidate')
         from hindsight_app_source_adapter import plan_app_input
 
         sessions = _load_approved_sessions()
         ledger = IncrementalLedger(APP_LEDGER_ROOT, 'hermes')
-        report = plan_app_input(sessions, ledger=ledger, hermes_home=APP_HERMES_HOME,
-            approved_session_ids=APPROVED, approved_source_sha256=APPROVED_SOURCE_SHA256)
-        print(json.dumps(report, ensure_ascii=False), flush=True)
-        return 0
-    if args.plan_only:
+        with ledger.locked():
+            report = plan_app_input(sessions, ledger=ledger, hermes_home=APP_HERMES_HOME,
+                approved_session_ids=APPROVED, approved_source_sha256=APPROVED_SOURCE_SHA256)
+            if args.plan_only or report['status'] == 'blocked':
+                print(json.dumps(report, ensure_ascii=False), flush=True)
+                return 2 if args.execute else 0
+            return _execute_app(sessions, ledger, report)
+    if args.plan_only or args.execute:
         parser.error('App candidate options require explicit --source-mode app')
     if bool(args.transition_certificate) != bool(args.approved_transition_sha256):
         parser.error('a reviewed certificate and its independent approval pin are both required')

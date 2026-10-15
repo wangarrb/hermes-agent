@@ -1,8 +1,10 @@
-# Bounded App source candidate — review only
+# Bounded App source and execution candidate
 
-The App runner remains plan-only. It reads the original three frozen sessions,
-their existing production exports and the existing ledger; it never registers
-a contract, captures a batch, constructs the runtime or calls a model.
+The runner accepts explicit `--source-mode app --plan-only` or
+`--source-mode app --execute`. Planning reads the original three frozen
+sessions, their existing production exports and the existing ledger without
+constructing a runtime or capturing a batch. Execution performs the same
+bounded admission before entering the existing incremental pipeline.
 The original447 code-side raw-byte pins and one-read hash/parse stay unchanged.
 Newer items, other sessions and same-count content substitutions stay excluded.
 
@@ -27,7 +29,16 @@ The read-only plan verifies actual source state and any relevant existing
 batch payload. It rejects a changed origin/body, competing known owner,
 mixed unauthorized source batch/derived parents and unrelated pending work.
 An existing unknown POST remains attached to its original operation UUID and
-phase; the plan does not call GET/POST or report it as completed.
+phase; the plan does not call GET/POST or report it as completed. Execution
+passes that state to the existing delivery reconciliation rather than issuing
+a new operation ID or resetting its phase.
+
+Execution holds the existing bank lock across admission and processing. It
+uses the original runtime, native isolation, producer window, capture,
+operation reconciliation, summary quality gates and publication chain. The
+injected App reader revalidates the pinned exports and bounded snapshots.
+It does not sync or rewrite production session exports. The fixed home,
+ledger, bank, Hindsight endpoint and summary destination remain checked.
 
 Unrelated historical batches do not need new dual-view proofs. An existing
 unknown-row policy does not forbid all future sessions. Exact legacy/unknown
@@ -41,17 +52,26 @@ real-data admission. The narrowed candidate must pass real opaque-ID fixtures,
 App/physical replay in both orders, immutable-payload/authorization failures,
 operation reconciliation and the existing physical rejection regressions.
 
-This candidate authorizes no deployment or external extraction. A real447
-read-only plan and independent review are required before any later execution.
+This candidate authorizes no deployment or production extraction. Actual
+execution has only been exercised against temporary files and a fixture
+runtime; no production runtime preflight or external model call was performed
+for this wiring change.
 
-Canonical validation:11 test files,562 passed,0 failed with automatic file
-retries disabled. This includes21 bounded-adapter cases,7 boundary/delivery/
-concurrency/crash cases and4 original raw-pin cases, plus the existing ledger,
-physical-source, native-copy, finite-unknown, transition and pipeline checks.
+The execution fixtures pass13/13 cases, using temporary exports and a real
+ledger through the actual runner and pipeline. They cover replay, lost POST
+acknowledgement, publication recovery and changed inputs/targets. The expanded
+16-file regression passes752 tests and exposes one pre-existing runtime
+integration failure: the delta publication proof compares preserved model IDs
+against canonical observation IDs. This needs a separate minimal correction
+before production execution. Automatic file retries are disabled. Validation
+and independent review receipts are recorded in the task's evidence directory.
 
 The real frozen447 plan now passes:3 sources,447 new messages,0 known messages
 and0 relevant conflicts. The existing60000-character capture budget projects6
 source batches; these are metadata calculations, not captured files or LLM-call
 counts. Ledger tables, baseline/unknown artifacts, original frozen/production
-exports and the3438-key physical-feed inventory stayed unchanged. Execution
-and native-runtime preflight remain disabled and unattempted.
+exports and the3438-key physical-feed inventory stayed unchanged. This is
+evidence of read-only admission and projected grouping, not evidence that the
+production447 messages have already been retained or published. Historical
+App LLM request/attempt/retry/success counts remain unknown; assistant-message
+and tool counts are not substitutes for transport telemetry.
