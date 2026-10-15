@@ -59,12 +59,23 @@ for this wiring change.
 
 The execution fixtures pass13/13 cases, using temporary exports and a real
 ledger through the actual runner and pipeline. They cover replay, lost POST
-acknowledgement, publication recovery and changed inputs/targets. The expanded
-16-file regression passes752 tests and exposes one pre-existing runtime
-integration failure: the delta publication proof compares preserved model IDs
-against canonical observation IDs. This needs a separate minimal correction
-before production execution. Automatic file retries are disabled. Validation
-and independent review receipts are recorded in the task's evidence directory.
+acknowledgement, publication recovery and changed inputs/targets. An expanded
+16-file regression exposed a pre-existing delta publication bug: preserved
+model IDs were compared against canonical observation IDs. A separate minimal
+fix now projects only the temporary consumer comparison view to typed identity;
+the original model IDs, sealed bytes, quantity, text and hash checks remain.
+Nine added proof cases cover model/canonical/missing IDs and consumer omissions,
+duplicates and changed text. The new case reproduced the failure before fixing.
+
+The isolated final regression passes205/205 tests in7 affected files, including
+all50 concrete-runtime and68 publication cases. Automatic file retries are
+disabled. Earlier failing logs remain preserved. The old runtime fixture also
+needed temporary HERMES_HOME/Path.home isolation: legacy imports could otherwise
+select the production scripts tree and default profile paths. It now asserts
+that the publication module comes from this checkout. No credentials appear in
+the logs and no data was sent to an external service; the final run starts with
+an explicitly temporary HERMES_HOME. Validation and independent review receipts
+are recorded in the task's evidence directory.
 
 The real frozen447 plan now passes:3 sources,447 new messages,0 known messages
 and0 relevant conflicts. The existing60000-character capture budget projects6

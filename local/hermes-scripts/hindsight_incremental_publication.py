@@ -208,11 +208,10 @@ def delta_parse_proof(delta_root: Path, script_dir: Path | None = None) -> dict:
     ids = sorted(merge.observation_id(r) for r in rows)
 
     def view_row(value):
-        # A raw index view has no explicit id key; derive the exact declared
-        # observation id without changing any other field.
+        # The raw delta may preserve a model's noncanonical id. Compare both
+        # views using typed identity without changing the sealed source bytes.
         value = dict(value)
-        if not isinstance(value.get('id'), str) or not value['id']:
-            value['id'] = merge.observation_id(value)
+        value['id'] = merge.observation_id(value)
         return value
 
     conflict = [view_row(r) for r in conflict]

@@ -21,12 +21,16 @@ def runtime_module():
 
 
 @pytest.fixture(autouse=True)
-def isolated_native_metadata(monkeypatch):
+def isolated_native_metadata(tmp_path, monkeypatch):
     """These tests own REST/lease flow, not production process attestation.
 
     The sibling isolation suite exercises the real gate with adversarial SQL
     metadata and the readonly deployed-source audit tests real provenance.
     """
+    # Legacy reflection imports prepend HERMES_HOME/scripts. Keep those
+    # imports and profile defaults away from the user's production tree.
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes-home'))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     class Isolation:
         def __init__(self, runtime):
             self.runtime = runtime
@@ -517,6 +521,7 @@ def test_real_engine_runtime_reflect_and_publication_callbacks_are_incremental(t
     import hindsight_incremental_merge as merge
     import hindsight_incremental_pipeline as flow
     from hindsight_incremental_publication import PublicationAdapter
+    assert Path(importlib.import_module('hindsight_incremental_publication').__file__).resolve().parent == ROOT
     # Reuse the publisher contract's SQL double rather than invent a second SQL
     # protocol. This still exercises the real publication transaction/readback.
     sys.path.insert(0, str(ROOT / 'tests'))

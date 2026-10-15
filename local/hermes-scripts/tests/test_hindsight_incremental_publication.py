@@ -909,3 +909,62 @@ def test_gate_delta_scope_reads_only_delta_records_seed_evidence_and_publishes(e
         assert report['cards_root'] == str(cards_root)
     publication = adapter.publish_generation(second, gate, ledger=ledger)
     assert publication['readback_verified'] is True
+
+
+def delta_proof_fixture(tmp_path, identity):
+    rows = [{'insight': f'Independent sealed observation {i}', 'topic': 'fixture',
+             'type': 'technical_lesson', 'applicability': 'local fixture only'} for i in range(2)]
+    for row in rows:
+        if identity == 'model':
+            row['id'] = 'model-chosen-id'
+        elif identity == 'canonical':
+            row['id'] = merge.observation_id(row)
+    payload = ''.join(json.dumps(row) + '\n' for row in rows).encode()
+    (tmp_path / 'observations_index.jsonl').write_bytes(payload)
+    pointer = {'manifest_sha256': 'a' * 64, 'delta_sha256': hashlib.sha256(payload).hexdigest(),
+               'delta_count': len(rows)}
+    (tmp_path / 'delta-manifest.json').write_text(json.dumps(pointer))
+    return rows, payload
+
+
+@pytest.mark.parametrize('identity', ['model', 'canonical', 'missing'])
+def test_delta_consumers_prove_canonical_identity_without_rewriting_declared_model_ids(tmp_path, identity):
+    mod = importlib.import_module('hindsight_incremental_publication')
+    rows, payload = delta_proof_fixture(tmp_path, identity)
+    proof = mod.delta_parse_proof(tmp_path)
+    assert proof['delta_count'] == proof['observation_count'] == len(rows)
+    assert proof['ids_sha256'] == merge.canonical_hash(sorted(merge.observation_id(row) for row in rows))
+    assert (tmp_path / 'observations_index.jsonl').read_bytes() == payload
+
+
+@pytest.mark.parametrize('consumer,damage', [
+    ('conflict', 'omit'), ('conflict', 'duplicate'), ('conflict', 'change'),
+    ('layered', 'omit'), ('layered', 'duplicate'), ('layered', 'change'),
+])
+def test_delta_identity_projection_still_rejects_consumer_loss_duplication_and_text_changes(
+        tmp_path, monkeypatch, consumer, damage):
+    mod = importlib.import_module('hindsight_incremental_publication')
+    delta_proof_fixture(tmp_path, 'model')
+    run_path = mod.runpy.run_path
+    script, loader = (('hindsight_conflict_audit.py', 'load_observations') if consumer == 'conflict'
+                      else ('hindsight_recall_layered.py', 'load_local_cards'))
+
+    def altered_consumer(path, *args, **kwargs):
+        namespace = run_path(path, *args, **kwargs)
+        if Path(path).name == script:
+            original = namespace[loader]
+
+            def changed(root):
+                result = original(root)
+                if damage == 'omit':
+                    return result[1:]
+                if damage == 'duplicate':
+                    return result + [copy.deepcopy(result[0])]
+                result[0]['insight' if consumer == 'conflict' else 'text'] = 'Changed consumer text'
+                return result
+            namespace[loader] = changed
+        return namespace
+
+    monkeypatch.setattr(mod.runpy, 'run_path', altered_consumer)
+    with pytest.raises(ValueError, match='delta consumer'):
+        mod.delta_parse_proof(tmp_path)
