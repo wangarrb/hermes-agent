@@ -544,6 +544,10 @@ class IncrementalLedger:
             raise ValueError('derived batches require capture_derived and verified parent receipts')
         validate_snapshot(snapshot)
         with self.locked(), self._connection(write=True) as con:
+            # Both physical and App readers pass the same finite ownership gate;
+            # reservations, source coverage and batches commit in one transaction.
+            import hindsight_app_event_ownership as ownership
+            ownership_plan = ownership.prepare_capture(self, con, snapshot)
             self._bind_source_epoch(con, snapshot)
             state = self._source_state(snapshot)
             previous = self._read(con, 'sources', snapshot['source_key'])
@@ -556,8 +560,10 @@ class IncrementalLedger:
                 state['legacy_event_ids'] = previous['legacy_event_ids']
             known = previous['events'] if previous else {}
             unseen = [m for m in snapshot['messages'] if m['event_id'] not in known]
+            unseen = ownership.select_unowned(ownership_plan, snapshot, unseen)
             groups = self._split(unseen, max_input_chars)
             batches = [self._make_batch(con, snapshot, group) for group in groups]
+            ownership.commit_capture(self, con, ownership_plan, snapshot, batches)
             # Coverage + cursor advance in the SAME transaction as batch state.
             if state != previous:
                 self._put(con, 'sources', snapshot['source_key'], state)
