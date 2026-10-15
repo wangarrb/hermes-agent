@@ -447,11 +447,17 @@ _NO_SOURCE_UNKNOWN_POLICY = object()
 
 def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
                           physical_baseline: dict | None = None,
-                          source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY) -> list[dict]:
+                          source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
+                          source_transition_certificate: dict | None = None,
+                          approved_transition_sha256: str | None = None) -> list[dict]:
     """Read a finite source view, never infer historical completion or CDC."""
     if physical_baseline is not None:
         return _scan_physical_sources(hermes_home, profile_mode, physical_baseline,
-                                      source_unknown_policy=source_unknown_policy)
+                                      source_unknown_policy=source_unknown_policy,
+                                      source_transition_certificate=source_transition_certificate,
+                                      approved_transition_sha256=approved_transition_sha256)
+    if source_transition_certificate is not None or approved_transition_sha256 is not None:
+        raise ValueError('source transition requires original physical baseline')
     if source_unknown_policy is not _NO_SOURCE_UNKNOWN_POLICY:
         raise ValueError('source unknown policy requires original physical baseline')
     home = checked_path(Path(hermes_home))
@@ -547,6 +553,7 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
 
 PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
 SOURCE_UNKNOWN_POLICY_SCHEMA = 'hindsight-source-approved-unknown/1'
+SOURCE_TRANSITION_SCHEMA = 'hindsight-approved-sqlite-header-transition/1'
 _MUTABLE_ROW_FIELDS = {'active', 'compacted', 'display_order'}
 _NATIVE_ORIGIN_FIELDS = ('origin_message_id', 'platform_message_id', 'original_id', 'message_id', 'event_id')
 
@@ -753,7 +760,34 @@ def _native_session_binding(row):
     return digest({k: row.get(k) for k in ('id', 'started_at', 'parent_session_id', 'source')})
 
 
-def _read_physical_db(path: Path, *, consume=None):
+def _sqlite_structure_hash(con):
+    return digest([list(row) for row in con.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")])
+
+
+def inspect_sqlite_transition_header(path: Path):
+    """Read the exact prospective header; this does not approve a transition."""
+    path = checked_path(path)
+    identity = _location_identity(path)
+    con = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+    try:
+        con.execute('PRAGMA query_only=ON')
+        con.execute('BEGIN')
+        app_id = con.execute('PRAGMA application_id').fetchone()[0]
+        header = {'identity': identity, 'application_id': app_id,
+            'epoch': 'sqlite:' + digest({'inode': identity, 'application_id': app_id}),
+            'schema_version': con.execute('PRAGMA schema_version').fetchone()[0],
+            'message_columns': [r[1] for r in con.execute('PRAGMA table_info(messages)')],
+            'structure_sha256': _sqlite_structure_hash(con)}
+        con.rollback()
+    finally:
+        con.close()
+    if _location_identity(path) != identity:
+        raise SourceChangedError('source_changed: SQLite replaced during transition inspection')
+    return header
+
+
+def _read_physical_db(path: Path, *, consume=None, include_structure=False):
     """Stream all roles in one mode=ro/query_only snapshot; never SessionDB."""
     identity = _location_identity(path)
     for suffix in ('-wal', '-shm', '-journal'):
@@ -783,6 +817,10 @@ def _read_physical_db(path: Path, *, consume=None):
                       'application_id': application_id, 'schema_version': schema_version, 'message_columns': columns,
                       'sessions': [{'session_id': sid, 'identity_hash': _native_session_binding(row)}
                                    for sid, row in sorted(sessions.items())], 'rows': []}
+            if include_structure:
+                header['structure_sha256'] = _sqlite_structure_hash(con)
+                header['native_copy_receipt_sessions'] = sum(
+                    _COPY_RECEIPTS_KEY in row.get('model_config', {}) for row in sessions.values())
             if consume is not None:
                 consume(None, sessions, {**header, 'copy_roots': copy_roots,
                         'copy_sources': copy_sources, 'copy_receipts_sha256': receipt_hash})
@@ -1002,6 +1040,59 @@ def validate_source_unknown_policy(policy, *, physical_baseline, bank, hermes_ho
             raise ValueError('source unknown policy rows must have canonical order')
 
 
+def validate_source_transition_certificate(certificate, *, physical_baseline,
+        source_unknown_policy, approved_transition_sha256):
+    """The caller must pin a separately approved digest, not trust an approval flag.
+
+    Only the original default header is aliased to one exact replacement.
+    Baseline rows, policy rows, lineage, receipts and ledger epochs stay intact.
+    """
+    from hindsight_incremental_merge import canonical_hash
+
+    _require_hash(approved_transition_sha256)
+    if canonical_hash(certificate) != approved_transition_sha256:
+        raise ValueError('source transition approved digest mismatch')
+    _require_shape(certificate, ('schema_version', 'bank', 'hermes_home', 'profile', 'state_db',
+        'physical_baseline_sha256', 'source_unknown_policy_sha256', 'authorization',
+        'approval_reference', 'continuity_proof_sha256', 'native_copy_receipt_precondition', 'old', 'new'))
+    profiles = {p['profile']: p for p in physical_baseline['profiles']}
+    profile = profiles['default']
+    old = profile['sqlite']
+    expected_policy = (None if source_unknown_policy is _NO_SOURCE_UNKNOWN_POLICY
+                       else canonical_hash(source_unknown_policy))
+    fields = ('identity', 'epoch', 'schema_version', 'application_id', 'message_columns')
+    if (certificate['schema_version'] != SOURCE_TRANSITION_SCHEMA
+            or certificate['bank'] != physical_baseline['bank']
+            or certificate['hermes_home'] != physical_baseline['hermes_home']
+            or certificate['profile'] != 'default' or certificate['state_db'] != profile['state_db']
+            or certificate['physical_baseline_sha256'] != canonical_hash(physical_baseline)
+            or certificate['source_unknown_policy_sha256'] != expected_policy
+            or certificate['authorization'] != 'explicit-exact-sqlite-header-transition'
+            or not _valid_native(certificate['approval_reference']) or old is None):
+        raise ValueError('source transition scope/authorization mismatch')
+    _require_hash(certificate['continuity_proof_sha256'])
+    receipt = certificate['native_copy_receipt_precondition']
+    _require_shape(receipt, ('policy', 'sessions', 'sha256'))
+    if (receipt['policy'] != 'current-epoch-exact-inventory'
+            or type(receipt['sessions']) is not int or receipt['sessions'] < 0
+            or (receipt['sessions'] == 0) != (receipt['sha256'] is None)):
+        raise ValueError('source transition native receipt precondition mismatch')
+    _require_hash(receipt['sha256'], optional=True)
+    _require_shape(certificate['old'], fields)
+    _require_shape(certificate['new'], (*fields, 'structure_sha256'))
+    if certificate['old'] != {k: old[k] for k in fields}:
+        raise ValueError('source transition original header mismatch')
+    new = certificate['new']
+    _require_identity(new['identity'])
+    _require_hash(new['structure_sha256'])
+    if (new['identity'] == old['identity'] or new['application_id'] != old['application_id']
+            or new['epoch'] != 'sqlite:' + digest({'inode': new['identity'], 'application_id': new['application_id']})
+            or type(new['schema_version']) is not int or new['schema_version'] < 0
+            or new['message_columns'] != old['message_columns']):
+        raise ValueError('source transition replacement header mismatch')
+    return certificate
+
+
 def _profile_anchors(profile):
     sids = {a['session_id'] for a in profile['artifacts'] if a['session_id']}
     if profile['sqlite']:
@@ -1117,7 +1208,7 @@ def _exclude_old_copy(record, sid, old_index, evidence, *, cutover_anchors,
     return False
 
 
-def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
+def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, header_transition=None):
     directory, db = Path(profile['sessions_dir']), Path(profile['state_db'])
     if profile['directory_identity'] is not None:
         if _location_identity(directory, directory=True) != profile['directory_identity']:
@@ -1128,6 +1219,8 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
         raise SourceChangedError('source_changed: legacy JSON membership lost')
     artifacts, old_index = [], defaultdict(list)
     copy_index, changes, current_db_exports = defaultdict(list), [], set()
+    if header_transition is not None:
+        changes.append({'approved_header_transition_sha256': digest(header_transition)})
     old_origins = defaultdict(list)
     for artifact in profile['artifacts']:
         for record in artifact['records']:
@@ -1185,8 +1278,17 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
         nonlocal evidence, copy_roots, copy_sources
         if row is None:
             if old_db:
-                if (header['epoch'] != old_db['epoch'] or header['schema_version'] != old_db['schema_version']
-                        or header['message_columns'] != old_db['message_columns']
+                if header_transition is not None:
+                    expected_header = header_transition['new']
+                    if {k: header.get(k) for k in expected_header} != expected_header:
+                        raise SourceChangedError('source_changed: approved SQLite header transition drift')
+                    receipt = header_transition['native_copy_receipt_precondition']
+                    if (header['native_copy_receipt_sessions'] != receipt['sessions']
+                            or header['copy_receipts_sha256'] != receipt['sha256']):
+                        raise SourceChangedError('source_changed: approved native receipt inventory drift')
+                elif header['epoch'] != old_db['epoch'] or header['schema_version'] != old_db['schema_version']:
+                    raise SourceChangedError('source_changed: SQLite physical epoch/schema/session loss')
+                if (header['message_columns'] != old_db['message_columns']
                         or not set(s['session_id'] for s in old_db['sessions']) <= set(sessions)):
                     raise SourceChangedError('source_changed: SQLite physical epoch/schema/session loss')
                 for old in old_db['sessions']:
@@ -1250,7 +1352,10 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
     if db.exists():
         if not old_db:
             raise SourceChangedError('source_changed: new SQLite feed needs explicit epoch binding')
-        _read_physical_db(db, consume=consume)
+        if header_transition is None:
+            _read_physical_db(db, consume=consume)
+        else:
+            _read_physical_db(db, consume=consume, include_structure=True)
     if seen_old != set(expected_rows):
         raise SourceChangedError('source_changed: legacy SQLite row coverage lost')
     if seen_unknown != set(expected_unknown):
@@ -1291,7 +1396,8 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None):
 
 
 def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
-                           source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY):
+                           source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
+                           source_transition_certificate=None, approved_transition_sha256=None):
     home = checked_path(Path(hermes_home))
     if not isinstance(baseline, dict):
         raise ValueError('invalid physical baseline header')
@@ -1305,12 +1411,16 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
         policy_hash = digest(source_unknown_policy)
         for scope in source_unknown_policy['scopes']:
             unknown_rows[scope['profile']].extend(scope['rows'])
+    if source_transition_certificate is not None or approved_transition_sha256 is not None:
+        validate_source_transition_certificate(source_transition_certificate, physical_baseline=baseline,
+            source_unknown_policy=source_unknown_policy, approved_transition_sha256=approved_transition_sha256)
     current = {s['profile']: s for s in _discover_sources(home, profile_mode)}
     old_profiles = {p['profile']: p for p in baseline['profiles']}
     if not set(old_profiles) <= set(current):
         raise SourceChangedError('source_changed: legacy profile coverage lost')
     result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(
-        profile, home, unknown_rows=unknown_rows[profile['profile']], policy_hash=policy_hash)]
+        profile, home, unknown_rows=unknown_rows[profile['profile']], policy_hash=policy_hash,
+        header_transition=source_transition_certificate if profile['profile'] == 'default' else None)]
     for name in sorted(set(current) - set(old_profiles)):
         # A genuinely new profile is strict, not silently turned into legacy.
         profile_home = Path(current[name]['state_db']).parent
