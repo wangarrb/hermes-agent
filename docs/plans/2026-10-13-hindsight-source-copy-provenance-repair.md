@@ -165,4 +165,9 @@ delta; the seed hash is recorded for evaluation, NOT a blocking gate.
   `policy: recorded_not_blocking`); `checks` and their consumers unchanged.
 - Legacy fallback: a generation without `delta_index.jsonl` runs the exact
   previous full-scope path (suite-verified byte-for-byte behavior).
+- `_readback` (publish-time DB verification) keeps the FULL-state safety net
+  by design: the delta scope governs evaluation (gate/evals/parse proofs),
+  while the publish readback still verifies the committed DB against the
+  complete frozen generation. Probe-verified: the gate succeeds with the full
+  index renamed away; the readback runs with it restored.
 
