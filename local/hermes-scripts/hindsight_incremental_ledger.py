@@ -798,7 +798,15 @@ class IncrementalLedger:
             raise ValueError('manifest receipt batch coverage mismatch')
         if verify_files:
             _private(path)
-            if validate_generation(path) != manifest:
+            # Frozen-manifest proof without re-hashing the payload files:
+            # manifest_sha256 already covers files[] hashes, the frozen
+            # manifest.json must match the receipt exactly, and every listed
+            # file must still be private and present. Payload hashes stay
+            # recorded evidence (checked at generation write, gate and
+            # publish), never a per-write 1.27GB re-read.
+            stored = json.loads(path.read_text(encoding='utf-8'))
+            if (not isinstance(stored, dict) or stored != manifest
+                    or digest({k: v for k, v in stored.items() if k != 'manifest_sha256'}) != checksum):
                 raise ValueError('manifest receipt differs from frozen generation')
             for entry in manifest['files']:
                 _private(path.parent / entry['path'])
