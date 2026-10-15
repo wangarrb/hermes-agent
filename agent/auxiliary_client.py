@@ -558,6 +558,8 @@ def _provider_alias_table() -> dict[str, str]:
         with contextlib.suppress(Exception):
             from hermes_cli.auth import _PROVIDER_ALIASES as _auth_table
             merged.update(_auth_table)
+        # Existing auxiliary lanes use Bailian for Alibaba/DashScope.
+        merged.setdefault("bailian", "alibaba")
         _ALIAS_TABLE = merged
     return _ALIAS_TABLE
 
