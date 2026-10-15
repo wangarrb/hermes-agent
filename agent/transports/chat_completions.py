@@ -566,7 +566,9 @@ class ChatCompletionsTransport(ProviderTransport):
         With ``provider_profile`` every quirk comes from the profile; the legacy flag
         path below (is_kimi, is_openrouter, ...) is only reached for unregistered providers.
         """
-        if _is_xunfei_maas_route(params.get("provider_name"), params.get("base_url")):
+        _profile = params.get("provider_profile")
+        provider = params.get("provider_name") or getattr(_profile, "name", None)
+        if _is_xunfei_maas_route(provider, params.get("base_url")):
             params = dict(params)
             overrides = dict(params.get("request_overrides") or {})
             extra_body = dict(overrides.get("extra_body") or {})
@@ -575,7 +577,6 @@ class ChatCompletionsTransport(ProviderTransport):
             extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
             overrides["extra_body"] = extra_body
             params["request_overrides"] = overrides
-        _profile = params.get("provider_profile")
         sanitized = self.convert_messages(
             messages, model=model, base_url=params.get("base_url"), provider_profile=_profile,
             provider=params.get("provider_name"),
@@ -644,7 +645,12 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
         if params.get("request_overrides"):
-            api_kwargs.update(params["request_overrides"])
+            overrides = params["request_overrides"]
+            if _is_xunfei_maas_route(provider, base_url):
+                # Selector thinking must not replace generated fields/additions.
+                # Keep the legacy replacement precedence untouched for nonmatches.
+                overrides = {**overrides, "extra_body": {**extra_body, **overrides["extra_body"]}}
+            api_kwargs.update(overrides)
         return _finish_kwargs(
             api_kwargs, sanitized, params,
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key")) or _is_openai_api_base_url(base_url),

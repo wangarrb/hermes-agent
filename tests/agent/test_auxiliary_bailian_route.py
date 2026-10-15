@@ -14,10 +14,8 @@ def isolated_config(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text("model: {}\n")
     monkeypatch.setattr(ac, "_ALIAS_TABLE", None)
-    monkeypatch.setattr("hermes_cli.auth.resolve_api_key_provider_credentials", lambda provider: {
-        "api_key": "unit-only-dashscope-key",
-        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    })
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "unit-only-dashscope-key")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
     def forbidden(*args, **kwargs):
         pytest.fail("Bailian route must not discover another cloud")
     monkeypatch.setattr(ac, "_try_discovery_chain", forbidden)
@@ -89,3 +87,40 @@ def test_auto_keeps_bailian_main_endpoint_key_and_wire(mode):
     assert model == runtime["model"]
     assert provider == "bailian"
     assert isinstance(client, ac.CodexAuxiliaryClient) == (mode == "codex_responses")
+
+@pytest.mark.parametrize("label", ["bailian", "custom:bailian"])
+@pytest.mark.parametrize("entry_key", ["bailian", "unit-named-key"])
+@pytest.mark.parametrize("flag", [False, "false", 0, True, "absent"])
+def test_bailian_disabled_policy_precedes_alias_registry(isolated_config, monkeypatch, label, entry_key, flag):
+    """Real config, credentials and router; observe lookup without replacing its result."""
+    from agent import auxiliary_client as ac
+    from hermes_cli import auth
+
+    entry = {"name": "Bailian", "base_url": "https://named-bailian.invalid/v1",
+             "api_key": "unit-only-named-key", "enabled": flag}
+    config = {} if flag == "absent" else {"providers": {entry_key: entry}}
+    (isolated_config / "config.yaml").write_text(json.dumps(config))
+    credential_lookups = []
+    real_lookup = auth.resolve_api_key_provider_credentials
+
+    def observe_lookup(*args, **kwargs):
+        credential_lookups.append(args)
+        return real_lookup(*args, **kwargs)
+
+    monkeypatch.setattr(auth, "resolve_api_key_provider_credentials", observe_lookup)
+    client, model = ac.resolve_provider_client(label, "unit-qwen", api_mode="chat_completions")
+    if flag in (False, "false", 0):
+        assert client is None
+        assert model is None
+        assert credential_lookups == []
+    else:
+        assert client is not None
+        assert model == "unit-qwen"
+        if flag == "absent":
+            assert client.api_key == "unit-only-dashscope-key"
+            assert str(client.base_url).rstrip("/") == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+            assert credential_lookups
+        else:
+            assert client.api_key == "unit-only-named-key"
+            assert str(client.base_url).rstrip("/") == entry["base_url"]
+            assert credential_lookups == []
