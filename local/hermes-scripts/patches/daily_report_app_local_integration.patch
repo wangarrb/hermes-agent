@@ -1,0 +1,60 @@
+--- a/local/hermes-scripts/daily_report.py
++++ b/local/hermes-scripts/daily_report.py
+@@ -380,16 +380,11 @@
+ def parse_codex_rollout_events(
+     files: list[tuple[str, str]], start: datetime, end: datetime,
+ ) -> dict | None:
+-    """Aggregate per-call rollout usage within [start, end).
+-
+-    每个 token_count 事件携带 last_token_usage（该次调用的增量），因此
+-    事件数 = 真实 LLM 调用次数、tokens = 各事件增量求和。该口径对
+-    cumulative 计数重置（会话 resume/重建）免疫——旧的"按日累计差"
+-    （末次-首次）方法遇重置会产出负数并吞掉重置期间的用量（2026-09-13 修复：
+-    Codex(kanban) 曾显示 -75.7M，真实为 1,312 次 / 588M input）。
+-
+-    Returns {'sources': {label: {'calls','input','cached','output'}}, 'total': {...}}
+-    or None when nothing is found.
++    """Aggregate token_count usage observations within [start, end).
++
++    The historical ``calls`` field counts nonempty usage events. It does not
++    prove request/attempt/retry totals; missing or repeated telemetry can differ
++    from actual LLM requests. Token values retain the existing summation policy.
+     """
+     sources: dict[str, dict[str, int]] = {}
+     for source_label, session_file in files:
+@@ -962,7 +957,7 @@
+     codex_usage = parse_codex_usage(start, end)
+     if codex_usage:
+         print_table(
+-            ["来源", "调用", "输入", "Cache读", "输出", "命中率"],
++            ["来源", "用量事件", "输入", "Cache读", "输出", "命中率"],
+             [
+                 [
+                     src,
+@@ -978,11 +973,11 @@
+         t = codex_usage["total"]
+         t_hit = f"{t['cached'] / t['input'] * 100:.1f}%" if t["input"] else "-"
+         print_table(
+-            ["来源", "调用", "输入", "Cache读", "输出", "命中率"],
++            ["来源", "用量事件", "输入", "Cache读", "输出", "命中率"],
+             [["合计", str(t["calls"]), fmt_tok(t["input"]), fmt_tok(t["cached"]), fmt_tok(t["output"]), t_hit]],
+         )
+     else:
+-        print("未采集到外部 CLI Agent 调用记录")
++        print("未采集到外部 CLI Agent 用量事件")
+     print()
+ 
+     # ── Hindsight 运行模型配置 (full table) ──
+@@ -1165,6 +1160,12 @@
+     print("• Mental Models: /home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/")
+     print("• 算法坑: /home/wyr/wiki/auto-maintenance/project/egomotion4d/mental-models/pitfall-catalog.md")
+     print("• Hindsight 状态: /home/wyr/wiki/auto-maintenance/reports/")
++    print()
++    from hindsight_app_daily_sidecar import render_daily_sidecar
++    print(render_daily_sidecar(
++        report_date_str,
++        archive_root=HERMES_HOME / "hindsight" / "app_archive" / "account-visible",
++    ), end="")
+     return 0
+ 
+ 

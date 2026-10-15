@@ -11,9 +11,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from datetime import date, datetime, timedelta
 
 from hindsight_app_sessions import sync_sessions
-from hindsight_app_usage import render_app_daily
+from hindsight_app_usage import render_app_daily, UTC8
 from hindsight_incremental_ledger import IncrementalLedger
 from hindsight_incremental_sources import checked_path, scan_source_snapshots
 
@@ -37,8 +38,9 @@ def archive_local(source, archive, hermes_home, scope):
     blocked = [hermes_home / 'sessions', hermes_home / 'profiles', hermes_home / 'hindsight/incremental']
     if archive == hermes_home or any(archive.is_relative_to(p) or p.is_relative_to(archive) for p in blocked):
         raise ValueError('archive must not overlap an automatically processed production feed')
-    incoming = [json.loads(p.read_text()) for p in sorted(source.glob('session_codex-app-*.json'))]
-    if not incoming or any(s.get('source_session_id') not in scope for s in incoming):
+    incoming = [json.loads(p.read_text()) for p in sorted(source.glob('session_*.json'))]
+    if not incoming or any(s.get('source_session_id') not in scope or
+                           s.get('source') not in {'codex-app', 'chatgpt-app'} for s in incoming):
         raise ValueError('archive inputs must match explicit authorized scope')
     reports = sync_sessions(incoming, archive / 'sessions', write=True)
     ledger_root = archive / 'local-capture'
@@ -48,15 +50,22 @@ def archive_local(source, archive, hermes_home, scope):
         ledger.initialize_legacy([], {'purpose': 'local_archive_only'}, [],
                                  confirm='initialize-hindsight-incremental')
     snapshots = scan_source_snapshots(archive, profile_mode='none')
-    batches = [b for snapshot in snapshots for b in ledger.capture_snapshot(snapshot)]
+    # These are local preservation documents, never model input. Keep a long
+    # public message whole; production retain budgets remain unchanged.
+    budgets = {s['source_key']: max([60000] + [len(m['content']) for m in s['messages']]) for s in snapshots}
+    batches = [b for snapshot in snapshots for b in ledger.capture_snapshot(
+        snapshot, max_input_chars=budgets[snapshot['source_key']])]
     all_batches = ledger.list_batches()
-    sessions = [json.loads((archive / 'sessions' / f"session_codex-app-{sid}.json").read_text())
-                for sid in sorted(scope) if (archive / 'sessions' / f"session_codex-app-{sid}.json").exists()]
+    sessions = [json.loads(p.read_text()) for p in sorted((archive / 'sessions').glob('session_*.json'))]
+    if any(s.get('source_session_id') not in scope for s in sessions):
+        raise ValueError('archive scope cannot silently shrink')
     manifest = {
         'schema': 'app-local-archive/1', 'scope': sorted(scope),
         'sessions': reports, 'messages': sum(len(s['messages']) for s in sessions),
         'local_documents': len(all_batches), 'local_document_state': 'captured_not_retained',
         'new_messages': sum(r['new_messages'] for r in reports), 'new_local_documents': len(batches),
+        'local_preservation_document_char_budgets': budgets,
+        'production_input_budget_changed': False,
         'production_feed_written': False, 'hindsight_api_calls': 0, 'embedding_calls': 0,
         'summary_llm_calls': 0, 'requires_destination_approval_before_model_processing': True,
         'documents': [{k: b[k] for k in ('document_id', 'source_key', 'source_event_ids', 'payload_path', 'payload_hash', 'phase')}
@@ -66,19 +75,29 @@ def archive_local(source, archive, hermes_home, scope):
     return manifest, sessions
 
 
-def daily_local(sessions, evidence_dir, canonical_dir):
+def daily_local(sessions, evidence_dir, canonical_dir, *, today=None):
+    """Refresh observed UTC+8 days and append evidence to existing next-day reports.
+
+    Current/future dates stay partial. A sidecar is evidence coverage, never a
+    claim that the account or that calendar day has been fully enumerated.
+    """
+    today = date.fromisoformat(today) if isinstance(today, str) else today or datetime.now(UTC8).date()
     outputs = []
-    # Frozen first-batch history spans these days. Later callers may select
-    # other periods; no future day is presented as a completed report here.
-    block = render_app_daily(sessions, '2026-10-14')
-    partial = '本地封存批次的部分覆盖；不是整日全账号统计。\n\n' + render_app_daily(sessions, '2026-10-15')
-    sidecars = [('2026-10-14.md', block), ('2026-10-15.partial.md', partial)]
-    for name, content in sidecars:
+    days = sorted({datetime.fromisoformat(m['timestamp'].replace('Z', '+00:00')).astimezone(UTC8).date()
+                   for s in sessions for m in s.get('messages', [])})
+    for day in days:
+        block = render_app_daily(sessions, day)
+        partial = day >= today
+        name = f"{day.isoformat()}{'.partial' if partial else ''}.md"
+        content = '本地封存可访问会话的部分覆盖；不是整日全账号统计。\n\n' + block
         path = canonical_dir / 'app-sessions' / name
         changed = private_write(path, content)
         outputs.append({'path': str(path), 'changed': changed})
-    canonical = canonical_dir / '2026-10-15.md'
-    if canonical.exists():
+        if partial:
+            continue
+        canonical = canonical_dir / f'{(day + timedelta(days=1)).isoformat()}.md'
+        if not canonical.exists():
+            continue
         original = canonical.read_text()
         start, end = '<!-- app-session-local-evidence:start -->', '<!-- app-session-local-evidence:end -->'
         replacement = start + '\n' + block + end
@@ -91,7 +110,7 @@ def daily_local(sessions, evidence_dir, canonical_dir):
             updated = original.rstrip() + '\n\n' + replacement + '\n'
         if updated != original:
             sha = hashlib.sha256(original.encode()).hexdigest()
-            private_write(evidence_dir / f'daily-2026-10-15-before-{sha}.md', original)
+            private_write(evidence_dir / f'daily-{canonical.stem}-before-{sha}.md', original)
         outputs.append({'path': str(canonical), 'changed': private_write(canonical, updated),
                         'base_report_regenerated': False, 'only_local_app_evidence_appended': True})
     return outputs

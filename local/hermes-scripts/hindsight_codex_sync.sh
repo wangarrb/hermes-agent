@@ -10,5 +10,9 @@
 # implementer home is intentionally excluded (user decision).
 # See hermes-daily-report skill 16.3.
 set -euo pipefail
+if ! /home/wyr/.hermes/hermes-agent/venv/bin/python \
+  /home/wyr/.hermes/scripts/hindsight_app_ingest_pending.py --write; then
+  echo "WARNING: local App export consumer failed; continuing existing CLI sync." >&2
+fi
 exec /home/wyr/.hermes/hermes-agent/venv/bin/python \
   /home/wyr/.hermes/scripts/hindsight_backfill_codex_rollouts.py --write

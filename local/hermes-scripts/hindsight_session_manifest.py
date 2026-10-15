@@ -52,6 +52,7 @@ NOISE_PATTERNS = [
 ]
 TAG_RULES: list[tuple[str, list[str], list[str]]] = [
     ("source:codex-app", ["[source:codex-app "], []),
+    ("source:chatgpt-app", ["[source:chatgpt-app "], []),
     ("project:egomotion4d", ["egomotion4d", "trackingworld", "vggt4d", "dggt", "dgegt", "dage", "ate_metric", "ate metric", "joint ba", "roma2"], ["domain:autodrive"]),
     ("project:vggt-long", ["vggt-long", "vggt long", "loop closure", "salad", "dinov2"], ["domain:autodrive"]),
     ("project:openclaw", ["openclaw", "clawhub", "approval", "gateway probe"], []),

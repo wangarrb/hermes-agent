@@ -1,146 +1,157 @@
-# Scoped app history ingestion (staged, not deployed)
+# App history: supported capture, local archive and daily evidence
 
-## Authorized local-only persistence
+## Scope and coverage
 
-`hindsight_app_local_archive.py` persists the already sealed first batch without
-re-fetching history or running model code. It refuses an archive root overlapping
-production sessions, profiles, or the production incremental ledger. The archive
-has its own `app-archive` ledger, with documents at `captured` only. These are six
-local input-document drafts, not six extracted Hindsight memories.
+The first installed ChatGPT app date is **2026-09-09 UTC+8**, proven by the
+same-user package install log and filesystem birth metadata. The inclusive
+boundary is `2026-09-09T00:00:00+08:00`. Filter individual event/turn boundary
+times, never session creation dates; an older conversation can gain new content.
+Dates never own deduplication identity.
 
-The authorized archive is
-`~/.hermes/hindsight/app_archive/scoped-seqscale`: three native snapshots and
-447 messages. A repeated run adds zero messages/documents. The first frozen batch
-spans 2026-10-14/15, so this task's local reporter writes corresponding sidecars
-and appends a marked 2026-10-14 block to the 2026-10-15 canonical daily report,
-backing up and preserving its original content. The 2026-10-15 event-day sidecar
-is labelled partial coverage; it is not a completed 2026-10-16 canonical report.
-No default production source, service, scheduler or model configuration is
-changed. The optional daily entry-point patch below remains unapplied because
-that tracked production script contains the user's separate uncommitted edits;
-future full regeneration must incorporate the preserved local sidecar.
+The supported current listing returned 50 non-pinned conversations (47 Codex,
+3 ordinary ChatGPT); Codex archived pagination returned 1 more. This **51-ID
+visible subset is not the full account**: the current listing has no cursor,
+and archived ordinary ChatGPT returns an explicit local-desktop-context refusal.
+Do not switch interfaces to evade that refusal. The parent conversation can
+return no turns. These limitations stay in `collection-status.json` and the daily.
+Only same-account visible user/assistant text is preserved. No tool output,
+commands, hidden reasoning, credentials, attachment URLs or internal sessions.
 
-This local processing was explicitly authorized by the parent after the initial
-handoff. The first 264-test result remains the original validation; it was not
-rerun. Local archive/report idempotence was checked by actually running this
-local-only path twice and verifying the saved item IDs, file hashes and prior
-daily body. Runtime evidence is in `evidence/local-persistence.json` on the task.
+`hindsight_app_export.js` needs the supported orchestrator-provided `tools`.
+It handles both `codex` and `chatgpt`, requests up to 20,000 output characters
+per item, follows opaque cursors, and re-fetches the head each run. It is an
+on-demand bridge, **not a Node cron collector**. Always write to a private,
+user-owned staging directory and record a receipt for the complete cursor chain.
+A returned oldest page alone does not prove a continuous chain or full transcript.
 
-The existing nightly `hindsight_codex_sync.sh` invokes
-`hindsight_backfill_codex_rollouts.py`, whose two sources are CLI rollout
-directories. App threads returned by the supported `list_threads` / `read_thread`
-tools are a separate source. Never guess a filesystem or hidden API for them.
+`read_thread` provides a public summary view. Missing user continuation bodies,
+exact item timestamps and summarized-away history remain missing even when
+pagination ends. Failed/in-progress/interrupted turns stay deferred. Explicit
+truncation is separately recorded; it never becomes a complete stable event.
+Transport errors resume only from unsealed cursors. Never manufacture message text.
 
-## Supported bridge
+## Local preservation and identity
 
-`hindsight_app_export.js` runs inside the tool orchestrator (where `tools` is
-provided). Call `collectAppHistory({scope, outputDir})` with an explicit thread-ID
-map and a private staging directory. It discovers the scoped IDs in the bounded
-listing, reads scoped IDs directly even when outside that listing, follows opaque
-pagination cursors, and saves only public user/assistant items. Every invocation
-refetches the head so newly completed turns can be discovered. It does not save
-tool commands, outputs, reasoning, credentials, or authorize additional threads.
-The listing is bounded; there is no claim of account-wide enumeration. Check
-`reached_oldest` and `resume_cursor` if a chosen page budget is exhausted; increasing
-the budget on a subsequent head scan is safe. This is an on-demand tool bridge,
-not a newly installed unattended service or scheduler.
+`hindsight_app_sessions.py --export-dir DIR --scope SCOPE.json
+--output-sessions TARGET --since 2026-09-09T00:00:00+08:00 --allow-partial`
+is a dry plan unless `--write` is supplied. It makes no network/model calls.
+Native snapshot IDs are `codex-app-UUID` / `chatgpt-app-UUID`; origins are
+`SOURCE:UUID:TURN:ITEM`. Stable identity owns union/dedup; a rewritten stable
+item fails closed. First-observed append order preserves sealed JSON prefixes
+even when newly discovered history has older timestamps. Partial snapshots cannot remove previously saved history.
 
-An app read is a **history summary view**, not a guaranteed full transcript.
-Missing user/delegation bodies and missing exact message timestamps remain
-unknown. Completed turns supply stable public item IDs. The adapter defers
-in-progress/failed turns and rejects explicitly truncated or rewritten items.
-Refetch a truncated item through a supported fuller export before publication;
-the adapter does not invent its missing suffix.
+Parent metadata is `app_parent_session_id`, never Hermes compression
+`parent_session_id`. Relation evidence comes from an initial public delegation
+wrapper or an explicit authorized assertion. Same project/title is no proof.
+Public provenance includes session, turn, item, time and parent basis. Timestamps
+use labelled turn start/completion fallbacks, not precise item event times.
+The existing manifest tagger recognizes both source labels.
 
-`hindsight_app_sessions.py --export-dir STAGING --scope SCOPE.json
---output-sessions TARGET` is a read-only plan by default. `--write` writes only
-native `session_codex-app-UUID.json` snapshots. It never calls Hindsight or a model.
-An example scope value is
-`{"UUID":{"parent_session_id":"PARENT_UUID","relation_basis":"user_supplied_delegation"}}`.
-The scope is an authorization input, not inferred from conversation commands.
+`hindsight_app_local_archive.py` reuses the real arrival scanner and ledger,
+inside `~/.hermes/hindsight/app_archive/account-visible`. This root is outside
+production `sessions`, `profiles` and the production incremental ledger; overlap
+is rejected. Local documents remain **captured, not retained memories**. The
+independent `app-archive` ledger never runs Hindsight. An oversized public message
+is preserved whole locally, using a local document budget large enough for that
+message; production/model budgets are unchanged. Re-running the same input adds
+zero messages and zero documents. The original frozen three-session archive at
+`app_archive/scoped-seqscale` remains separately available.
 
-## Existing pipeline and identity
+Compare source UUIDs with existing CLI exports before any production ingestion.
+Seventeen currently visible IDs overlap the local CLI/VScode state store; twelve
+already have CLI exports. These twelve are labelled `legacy_cli_session_overlap`:
+the App view is retained locally but is **not additive to CLI totals** and cannot
+be re-imported as a second production source. The old exports lack original item
+IDs, so an exact between-view message delta remains unknown. Do not guess it
+from text similarity or different clocks. Within App history, audit exact shared
+turn/item IDs across sessions; report occurrences and unique shared history
+separately and never assume a fork from similar text.
 
-Only after authorization review, use the existing default-profile session
-directory as TARGET. That makes the existing logical/physical arrival scanner
-and existing bank-scoped ledger discover the feed without a second ingestion
-pipeline. The source key is `default:hermes:codex-app-UUID`; the public native
-origin is `codex-app:UUID:TURN:ITEM`. A content change under the same ID fails
-closed. Partial later exports union with old snapshots and cannot erase history.
-Repeated input creates no new messages or ledger batches.
+## Daily integration and actual automation status
 
-App parent IDs are `app_parent_session_id`, with an explicit evidence basis.
-They are not `parent_session_id`: the latter means Hermes compression ancestry
-and would incorrectly merge independently delegated app conversations. Each
-message retains source/session/turn/item/parent/time provenance in its input text,
-and the existing manifest tagger recognizes `source:codex-app`.
+`hindsight_app_usage` counts only explicit `llm.request`, `llm.attempt`,
+`llm.retry`, `llm.success`, `llm.failure` events. Raw references, identities,
+retry outcomes, conflicts and UTC+8 boundaries are preserved. App history and
+currently correlated logs expose none, so all five call columns remain unknown.
+Assistant messages, tool calls, completed turns and token_count events are not
+actual request/attempt counts. The historical CLI `calls` field still counts
+usage events internally; the production daily column now says **用量事件**.
 
-An existing CLI snapshot ending in the same UUID blocks import for that session
-until its event identity is reconciled; heuristic content dedup is not used.
-Review both default and reviewer exports before approval. This is conservative
-overlap rejection, not a completed CLI/app migration merge.
+`hindsight_app_daily_sidecar.py` is deployed as a reader of `account-visible`.
+The existing **08:30 `daily_report.py` entry point now invokes it** for the prior
+UTC+8 calendar day. Only the small insertion and truthful CLI event labels/doc
+were applied to the current dirty production file; all prior uncommitted edits
+were preserved and backed up by hash. The isolated worktree's older reporter
+was never copied over it. Deployment receipts are outside Git under task evidence.
+The exact patch is `patches/daily_report_app_local_integration.patch`; the older
+`app-daily-integration.patch` and six-line sidecar-only patch are superseded,
+unapplied alternatives and must not be reapplied.
 
-## Calls and daily output
+Historical evidence sidecars are generated for observed days. Completed prior
+days may append a single idempotent marked block to an existing next-day report,
+with a private backup. Today's sidecar stays `.partial.md`; no future canonical
+report is invented. CLI-overlap rows are explicitly non-additive. Source item
+references permit checking totals without publishing private conversation bodies.
 
-`hindsight_app_usage.aggregate_llm_events` counts only explicit normalized
-`llm.request/attempt/retry/success/failure` events, preserving raw references,
-scope, and conflicts. A `token_count`, assistant item, tool call, or completed
-turn is not such an event. Supported app history currently exposes none of
-these telemetry events. Unknown columns remain unknown, including zero-looking
-days without telemetry coverage. The normalization API is ready for a separately
-verified telemetry source; it does not prove that such a source is available.
+**Automatic App discovery/history fetch is not deployed.** The existing 23:00
+script now first consumes App exports locally and then syncs CLI rollouts;
+00:01 runs the existing memory pipeline. The deployed consumer was exercised
+against a real supported-API export and added zero messages/documents on replay.
+A
+same-user official local app-server transport was read-only verified, but that
+store returned only 52 CLI/VScode threads and excluded the known App samples.
+It cannot be presented as a full App collector. A supported App-native task
+context/schedule must supply list/read capability and private staging for actual
+daily App collection. No new schedule, service, credentials, permissions, proxy
+or exporter was created. The daily shows unknown/stale coverage when collection
+has not been proved current. A report reader alone is not a daily collector.
 
-`render_app_daily(sessions, "YYYY-MM-DD")` produces an appendable daily block
-with source-session totals and item references. The interval is explicitly
-UTC+8 `[00:00,next 00:00)`. Message allocation uses turn start/completion as a
-labelled approximation, not exact message event times; cross-day turns remain
-an attribution limit. The report does not add these counts to the existing
-CLI LLM-call total. Existing production `daily_report.py` has uncommitted user
-changes, so this branch deliberately leaves that file untouched. The remaining
-small integration is to load approved app snapshots and append this block to
-its calendar-day report window, after those changes are reconciled by the parent.
-`app-daily-integration.patch` is a prepared, unapplied patch against the observed
-production file including its existing user changes. It adds an explicit
-`--app-sessions` argument and appends the sidecar using the report window's UTC+8
-day. Verify the recorded baseline hash and use `git apply --check --unidiff-zero`
-before applying with `git apply --unidiff-zero` (the patch omits context lines);
-do not restore the branch's older `daily_report.py`. No default cron changes are
-included, and the patch has not been applied to production or this branch's old
-reporter.
-The prepared patch also labels the existing external CLI counter as usage events
-and explains that `token_count` does not prove request/attempt/success totals.
+## Formal Hindsight processing and approval boundary
 
-## Data flow approval boundary
+External processing was approved for **only three frozen SeqScale conversations,
+447 cleaned public messages**. `hindsight_app_approved_run.py` validates their
+exact proof, refuses unrelated pending work, writes only these three snapshots
+to `~/.hermes/sessions`, and invokes the existing native arrival pipeline with
+its original integrity guards and publication gates. Its first execution was
+blocked by `SourceChangedError` **before capture**: zero batches, network calls
+and offline LLM calls. The confirmed cause is an unrelated physical replacement of `~/.hermes/state.db`
+(inode 41059815 → 41059857; SQLite schema cookie 163 → 208). All 1508 baseline
+session identities and all 277999 baseline row hashes were proved unchanged in
+one read-only snapshot; the 17 default-policy unknown rows also match. There
+are 7278 later SQL rows, which must remain future. The original CLI has no epoch
+migration command. A new opt-in exact header-transition candidate preserves all
+original row/session/unknown/profile/JSON checks and the original feed epoch.
+It requires a certificate and independently reviewed SHA. Its 199 targeted tests
+passed; the real certificate remains DRAFT pending the parent's independent pin.
+No baseline, gate or source unknown policy is weakened. Local archives are not memory
+extraction, and retained/submitted/published are separate receipt states.
 
-Local staging is private and outside the production feed. Planned production
-targets are `~/.hermes/sessions`, the existing `hermes` incremental ledger,
-Hindsight `http://127.0.0.1:8888`, its configured local PostgreSQL database, and
-the existing wiki daily report. None is written by the read-only plan.
+The accessible archive currently contains 50 sessions (47 Codex,3 ordinary
+ChatGPT), 10366 cleaned source occurrences /7602 unique App items and154 captured
+local documents. All pagination/coverage limitations remain explicit. Re-running
+the whole archive adds zero messages/documents. A single newest-turn refresh in
+an existing session added5 completed messages, then zero on replay; those5 are
+local-only and do not expand the frozen447 external scope. The real source-level
+raw view has10799 occurrences /7800 unique items, with2999 shared occurrences;
+cleaning/deferred-turn selection explains the different normalized counts.
 
-`pipeline_config.json` declares publication embedding at
-`http://127.0.0.1:11434/v1`, `bge-m3` (local Ollama). Its consolidation profile is
-`oneapi-auto-cheep`, whose built-in route is `http://127.0.0.1:3000/v1`, model
-`auto_cheep_model`. Runtime overrides and the proxy's active upstream routing
-must be attested without reading credentials before sending new app data.
-The current reporter identifies One API's DB as
-`~/.local/share/one-api/data/one-api.db`. A read-only query of non-secret channel
-fields finds the enabled priority-100 `codex-subscription-luna-muse` route for
-`auto_cheep_model` at `http://172.17.0.1:4458`. Disabled routes also exist and are
-not presumed to be processing these data. This configuration is not a per-request
-runtime trace: the bridge's remote destination remains unattested. The user-bus
-and Docker socket were not accessible in this delegated sandbox; no permission
-or service changes were made to inspect them.
-The already-generated `2026-10-15.md` daily report's public configuration table
-records retain/reflect/consolidation/default at the same local One API URL and
-`auto_cheep_model` under `systemd:hindsight`. This is the latest observed runtime
-evidence, not a fresh service attestation. Do not label the known local embedding
-endpoint as external. Before execution, confirm that runtime overrides and the
-bridge's ultimate destination have not changed.
+Fresh safe-field attestation proved native retain/consolidate/reflect/default
+and offline summary use `auto_cheep_model` via `http://127.0.0.1:3000/v1`.
+The enabled One API route reaches `http://172.17.0.1:4458`, which selects among:
 
-The native retain stage receives cleaned public conversation text plus source
-provenance. Offline summary generation then receives newly extracted
-world/experience facts with fact/document IDs and timestamps. Publication embeds
-the accepted canonical text locally. Formal retain, external processing and wiki
-rebuild remain gated on the parent's authorization check of targets, categories,
-destinations and counts. No credentials, permissions, proxy settings, cron jobs,
-old histories or unrelated SeqScale files are changed by this branch.
+- LongCat `longcat-2.5-preview-free`: `https://opencode.ai/zen/go/v1/chat/completions`;
+- Muse `muse-spark-1.3-contributor`: `https://opencode.ai/zen/go/v1/responses`;
+- Luna `gpt-6-luna`: `https://chatgpt.com/backend-api/codex/responses`.
+
+No failure cross-model or paid fallback was enabled. Publication embedding is
+**local** Ollama-compatible `http://127.0.0.1:11434/v1`, `bge-m3`; the provider
+name `openai` describes the protocol and is not evidence of external embedding.
+No credential values are read into reports or logs.
+
+Retain sends cleaned public text plus provenance; offline summary sends newly
+extracted world/experience facts with IDs/time; local publication embedding gets
+accepted canonical text. Other discovered conversations, including ordinary or
+sensitive discussions, remain local-only. Before expanding external extraction,
+the parent must approve the concrete session/message inventory, categories,
+ultimate destinations and purposes. A successful operation is not a measured
+LLM attempt; unknown native request/retry telemetry remains unknown.

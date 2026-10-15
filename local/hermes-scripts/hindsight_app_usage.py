@@ -163,10 +163,17 @@ def render_app_daily(sessions: Iterable[Mapping[str, Any]], day: str | date | da
     """
     start, end = day_window(day)
     grouped: dict[str, dict] = {}
+    labels = {}
+    legacy_overlap = set()
     for session in sessions:
-        if session.get("source") != "codex-app" and session.get("platform") != "backfill-codex-app":
+        if session.get("source") not in {"codex-app", "chatgpt-app"}:
             continue
         sid = str(session.get("source_session_id") or session["session_id"])
+        if sid in labels and labels[sid] != session['source']:
+            raise ValueError('source kind changed for stable session identity')
+        labels[sid] = session['source']
+        if session.get('legacy_cli_session_overlap'):
+            legacy_overlap.add(sid)
         events = grouped.setdefault(sid, {})
         for message in session.get("messages", []):
             if message.get("role") not in {"user", "assistant"}:
@@ -177,6 +184,13 @@ def render_app_daily(sessions: Iterable[Mapping[str, Any]], day: str | date | da
             if origin in events and events[origin] != message:
                 raise ValueError("App daily source item changed")
             events[origin] = message
+
+    def item_key(sid, message):
+        if message.get('source_turn_id') and message.get('source_item_id'):
+            return (labels[sid], message['source_turn_id'], message['source_item_id'])
+        return (labels[sid], sid, message['origin_message_id'])
+
+    cli_keys = {item_key(sid, m) for sid in legacy_overlap for m in grouped[sid].values()}
 
     def cell(value):
         return str(value).replace("|", "\\|").replace("`", "'").replace("\n", " ")
@@ -193,6 +207,9 @@ def render_app_daily(sessions: Iterable[Mapping[str, Any]], day: str | date | da
     ]
     references = []
     missing_time = 0
+    additive_messages = overlap_messages = 0
+    unique_items = {}
+    conflicting_items = set()
     for sid, events in sorted(grouped.items()):
         visible = []
         for origin, message in events.items():
@@ -207,9 +224,30 @@ def render_app_daily(sessions: Iterable[Mapping[str, Any]], day: str | date | da
             if start <= timestamp < end:
                 visible.append(message)
                 references.append(f"- `{cell(sid)}` / `{cell(origin)}` / {timestamp.astimezone(UTC8).isoformat()}")
+                key = item_key(sid, message)
+                body = str(message.get('content', ''))
+                if body.startswith('[source:') and '\n' in body:
+                    body = body.split('\n', 1)[1]
+                signature = (message['role'], timestamp.isoformat(), body)
+                if key in unique_items and unique_items[key] != signature:
+                    conflicting_items.add(key)
+                unique_items.setdefault(key, signature)
         users = sum(message["role"] == "user" for message in visible)
         assistants = sum(message["role"] == "assistant" for message in visible)
-        lines.append(f"| codex-app | `{cell(sid)}` | {users} | {assistants} | 未知 | 未知 | 未知 | 未知 | 未知 |")
+        if visible:
+            shares_cli = any(item_key(sid, m) in cli_keys for m in visible)
+            label = labels[sid] + ('（CLI 同源）' if sid in legacy_overlap else '（含 CLI 共享历史）' if shares_cli else '')
+            lines.append(f"| {label} | `{cell(sid)}` | {users} | {assistants} | 未知 | 未知 | 未知 | 未知 | 未知 |")
+            overlap = sum(item_key(sid, m) in cli_keys for m in visible)
+            overlap_messages += overlap
+            additive_messages += len(visible) - overlap
+    total = additive_messages + overlap_messages
+    lines.append(f"\n本日 App 来源条目：{total}；其中 CLI 同源或共享历史视图 {overlap_messages}，不得与旧 CLI 统计相加。")
+    if conflicting_items:
+        lines.append(f"App 唯一条目数量未知：{len(conflicting_items)} 个共享身份的正文或时间冲突，需核对来源。")
+    else:
+        lines.append(f"按返回的稳定 turn/item 身份去重：{len(unique_items)} 条，跨 session 额外出现 {total - len(unique_items)} 次。")
+    lines.append(f"无已知 CLI 同源身份重叠的来源条目：{additive_messages}；旧导出缺 item 身份，跨 CLI 的精确新增差额仍未知。以上均不是 LLM 调用数。")
     if missing_time:
         lines.append(f"\n另有 {missing_time} 个可见条目缺少带时区时间，未分配至本日。")
     lines.extend(["", "原始条目核对（turn 边界时间）：", *sorted(references)])

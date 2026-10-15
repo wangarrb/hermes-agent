@@ -89,3 +89,20 @@ def test_chat_exports_do_not_establish_calls_or_zero_usage_under_utc_runner():
     assert "| codex-app | `session` | 0 | 1 | 未知 | 未知 | 未知 | 未知 | 未知 |" in markdown
     assert "app:item-1" in markdown and "prior-day" not in markdown
     assert "非精确消息事件时刻" in markdown and "用户正文覆盖不完整" in markdown
+
+
+def test_shared_app_items_and_cli_aliases_are_nonadditive_and_conflicts_visible():
+    item = {'role': 'assistant', 'timestamp': '2026-10-14T17:00:00Z',
+            'source_turn_id': 'shared-turn', 'source_item_id': 'shared-item',
+            'origin_message_id': 'source-a', 'content': '[source:codex-app session=a]\nSame public body.'}
+    first = {'source': 'codex-app', 'source_session_id': 'a', 'legacy_cli_session_overlap': True,
+             'messages': [item]}
+    second = {'source': 'codex-app', 'source_session_id': 'b',
+              'messages': [dict(item, origin_message_id='source-b', content='[source:codex-app session=b]\nSame public body.')]}
+    rendered = usage.render_app_daily([first, second], '2026-10-15')
+    assert '来源条目：2；其中 CLI 同源或共享历史视图 2' in rendered
+    assert '身份去重：1 条，跨 session 额外出现 1 次' in rendered
+    assert '含 CLI 共享历史' in rendered
+    second['messages'][0]['content'] = 'Conflicting visible body'
+    conflicted = usage.render_app_daily([first, second], '2026-10-15')
+    assert '唯一条目数量未知' in conflicted
