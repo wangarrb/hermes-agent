@@ -149,3 +149,62 @@ def test_production_profile_caller_uses_profile_identity(monkeypatch, provider, 
     else:
         assert "thinking" not in kw["extra_body"]
     assert (overrides, reasoning) == before
+
+
+@pytest.mark.parametrize("schema", ["providers", "legacy"])
+@pytest.mark.parametrize("provider", ["xunfei-coding", "custom:xunfei-coding", "unit-remote-control", "custom:unit-remote-control"])
+@pytest.mark.parametrize("reasoning,expected", [
+    (None, "enabled"), ({"enabled": False}, "disabled"),
+    ({"enabled": 0}, "enabled"), ({"enabled": "false"}, "enabled"),
+])
+@pytest.mark.parametrize("caller_thinking", [False, True], ids=["no-thinking", "override-thinking"])
+def test_real_config_registry_and_caller_preserve_requested_identity(
+    tmp_path, monkeypatch, schema, provider, reasoning, expected, caller_thinking,
+):
+    """Real generic profile and caller; no replacement registry/profile/routing result."""
+    import json
+    from types import SimpleNamespace
+    from providers import get_provider_profile
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+    from agent.chat_completion_helpers import _build_chat_completions_kwargs
+
+    home = tmp_path / "real-config"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    name = provider.removeprefix("custom:")
+    base = "https://unit-remote.invalid/v1"
+    entry = {"name": name, "base_url": base, "api_key": "unit-only-key", "api_mode": "chat_completions"}
+    config = {"providers": {"stable-route": entry}} if schema == "providers" else {"custom_providers": [entry]}
+    (home / "config.yaml").write_text(json.dumps(config))
+    selected = _get_named_custom_provider(provider)
+    assert selected["base_url"] == base and selected["api_key"] == "unit-only-key"
+    profile = get_provider_profile(provider)
+    assert profile is not None and profile.name == "custom"
+    transport = ChatCompletionsTransport()
+    agent = SimpleNamespace(
+        provider=provider, model="unit-model", base_url=selected["base_url"],
+        _base_url_lower=base, _base_url_hostname="unit-remote.invalid",
+        session_id="unit-session", max_tokens=None, _ollama_num_ctx=None,
+        openrouter_min_coding_score=None, providers_allowed=None, providers_ignored=None,
+        providers_order=None, provider_sort=None, provider_require_parameters=False,
+        provider_data_collection=None, _get_transport=lambda: transport,
+        _is_qwen_portal=lambda: False, _is_openrouter_url=lambda: False,
+        _resolved_api_call_timeout=lambda: 30, _supports_reasoning_extra_body=lambda: False,
+        _max_tokens_param=lambda value: {"max_tokens": value},
+        _prepare_messages_for_non_vision_model=lambda messages: messages,
+    )
+    messages = [{"role": "user", "content": "unit"}]
+    overrides = {"extra_body": {"must_keep": {"value": "unit-marker"}}}
+    if caller_thinking:
+        overrides["extra_body"]["thinking"] = {"type": "caller"}
+    before = deepcopy((messages, overrides, reasoning))
+    kw = _build_chat_completions_kwargs(agent, messages, [], reasoning, overrides, "unit-cache")
+    assert kw["extra_body"]["must_keep"] == {"value": "unit-marker"}
+    if provider == "xunfei-coding":
+        assert kw["extra_body"].get("thinking") == {"type": expected}
+    elif caller_thinking:
+        assert kw["extra_body"]["thinking"] == {"type": "caller"}
+    else:
+        assert "thinking" not in kw["extra_body"]
+    assert (messages, overrides, reasoning) == before
+    assert agent.provider == provider and agent.base_url == base

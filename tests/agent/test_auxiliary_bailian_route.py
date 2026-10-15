@@ -124,3 +124,43 @@ def test_bailian_disabled_policy_precedes_alias_registry(isolated_config, monkey
             assert client.api_key == "unit-only-named-key"
             assert str(client.base_url).rstrip("/") == entry["base_url"]
             assert credential_lookups == []
+
+
+@pytest.mark.parametrize("name", ["Bailian", "Kimi", "unit-route"])
+@pytest.mark.parametrize("explicit_name", [False, True], ids=["bare", "custom"])
+@pytest.mark.parametrize("layout", ["active-retired", "new-before-legacy", "disabled-new-legacy"])
+@pytest.mark.parametrize("mode", ["chat_completions", "codex_responses"])
+@pytest.mark.parametrize("override", [False, True], ids=["entry-defaults", "explicit-overrides"])
+def test_real_named_binding_survives_unselected_disabled_entries(
+    isolated_config, name, explicit_name, layout, mode, override,
+):
+    """The existing resolver, not an all-disabled scan, owns enabled/key/schema selection."""
+    from agent import auxiliary_client as ac
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+    active = {"name": name, "enabled": True, "base_url": "https://active.invalid/v1",
+              "api_key": "unit-only-active-key", "api_mode": mode}
+    retired = {"name": name, "enabled": False, "base_url": "https://retired.invalid/v1",
+               "api_key": "unit-only-retired-key", "api_mode": mode}
+    legacy = {"name": name, "provider_key": "legacy-route", "base_url": "https://legacy.invalid/v1",
+              "api_key": "unit-only-legacy-key", "api_mode": mode}
+    config = {"providers": {"active-route": active, "retired-route": retired}}
+    if layout == "new-before-legacy":
+        config["custom_providers"] = [legacy]
+    elif layout == "disabled-new-legacy":
+        config = {"providers": {"retired-route": retired}, "custom_providers": [legacy]}
+    (isolated_config / "config.yaml").write_text(json.dumps(config))
+    label = ("custom:" if explicit_name else "") + name.lower()
+    selected = _get_named_custom_provider(label)
+    expected = legacy if layout == "disabled-new-legacy" else active
+    assert selected["base_url"] == expected["base_url"]
+    assert selected["api_key"] == expected["api_key"]
+    if layout != "disabled-new-legacy":
+        assert selected["provider_key"] == "active-route"
+    kwargs = {"explicit_base_url": "https://explicit.invalid/v1", "explicit_api_key": "unit-only-explicit-key"} if override else {}
+    client, model = ac.resolve_provider_client(label, "unit-model", **kwargs)
+    assert client is not None
+    assert str(client.base_url).rstrip("/") == (kwargs.get("explicit_base_url") or expected["base_url"])
+    assert client.api_key == (kwargs.get("explicit_api_key") or expected["api_key"])
+    assert isinstance(client, ac.CodexAuxiliaryClient) == (mode == "codex_responses")
+    assert model == "unit-model"

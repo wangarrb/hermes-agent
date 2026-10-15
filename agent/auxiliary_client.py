@@ -5175,17 +5175,18 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     # canonical name (e.g. ``nous``) still defer to the built-in.
     custom_entry = None
     if req.original_provider and req.original_provider != provider:
+        custom_entry = _get_named_custom_provider(req.original_provider)
+    if custom_entry is None and req.original_provider in {"bailian", "custom:bailian"}:
         from hermes_cli.config import is_provider_enabled, load_config_readonly
         from hermes_cli.providers import custom_provider_aliases
 
         providers = load_config_readonly().get("providers")
-        # An explicitly disabled alias is a denial, not an absent named endpoint:
-        # do not escape its policy through the canonical provider's credentials.
+        # Only an unresolved Bailian alias needs the new Alibaba escape guard.
+        # The existing resolver owns enabled selection and new/legacy precedence.
         for name, entry in (providers.items() if isinstance(providers, dict) else ()):
             if (isinstance(entry, dict) and not is_provider_enabled(entry)
                     and req.original_provider in custom_provider_aliases(str(entry.get("name") or name), str(name))):
                 return None, None
-        custom_entry = _get_named_custom_provider(req.original_provider)
     if custom_entry is None:
         custom_entry = _get_named_custom_provider(provider)
     if not custom_entry:

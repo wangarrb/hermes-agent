@@ -567,7 +567,7 @@ class ChatCompletionsTransport(ProviderTransport):
         path below (is_kimi, is_openrouter, ...) is only reached for unregistered providers.
         """
         _profile = params.get("provider_profile")
-        provider = params.get("provider_name") or getattr(_profile, "name", None)
+        provider = params.get("provider_name")
         if _is_xunfei_maas_route(provider, params.get("base_url")):
             params = dict(params)
             overrides = dict(params.get("request_overrides") or {})
