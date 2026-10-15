@@ -439,6 +439,13 @@ module['main']()
             if stored != ancestor:
                 raise ValueError('ancestor manifest differs from the bound parent')
             ancestor = ancestor['parent']
+        # The chain must root in THIS ledger's authoritative initial export.
+        # The ledger manifest carries the seed provenance; no seed artifact read.
+        seed = ledger.initialization_manifest().get('seed') or {}
+        if seed.get('bank') != self.bank:
+            raise ValueError('initial seed bank mismatch')
+        if ancestor != seed.get('provenance'):
+            raise ValueError('parent seed provenance mismatch')
         cards = _delta_cards(delta, self.publisher)
         targets = [self.publisher.card_document_id(c) for c in cards]
         if len(set(targets)) != len(targets):
