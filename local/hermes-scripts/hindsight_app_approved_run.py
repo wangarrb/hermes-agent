@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import argparse
+import hashlib
 from pathlib import Path
 import sys
 
@@ -19,11 +20,14 @@ from hindsight_incremental_runtime import ArrivalRuntime
 from hindsight_incremental_sources import scan_source_snapshots, _message, digest
 from hindsight_pipeline_common import load_config
 
-APPROVED = frozenset({
-    '01a1381d-d6a5-7103-9aba-8d12ea797006',
-    '01a137c5-3f40-76b8-a871-b2567a8f6025',
-    '01a13ed4-a7da-71fa-ba33-e9879482c024',
-})
+# Pinned to the original 447-message freeze, independently checked against the
+# prior archive manifest/payload hashes. Mutable source proofs never grant approval.
+APPROVED_SOURCE_SHA256 = {
+    '01a1381d-d6a5-7103-9aba-8d12ea797006': '30f42c75d75c36866096906d1e613c9891816f6eebaee2bbbbac4d6b98c77095',
+    '01a137c5-3f40-76b8-a871-b2567a8f6025': 'd38e987e80add1503b71739cd73bcb668c2ba9bc342d9b5189532a370c568f2b',
+    '01a13ed4-a7da-71fa-ba33-e9879482c024': '33f743c8126c84ed41254f5a1889dd8171d51e051a05dec1ab797da8aa4468a1',
+}
+APPROVED = frozenset(APPROVED_SOURCE_SHA256)
 TASK = Path('/home/wyr/Documents/Codex/2026-10-15/task')
 SOURCE = TASK / 'evidence/staged-home-v2/sessions'
 REPORT = TASK / 'evidence/approved-three-production.json'
@@ -34,6 +38,18 @@ def _proof(messages):
             for m in messages}
 
 
+def _load_approved_sessions():
+    sessions = []
+    for sid in sorted(APPROVED):
+        raw = (SOURCE / f'session_codex-app-{sid}.json').read_bytes()
+        if hashlib.sha256(raw).hexdigest() != APPROVED_SOURCE_SHA256[sid]:
+            raise ValueError('approved frozen source bytes changed')
+        sessions.append(json.loads(raw))
+    if {s['source_session_id'] for s in sessions} != APPROVED or sum(len(s['messages']) for s in sessions) != 447:
+        raise ValueError('approved frozen source changed')
+    return sessions
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--transition-certificate', type=Path)
@@ -42,15 +58,13 @@ def main(argv=None):
     if bool(args.transition_certificate) != bool(args.approved_transition_sha256):
         parser.error('a reviewed certificate and its independent approval pin are both required')
     transition = json.loads(args.transition_certificate.read_text()) if args.transition_certificate else None
+    sessions = _load_approved_sessions()
     cfg = load_config()
     if cfg['bank'] != 'hermes' or cfg['api_url'] != 'http://127.0.0.1:8888':
         raise ValueError('approved production target changed')
     cfg['incremental'] = dict(cfg.get('incremental') or {})
     cfg['incremental']['mode'] = 'daily'
     cfg['incremental']['include_wiki'] = False
-    sessions = [json.loads((SOURCE / f'session_codex-app-{sid}.json').read_text()) for sid in sorted(APPROVED)]
-    if {s['source_session_id'] for s in sessions} != APPROVED or sum(len(s['messages']) for s in sessions) != 447:
-        raise ValueError('approved frozen source changed')
     expected = {f"default:hermes:{s['session_id']}": _proof([_message(m, codex=True) for m in s['messages']])
                 for s in sessions}
     runtime = ArrivalRuntime(cfg)

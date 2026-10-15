@@ -99,3 +99,13 @@ valid separately approved new-epoch receipt keeps copied future input no-op.
 
 Never use `initialize`, replace the baseline, reset a cursor, edit ledger metadata,
 or choose an isolated feed to make the current production error disappear.
+
+## Frozen external-input guard follow-up
+
+Independent review found that a session/count-only allowlist did not pin content.
+The owning runner now pins the three original frozen file SHA256 values in code,
+verifies one read_bytes result, then parses those same bytes. It rejects equal-count
+content substitution before runtime/configuration. Four focused canonical-runner
+tests passed, including a read-then-path-replacement case. This runner change is
+a review candidate only: no external run, baseline rebuild, or transition apply
+was performed. Evidence: task/evidence/approved-run-frozen-hash-fix.json.
