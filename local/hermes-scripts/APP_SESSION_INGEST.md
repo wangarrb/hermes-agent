@@ -1,5 +1,15 @@
 # App history: supported capture, local archive and daily evidence
 
+The original omission occurs before incremental capture: the nightly feed only
+discovers CLI rollout files in its configured default/reviewer directories, and
+the original usage report scans CLI files too. The three known App source IDs
+were absent from the local CLI state store, old CLI exports and production ledger.
+They therefore never became Hermes snapshots for Hindsight. Ordinary ChatGPT is
+also a distinct history kind. This is a discovery/source-adapter gap, rather than
+evidence that a date filter or ledger cursor dropped these three conversations.
+The local daemon's successful read-only listing contained only CLI/VScode data;
+its transport alone cannot recover the separate App sources.
+
 ## Scope and coverage
 
 The first installed ChatGPT app date is **2026-09-09 UTC+8**, proven by the
