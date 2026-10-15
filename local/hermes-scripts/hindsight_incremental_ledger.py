@@ -19,6 +19,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -173,7 +174,18 @@ class IncrementalLedger:
                 self._require_initialized(con)
             yield con
             if write:
-                con.commit()
+                # Bounded commit retry: a transient long reader (maintenance or
+                # monitor scan) must not fail a producing run. The transaction
+                # stays open across attempts; the final failure still surfaces
+                # as the same ledger integrity error.
+                for attempt in range(3):
+                    try:
+                        con.commit()
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if 'locked' not in str(exc) or attempt == 2:
+                            raise
+                        time.sleep(30)
         except sqlite3.Error as exc:
             raise LedgerIntegrityError('invalid ledger SQLite state') from exc
         finally:
