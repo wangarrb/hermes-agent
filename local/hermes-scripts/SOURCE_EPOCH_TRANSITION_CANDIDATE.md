@@ -118,6 +118,29 @@ files. The original exclusions stay fixed and later arrivals are preserved.
 Never use `initialize`, replace the baseline, reset a cursor, edit ledger metadata,
 or choose an isolated feed to make a production error disappear.
 
+## Compaction successor approvals
+
+The context compressor archives originals as rewind-style rows
+(`active=0, compacted=0`) and stores the surviving body as a later row
+(`compacted=1`), sometimes with tool-call text partially redacted, so the
+native copy hash cannot bind the pair. Those same-session duplicates stay
+ambiguous by default (an uncaused copy must block). A second finite approval,
+`hindsight-source-approved-compaction-successor/1`, pins the exact pairs:
+
+- every pinned pair names the archived original's row id, row hash, copy
+  hash and visibility flags plus the successor's identical set;
+- the scanner admits the successor only when the observed pair matches the
+  pin completely and the event body is then captured once (same event id,
+  same message hash);
+- unpinned, drifted, or receipt-covered pairs keep their existing behavior
+  (block, or the native receipt exclusion);
+- the policy is bound to the baseline, registered under the bank lock after
+  a full read-only coverage scan, and supplied like the other approved
+  inputs (ledger reference, never an implicit lookup).
+
+New compressor pairs after registration require a renewed explicit approval
+(extend the frozen policy and re-register with its confirm token).
+
 ## Frozen external-input guard follow-up
 
 Independent review found that a session/count-only allowlist did not pin content.

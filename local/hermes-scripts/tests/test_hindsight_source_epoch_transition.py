@@ -341,3 +341,57 @@ def test_superset_receipt_inventory_pins_existing_operations(tmp_path):
         con.execute('UPDATE sessions SET model_config=? WHERE id=?', (json.dumps(current), 'native'))
     with pytest.raises(src.SourceChangedError, match='operation lost'):
         scan(f)
+
+
+def test_pinned_compaction_successor_admits_successor_once(tmp_path):
+    f = fixture(tmp_path)
+    src, home, db, reviewer, export, baseline, policy, cert = f
+    # A compressor-style archive: hidden original row, then the compacted successor.
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO messages VALUES (3,'native','user',200,'Pinned compaction successor fact',0,0,'',x'03')")
+        con.execute("INSERT INTO messages VALUES (4,'native','user',200,'Pinned compaction successor fact',0,1,'',x'04')")
+    with sqlite3.connect(db) as con:
+        con.row_factory = sqlite3.Row
+        left = dict(con.execute('SELECT * FROM messages WHERE id=3').fetchone())
+        right = dict(con.execute('SELECT * FROM messages WHERE id=4').fetchone())
+    left_msg = src._message({**left, 'content': src._decode_db_content(left.get('content'))})
+    left_record = src._physical_record(left, sqlite_row=True)
+    right_record = src._physical_record(right, sqlite_row=True)
+    successors = {'schema_version': src.COMPACTION_SUCCESSOR_SCHEMA, 'bank': 'fixture',
+        'hermes_home': str(home), 'physical_baseline_sha256': src.digest(baseline),
+        'authorization': 'explicit-finite-compaction-successor-admission',
+        'status': 'approved', 'completion_proven': False,
+        'pairs': [{'profile': 'default', 'session_id': 'native', 'event_id': left_msg['event_id'],
+            'message_hash': src.message_hash(left_msg),
+            'original': {'row_id': 3, 'row_hash': left_record['row_hash'],
+                         'copy_hash': left_record['copy_hash'], 'active': 0, 'compacted': 0},
+            'successor': {'row_id': 4, 'row_hash': right_record['row_hash'],
+                          'copy_hash': right_record['copy_hash'], 'active': 0, 'compacted': 1},
+            'decision': 'admit-successor-as-event'}]}
+    options = {'physical_baseline': baseline, 'source_unknown_policy': policy,
+        'source_transition_certificates': [cert], 'approved_transition_sha256s': [src.digest(cert)]}
+    # Without the explicit approval the pair stays ambiguous.
+    with pytest.raises(src.SourceChangedError, match='ambiguous'):
+        src.scan_source_snapshots(home, **options)
+    snapshots = src.scan_source_snapshots(home, **options, source_compaction_successors=successors)
+    events = [m for s in snapshots for m in s['messages']]
+    assert sum(1 for m in events if m['event_id'] == left_msg['event_id']) == 1
+    # A drifted pin (same ids, different hash) fails closed.
+    drifted = json.loads(json.dumps(successors))
+    drifted['pairs'][0]['successor']['row_hash'] = '0' * 64
+    with pytest.raises(src.SourceChangedError, match='ambiguous'):
+        src.scan_source_snapshots(home, **options, source_compaction_successors=drifted)
+
+
+def test_compaction_successor_policy_binding_is_enforced(tmp_path):
+    f = fixture(tmp_path)
+    src, home, db, reviewer, export, baseline, policy, cert = f
+    bad = {'schema_version': src.COMPACTION_SUCCESSOR_SCHEMA, 'bank': 'other', 'hermes_home': str(home),
+        'physical_baseline_sha256': src.digest(baseline),
+        'authorization': 'explicit-finite-compaction-successor-admission',
+        'status': 'approved', 'completion_proven': False, 'pairs': []}
+    with pytest.raises(ValueError, match='binding'):
+        src.scan_source_snapshots(home, physical_baseline=baseline, source_unknown_policy=policy,
+            source_compaction_successors=bad)
+    with pytest.raises(ValueError, match='physical baseline'):
+        src.scan_source_snapshots(home, source_compaction_successors=bad)

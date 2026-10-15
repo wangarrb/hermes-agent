@@ -212,6 +212,19 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     report['source_unknown_policy'] = {'artifact_hash': unknown_reference['artifact_hash'],
                         'status': 'unknown', 'completion_proven': False,
                         'excluded_sql_rows': sum(len(scope['rows']) for scope in unknown['scopes'])}
+                successors_reference = ledger.source_compaction_successors_reference()
+                if successors_reference is not None:
+                    if 'physical_baseline' not in reader_options:
+                        raise ValueError('compaction_successors_requires_physical_baseline')
+                    successors = _read(ledger.root, successors_reference['artifact_path'],
+                                       successors_reference['artifact_hash'])
+                    from hindsight_incremental_sources import validate_source_compaction_successors
+                    validate_source_compaction_successors(successors,
+                        physical_baseline=reader_options['physical_baseline'], bank=ledger.bank,
+                        hermes_home=Path(config['hermes_home']))
+                    reader_options['source_compaction_successors'] = successors
+                    report['source_compaction_successors'] = {'artifact_hash': successors_reference['artifact_hash'],
+                        'status': 'approved', 'pairs': len(successors['pairs'])}
                 if source_transition_certificates is not None or approved_transition_sha256s is not None:
                     if 'physical_baseline' not in reader_options:
                         raise ValueError('source_transition_requires_physical_baseline')

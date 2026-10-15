@@ -31,6 +31,7 @@ PHASES = ('captured', 'generated', 'submitted', 'unknown', 'retained', 'consolid
 SUCCESS_PHASES = ('captured', 'generated', 'retained', 'consolidated', 'locally_merged', 'gated', 'published')
 CONFIRM_INITIALIZE = 'initialize-hindsight-incremental'
 CONFIRM_APPROVE_SOURCE_UNKNOWN = 'approve-hindsight-source-unknown'
+CONFIRM_APPROVE_COMPACTION_SUCCESSORS = 'approve-hindsight-compaction-successors'
 PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
 _SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, state TEXT NOT NULL, state_hash TEXT NOT NULL);
@@ -369,6 +370,34 @@ class IncrementalLedger:
         except (OSError, ValueError, TypeError, KeyError, RemoteCallError):
             raise LedgerIntegrityError('invalid source unknown policy artifact binding') from None
 
+    def _source_compaction_successors_artifact(self, reference, physical_reference):
+        from hindsight_incremental_delivery import _read
+        from hindsight_offline_retry import RemoteCallError
+        import hindsight_incremental_sources as sources
+
+        try:
+            physical_reference, baseline_before = self._physical_reference(physical_reference)
+            reference, before = self._frozen_reference(reference,
+                schema=sources.COMPACTION_SUCCESSOR_SCHEMA, suffix='source-compaction-successors',
+                extra_fields=('physical_baseline_sha256',))
+            if (reference['physical_baseline_sha256'] != physical_reference['artifact_hash']
+                    or reference['hermes_home'] != physical_reference['hermes_home']):
+                raise ValueError('different original baseline')
+            baseline = _read(self.root, physical_reference['artifact_path'], physical_reference['artifact_hash'])
+            policy = _read(self.root, reference['artifact_path'], reference['artifact_hash'])
+            sources.validate_source_compaction_successors(policy, physical_baseline=baseline, bank=self.bank,
+                                                          hermes_home=Path(reference['hermes_home']))
+            _, after = self._frozen_reference(reference,
+                schema=sources.COMPACTION_SUCCESSOR_SCHEMA, suffix='source-compaction-successors',
+                extra_fields=('physical_baseline_sha256',))
+            _, baseline_after = self._physical_reference(physical_reference)
+            if (self._artifact_fence(before) != self._artifact_fence(after)
+                    or self._artifact_fence(baseline_before) != self._artifact_fence(baseline_after)):
+                raise ValueError('artifact changed during validation')
+            return reference
+        except (OSError, ValueError, TypeError, KeyError, RemoteCallError):
+            raise LedgerIntegrityError('invalid compaction successors artifact binding') from None
+
     def source_unknown_policy_reference(self) -> dict | None:
         """Absent is not JSON null. Paired hashed metadata prevents lost-pointer downgrade."""
         with self._connection() as con:
@@ -425,6 +454,64 @@ class IncrementalLedger:
                         'artifact_hash': checksum, 'physical_baseline_sha256': baseline_ref['artifact_hash']})
             if self.source_unknown_policy_reference() != reference:
                 raise LedgerIntegrityError('source unknown policy readback mismatch')
+            return reference
+
+    def source_compaction_successors_reference(self) -> dict | None:
+        """Absent is not JSON null. A hashed reference prevents lost-pointer downgrade."""
+        with self._connection() as con:
+            keys = {r[0] for r in con.execute("SELECT key FROM meta WHERE key IN "
+                "('source-compaction-successors',)")}
+            if not keys:
+                return None
+            reference = self._read(con, 'meta', 'source-compaction-successors')
+            legacy = self._require_initialized(con)
+            return self._source_compaction_successors_artifact(reference, legacy.get('physical_baseline'))
+
+    def register_source_compaction_successors(self, policy: dict, *, confirm: str,
+            transition_certificates=None, approved_transition_sha256s=None) -> dict:
+        """Explicit finite approval, under bank lock, after native read-only coverage.
+
+        Never alters the baseline, seed, arrival cursor, batches, or completion.
+        Re-registration may read back identical bytes but cannot widen the policy.
+        Reviewed header transitions may be supplied together for the coverage scan.
+        """
+        from hindsight_incremental_delivery import _read, _freeze
+        import hindsight_incremental_sources as sources
+
+        if confirm != CONFIRM_APPROVE_COMPACTION_SUCCESSORS:
+            raise ValueError('confirm must be approve-hindsight-compaction-successors')
+        with self.locked():
+            legacy = self.initialization_manifest()
+            if 'physical_baseline' not in legacy:
+                raise LedgerIntegrityError('compaction successors require original physical baseline')
+            baseline_ref = self.physical_baseline_reference()
+            baseline = _read(self.root, baseline_ref['artifact_path'], baseline_ref['artifact_hash'])
+            sources.validate_source_compaction_successors(policy, physical_baseline=baseline, bank=self.bank,
+                                                          hermes_home=Path(baseline_ref['hermes_home']))
+            prior = self.source_compaction_successors_reference()
+            if prior is not None and _read(self.root, prior['artifact_path'], prior['artifact_hash']) != policy:
+                raise LedgerIntegrityError('compaction successors policy is immutable')
+            # The normal adapter verifies every baseline and approved row in
+            # mode=ro/query_only transactions; no Core writer or native client.
+            unknown_reference = self.source_unknown_policy_reference()
+            unknown = (None if unknown_reference is None else
+                       _read(self.root, unknown_reference['artifact_path'], unknown_reference['artifact_hash']))
+            sources.scan_source_snapshots(Path(baseline_ref['hermes_home']),
+                profile_mode=baseline['profile_mode'], physical_baseline=baseline,
+                source_unknown_policy=(sources._NO_SOURCE_UNKNOWN_POLICY if unknown is None else unknown),
+                source_transition_certificates=transition_certificates,
+                approved_transition_sha256s=approved_transition_sha256s,
+                source_compaction_successors=policy)
+            path, checksum = _freeze(self.root, policy, 'source-compaction-successors')
+            reference = {'schema_version': sources.COMPACTION_SUCCESSOR_SCHEMA, 'bank': self.bank,
+                'hermes_home': baseline_ref['hermes_home'], 'artifact_path': path, 'artifact_hash': checksum,
+                'physical_baseline_sha256': baseline_ref['artifact_hash']}
+            self._source_compaction_successors_artifact(reference, baseline_ref)
+            with self._connection(write=True) as con:
+                if prior is None:
+                    self._put(con, 'meta', 'source-compaction-successors', reference)
+            if self.source_compaction_successors_reference() != reference:
+                raise LedgerIntegrityError('compaction successors readback mismatch')
             return reference
 
     def initialization_manifest(self) -> dict:

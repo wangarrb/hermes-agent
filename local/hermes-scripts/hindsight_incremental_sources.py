@@ -250,8 +250,7 @@ def _add_event(view, message):
 
 
 def _proved_db_clone(left, right, evidence, *, cutover_anchors=()):
-    physical = {'id', 'session_id', 'active', 'compacted', 'display_order'}
-    if {k: v for k, v in left.items() if k not in physical} != {k: v for k, v in right.items() if k not in physical}:
+    if left['copy_hash'] != right['copy_hash']:
         return False
     a, b = left['session_id'], right['session_id']
     if a == b:
@@ -449,15 +448,19 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
                           physical_baseline: dict | None = None,
                           source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
                           source_transition_certificates: list | None = None,
-                          approved_transition_sha256s: list | None = None) -> list[dict]:
+                          approved_transition_sha256s: list | None = None,
+                          source_compaction_successors: dict | None = None) -> list[dict]:
     """Read a finite source view, never infer historical completion or CDC."""
     if physical_baseline is not None:
         return _scan_physical_sources(hermes_home, profile_mode, physical_baseline,
                                       source_unknown_policy=source_unknown_policy,
                                       source_transition_certificates=source_transition_certificates,
-                                      approved_transition_sha256s=approved_transition_sha256s)
+                                      approved_transition_sha256s=approved_transition_sha256s,
+                                      source_compaction_successors=source_compaction_successors)
     if source_transition_certificates is not None or approved_transition_sha256s is not None:
         raise ValueError('source transition requires original physical baseline')
+    if source_compaction_successors is not None:
+        raise ValueError('compaction successors require original physical baseline')
     if source_unknown_policy is not _NO_SOURCE_UNKNOWN_POLICY:
         raise ValueError('source unknown policy requires original physical baseline')
     home = checked_path(Path(hermes_home))
@@ -554,6 +557,7 @@ def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
 PHYSICAL_BASELINE_SCHEMA = 'hindsight-physical-legacy-baseline/1'
 SOURCE_UNKNOWN_POLICY_SCHEMA = 'hindsight-source-approved-unknown/1'
 SOURCE_TRANSITION_SCHEMA = 'hindsight-approved-sqlite-header-transition/1'
+COMPACTION_SUCCESSOR_SCHEMA = 'hindsight-source-approved-compaction-successor/1'
 _MUTABLE_ROW_FIELDS = {'active', 'compacted', 'display_order'}
 _NATIVE_ORIGIN_FIELDS = ('origin_message_id', 'platform_message_id', 'original_id', 'message_id', 'event_id')
 
@@ -608,9 +612,15 @@ def _physical_record(raw, *, sqlite_row=False):
             'origin_hash': digest(str(_native_origin(raw))) if isinstance(raw, dict) and _native_origin(raw) else None}
 
 
-def _clone_binding(record):
+def _clone_binding(record, row=None):
     # Duplicate/lineage checks need complete copy hashes, not retained bodies.
-    return {k: record[k] for k in ('id', 'session_id', 'copy_hash')}
+    # The optional row adds visibility flags for approved successor matching;
+    # the clone proof itself compares only the copy hash.
+    binding = {k: record[k] for k in ('id', 'session_id', 'copy_hash')}
+    if row is not None:
+        binding.update({'row_hash': record['row_hash'],
+                        'active': row.get('active'), 'compacted': row.get('compacted')})
+    return binding
 
 
 def _location_identity(path: Path, *, directory=False):
@@ -1157,6 +1167,68 @@ def validate_source_transition_certificate_set(certificates, *, physical_baselin
     return by_profile
 
 
+def validate_source_compaction_successors(policy, *, physical_baseline, bank, hermes_home):
+    """Finite explicit approvals for compressor archive/successor pairs.
+
+    Each pinned pair names one archived original row and the exact surviving
+    successor row. The scanner admits only pairs whose complete row hashes
+    and visibility flags match the pin; anything else stays ambiguous.
+    Nothing is looked up here; the trusted caller supplies it explicitly.
+    """
+    from hindsight_incremental_merge import canonical_hash
+
+    _require_shape(policy, ('schema_version', 'bank', 'hermes_home', 'physical_baseline_sha256',
+        'authorization', 'status', 'completion_proven', 'pairs'))
+    if (policy['schema_version'] != COMPACTION_SUCCESSOR_SCHEMA
+            or policy['bank'] != bank or policy['hermes_home'] != str(hermes_home)
+            or policy['physical_baseline_sha256'] != canonical_hash(physical_baseline)
+            or policy['authorization'] != 'explicit-finite-compaction-successor-admission'
+            or policy['status'] != 'approved' or policy['completion_proven'] is not False
+            or type(policy['pairs']) is not list):
+        raise ValueError('compaction successor policy binding mismatch')
+    profiles = {p['profile'] for p in physical_baseline['profiles']}
+    seen = set()
+    for pair in policy['pairs']:
+        _require_shape(pair, ('profile', 'session_id', 'event_id', 'message_hash',
+            'original', 'successor', 'decision'))
+        if (pair['profile'] not in profiles or not _valid_native(pair['session_id'])
+                or not _valid_native(pair['event_id']) or not _valid_native(pair['message_hash'])
+                or pair['decision'] != 'admit-successor-as-event'):
+            raise ValueError('compaction successor policy pair mismatch')
+        for side in ('original', 'successor'):
+            _require_shape(pair[side], ('row_id', 'row_hash', 'copy_hash', 'active', 'compacted'))
+            if (type(pair[side]['row_id']) is not int or pair[side]['row_id'] <= 0
+                    or not _valid_native(pair[side]['row_hash'])
+                    or not _valid_native(pair[side]['copy_hash'])
+                    or pair[side]['active'] not in (0, 1)
+                    or pair[side]['compacted'] not in (0, 1)):
+                raise ValueError('compaction successor policy pair mismatch')
+        if pair['original']['row_id'] >= pair['successor']['row_id']:
+            raise ValueError('compaction successor policy pair mismatch')
+        key = (pair['profile'], pair['session_id'], pair['event_id'])
+        if key in seen:
+            raise ValueError('compaction successor policy duplicate pair')
+        seen.add(key)
+    return policy
+
+
+def _approved_compaction_successor(previous, binding, approved_successors, session_id, event_id):
+    """Admit exactly the pinned successor of an archived original row."""
+    if not approved_successors:
+        return False
+    pair = approved_successors.get((session_id, event_id))
+    if pair is None:
+        return False
+    for side, seen_row in (('original', previous), ('successor', binding)):
+        expected = pair[side]
+        if (seen_row.get('id') != expected['row_id'] or seen_row.get('row_hash') != expected['row_hash']
+                or seen_row.get('copy_hash') != expected['copy_hash']
+                or seen_row.get('active') != expected['active']
+                or seen_row.get('compacted') != expected['compacted']):
+            return False
+    return True
+
+
 def _profile_anchors(profile):
     sids = {a['session_id'] for a in profile['artifacts'] if a['session_id']}
     if profile['sqlite']:
@@ -1272,7 +1344,8 @@ def _exclude_old_copy(record, sid, old_index, evidence, *, cutover_anchors,
     return False
 
 
-def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, header_transition=None):
+def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, header_transition=None,
+                           approved_successors=None):
     directory, db = Path(profile['sessions_dir']), Path(profile['state_db'])
     if profile['directory_identity'] is not None:
         if _location_identity(directory, directory=True) != profile['directory_identity']:
@@ -1406,11 +1479,14 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
             return
         msg = _message({**row, 'content': _decode_db_content(row.get('content'))})
         if msg:
-            binding = _clone_binding(record)
+            binding = _clone_binding(record, row)
             previous = physical[root].get(msg['event_id'])
             if previous is not None and not msg['origin'] and not _proved_db_clone(
                     previous, binding, evidence, cutover_anchors=anchors):
-                raise SourceChangedError('source_changed: ambiguous identical future SQLite rows')
+                if not _approved_compaction_successor(previous, binding, approved_successors, sid,
+                                                      msg['event_id']):
+                    raise SourceChangedError('source_changed: ambiguous identical future SQLite rows')
+                changes.append({'approved_compaction_successor_row_id': record['id']})
             physical[root][msg['event_id']] = binding
             if (row['id'] not in copy_sources and 'active' in row and 'compacted' in row
                     and not (row['active'] or row['compacted'])):
@@ -1470,7 +1546,8 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
 
 def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                            source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
-                           source_transition_certificates=None, approved_transition_sha256s=None):
+                           source_transition_certificates=None, approved_transition_sha256s=None,
+                           source_compaction_successors=None):
     home = checked_path(Path(hermes_home))
     if not isinstance(baseline, dict):
         raise ValueError('invalid physical baseline header')
@@ -1489,13 +1566,20 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
         certs_by_profile = validate_source_transition_certificate_set(source_transition_certificates,
             physical_baseline=baseline, source_unknown_policy=source_unknown_policy,
             approved_transition_sha256s=approved_transition_sha256s)
+    successors_by_profile = {}
+    if source_compaction_successors is not None:
+        validate_source_compaction_successors(source_compaction_successors, physical_baseline=baseline,
+            bank=baseline['bank'], hermes_home=home)
+        for pair in source_compaction_successors['pairs']:
+            successors_by_profile.setdefault(pair['profile'], {})[(pair['session_id'], pair['event_id'])] = pair
     current = {s['profile']: s for s in _discover_sources(home, profile_mode)}
     old_profiles = {p['profile']: p for p in baseline['profiles']}
     if not set(old_profiles) <= set(current):
         raise SourceChangedError('source_changed: legacy profile coverage lost')
     result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(
         profile, home, unknown_rows=unknown_rows[profile['profile']], policy_hash=policy_hash,
-        header_transition=certs_by_profile.get(profile['profile']))]
+        header_transition=certs_by_profile.get(profile['profile']),
+        approved_successors=successors_by_profile.get(profile['profile'], {}))]
     for name in sorted(set(current) - set(old_profiles)):
         # A genuinely new profile is strict, not silently turned into legacy.
         profile_home = Path(current[name]['state_db']).parent
