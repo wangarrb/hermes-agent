@@ -1,5 +1,31 @@
 # Scoped app history ingestion (staged, not deployed)
 
+## Authorized local-only persistence
+
+`hindsight_app_local_archive.py` persists the already sealed first batch without
+re-fetching history or running model code. It refuses an archive root overlapping
+production sessions, profiles, or the production incremental ledger. The archive
+has its own `app-archive` ledger, with documents at `captured` only. These are six
+local input-document drafts, not six extracted Hindsight memories.
+
+The authorized archive is
+`~/.hermes/hindsight/app_archive/scoped-seqscale`: three native snapshots and
+447 messages. A repeated run adds zero messages/documents. The first frozen batch
+spans 2026-10-14/15, so this task's local reporter writes corresponding sidecars
+and appends a marked 2026-10-14 block to the 2026-10-15 canonical daily report,
+backing up and preserving its original content. The 2026-10-15 event-day sidecar
+is labelled partial coverage; it is not a completed 2026-10-16 canonical report.
+No default production source, service, scheduler or model configuration is
+changed. The optional daily entry-point patch below remains unapplied because
+that tracked production script contains the user's separate uncommitted edits;
+future full regeneration must incorporate the preserved local sidecar.
+
+This local processing was explicitly authorized by the parent after the initial
+handoff. The first 264-test result remains the original validation; it was not
+rerun. Local archive/report idempotence was checked by actually running this
+local-only path twice and verifying the saved item IDs, file hashes and prior
+daily body. Runtime evidence is in `evidence/local-persistence.json` on the task.
+
 The existing nightly `hindsight_codex_sync.sh` invokes
 `hindsight_backfill_codex_rollouts.py`, whose two sources are CLI rollout
 directories. App threads returned by the supported `list_threads` / `read_thread`
