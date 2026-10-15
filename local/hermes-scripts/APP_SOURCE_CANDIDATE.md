@@ -1,68 +1,57 @@
-# Finite App source candidate — fixture review only
+# Bounded App source candidate — review only
 
-This candidate is not deployed and does not authorize external processing.
-The approved runner's App dispatch is plan-only. Its original physical dispatch
-keeps every physical-source rejection. The original447 byte pins remain fixed;
-the newer70 items and other sessions do not enter that authorization.
+The App runner remains plan-only. It reads the original three frozen sessions,
+their existing production exports and the existing ledger; it never registers
+a contract, captures a batch, constructs the runtime or calls a model.
+The original447 code-side raw-byte pins and one-read hash/parse stay unchanged.
+Newer items, other sessions and same-count content substitutions stay excluded.
 
-The existing ledger deduplicates within source_key. Sharing that ledger alone
-does not prevent App→CLI or CLI→App double capture. App provenance headers also
-make the two raw payloads different. An event-ID rewrite or equal text is not
-native identity evidence.
+The supported API supplies opaque stable item IDs: the real447 contains444
+`msg_...` items and3 UUID items. UUID is not the item-ID contract. Session,
+turn, item and the exact composite origin are checked together. The task's
+existing approved source scope and bank/home/ledger target provide the local
+account boundary; no native account-ID field or new namespace is invented.
 
-The local candidate therefore uses a finite, independently reviewed contract
-with account/session/turn/item identity, both immutable view payloads, canonical
-payload binding and complete snapshot/event lists. The independent contract pin
-means an operator has reviewed concrete native identity evidence; calculating a
-hash of a newly generated contract does not supply that approval. A proof hash
-alone is an integrity reference, not proof an alias exists.
-The validator checks the proof's declared identity and both original view
-bindings. It cannot verify the meaning or provenance of evidence named by that
-hash; review of that evidence and approval of the exact contract are external
-preconditions. The synthetic test authority supplies no production evidence.
+The App view uses the same final physical source_key, normalized event_id and
+original default feed_epoch as its already-present production JSON export.
+The immutable payload is unchanged. Both views therefore use the existing
+per-source ledger cursor and deterministic batch/operation IDs. No global
+alias/ownership table or additional capture hook is needed.
 
-Ownership is checked inside the existing bank lock and capture transaction.
-The contract and a per-contract integrity marker are registered atomically;
-missing or inconsistent pairs and orphan owners are rejected before either
-reader can fall back to ordinary capture.
-The first bound event owns its original payload, batch and deterministic
-operation UUID; the other view records coverage without a second batch. The
-original payload is never rewritten. Owner phase is reported separately:
-captured, unknown or pending does not mean retained or published. Mixed batches
-with unauthorized events, legacy exclusions, finite unknown bindings, changed
-payloads or unresolved ownership are rejected.
+Each App observation is bounded to its own source key. It does not claim to
+observe the complete default physical feed and cannot shrink its existing
+source inventory. The normal physical reader retains its baseline, finite
+unknown-row exclusions, copy/ambiguity, epoch and schema checks.
 
-The closed-world rule is deliberately conservative: once a finite contract is
-registered, a source outside its complete scopes is ambiguous. Registration
-also rejects existing sources/batches that the contract cannot account for.
-This blocks unbound third-reader aliases; it is not a usable general production
-source registry. No new bank, ledger or global alias inference system is used.
-This version also refuses any physical source-unknown policy, including the
-existing69 bindings: no reviewed disjointness proof exists. A larger contract
-or broader session allowlist cannot repair this evidence gap by itself.
-An active scope is immutable: appended or truncated snapshots are refused.
-This finite candidate is not a production incremental collector; the existing
-local archival collector remains the separate resumable discovery path.
+The read-only plan verifies actual source state and any relevant existing
+batch payload. It rejects a changed origin/body, competing known owner,
+mixed unauthorized source batch/derived parents and unrelated pending work.
+An existing unknown POST remains attached to its original operation UUID and
+phase; the plan does not call GET/POST or report it as completed.
 
-The real production ledger has110 old published batches and a physical legacy
-baseline whose logical events do not reconstruct old CLI ownership. No complete
-native cross-view contract has been approved for the original447. Therefore
-their current result is **ambiguity/no capture**, even if synthetic fixtures
-pass. They must not be admitted from equal text, missing UUID overlap, a fixture
-contract or a self-generated approval pin.
+Unrelated historical batches do not need new dual-view proofs. An existing
+unknown-row policy does not forbid all future sessions. Exact legacy/unknown
+identity or raw-export matches remain exclusions; incomplete historical
+coverage stays explicitly unknown, rather than becoming an unbounded demand
+to disprove every possible semantic copy.
 
-Required local checks cover both ingestion orders, repeat capture, view-content
-conflicts, same-count raw replacement, an unbound third source, legacy/unknown
-overlap, mixed unauthorized batches, account/session item collisions, atomic
-owner creation and crash recovery. Unknown remote POST outcomes must reconcile
-the same existing operation UUID before any further POST. Delivery and publish
-remain owned by the existing runtime and gates; tests use local fakes only.
+The earlier finite-contract framework was an overbroad candidate. It has been
+removed from the implementation; its prior fixture results do not establish
+real-data admission. The narrowed candidate must pass real opaque-ID fixtures,
+App/physical replay in both orders, immutable-payload/authorization failures,
+operation reconciliation and the existing physical rejection regressions.
 
-Validation completed through the repository's canonical scripts/run_tests.sh:
-17 files,578 tests passed,0 failed;71 are the new ownership/adapter/delivery
-cases. The set includes prior physical sources, ledger, delivery, entrypoint,
-pipeline, unknown-policy, source-transition, App archival/producer and UTC+8
-usage/day-boundary checks. The raw447 same-count replacement tests also passed.
-All test ledgers, payloads and delivery clients were temporary local fixtures.
-Independent static review found no blocking issue within this fixture-only,
-plan-only scope. These results do not establish production447 readiness.
+This candidate authorizes no deployment or external extraction. A real447
+read-only plan and independent review are required before any later execution.
+
+Canonical validation:11 test files,562 passed,0 failed with automatic file
+retries disabled. This includes21 bounded-adapter cases,7 boundary/delivery/
+concurrency/crash cases and4 original raw-pin cases, plus the existing ledger,
+physical-source, native-copy, finite-unknown, transition and pipeline checks.
+
+The real frozen447 plan now passes:3 sources,447 new messages,0 known messages
+and0 relevant conflicts. The existing60000-character capture budget projects6
+source batches; these are metadata calculations, not captured files or LLM-call
+counts. Ledger tables, baseline/unknown artifacts, original frozen/production
+exports and the3438-key physical-feed inventory stayed unchanged. Execution
+and native-runtime preflight remain disabled and unattempted.

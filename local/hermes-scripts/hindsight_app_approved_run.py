@@ -33,6 +33,7 @@ SOURCE = TASK / 'evidence/staged-home-v2/sessions'
 REPORT = TASK / 'evidence/approved-three-production.json'
 # This task's existing approval target, never an alternate bank/root CLI option.
 APP_LEDGER_ROOT = Path('/home/wyr/.hermes/hindsight/incremental')
+APP_HERMES_HOME = Path('/home/wyr/.hermes')
 
 
 def _proof(messages):
@@ -55,28 +56,24 @@ def _load_approved_sessions():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-mode', choices=('physical', 'app'), default='physical')
-    parser.add_argument('--app-contract', type=Path)
-    parser.add_argument('--approved-app-contract-sha256')
     parser.add_argument('--plan-only', action='store_true', help='App candidate only; capture/execution stays disabled')
     parser.add_argument('--transition-certificate', type=Path)
     parser.add_argument('--approved-transition-sha256', help='Canonical SHA pinned independently after parent review')
     args = parser.parse_args(argv)
     if args.source_mode == 'app':
-        if not args.plan_only or not args.app_contract or not args.approved_app_contract_sha256:
-            parser.error('App candidate requires --plan-only, a finite contract and its independent approval pin')
+        if not args.plan_only:
+            parser.error('App candidate requires --plan-only; execution remains disabled')
         if args.transition_certificate or args.approved_transition_sha256:
             parser.error('physical transition options cannot authorize the App candidate')
-        from hindsight_app_source_adapter import build_app_snapshots, describe_plan, load_contract
+        from hindsight_app_source_adapter import plan_app_input
 
         sessions = _load_approved_sessions()
-        contract = load_contract(args.app_contract,
-                                 approved_contract_sha256=args.approved_app_contract_sha256)
-        snapshots = build_app_snapshots(sessions, contract=contract,
-            approved_contract_sha256=args.approved_app_contract_sha256,
-            bank='hermes', ledger_root=APP_LEDGER_ROOT, approved_session_ids=APPROVED)
-        print(json.dumps(describe_plan(snapshots), ensure_ascii=False), flush=True)
+        ledger = IncrementalLedger(APP_LEDGER_ROOT, 'hermes')
+        report = plan_app_input(sessions, ledger=ledger, hermes_home=APP_HERMES_HOME,
+            approved_session_ids=APPROVED, approved_source_sha256=APPROVED_SOURCE_SHA256)
+        print(json.dumps(report, ensure_ascii=False), flush=True)
         return 0
-    if args.app_contract or args.approved_app_contract_sha256 or args.plan_only:
+    if args.plan_only:
         parser.error('App candidate options require explicit --source-mode app')
     if bool(args.transition_certificate) != bool(args.approved_transition_sha256):
         parser.error('a reviewed certificate and its independent approval pin are both required')
