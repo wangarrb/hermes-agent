@@ -208,6 +208,39 @@ def merge_observations(seed: list[dict], delta: list[dict]) -> list[dict]:
     return result
 
 
+def delta_rows(seed: list[dict], merged: list[dict]) -> list[dict]:
+    """Exact new/changed typed rows by observation id + content hash.
+
+    The delta scope is only an evaluation scope: the full sealed state remains
+    the authority. Opaque legacy seed rows are never rewritten, so they are
+    never part of a delta; the exact sealed row is compared, not its wrapper.
+    """
+    for value, label in ((seed, 'seed'), (merged, 'merged state')):
+        if not isinstance(value, list):
+            raise ValueError(f'{label} observations must be an array')
+        for row in value:
+            if not isinstance(row, dict):
+                raise ValueError('observation must be an object')
+            _json(row)
+    previous: dict[str, str] = {}
+    for row in seed:
+        key = observation_id(row)
+        if key in previous:
+            raise ValueError('duplicate seed observation id')
+        previous[key] = observation_content_hash(row)
+    delta, seen = [], set()
+    for row in merged:
+        key = observation_id(row)
+        if key in seen:
+            raise ValueError('duplicate merged observation id')
+        seen.add(key)
+        if row.get('kind') == 'opaque_legacy':
+            continue
+        if key not in previous or previous[key] != observation_content_hash(row):
+            delta.append(copy.deepcopy(row))
+    return sorted(delta, key=observation_id)
+
+
 def _hash(value: Any, name: str) -> str:
     if not isinstance(value, str) or not HASH_RE.fullmatch(value):
         raise ValueError(f'invalid {name} hash')
@@ -220,7 +253,8 @@ def _name(value: Any, name: str) -> str:
     return value
 
 
-def _parent(parent: Any, bank: Any, *, _ancestors: tuple[Path, ...] = ()) -> None:
+def _bound_parent(parent: Any, bank: Any) -> None:
+    """Manifest-level parent binding; never reads the parent's full index."""
     if not isinstance(parent, dict) or parent.get('bank') != bank:
         raise ValueError('parent bank mismatch')
     field = 'manifest_sha256' if parent.get('schema_version') == SCHEMA else 'seed_sha256'
@@ -232,11 +266,22 @@ def _parent(parent: Any, bank: Any, *, _ancestors: tuple[Path, ...] = ()) -> Non
         path = _absolute(_name(parent.get('manifest_path'), 'parent manifest path'))
         if _absolute(_name(parent.get('root'), 'parent root path')) != path.parent:
             raise ValueError('parent root/path mismatch')
+    _json(parent)
+
+
+def _parent(parent: Any, bank: Any, *, _ancestors: tuple[Path, ...] = ()) -> list[dict] | None:
+    """Validate the bound parent; return its sealed rows for chained generations."""
+    _bound_parent(parent, bank)
+    rows = None
+    if parent.get('schema_version') == SCHEMA:
+        path = _absolute(_name(parent.get('manifest_path'), 'parent manifest path'))
         # A dictionary/hash binding does not prove rollback files still exist.
         # Verify every exact ancestor's index/cards before seed use or publish.
-        if _validated(path, _ancestors=_ancestors)[0] != parent:
+        validated = _validated(path, _ancestors=_ancestors)
+        if validated[0] != parent:
             raise ValueError('parent artifact differs from bound manifest')
-    _json(parent)
+        rows = validated[2]
+    return rows
 
 
 def _legacy_primary_key(row: Any, bank: str) -> tuple[str, str]:
@@ -788,13 +833,13 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
     _hash(manifest.get('manifest_sha256'), 'manifest')
     if canonical_hash({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
         raise ValueError('manifest hash mismatch')
-    _parent(manifest.get('parent'), bank, _ancestors=_ancestors)
+    parent_rows = _parent(manifest.get('parent'), bank, _ancestors=_ancestors)
     if canonical_hash(manifest['parent']) != _hash(manifest.get('parent_sha256'), 'parent'):
         raise ValueError('parent hash mismatch')
     batches = manifest.get('consumed_batch_ids')
     if not isinstance(batches, list) or any(not isinstance(b, str) or not b.strip() for b in batches) or batches != sorted(set(batches)):
         raise ValueError('invalid consumed batch ids')
-    paths, card_objects, rows = set(), {}, None
+    paths, card_objects, rows, sealed_delta = set(), {}, None, None
     files = manifest.get('files')
     if not isinstance(files, list) or not files:
         raise ValueError('missing exact artifact manifest')
@@ -806,10 +851,15 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
             raise ValueError('duplicate artifact path')
         if entry.get('kind') not in {'observations', 'card', 'markdown'}:
             raise ValueError('invalid artifact kind')
+        if name == 'delta_index.jsonl' and entry['kind'] != 'observations':
+            raise ValueError('delta artifact must be a sealed observation index')
         expected = {'sha256': _hash(entry.get('sha256'), 'artifact'),
                     'size': _count(entry.get('size'), 'artifact size')}
         if entry['kind'] == 'observations':
-            rows, info = _read_index(root / name, expected)
+            if name == 'delta_index.jsonl':
+                sealed_delta, info = _read_index(root / name, expected)
+            else:
+                rows, info = _read_index(root / name, expected)
         elif entry['kind'] == 'card':
             payload = _read(root / name)
             info = _payload_info([payload])
@@ -822,13 +872,31 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
             del payload
         paths.add(name)
     _inventory(root, paths | {'manifest.json'})
-    index_files = [e['path'] for e in files if e['kind'] == 'observations']
-    if index_files != ['observations_index.jsonl']:
-        raise ValueError('exact single observation index required')
+    index_files = sorted(e['path'] for e in files if e['kind'] == 'observations')
+    expected_index = (['delta_index.jsonl', 'observations_index.jsonl']
+                      if sealed_delta is not None else ['observations_index.jsonl'])
+    if index_files != expected_index:
+        raise ValueError('exact observation index layout required')
     assert rows is not None
     _rows(rows, bank, _ancestors=_ancestors)
     if len(rows) != _count(manifest.get('observation_count'), 'observation') or _state_hash(rows) != _hash(manifest.get('observations_sha256'), 'observations'):
         raise ValueError('observation count/content hash mismatch')
+    if sealed_delta is not None:
+        _rows(sealed_delta, bank, _ancestors=_ancestors)
+        if len(sealed_delta) != _count(manifest.get('delta_count'), 'delta'):
+            raise ValueError('delta count mismatch')
+        if any(r.get('kind') == 'opaque_legacy' for r in sealed_delta):
+            raise ValueError('delta index must not contain opaque legacy rows')
+        sealed = {observation_id(r): r for r in rows}
+        if any(observation_id(r) not in sealed or observation_content_hash(
+                sealed[observation_id(r)]) != observation_content_hash(r) for r in sealed_delta):
+            raise ValueError('delta rows differ from the sealed observation index')
+        # Chained generations declare exactly the new/changed rows of the parent
+        # state; the initial generation (seed parent) has no parent rows here.
+        if parent_rows is not None and sealed_delta != delta_rows(parent_rows, rows):
+            raise ValueError('delta rows differ from the exact parent state delta')
+    elif manifest.get('delta_count') is not None:
+        raise ValueError('delta count without a sealed delta index')
     digest = _generation_hash(bank, manifest['parent_sha256'], manifest['observations_sha256'], batches)
     if manifest.get('generation_id') != 'gen:' + digest or root.name != digest:
         raise ValueError('generation bank/content hash mismatch')
@@ -845,6 +913,8 @@ def _validated(path: Path, *, _ancestors: tuple[Path, ...] = ()) -> tuple[dict, 
     if cards != expected_cards:
         raise ValueError('compact cards do not project the complete sealed index')
     expected_files = {'observations_index.jsonl': 'observations'}
+    if sealed_delta is not None:
+        expected_files['delta_index.jsonl'] = 'observations'
     for card in expected_cards:
         stem = canonical_hash({'topic': card['topic']})
         expected_files[f'topics/{stem}.json'] = 'card'
@@ -870,11 +940,14 @@ def _write(path: Path, payload: bytes | Iterable[bytes]) -> None:
 
 
 def write_generation(root: Path, *, bank: str, parent: dict, observations: list[dict],
-                     consumed_batch_ids: list[str]) -> dict:
+                     consumed_batch_ids: list[str], delta: list[dict] | None = None) -> dict:
     """Create a private immutable generation, or verify the exact existing one.
 
     The caller holds its bank producer lock. A partial/corrupt directory is an
     explicit blocker; retry never overwrites it or deletes evidence of failure.
+    An explicit delta is sealed as `delta_index.jsonl` (the new/changed typed
+    rows only) and declared by `delta_count`; without it the generation keeps
+    the legacy full-scope layout.
     """
     root = _absolute(root)
     _name(bank, 'bank')
@@ -883,6 +956,27 @@ def write_generation(root: Path, *, bank: str, parent: dict, observations: list[
         raise ValueError('consumed batch ids must be a list')
     batches = sorted({_name(b, 'batch id') for b in consumed_batch_ids})
     rows = sorted(copy.deepcopy(observations), key=observation_id)
+    if delta is not None:
+        if not isinstance(delta, list):
+            raise ValueError('delta observations must be a list')
+        for row in delta:
+            if not isinstance(row, dict):
+                raise ValueError('observation must be an object')
+        delta = sorted(copy.deepcopy(delta), key=observation_id)
+        seen = set()
+        for row in delta:
+            key = observation_id(row)
+            if key in seen:
+                raise ValueError('delta rows contain a duplicate observation id')
+            seen.add(key)
+        _rows(delta, bank)
+        if any(row.get('kind') == 'opaque_legacy' for row in delta):
+            raise ValueError('delta must not rewrite opaque legacy seed rows')
+        sealed = {observation_id(row): row for row in rows}
+        for row in delta:
+            key = observation_id(row)
+            if key not in sealed or observation_content_hash(sealed[key]) != observation_content_hash(row):
+                raise ValueError('delta rows must be the sealed new or changed typed state')
     parent_hash, state_hash = canonical_hash(parent), _state_hash(rows)
     digest = _generation_hash(bank, parent_hash, state_hash, batches)
     directory = root / 'generations' / digest
@@ -890,6 +984,8 @@ def write_generation(root: Path, *, bank: str, parent: dict, observations: list[
     # Include the prospective child in the ancestry budget before any writes.
     _parent(parent, bank, _ancestors=(directory / 'manifest.json',))
     payloads = {'observations_index.jsonl': ('observations', rows)}
+    if delta is not None:
+        payloads['delta_index.jsonl'] = ('observations', delta)
     cards, entries = _projection(rows), []
     for card in cards:
         stem = canonical_hash({'topic': card['topic']})
@@ -908,6 +1004,8 @@ def write_generation(root: Path, *, bank: str, parent: dict, observations: list[
         'observation_count': len(rows), 'card_count': len(cards), 'cards': entries,
         'files': [{'path': name, 'kind': kind, **_payload_info(_artifact_chunks(kind, payload))}
                   for name, (kind, payload) in sorted(payloads.items())]}
+    if delta is not None:
+        manifest['delta_count'] = len(delta)
     manifest['manifest_sha256'] = canonical_hash(manifest)
     if directory.exists():
         existing = validate_generation(directory / 'manifest.json')
@@ -984,3 +1082,53 @@ def load_manifest_artifacts(cards_root: Path, *, bank: str | None = None) -> tup
         expected.add('observations_index.jsonl')
     _inventory(root, expected)
     return manifest, cards, rows
+
+
+def load_delta_artifacts(cards_root: Path, *, bank: str | None = None) -> tuple[dict, list[dict]]:
+    """Read ONLY a delta-scoped generation's manifest and sealed delta index.
+
+    The full observation index is never read here: the delta bytes are verified
+    against the manifest's exact files[] entry, and the parent chain stays a
+    manifest-level binding. Full-state hashes remain recorded evidence for the
+    evaluation scope; strict full-state validation stays in the legacy path.
+    """
+    root = _absolute(cards_root)
+    _watch_validation_inventory(root)
+    manifest = _object(_read(root / 'manifest.json'), 'manifest')
+    if manifest.get('schema_version') != SCHEMA:
+        raise ValueError('delta scope requires an exact generation manifest')
+    if _absolute(_name(manifest.get('root'), 'root path')) != root or manifest.get('manifest_path') != str(root / 'manifest.json'):
+        raise ValueError('manifest root/path mismatch')
+    _hash(manifest.get('manifest_sha256'), 'manifest')
+    if canonical_hash({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
+        raise ValueError('manifest hash mismatch')
+    name = _name(manifest.get('bank'), 'bank')
+    if bank is not None and name != bank:
+        raise ValueError('publisher manifest bank mismatch')
+    _bound_parent(manifest.get('parent'), name)
+    if canonical_hash(manifest['parent']) != _hash(manifest.get('parent_sha256'), 'parent'):
+        raise ValueError('parent hash mismatch')
+    files = manifest.get('files')
+    if not isinstance(files, list) or not files:
+        raise ValueError('missing exact artifact manifest')
+    entry = None
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError('invalid artifact entry')
+        if _relative(item.get('path')) == 'delta_index.jsonl':
+            if item.get('kind') != 'observations' or entry is not None:
+                raise ValueError('delta artifact must be a single sealed observation index')
+            entry = item
+    if entry is None:
+        raise ValueError('generation has no sealed delta index')
+    expected = {'sha256': _hash(entry.get('sha256'), 'artifact'),
+                'size': _count(entry.get('size'), 'artifact size')}
+    sealed_delta, info = _read_index(root / 'delta_index.jsonl', expected)
+    if info != expected:
+        raise ValueError('artifact hash/size mismatch: delta_index.jsonl')
+    _rows(sealed_delta, bank)
+    if len(sealed_delta) != _count(manifest.get('delta_count'), 'delta'):
+        raise ValueError('delta count mismatch')
+    if any(r.get('kind') == 'opaque_legacy' for r in sealed_delta):
+        raise ValueError('delta index must not contain opaque legacy rows')
+    return manifest, sealed_delta

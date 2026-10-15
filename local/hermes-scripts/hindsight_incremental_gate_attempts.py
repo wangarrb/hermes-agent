@@ -189,6 +189,9 @@ def recipe(adapter, *, interpreter=None) -> dict:
 
 def commands(adapter, manifest: dict, directory: Path, benchmarks: dict, invocation: dict) -> dict:
     root, api = manifest['root'], invocation['api']
+    delta_root = directory.parent / 'delta-cards'
+    if (delta_root / 'observations_index.jsonl').exists():
+        root = str(delta_root)
     result = {'conflict': [adapter.python, str(adapter.script_dir / SOURCES[0]),
         '--cards-root', root, '--offline-root', root, '--output-dir', str(directory / 'conflict'),
         '--api', api, '--bank', adapter.bank, '--json']}
@@ -214,10 +217,9 @@ class GateAttempt:
         self.scoped = scoped
         self.manifest_identity = merge.canonical_hash(manifest)
         if candidate_fence is None:
-            from hindsight_incremental_publication import candidate_parse_proof
             with merge._validation_read_scope() as candidate_fence:
-                adapter._candidate(manifest, ledger)
-                if candidate_parse_proof(manifest['root'], adapter.script_dir) != parse:
+                _m, scope_rows, _, _cards, _r = adapter._scope_candidate(manifest, ledger)
+                if adapter._scope_parse_proof(manifest, ledger, scope_rows) != parse:
                     raise ValueError('candidate parse proof differs from strict dependency closure')
         self.candidate_fence = candidate_fence
         self.root = merge._absolute(ledger.root) / 'publication' / manifest['manifest_sha256']

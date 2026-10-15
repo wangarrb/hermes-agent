@@ -156,6 +156,92 @@ def candidate_parse_proof(root: str | Path, script_dir: Path | None = None) -> d
         'conflict_view_sha256': merge.canonical_hash(conflict), 'eval_view_sha256': merge.canonical_hash(layered)}
 
 
+def delta_cards_root(ledger_root: Path, manifest: dict) -> Path:
+    """Stable delta-cards root beside the frozen gate attempt directory."""
+    return merge._absolute(ledger_root) / 'publication' / manifest['manifest_sha256'] / 'delta-cards'
+
+
+def freeze_delta_cards(ledger_root: Path, manifest: dict, rows: list[dict]) -> Path:
+    """Write (or verify) the delta-cards root: the delta rows as the exact
+    observations index the conflict and layered readers consume directly."""
+    import os
+    from hindsight_incremental_gate_attempts import fsync_directory
+    root = delta_cards_root(ledger_root, manifest)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = root / 'observations_index.jsonl'
+    payload = b''.join(merge._artifact_chunks('observations', rows))
+    entry = next((f for f in manifest['files'] if f['path'] == 'delta_index.jsonl'), None)
+    if entry is None:
+        raise ValueError('delta cards root requires a sealed delta index')
+    pointer = {'manifest_sha256': manifest['manifest_sha256'], 'delta_sha256': entry['sha256'],
+               'delta_count': len(rows)}
+    pointer_payload = json.dumps(pointer, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    for target, data in ((path, payload), (root / 'delta-manifest.json', pointer_payload)):
+        if target.exists():
+            if target.read_bytes() != data:
+                raise ValueError('delta cards root differs from the sealed delta')
+        else:
+            tmp = target.with_name('.' + target.name + '.preparing')
+            with open(tmp, 'wb') as handle:
+                handle.write(data)
+            os.replace(tmp, target)
+    fsync_directory(root)
+    return root
+
+
+def delta_parse_proof(delta_root: Path, script_dir: Path | None = None) -> dict:
+    """Exhaustive parse proof over the sealed delta root through both real
+    consumers (conflict audit + layered local cards), never the full index.
+    The root carries its own pointer (manifest_sha256/delta_sha256/count)."""
+    root = merge._absolute(delta_root)
+    pointer = merge._object(merge._read(root / 'delta-manifest.json'), 'delta manifest pointer')
+    payload = (root / 'observations_index.jsonl').read_bytes()
+    if (not isinstance(pointer, dict) or pointer.get('delta_sha256') != hashlib.sha256(payload).hexdigest()
+            or type(pointer.get('delta_count')) is not int):
+        raise ValueError('delta parse proof pointer mismatch')
+    rows = [json.loads(line) for line in payload.decode('utf-8').splitlines() if line.strip()]
+    if len(rows) != pointer['delta_count']:
+        raise ValueError('delta parse proof count mismatch')
+    scripts = script_dir or Path(__file__).parent
+    conflict = runpy.run_path(str(scripts / 'hindsight_conflict_audit.py'))['load_observations'](root)
+    layered = runpy.run_path(str(scripts / 'hindsight_recall_layered.py'))['load_local_cards'](root)
+    ids = sorted(merge.observation_id(r) for r in rows)
+
+    def view_row(value):
+        # A raw index view has no explicit id key; derive the exact declared
+        # observation id without changing any other field.
+        value = dict(value)
+        if not isinstance(value.get('id'), str) or not value['id']:
+            value['id'] = merge.observation_id(value)
+        return value
+
+    conflict = [view_row(r) for r in conflict]
+    if sorted(r['id'] for r in conflict) != ids:
+        raise ValueError('delta consumer omitted or duplicated declared rows')
+    by_id = {r['id']: r for r in conflict}
+    for row in rows:
+        if by_id[merge.observation_id(row)]['insight'] != row['insight']:
+            raise ValueError('delta consumer changed declared observation text')
+    # The layered view carries no raw identity fields; bind one-to-one by
+    # exact declared text (visible text starts with the insight).
+    if len(layered) != len(rows):
+        raise ValueError('delta consumer omitted or duplicated declared rows')
+    remaining = list(layered)
+    for row in rows:
+        expected = row['insight']
+        for index, candidate in enumerate(remaining):
+            got = candidate.get('text')
+            if isinstance(got, str) and got.startswith(expected):
+                remaining.pop(index)
+                break
+        else:
+            raise ValueError('delta consumer changed declared observation text')
+    return {'manifest_sha256': pointer.get('manifest_sha256'), 'delta_count': len(rows),
+        'observation_count': len(rows),
+        'delta_sha256': pointer['delta_sha256'], 'ids_sha256': merge.canonical_hash(ids), 'parse_errors': 0,
+        'conflict_view_sha256': merge.canonical_hash(conflict), 'eval_view_sha256': merge.canonical_hash(layered)}
+
+
 def _benchmark_ids(path: Path) -> list[str]:
     rows = [json.loads(line) for line in merge._read(path).decode('utf-8').splitlines()
             if line.strip() and not line.lstrip().startswith('#')]
@@ -273,8 +359,12 @@ g['LAYERED_PATH']=path.parent/'hindsight_recall_layered.py'
 if 'run_eval' in g:
     original=g['run_eval']
     def checked_eval(*args, **kwargs):
-        from hindsight_incremental_publication import candidate_parse_proof
-        proof=candidate_parse_proof(kwargs['cards_root'], path.parent) if kwargs.get('cards_root') else None
+        from hindsight_incremental_publication import candidate_parse_proof, delta_parse_proof
+        proof=None
+        if kwargs.get('cards_root'):
+            root=pathlib.Path(str(kwargs['cards_root']))
+            proof=(candidate_parse_proof(kwargs['cards_root'], path.parent)
+                   if (root/'manifest.json').exists() else delta_parse_proof(kwargs['cards_root'], path.parent))
         report=original(*args, **kwargs)
         report['candidate_parse_proof']=proof
         report['invocation']={'bank':kwargs['bank'],'api':kwargs['api'],
@@ -319,6 +409,60 @@ module['main']()
         payload['export_sha256'] = merge.canonical_hash(payload)
         _freeze(path, payload)
         return payload
+
+    @staticmethod
+    def _has_delta(manifest: dict) -> bool:
+        return any(isinstance(f, dict) and f.get('path') == 'delta_index.jsonl'
+                   for f in manifest.get('files', []))
+
+    def _delta_candidate(self, manifest: dict, ledger, remote=None):
+        """Delta-scoped candidate: reads ONLY the sealed delta index. The full
+        state and seed stay bound by manifest hashes as recorded evaluation
+        evidence (user policy: hashes for evaluation, never a per-gate full
+        re-read or a blocking obstacle)."""
+        root = merge._absolute(manifest['root'])
+        if not root.is_relative_to(merge._absolute(ledger.root)):
+            raise ValueError('candidate outside private ledger root')
+        with span('delta_load') as counts:
+            bound, delta = merge.load_delta_artifacts(root, bank=self.bank)
+            counts.update(row_count=len(delta))
+        if bound != manifest:
+            raise ValueError('candidate differs from exact frozen manifest')
+        # Manifest-level ancestry walk (94KB manifests; never parent indexes).
+        ancestor = manifest['parent']
+        while ancestor.get('schema_version') == merge.SCHEMA:
+            parent_root = merge._absolute(ancestor['root'])
+            if not parent_root.is_relative_to(merge._absolute(ledger.root)):
+                raise ValueError('ancestor outside private ledger root')
+            merge._bound_parent(ancestor, self.bank)
+            stored = merge._object(merge._read(parent_root / 'manifest.json'), 'ancestor manifest')
+            if stored != ancestor:
+                raise ValueError('ancestor manifest differs from the bound parent')
+            ancestor = ancestor['parent']
+        cards = _delta_cards(delta, self.publisher)
+        targets = [self.publisher.card_document_id(c) for c in cards]
+        if len(set(targets)) != len(targets):
+            raise ValueError('incremental target overlaps another node')
+        if remote is not None and set(targets) & set(remote['document_ids']):
+            raise ValueError('incremental target overlaps legacy seed or another node')
+        return manifest, delta, None, cards, remote
+
+    def _scope_candidate(self, manifest: dict, ledger, remote=None):
+        """Delta scope when the generation seals a delta index; legacy full
+        candidate otherwise."""
+        if self._has_delta(manifest):
+            return self._delta_candidate(manifest, ledger, remote)
+        return self._candidate(manifest, ledger)
+
+    def _scope_parse_proof(self, manifest: dict, ledger, rows: list[dict] | None = None) -> dict:
+        """Parse proof over the exact scope the gate reads: delta rows when a
+        sealed delta exists, otherwise the full candidate index."""
+        if self._has_delta(manifest):
+            if rows is None:
+                rows = merge.load_delta_artifacts(merge._absolute(manifest['root']), bank=self.bank)[1]
+            root = freeze_delta_cards(ledger.root, manifest, rows)
+            return delta_parse_proof(root, self.script_dir)
+        return candidate_parse_proof(manifest['root'], self.script_dir)
 
     @timed('initial_seed')
     def _initial_seed(self, ledger) -> tuple[list[dict], dict, dict]:
@@ -498,9 +642,15 @@ module['main']()
         return result
 
     def gate(self, manifest: dict, *, ledger, scoped_proof: dict) -> dict:
+        delta_scope = self._has_delta(manifest)
+        remote = None
+        if delta_scope:
+            # One seed read for the legacy-seed overlap anchor; the full state
+            # itself stays recorded evidence (never a blocking re-read).
+            _seed_rows, _provenance, remote = self._initial_seed(ledger)
         with merge._validation_read_scope() as candidate_fence:
-            manifest, _, _, cards, _ = self._candidate(manifest, ledger)
-            parse_proof = candidate_parse_proof(manifest['root'], self.script_dir)
+            manifest, scope_rows, _, cards, _ = self._scope_candidate(manifest, ledger, remote)
+            parse_proof = self._scope_parse_proof(manifest, ledger, scope_rows)
         if not cards:
             raise ValueError('unchanged candidate requires parent no-op, not a fabricated gate')
         self._proof(manifest, scoped_proof)
@@ -515,8 +665,9 @@ module['main']()
         benchmarks = {label: Path(value['snapshot']['path']) for label, value in attempt.binding['benchmarks'].items()}
         benchmark_ids = {label: value['ids'] for label, value in attempt.binding['benchmarks'].items()}
         root, api = manifest['root'], attempt.binding['recipe']['api']
+        scope_root = str(delta_cards_root(ledger.root, manifest)) if delta_scope else root
         conflict = attempt.run('conflict')
-        _validate_conflict_report(conflict, self.bank, root, api, parse_proof)
+        _validate_conflict_report(conflict, self.bank, scope_root, api, parse_proof)
         conflict_check = evaluate_conflict_audit(directory / 'conflict.json', required=True)
         pairs = []
         for label in ('generic', 'local'):
@@ -525,7 +676,8 @@ module['main']()
             for mode in ('baseline', 'cards'):
                 path = directory / f'{label}-{mode}.json'
                 report = attempt.run(f'{label}-{mode}')
-                expected = None if mode == 'baseline' else root
+                expected = None if mode == 'baseline' else (str(delta_cards_root(ledger.root, manifest))
+                                                             if delta_scope else root)
                 if report.get('cards_root') != expected:
                     raise ValueError('eval report does not match exact candidate root')
                 _validate_eval(report, benchmark_ids[label])
@@ -538,8 +690,8 @@ module['main']()
         # Detect mutation during eval, including source receipts/benchmark files.
         attempt.check()
         with merge._validation_read_scope() as final_fence:
-            self._candidate(manifest, ledger)
-            final_parse = candidate_parse_proof(manifest['root'], self.script_dir)
+            _m2, final_rows, _, _c2, _r2 = self._scope_candidate(manifest, ledger, remote)
+            final_parse = self._scope_parse_proof(manifest, ledger, final_rows)
         if coverage != self._coverage(manifest, ledger):
             raise ValueError('source coverage changed during gate')
         self._proof(manifest, scoped_proof)
@@ -557,7 +709,15 @@ module['main']()
                 raise ValueError('gate input/report changed during eval')
         checks = dict(schema=True, coverage=True, conflict=conflict_check['passed'],
                       generic_eval=pairs[0]['passed'], local_eval=pairs[1]['passed'], scoped_drain=True)
+        delta_entry = next((f for f in manifest['files'] if f['path'] == 'delta_index.jsonl'), None)
         receipt = {'schema_version': 'hindsight-incremental-gate/1', 'bank': self.bank,
+            'gate_scope': 'delta' if delta_scope else 'full',
+            'seed_evidence': ({'observations_sha256': manifest.get('observations_sha256'),
+                               'observation_count': manifest.get('observation_count'),
+                               'parent_sha256': manifest.get('parent_sha256'),
+                               'delta_sha256': delta_entry['sha256'] if delta_entry else None,
+                               'delta_count': manifest.get('delta_count'),
+                               'policy': 'recorded_not_blocking'} if delta_scope else None),
             'manifest_sha256': manifest['manifest_sha256'], 'root': root,
             'parent_sha256': manifest['parent_sha256'], 'coverage': coverage,
             'scoped_proof': copy.deepcopy(scoped_proof), 'artifacts': artifacts,
@@ -603,9 +763,11 @@ module['main']()
             raise ValueError('frozen native proofs differ from ledger receipts')
         if [p.get('label') for p in gate['pairs']] != ['generic', 'local']:
             raise ValueError('fresh generic/local eval pairs both required')
+        delta_scope = self._has_delta(manifest)
+        expected_cards = str(delta_cards_root(ledger.root, manifest)) if delta_scope else manifest['root']
         with merge._validation_read_scope() as candidate_fence:
-            self._candidate(manifest, ledger)
-            proof = candidate_parse_proof(manifest['root'], self.script_dir)
+            _m, scope_rows, _, _c, _r = self._scope_candidate(manifest, ledger)
+            proof = self._scope_parse_proof(manifest, ledger, scope_rows)
         if gate.get('candidate_parse_proof') != proof:
             raise ValueError('frozen candidate parse proof mismatch')
         benchmarks = {label: merge._absolute(self.config[label + '_benchmark']) for label in ('generic', 'local')}
@@ -638,18 +800,18 @@ module['main']()
                 _validate_eval(report, ids)
                 _validate_eval_options(report, top_k)
                 benchmark = str(benchmarks[pair['label']])
-                if (report.get('cards_root') != (manifest['root'] if mode == 'cards' else None)
+                if (report.get('cards_root') != (expected_cards if mode == 'cards' else None)
                         or report.get('invocation') != {'bank': self.bank, 'api': api, 'benchmark': benchmark}
                         or report.get('candidate_parse_proof') != (proof if mode == 'cards' else None)):
                     raise ValueError('frozen eval invocation/parse proof mismatch')
             actual = evaluate_pair(pair['label'], Path(pair['baseline_eval']), Path(pair['cards_eval']), **THRESHOLDS)
-            if actual != pair or actual['passed'] is not True or actual['cards_root'] != manifest['root']:
+            if actual != pair or actual['passed'] is not True or actual['cards_root'] != expected_cards:
                 raise ValueError('frozen eval pair no longer passes original thresholds')
         conflict_path = path.parent / 'conflict.json'
         if gate['conflict_check']['audit_path'] != str(conflict_path):
             raise ValueError('frozen conflict path differs from exact attempt output')
         _validate_conflict_report(merge._object(merge._read(conflict_path), 'frozen conflict'),
-                                  self.bank, manifest['root'], api, proof)
+                                  self.bank, expected_cards, api, proof)
         if evaluate_conflict_audit(conflict_path, required=True) != gate['conflict_check']:
             raise ValueError('frozen conflict audit mismatch')
         candidate_fence.check()
@@ -758,7 +920,7 @@ module['main']()
 
     @timed('publish_generation')
     def publish_generation(self, manifest: dict, gate: dict, *, ledger) -> dict:
-        manifest, _, _, cards, remote = self._candidate(manifest, ledger)
+        manifest, _, _, cards, remote = self._scope_candidate(manifest, ledger)
         self._validate_gate(manifest, gate, ledger)
         if not cards:
             raise ValueError('unchanged candidate requires no-op')
@@ -780,7 +942,7 @@ module['main']()
             current, _ = self._readback(conn, manifest, ledger, for_update=True)
             if not current['write_ready']:
                 raise ValueError('seed or typed parent changed before transaction')
-            self._candidate(manifest, ledger)
+            self._scope_candidate(manifest, ledger)
             self._validate_gate(manifest, gate, ledger)
         @timed('precommit_check', reporter=reporter)
         def precommit(conn):

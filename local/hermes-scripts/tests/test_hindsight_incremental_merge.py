@@ -817,3 +817,144 @@ def test_nested_json_matches_stdlib_values_grammar_and_hash_precedence(merge, wo
         for _ in range(depth):
             actual = actual[0]['k']
         assert actual == 0
+
+
+def delta_rows_snapshot(merge, rows):
+    return {merge.observation_id(r): merge.observation_content_hash(r) for r in rows}
+
+
+def test_delta_rows_selects_new_and_changed_typed_rows_only(merge):
+    seed = merge.merge_observations([], [row(), row(applicability='dynamic')])
+    changed = dict(next(r for r in seed if r['applicability'] == 'dynamic'), evidence_ids=['new-evidence'])
+    added = row(insight='A brand new lesson', applicability='third mode')
+    merged = merge.merge_observations(seed, [changed, added])
+    delta = merge.delta_rows(seed, merged)
+    assert delta == sorted(delta, key=merge.observation_id)
+    assert {merge.observation_id(r) for r in delta} == {
+        merge.observation_id(changed), merge.observation_id(added)}
+    unchanged = next(r for r in seed if r['applicability'] == 'static regions')
+    assert merge.observation_id(unchanged) not in {merge.observation_id(r) for r in delta}
+    assert merge.delta_rows(seed, seed) == []
+    assert merge.delta_rows(seed, merged) == merge.delta_rows(seed, list(reversed(merged)))
+
+
+def test_delta_rows_excludes_opaque_seed_and_rejects_bad_input(merge):
+    raw = {'id': 'old-db-uuid', 'bank_id': 'hermes', 'text': '原始 opaque', 'metadata': {}}
+    seed = merge.import_legacy_seed([raw], bank='hermes', provenance=parent())
+    merged = merge.merge_observations(seed, [row()])
+    delta = merge.delta_rows(seed, merged)
+    assert delta == [r for r in merged if r.get('kind') != 'opaque_legacy']
+    assert all(r.get('kind') != 'opaque_legacy' for r in delta)
+    for bad in (None, 'not-a-list', {'a': 1}, [1], ['x']):
+        with pytest.raises(ValueError):
+            merge.delta_rows(bad, merged)
+        with pytest.raises(ValueError):
+            merge.delta_rows(seed, bad)
+    duplicate = [row(), row()]
+    with pytest.raises(ValueError, match='duplicate'):
+        merge.delta_rows(duplicate, merged)
+
+
+def test_generation_delta_roundtrip_seals_exact_new_rows(merge, work):
+    first = generation(merge, work)
+    previous = merge.load_manifest_artifacts(Path(first['root']))[2]
+    merged = merge.merge_observations(previous, [row(applicability='dynamic'), row(insight='second')])
+    delta = merge.delta_rows(previous, merged)
+    assert len(delta) == 2
+    second = merge.write_generation(work, bank='hermes', parent=first, observations=merged,
+                                    consumed_batch_ids=['batch-b'], delta=delta)
+    assert second['delta_count'] == 2
+    entry = next(f for f in second['files'] if f['path'] == 'delta_index.jsonl')
+    assert entry['kind'] == 'observations'
+    path = Path(second['root']) / 'delta_index.jsonl'
+    assert path.read_bytes() == b''.join(merge._artifact_chunks('observations', delta))
+    assert merge.validate_generation(Path(second['manifest_path'])) == second
+    bound, sealed = merge.load_delta_artifacts(Path(second['root']), bank='hermes')
+    assert bound == second and sealed == delta
+    # The full index stays byte-identical and remains loadable by strict consumers.
+    assert merge.load_manifest_artifacts(Path(second['root']), bank='hermes')[2] == merged
+    repeated = merge.write_generation(work, bank='hermes', parent=first, observations=merged,
+                                      consumed_batch_ids=['batch-b'], delta=delta)
+    assert repeated == second and path.read_bytes() == b''.join(
+        merge._artifact_chunks('observations', delta))
+
+
+def test_first_generation_delta_must_be_subset_of_sealed_state(merge, work):
+    raw = {'id': 'old-db-uuid', 'bank_id': 'hermes', 'text': '原始 opaque', 'metadata': {}}
+    seed = merge.import_legacy_seed([raw], bank='hermes', provenance=parent())
+    merged = merge.merge_observations(seed, [row()])
+    delta = merge.delta_rows(seed, merged)
+    assert len(delta) == 1
+    first = merge.write_generation(work, bank='hermes', parent=parent(), observations=merged,
+                                   consumed_batch_ids=['batch-a'], delta=delta)
+    assert first['delta_count'] == 1 and merge.load_delta_artifacts(Path(first['root']))[1] == delta
+    with pytest.raises(ValueError, match='delta'):
+        merge.write_generation(work / 'other', bank='hermes', parent=parent(), observations=merged,
+                               consumed_batch_ids=['batch-a'], delta=[row(insight='unsealed row')])
+    with pytest.raises(ValueError, match='delta'):
+        merge.write_generation(work / 'other', bank='hermes', parent=parent(), observations=merged,
+                               consumed_batch_ids=['batch-a'], delta=[seed[0]])
+    with pytest.raises(ValueError, match='delta'):
+        merge.write_generation(work / 'other', bank='hermes', parent=parent(), observations=merged,
+                               consumed_batch_ids=['batch-a'], delta=delta + delta)
+
+
+def test_generation_without_delta_stays_legacy_without_delta_artifact(merge, work):
+    m = generation(merge, work)
+    assert 'delta_count' not in m
+    assert 'delta_index.jsonl' not in {f['path'] for f in m['files']}
+    assert not (Path(m['root']) / 'delta_index.jsonl').exists()
+    assert merge.validate_generation(Path(m['manifest_path'])) == m
+    assert merge.load_manifest_artifacts(Path(m['root']))[2] is not None
+    with pytest.raises(ValueError, match='delta'):
+        merge.load_delta_artifacts(Path(m['root']))
+
+
+@pytest.mark.parametrize('damage', ['bytes', 'count', 'nonmatching', 'unchanged-row', 'opaque', 'missing-file'])
+def test_delta_validation_fails_closed_on_tampering(merge, work, damage):
+    first = generation(merge, work)
+    previous = merge.load_manifest_artifacts(Path(first['root']))[2]
+    merged = merge.merge_observations(previous, [row(applicability='dynamic'), row(insight='second')])
+    delta = merge.delta_rows(previous, merged)
+    second = merge.write_generation(work, bank='hermes', parent=first, observations=merged,
+                                    consumed_batch_ids=['batch-b'], delta=delta)
+    path, root = Path(second['manifest_path']), Path(second['root'])
+    manifest = json.loads(path.read_text())
+    index = root / 'delta_index.jsonl'
+    entry = next(f for f in manifest['files'] if f['path'] == 'delta_index.jsonl')
+    if damage == 'bytes':
+        index.write_text(index.read_text() + ' ')
+    elif damage == 'count':
+        manifest['delta_count'] = len(delta) + 1
+        reseal_manifest(merge, path, manifest)
+    elif damage == 'nonmatching':
+        payload = b''.join(merge._artifact_chunks('observations', [row(insight='not sealed')]))
+        index.write_bytes(payload)
+        entry.update(sha256=hashlib.sha256(payload).hexdigest(), size=len(payload))
+        reseal_manifest(merge, path, manifest)
+    elif damage == 'unchanged-row':
+        payload = b''.join(merge._artifact_chunks('observations', previous[:1]))
+        index.write_bytes(payload)
+        entry.update(sha256=hashlib.sha256(payload).hexdigest(), size=len(payload))
+        manifest['delta_count'] = 1
+        reseal_manifest(merge, path, manifest)
+    elif damage == 'opaque':
+        raw = {'id': 'old-db-uuid', 'bank_id': 'hermes', 'text': 'opaque', 'metadata': {}}
+        opaque = merge.import_legacy_seed([raw], bank='hermes', provenance=parent())[0]
+        payload = b''.join(merge._artifact_chunks('observations', [opaque]))
+        index.write_bytes(payload)
+        entry.update(sha256=hashlib.sha256(payload).hexdigest(), size=len(payload))
+        manifest['delta_count'] = 1
+        reseal_manifest(merge, path, manifest)
+    else:
+        index.rename(work / 'preserved-delta.jsonl')
+    with pytest.raises(ValueError):
+        merge.validate_generation(path)
+    if damage == 'unchanged-row':
+        # The light delta reader cannot see the parent state (no full reads by
+        # design); an over-inclusive delta is an evaluation-scope residual,
+        # still caught wherever the full state is validated.
+        merge.load_delta_artifacts(root)
+    else:
+        with pytest.raises(ValueError):
+            merge.load_delta_artifacts(root)

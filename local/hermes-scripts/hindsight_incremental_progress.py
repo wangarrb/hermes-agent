@@ -27,6 +27,7 @@ OPERATIONS = frozenset({
     'readonly_transaction', 'prewrite_check', 'precommit_check',
     'publisher_publish', 'embeddings', 'remote_state_hash', 'cleanup',
     'source_parent_merge', 'source_parent_gate', 'source_parent_publish',
+    'delta_load',
 })
 _ACTIVE: ContextVar[ProgressReporter | None] = ContextVar('hindsight_incremental_progress', default=None)
 _UNBOUND = object()

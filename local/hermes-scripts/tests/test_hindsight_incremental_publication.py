@@ -244,14 +244,24 @@ def fake_report(cmd, **_):
     name = Path(cmd[1]).name
     arg = lambda k: cmd[cmd.index(k) + 1]
     if name == 'hindsight_conflict_audit.py':
+        root_path = Path(arg('--cards-root'))
+        if (root_path / 'manifest.json').exists():
+            count = len(merge.load_manifest_artifacts(root_path)[2])
+        else:
+            count = len([l for l in (root_path / 'observations_index.jsonl').read_text().splitlines() if l.strip()])
         return {'bank': arg('--bank'), 'cards_root': arg('--cards-root'), 'offline_root': arg('--offline-root'),
-                'observation_count': len(merge.load_manifest_artifacts(Path(arg('--cards-root')))[2]), 'api': arg('--api'),
+                'observation_count': count, 'api': arg('--api'),
                 'cases': [], 'summary': {'blocking_cases': 0}, 'decision': 'pass', 'source_scan_errors': []}
     assert name == 'hindsight_eval.py'
     use_cards = '--use-local-cards' in cmd
-    from hindsight_incremental_publication import candidate_parse_proof
+    from hindsight_incremental_publication import candidate_parse_proof, delta_parse_proof
+    proof = None
+    if use_cards:
+        root_path = Path(arg('--cards-root'))
+        proof = (candidate_parse_proof(arg('--cards-root'))
+                 if (root_path / 'manifest.json').exists() else delta_parse_proof(arg('--cards-root')))
     return {'cards_root': arg('--cards-root') if use_cards else None,
-            'candidate_parse_proof': candidate_parse_proof(arg('--cards-root')) if use_cards else None,
+            'candidate_parse_proof': proof,
             'invocation': {'bank': arg('--bank'), 'api': arg('--api'), 'benchmark': arg('--benchmark')},
             'include_hindsight_observations': '--no-hindsight-observations' not in cmd,
             'summary': {'case_count': 1, 'top_k': int(arg('--top-k')) if '--top-k' in cmd else 5,
@@ -867,3 +877,35 @@ print(json.dumps({'operation': operation, 'rows': len(value['observations']), 'b
     assert proof['rows'] == 4000 and proof['operation'] == operation
     (tmp_path / f'memory-{operation}.json').write_text(result.stdout)
     print(result.stdout.strip())
+
+
+def test_gate_delta_scope_reads_only_delta_records_seed_evidence_and_publishes(env, tmp_path):
+    """v2: a generation with a sealed delta is gated and published from the
+    delta scope only; the seed stays recorded evaluation evidence."""
+    mod, adapter, ledger, db, first, proof, row = env
+    # A chained publish needs the parent generation's frozen remote state, so
+    # publish the first (legacy-scope) generation before the delta one.
+    first_gate = adapter.gate(first, ledger=ledger, scoped_proof=proof)
+    assert adapter.publish_generation(first, first_gate, ledger=ledger)['readback_verified'] is True
+    prev_rows = merge.load_manifest_artifacts(Path(first['root']))[2]
+    row2 = dict(row, topic='topic-b', insight='Second delta insight')
+    merged = merge.merge_observations(prev_rows, [row2])
+    delta = merge.delta_rows(prev_rows, merged)
+    assert len(delta) == 1
+    second = merge.write_generation(tmp_path / 'canonical', bank=ledger.bank, parent=first,
+        observations=merged, consumed_batch_ids=['batch-b'], delta=delta)
+    proof2 = {'bank': ledger.bank, 'scope': ['arrival-batch:batch-b'], 'ready': True,
+              'pending_in_scope': 0, 'pending_operations': 0}
+    gate = adapter.gate(second, ledger=ledger, scoped_proof=proof2)
+    assert gate['gate_scope'] == 'delta' and gate['decision'] == 'eligible_for_local_proposal'
+    assert gate['seed_evidence']['policy'] == 'recorded_not_blocking'
+    assert gate['seed_evidence']['delta_count'] == 1
+    assert gate['candidate_parse_proof']['delta_count'] == 1
+    cards_root = mod.delta_cards_root(ledger.root, second)
+    assert (cards_root / 'observations_index.jsonl').exists()
+    assert (cards_root / 'delta-manifest.json').exists()
+    for pair in gate['pairs']:
+        report = merge._object(merge._read(Path(pair['cards_eval'])), 'eval')
+        assert report['cards_root'] == str(cards_root)
+    publication = adapter.publish_generation(second, gate, ledger=ledger)
+    assert publication['readback_verified'] is True

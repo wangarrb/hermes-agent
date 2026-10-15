@@ -451,8 +451,10 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                 parent, seed, _seq = _seed_state(ledger)
                 with span('merge', row_count=len(seed)) as counts:
                     merged = merge_observations(seed, _typed_delta(ready, ledger))
+                    from hindsight_incremental_merge import delta_rows
                     manifest = write_generation(ledger.root / 'canonical', bank=ledger.bank,
-                        parent=parent, observations=merged, consumed_batch_ids=[b['batch_id'] for b in ready])
+                        parent=parent, observations=merged, consumed_batch_ids=[b['batch_id'] for b in ready],
+                        delta=delta_rows(seed, merged))
                     counts.update(row_count=len(merged))
                 for batch in ready:
                     _advance(ledger, batch['batch_id'], 'locally_merged', {'manifest': manifest})

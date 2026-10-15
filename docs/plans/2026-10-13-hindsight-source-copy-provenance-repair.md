@@ -144,3 +144,25 @@ delta; the seed hash is recorded for evaluation, NOT a blocking gate.
    when delta exists (e.g., gate still succeeds with the full index renamed
    away — proving no full read); fallback to full scope when no delta file.
 
+### §19 implementation notes (as built)
+
+- `merge.load_delta_artifacts` + `_validated` delta layout: delta bytes verified
+  against `files[]`, rows/count/no-opaque/`subset-of-sealed` checks; chained
+  generations additionally compare `sealed_delta == delta_rows(parent_rows,
+  rows)` (strong path). The light reader cannot see the parent state, so an
+  over-inclusive (unchanged-row) delta is an evaluation-scope residual there;
+  it is caught wherever the full state is validated (documented in the test).
+- Delta-cards root (`publication/<manifest_sha256>/delta-cards/`): frozen
+  `observations_index.jsonl` (delta rows) + `delta-manifest.json` pointer
+  (manifest_sha256/delta_sha256/delta_count). Conflict + both eval runs and
+  the parse proof consume this root; the eval bootstrap dispatches
+  `candidate_parse_proof` vs `delta_parse_proof` by the root's layout.
+- `delta_parse_proof`: conflict view bound by derived observation ids; the
+  layered view has no raw identity fields, so it is bound one-to-one by exact
+  declared text (count equality + startswith).
+- Gate receipt: `gate_scope` + `seed_evidence` (observations_sha256,
+  observation_count, parent_sha256, delta_sha256, delta_count,
+  `policy: recorded_not_blocking`); `checks` and their consumers unchanged.
+- Legacy fallback: a generation without `delta_index.jsonl` runs the exact
+  previous full-scope path (suite-verified byte-for-byte behavior).
+
