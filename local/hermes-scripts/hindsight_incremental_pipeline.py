@@ -230,6 +230,12 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                         raise ValueError('source_transition_requires_physical_baseline')
                     reader_options['source_transition_certificates'] = source_transition_certificates
                     reader_options['approved_transition_sha256s'] = approved_transition_sha256s
+                    if source_transition_certificates is not None:
+                        report['source_transition_certificates'] = {
+                            'count': len(source_transition_certificates),
+                            'profiles': sorted(str(certificate.get('profile', 'unknown'))
+                                               for certificate in source_transition_certificates
+                                               if isinstance(certificate, dict))}
                 snapshots = source_reader(Path(config['hermes_home']), **reader_options)
             if not execute:
                 pending = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
