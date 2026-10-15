@@ -97,6 +97,41 @@ def _gate_valid(receipt, manifest, bank):
     return all(checks.get(name) is True for name in required)
 
 
+def _gate_reference(gate):
+    """Per-batch receipts reference the frozen gate; never duplicate its bytes.
+
+    A gate without frozen bytes (test doubles) keeps the legacy inline copy.
+    """
+    if not isinstance(gate, dict):
+        raise ValueError('gate_reference_requires_gate')
+    if not isinstance(gate.get('gate_path'), str) or not isinstance(gate.get('gate_sha256'), str):
+        return {'gate': gate}
+    return {'gate_reference': {key: gate.get(key) for key in
+            ('bank', 'manifest_sha256', 'decision', 'checks', 'gate_path', 'gate_sha256')}}
+
+
+def _stored_gate(receipt):
+    """Full gate for a stored receipt: legacy inline copy or frozen reference."""
+    if not isinstance(receipt, dict):
+        return None
+    if isinstance(receipt.get('gate'), dict):
+        return receipt['gate']
+    reference = receipt.get('gate_reference')
+    if not isinstance(reference, dict):
+        return None
+    path, sha = reference.get('gate_path'), reference.get('gate_sha256')
+    if not isinstance(path, str) or not isinstance(sha, str):
+        return None
+    value = json.loads(Path(path).read_text(encoding='utf-8'))
+    if (not isinstance(value, dict) or value.get('gate_sha256') != sha
+            or canonical_hash({k: v for k, v in value.items() if k != 'gate_sha256'}) != sha):
+        raise ValueError('gate_receipt_hash_mismatch')
+    for key in ('bank', 'manifest_sha256', 'decision', 'checks'):
+        if value.get(key) != reference.get(key):
+            raise ValueError('gate_receipt_field_mismatch')
+    return value
+
+
 def _published_valid(receipt, manifest, bank):
     return (isinstance(receipt, dict) and receipt.get('bank') == bank
             and receipt.get('manifest_sha256') == manifest['manifest_sha256']
@@ -426,7 +461,7 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                 manifest = None
             if manifest is not None:
                 first = ledger.get_batch(ready[0]['batch_id'])
-                gate = first['receipts'].get('gated', {}).get('gate')
+                gate = _stored_gate(first['receipts'].get('gated', {}))
                 if gate is None:
                     with span('gate'):
                         gate = client.gate(manifest)
@@ -438,7 +473,8 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     _record(report, 'gate', status='blocked')
                 else:
                     for batch in ready:
-                        _advance(ledger, batch['batch_id'], 'gated', {'gate': gate, 'manifest': manifest})
+                        _advance(ledger, batch['batch_id'], 'gated',
+                                 {**_gate_reference(gate), 'manifest': manifest})
                     _record(report, 'gate', status='passed')
                     with span('readback_generation'):
                         publication = client.readback_generation(manifest)
@@ -459,7 +495,7 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                         siblings = [b for b in ledger.list_batches() if parent_id in b['parent_batch_ids']]
                         if all(b['phase'] == 'published' for b in siblings):
                             for phase, proof in [('locally_merged', {'manifest': manifest}),
-                                                ('gated', {'gate': gate, 'manifest': manifest}),
+                                                ('gated', {**_gate_reference(gate), 'manifest': manifest}),
                                                 ('published', {'manifest': manifest, 'publication': publication,
                                                                'sequence': sequence + 1})]:
                                 operation = {'locally_merged': 'source_parent_merge',

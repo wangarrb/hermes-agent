@@ -751,3 +751,33 @@ def test_deferred_operation_is_retried_within_the_same_run(setup):
     assert report['remaining_batches'] == 0
     assert any(s['stage'] == 'native_stage' and s.get('status') == 'deferred'
                for s in report['stages']), report['stages']
+
+
+def test_publish_resume_loads_frozen_gate_reference_without_regating(setup, tmp_path):
+    """Gated receipts reference the frozen gate bytes; a resume must load the
+    reference (verify hash) instead of duplicating 466KB per batch or re-gating."""
+    src, ledger, flow, cfg = setup
+    runtime = Runtime(ledger, publish_fails=True)
+    real_gate = runtime.gate
+    def gate_with_freeze(manifest):
+        value = real_gate(manifest)
+        value['gate_path'] = str(tmp_path / 'gate.json')
+        value['gate_sha256'] = flow.canonical_hash(value)
+        Path(value['gate_path']).write_text(json.dumps(value, sort_keys=True))
+        return value
+    runtime.gate = gate_with_freeze
+    read = lambda *_a, **_k: [snapshot(src, 2)]
+    first = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                 source_reader=read, execute=True)
+    assert first['status'] == 'blocked', first
+    child = next(b for b in ledger.list_batches() if b['kind'] == 'daily_summary')
+    receipt = child['receipts']['gated']
+    assert 'gate' not in receipt and isinstance(receipt.get('gate_reference'), dict)
+    reference = receipt['gate_reference']
+    assert reference['gate_sha256'] and reference['gate_path'].endswith('gate.json')
+    runtime.publish_fails = False
+    gates_before = runtime.gates
+    second = flow.run_incremental(cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                                  source_reader=read, execute=True)
+    assert second['status'] == 'completed', second
+    assert runtime.gates == gates_before  # resumed from the frozen reference

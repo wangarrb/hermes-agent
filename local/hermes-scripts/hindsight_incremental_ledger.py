@@ -873,6 +873,20 @@ class IncrementalLedger:
             raise ValueError('manifest receipt differs from frozen merge proof')
         if phase == 'gated':
             gate = receipt.get('gate')
+            if gate is None:
+                # Frozen-reference receipt: never duplicate the gate bytes per
+                # batch; the frozen file stays the single authority.
+                reference = receipt.get('gate_reference')
+                if (not isinstance(reference, dict) or not isinstance(reference.get('gate_path'), str)
+                        or not reference['gate_path'] or not isinstance(reference.get('gate_sha256'), str)
+                        or not reference['gate_sha256']):
+                    raise ValueError('gated receipt requires exact eligible gate proof')
+                gate = reference
+                if verify_files:
+                    value = json.loads(Path(reference['gate_path']).read_text(encoding='utf-8'))
+                    if (not isinstance(value, dict) or value.get('gate_sha256') != reference['gate_sha256']
+                            or digest({k: v for k, v in value.items() if k != 'gate_sha256'}) != reference['gate_sha256']):
+                        raise ValueError('gated receipt frozen gate hash mismatch')
             required = ('schema', 'coverage', 'conflict', 'generic_eval', 'local_eval', 'scoped_drain')
             if (not isinstance(gate, dict) or gate.get('bank') != self.bank or
                     gate.get('manifest_sha256') != manifest['manifest_sha256'] or

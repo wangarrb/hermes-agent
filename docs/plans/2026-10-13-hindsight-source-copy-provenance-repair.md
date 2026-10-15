@@ -100,3 +100,47 @@ consumed no remote write: it must not permanently block the batch. Changes in
 - the evidence binding is unchanged and remains the one gate: every cited id
   must exist in the frozen facts.
 
+## 19. Delta-scoped gate + receipt dedup (user-directed)
+
+Measured gate cost (2026-10-15 night): 2h51m for ~240 new rows on a 74,609-row
+candidate. Root causes: (a) `_candidate()` full-loads a 1.27GB
+`observations_index.jsonl` three times per gate; (b) `_initial_seed` re-reads
+the 74k seed; (c) conflict + both eval "cards" runs re-load the full root into
+local cards; (d) `_validate_gate` re-reads everything; (e) the 466KB gate
+receipt was written into every batch row (52x) making the post-gate advance
+~4 min/batch. User directives: dedupe receipts (done: `_gate_reference` /
+`_stored_gate` in pipeline + ledger reference validation); evaluate ONLY the
+delta; the seed hash is recorded for evaluation, NOT a blocking gate.
+
+### v2 design (additive with legacy fallback)
+
+1. `merge.write_generation(..., delta=None)`: when given, writes
+   `delta_index.jsonl` (the new/changed rows; kind "observations", hashed via
+   `files[]`) and `delta_count` in the manifest. `merge.delta_rows(seed,
+   merged)` computes it by observation id + content hash. Generations without
+   the file keep the legacy full-scope gate.
+2. `publication._delta_candidate(manifest, ledger, remote)`: verifies the
+   stored manifest equals the passed manifest; reads ONLY `delta_index.jsonl`
+   (verify bytes vs `files[]` sha), validates rows, builds delta cards
+   (`_delta_cards`), checks target uniqueness vs `remote['document_ids']`;
+   walks the parent-manifest chain (94KB manifests) to the initial export for
+   provenance. No 1.27GB reads.
+3. `gate()` v2: when the delta file exists -> one `_initial_seed` read
+   (overlap/remote), delta candidate cycle; parse proof scoped to the delta
+   file; conflict + eval commands get a delta cards root (attempt dir /
+   `delta-cards/observations_index.jsonl`, read directly by
+   `load_local_cards`); mutation re-checks re-read the delta file + manifests.
+   `checks['coverage'] = True` stays (all consumers keep working) and the
+   receipt records `coverage_evidence` (parent_sha256, observations_sha256,
+   counts, file hashes) + `coverage_policy: "recorded_not_blocking"`.
+4. `_validate_gate` v2: revalidates the delta scope + recorded evidence, not
+   the full index. `publish_generation` uses the delta candidate for cards.
+5. `gate_attempts`: binding prep uses the delta candidate + delta parse proof;
+   commands point conflict/evals at the delta cards root; the cards_root check
+   accepts the delta cards root for cards mode.
+6. All existing tests must stay green on the legacy path (no delta file).
+   New tests: delta write+read roundtrip; delta-scoped gate receipt carries
+   coverage_evidence + delta scope marker; full index not required at gate
+   when delta exists (e.g., gate still succeeds with the full index renamed
+   away — proving no full read); fallback to full scope when no delta file.
+
