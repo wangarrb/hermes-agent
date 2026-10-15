@@ -8,7 +8,8 @@ import sys
 
 def alias_arguments(*, mode, execute, config=None, confirm=None, include_wiki=False,
                     resume_only=False, bank=None, llm_profile=None, llm_overrides=None,
-                    max_units=None, max_chars=None):
+                    max_units=None, max_chars=None, transition_certificates=None,
+                    approved_transition_sha256s=None):
     if mode not in {'daily', 'weekly', 'full'}:
         raise ValueError('invalid_incremental_mode')
     if execute and confirm != 'run-hindsight-pipeline':
@@ -35,15 +36,22 @@ def alias_arguments(*, mode, execute, config=None, confirm=None, include_wiki=Fa
         argv += ['--max-units', str(max_units)]
     if max_chars is not None:
         argv += ['--max-chars', str(max_chars)]
+    for path in transition_certificates or ():
+        argv += ['--transition-certificate', str(path)]
+    for value in approved_transition_sha256s or ():
+        argv += ['--approved-transition-sha256', value]
     return argv
 
 
 def run_alias(*, mode, execute, config=None, confirm=None, include_wiki=False,
               resume_only=False, bank=None, llm_profile=None, llm_overrides=None,
-              max_units=None, max_chars=None):
+              max_units=None, max_chars=None, transition_certificates=None,
+              approved_transition_sha256s=None):
     argv = alias_arguments(mode=mode, execute=execute, config=config, confirm=confirm,
         include_wiki=include_wiki, resume_only=resume_only, bank=bank, llm_profile=llm_profile,
-        llm_overrides=llm_overrides, max_units=max_units, max_chars=max_chars)
+        llm_overrides=llm_overrides, max_units=max_units, max_chars=max_chars,
+        transition_certificates=transition_certificates,
+        approved_transition_sha256s=approved_transition_sha256s)
     from hindsight_pipeline_common import load_config
     cfg = load_config(config)
     incremental = cfg.get('incremental', {})

@@ -147,7 +147,8 @@ def _record(report, stage, **values):
 
 
 def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=False,
-                    source_reader=scan_source_snapshots, retry_policy=None):
+                    source_reader=scan_source_snapshots, retry_policy=None,
+                    source_transition_certificates=None, approved_transition_sha256s=None):
     """Execute genuine component paths; injected adapters make isolation explicit.
 
     client implements exact REST delivery plus facts_for_batch/consolidate_batch,
@@ -211,6 +212,11 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     report['source_unknown_policy'] = {'artifact_hash': unknown_reference['artifact_hash'],
                         'status': 'unknown', 'completion_proven': False,
                         'excluded_sql_rows': sum(len(scope['rows']) for scope in unknown['scopes'])}
+                if source_transition_certificates is not None or approved_transition_sha256s is not None:
+                    if 'physical_baseline' not in reader_options:
+                        raise ValueError('source_transition_requires_physical_baseline')
+                    reader_options['source_transition_certificates'] = source_transition_certificates
+                    reader_options['approved_transition_sha256s'] = approved_transition_sha256s
                 snapshots = source_reader(Path(config['hermes_home']), **reader_options)
             if not execute:
                 pending = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
@@ -700,6 +706,10 @@ def main(argv=None):
     parser.add_argument('--llm-provider')
     parser.add_argument('--max-units', type=int)
     parser.add_argument('--max-chars', type=int)
+    parser.add_argument('--transition-certificate', action='append', default=None,
+        help='reviewed SQLite header transition certificate JSON file (repeatable)')
+    parser.add_argument('--approved-transition-sha256', action='append', default=None,
+        help='independently pinned canonical certificate digest (repeatable)')
     args = parser.parse_args(argv)
     config = load_config(args.config, require_exists=True)
     if args.bank is not None:
@@ -746,8 +756,16 @@ def main(argv=None):
                 parser.error('--confirm run-hindsight-pipeline is required')
             ledger = IncrementalLedger(root, config['bank'])
             runtime.ledger = ledger
+            certificates = approved_sha256s = None
+            if args.transition_certificate or args.approved_transition_sha256:
+                if not args.transition_certificate or not args.approved_transition_sha256:
+                    parser.error('transition certificates and approved digests are supplied together')
+                certificates = [json.loads(Path(path).read_text()) for path in args.transition_certificate]
+                approved_sha256s = list(args.approved_transition_sha256)
             result = run_incremental(config, ledger=ledger, client=runtime,
-                llm=runtime.generate_summary, execute=args.action == 'run')
+                llm=runtime.generate_summary, execute=args.action == 'run',
+                source_transition_certificates=certificates,
+                approved_transition_sha256s=approved_sha256s)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     return 0 if result.get('status') in {'plan', 'completed', 'no_op', None} else 2
 

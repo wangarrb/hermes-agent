@@ -183,8 +183,8 @@ def main(argv=None):
 
     def scoped_reader(home, **options):
         if transition is not None:
-            options.update(source_transition_certificate=transition,
-                           approved_transition_sha256=args.approved_transition_sha256)
+            options.update(source_transition_certificates=[transition],
+                           approved_transition_sha256s=[args.approved_transition_sha256])
         selected = [s for s in scan_source_snapshots(home, **options) if s['source_key'] in expected]
         if {s['source_key'] for s in selected} != set(expected):
             raise ValueError('approved source absent from native physical reader')

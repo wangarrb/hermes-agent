@@ -3210,14 +3210,18 @@ def main() -> int:
     # Normal memory execution has one arrival ledger; no legacy pre-clean,
     # whole-day replay, synchronous research digest or full-history fallback.
     from hindsight_incremental_entrypoint import run_alias
+    from hindsight_source_transitions import load_source_transition_arguments
     overrides = {key: value for key, value in {'model': _args.llm_model,
         'provider': _args.llm_provider, 'base_url': _args.llm_base_url,
         'api_key_env': _args.llm_api_key_env}.items() if value is not None}
+    transition_certificates, approved_transition_sha256s = load_source_transition_arguments(HERMES_HOME)
     return run_alias(mode=_args.mode, execute=True,
         config=_args.config or os.environ.get("HINDSIGHT_PIPELINE_CONFIG")
         or HERMES_HOME / "hindsight" / "pipeline_config.json",
         confirm="run-hindsight-pipeline", include_wiki=_args.include_wiki,
-        resume_only=_args.skip_daily, llm_overrides=overrides)
+        resume_only=_args.skip_daily, llm_overrides=overrides,
+        transition_certificates=transition_certificates,
+        approved_transition_sha256s=approved_transition_sha256s)
 
 
 if __name__ == "__main__":

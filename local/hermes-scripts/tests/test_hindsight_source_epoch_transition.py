@@ -1,4 +1,4 @@
-"""One approved physical header replacement never expands legacy exclusions.
+"""Approved physical header replacements never expand legacy exclusions.
 
 All SQLite, JSON, policy, ledger and approval inputs are real temporary fixtures.
 No production certificate is generated, registered or consumed by this suite.
@@ -81,13 +81,13 @@ def scan(f, *, certificate=True, approved=True):
     src, home, db, reviewer, export, baseline, policy, cert = f
     options = {'physical_baseline': baseline, 'source_unknown_policy': policy}
     if certificate:
-        options['source_transition_certificate'] = cert
+        options['source_transition_certificates'] = [cert]
     if approved:
-        options['approved_transition_sha256'] = src.digest(cert)
+        options['approved_transition_sha256s'] = [src.digest(cert)]
     return src.scan_source_snapshots(home, **options)
 
 
-def install_real_receipt(src, db, source_id, target_id, epoch):
+def install_real_receipt(src, db, source_id, target_id, epoch, *, append=False):
     with sqlite3.connect(db) as con:
         con.execute('INSERT INTO messages SELECT ?,session_id,role,timestamp,content,active,compacted,'
                     'origin_message_id,display_identity FROM messages WHERE id=?', (target_id, source_id))
@@ -99,14 +99,19 @@ def install_real_receipt(src, db, source_id, target_id, epoch):
             'source_row_hash': rows[source_id]['row_hash'], 'target_row_hash': rows[target_id]['row_hash'],
             'copy_hash': rows[source_id]['copy_hash']}]}
         operation['receipt_sha256'] = src.digest(operation)
+        operations = [operation]
+        if append:
+            current = json.loads(con.execute(
+                "SELECT model_config FROM sessions WHERE id='native'").fetchone()[0])
+            operations = [*current[src._COPY_RECEIPTS_KEY]['operations'], operation]
         container = {'schema_version': src._COPY_RECEIPTS_SCHEMA, 'session_id': 'native',
-                     'source_epoch': epoch, 'operations': [operation]}
+                     'source_epoch': epoch, 'operations': operations}
         config = {src._COPY_RECEIPTS_KEY: container}
         con.execute('UPDATE sessions SET model_config=? WHERE id=?', (json.dumps(config), 'native'))
         # Establish that this is a valid native receipt for the stated epoch.
         roots, sources, checksum = src._native_copy_bindings(con, {'native': {'model_config': config}}, epoch)
-        assert roots == {target_id: source_id} and sources == {source_id}
-        return checksum
+        assert roots.get(target_id) == source_id and source_id in sources
+        return checksum, operation
 
 
 def test_approved_transition_keeps_existing_ledger_epoch_and_captures_future_once(tmp_path):
@@ -138,13 +143,13 @@ def test_approved_transition_keeps_existing_ledger_epoch_and_captures_future_onc
     other = fixture(tmp_path / 'B')
     with pytest.raises(ValueError, match='scope'):
         src.scan_source_snapshots(other[1], physical_baseline=other[5], source_unknown_policy=other[6],
-            source_transition_certificate=cert, approved_transition_sha256=src.digest(cert))
+            source_transition_certificates=[cert], approved_transition_sha256s=[src.digest(cert)])
     assert scan(f) == first  # A -> B -> A has no process-global approval state.
     assert [b for s in scan(f) for b in ledger.capture_snapshot(s)] == []
     assert ledger.initialization_manifest() == initial
     assert ledger.physical_baseline_reference() == reference
     assert (src.digest(baseline), src.digest(policy)) == (baseline_before, policy_before)
-    receipt_hash = install_real_receipt(src, db, 3, 4, cert['new']['epoch'])
+    receipt_hash, _ = install_real_receipt(src, db, 3, 4, cert['new']['epoch'])
     # Original empty inventory approval cannot silently admit new receipts.
     with pytest.raises(src.SourceChangedError, match='receipt inventory'):
         scan(f)
@@ -174,7 +179,7 @@ def test_transition_never_weakens_other_source_proofs(tmp_path, damage):
     if damage == 'wrong-approved-hash':
         with pytest.raises(ValueError, match='digest'):
             src.scan_source_snapshots(home, physical_baseline=baseline, source_unknown_policy=policy,
-                source_transition_certificate=cert, approved_transition_sha256='0' * 64)
+                source_transition_certificates=[cert], approved_transition_sha256s=['0' * 64])
         return
     if damage in {'wrong-baseline', 'wrong-policy'}:
         cert['physical_baseline_sha256' if damage == 'wrong-baseline' else 'source_unknown_policy_sha256'] = '0' * 64
@@ -190,7 +195,7 @@ def test_transition_never_weakens_other_source_proofs(tmp_path, damage):
         data['messages'][0]['content'] = 'Rewritten old JSON'
         export.write_text(json.dumps(data))
     elif damage == 'legacy-copy-receipt':
-        receipt_hash = install_real_receipt(src, db, 1, 4, cert['old']['epoch'])
+        receipt_hash, _ = install_real_receipt(src, db, 1, 4, cert['old']['epoch'])
         cert['native_copy_receipt_precondition'].update(sessions=1, sha256=receipt_hash)
         # Even an approved inventory cannot translate old receipt epochs.
     else:
@@ -214,4 +219,125 @@ def test_transition_never_weakens_other_source_proofs(tmp_path, damage):
                 # Even a restored cookie cannot hide unapproved DDL.
                 con.execute('PRAGMA schema_version=' + str(cert['new']['schema_version']))
     with pytest.raises(src.SourceChangedError):
+        scan(f)
+
+
+def make_certificate(src, baseline, profile, db_path, policy, home):
+    record = next(p for p in baseline['profiles'] if p['profile'] == profile)
+    fields = ('identity', 'epoch', 'schema_version', 'application_id', 'message_columns')
+    old = {k: record['sqlite'][k] for k in fields}
+    return {'schema_version': src.SOURCE_TRANSITION_SCHEMA, 'bank': 'fixture',
+        'hermes_home': str(home), 'profile': profile, 'state_db': str(db_path),
+        'physical_baseline_sha256': src.digest(baseline),
+        'source_unknown_policy_sha256': src.digest(policy),
+        'authorization': 'explicit-exact-sqlite-header-transition',
+        'approval_reference': f'fixture-only-explicit-approval-{profile}',
+        'continuity_proof_sha256': src.digest({'fixture': f'{profile} old rows are checked live'}),
+        'native_copy_receipt_precondition': {'policy': 'current-epoch-exact-inventory',
+            'sessions': 0, 'sha256': None},
+        'old': old, 'new': src.inspect_sqlite_transition_header(db_path)}
+
+
+def test_multi_profile_transition_set_covers_each_drifted_profile(tmp_path):
+    f = fixture(tmp_path)
+    src, home, db, reviewer, export, baseline, policy, cert = f
+    replace_db(reviewer)
+    reviewer_cert = make_certificate(src, baseline, 'reviewer', reviewer, policy, home)
+    certificates = [cert, reviewer_cert]
+    approved = [src.digest(cert), src.digest(reviewer_cert)]
+    snapshots = src.scan_source_snapshots(home, physical_baseline=baseline,
+        source_unknown_policy=policy, source_transition_certificates=certificates,
+        approved_transition_sha256s=approved)
+    assert {s['profile'] for s in snapshots} == {'default', 'reviewer'}
+    # The same read without the reviewer certificate stays strict per profile.
+    with pytest.raises(src.SourceChangedError):
+        src.scan_source_snapshots(home, physical_baseline=baseline,
+            source_unknown_policy=policy, source_transition_certificates=[cert],
+            approved_transition_sha256s=[src.digest(cert)])
+
+
+def test_transition_set_requires_matched_unique_pins(tmp_path):
+    f = fixture(tmp_path)
+    src, home, db, reviewer, export, baseline, policy, cert = f
+    scan_args = {'physical_baseline': baseline, 'source_unknown_policy': policy}
+    with pytest.raises(ValueError, match='together'):
+        src.scan_source_snapshots(home, **scan_args, source_transition_certificates=[cert],
+            approved_transition_sha256s=None)
+    with pytest.raises(ValueError, match='together'):
+        src.scan_source_snapshots(home, **scan_args, source_transition_certificates=None,
+            approved_transition_sha256s=[src.digest(cert)])
+    with pytest.raises(ValueError, match='mismatch'):
+        src.scan_source_snapshots(home, **scan_args, source_transition_certificates=[cert],
+            approved_transition_sha256s=['0' * 64])
+    with pytest.raises(ValueError, match='unused'):
+        src.scan_source_snapshots(home, **scan_args, source_transition_certificates=[cert],
+            approved_transition_sha256s=[src.digest(cert), '0' * 64])
+    with pytest.raises(ValueError, match='duplicate approved'):
+        src.scan_source_snapshots(home, **scan_args, source_transition_certificates=[cert],
+            approved_transition_sha256s=[src.digest(cert), src.digest(cert)])
+    twin = json.loads(json.dumps(cert))
+    twin['approval_reference'] = 'fixture-only-explicit-approval-second'
+    with pytest.raises(ValueError, match='duplicate source transition profile'):
+        src.scan_source_snapshots(home, **scan_args, source_transition_certificates=[cert, twin],
+            approved_transition_sha256s=[src.digest(cert), src.digest(twin)])
+
+
+def test_inplace_schema_transition_without_replacement_is_coverable(tmp_path):
+    src = importlib.import_module('hindsight_incremental_sources')
+    home = tmp_path / 'home'
+    db = database(home)
+    baseline = src.capture_physical_baseline(home, bank='fixture')
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO messages VALUES (2,'native','user',101,'Finite unknown event',1,0,'unknown-event',x'02')")
+        con.row_factory = sqlite3.Row
+        unknown = src._physical_record(dict(con.execute('SELECT * FROM messages WHERE id=2').fetchone()), sqlite_row=True)
+    default = next(p for p in baseline['profiles'] if p['profile'] == 'default')
+    policy = {'schema_version': src.SOURCE_UNKNOWN_POLICY_SCHEMA, 'bank': 'fixture',
+        'hermes_home': str(home), 'physical_baseline_sha256': src.digest(baseline),
+        'authorization': 'explicit-finite-source-row-exclusion', 'status': 'unknown',
+        'completion_proven': False, 'scopes': [{'profile': 'default',
+            'feed_epoch': default['feed_epoch'], 'source_epoch': default['sqlite']['epoch'],
+            'session_id': 'native', 'rows': [unknown]}]}
+    # The live db evolves its schema in place; inode and epoch stay put.
+    with sqlite3.connect(db) as con:
+        con.execute('CREATE INDEX idx_inplace_evolution ON messages(role)')
+    inplace = make_certificate(src, baseline, 'default', db, policy, home)
+    assert inplace['old']['identity'] == inplace['new']['identity']
+    assert inplace['old']['epoch'] == inplace['new']['epoch']
+    assert inplace['old']['schema_version'] != inplace['new']['schema_version']
+    snapshots = src.scan_source_snapshots(home, physical_baseline=baseline,
+        source_unknown_policy=policy, source_transition_certificates=[inplace],
+        approved_transition_sha256s=[src.digest(inplace)])
+    assert {s['profile'] for s in snapshots} == {'default'}
+    # A further unapproved in-place change still fails closed.
+    with sqlite3.connect(db) as con:
+        con.execute('CREATE INDEX idx_unapproved_evolution ON messages(content)')
+    with pytest.raises(src.SourceChangedError):
+        src.scan_source_snapshots(home, physical_baseline=baseline,
+            source_unknown_policy=policy, source_transition_certificates=[inplace],
+            approved_transition_sha256s=[src.digest(inplace)])
+
+
+def test_superset_receipt_inventory_pins_existing_operations(tmp_path):
+    f = fixture(tmp_path)
+    src, home, db, reviewer, export, baseline, policy, cert = f
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO messages VALUES (3,'native','assistant',102,'New independent measurement',1,0,'future-event',x'03')")
+    checksum, op1 = install_real_receipt(src, db, 3, 4, cert['new']['epoch'])
+    cert['native_copy_receipt_precondition'] = {'policy': 'current-epoch-superset-inventory',
+        'sessions': 1, 'sha256': checksum,
+        'operations': {'native': {op1['operation_id']: src.digest(op1)}}}
+    assert scan(f)  # The pinned operation persists; the scan passes.
+    # A later legitimate append keeps the pinned operation and is admitted.
+    _, op2 = install_real_receipt(src, db, 1, 5, cert['new']['epoch'], append=True)
+    assert scan(f)
+    # Removing the pinned operation fails closed even while the rest stays valid.
+    with sqlite3.connect(db) as con:
+        current = json.loads(con.execute(
+            "SELECT model_config FROM sessions WHERE id='native'").fetchone()[0])
+        current[src._COPY_RECEIPTS_KEY]['operations'] = [
+            op for op in current[src._COPY_RECEIPTS_KEY]['operations']
+            if op['operation_id'] != op1['operation_id']]
+        con.execute('UPDATE sessions SET model_config=? WHERE id=?', (json.dumps(current), 'native'))
+    with pytest.raises(src.SourceChangedError, match='operation lost'):
         scan(f)

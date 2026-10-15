@@ -448,15 +448,15 @@ _NO_SOURCE_UNKNOWN_POLICY = object()
 def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
                           physical_baseline: dict | None = None,
                           source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
-                          source_transition_certificate: dict | None = None,
-                          approved_transition_sha256: str | None = None) -> list[dict]:
+                          source_transition_certificates: list | None = None,
+                          approved_transition_sha256s: list | None = None) -> list[dict]:
     """Read a finite source view, never infer historical completion or CDC."""
     if physical_baseline is not None:
         return _scan_physical_sources(hermes_home, profile_mode, physical_baseline,
                                       source_unknown_policy=source_unknown_policy,
-                                      source_transition_certificate=source_transition_certificate,
-                                      approved_transition_sha256=approved_transition_sha256)
-    if source_transition_certificate is not None or approved_transition_sha256 is not None:
+                                      source_transition_certificates=source_transition_certificates,
+                                      approved_transition_sha256s=approved_transition_sha256s)
+    if source_transition_certificates is not None or approved_transition_sha256s is not None:
         raise ValueError('source transition requires original physical baseline')
     if source_unknown_policy is not _NO_SOURCE_UNKNOWN_POLICY:
         raise ValueError('source unknown policy requires original physical baseline')
@@ -1044,8 +1044,9 @@ def validate_source_transition_certificate(certificate, *, physical_baseline,
         source_unknown_policy, approved_transition_sha256):
     """The caller must pin a separately approved digest, not trust an approval flag.
 
-    Only the original default header is aliased to one exact replacement.
-    Baseline rows, policy rows, lineage, receipts and ledger epochs stay intact.
+    Each certificate aliases one exact original baseline header to one exact
+    new header (a replacement or an in-place schema rebuild). Baseline rows,
+    policy rows, lineage, receipts and ledger epochs stay intact.
     """
     from hindsight_incremental_merge import canonical_hash
 
@@ -1056,15 +1057,15 @@ def validate_source_transition_certificate(certificate, *, physical_baseline,
         'physical_baseline_sha256', 'source_unknown_policy_sha256', 'authorization',
         'approval_reference', 'continuity_proof_sha256', 'native_copy_receipt_precondition', 'old', 'new'))
     profiles = {p['profile']: p for p in physical_baseline['profiles']}
-    profile = profiles['default']
-    old = profile['sqlite']
+    profile = profiles.get(certificate['profile'])
+    old = profile['sqlite'] if profile is not None else None
     expected_policy = (None if source_unknown_policy is _NO_SOURCE_UNKNOWN_POLICY
                        else canonical_hash(source_unknown_policy))
     fields = ('identity', 'epoch', 'schema_version', 'application_id', 'message_columns')
     if (certificate['schema_version'] != SOURCE_TRANSITION_SCHEMA
             or certificate['bank'] != physical_baseline['bank']
             or certificate['hermes_home'] != physical_baseline['hermes_home']
-            or certificate['profile'] != 'default' or certificate['state_db'] != profile['state_db']
+            or profile is None or certificate['state_db'] != profile['state_db']
             or certificate['physical_baseline_sha256'] != canonical_hash(physical_baseline)
             or certificate['source_unknown_policy_sha256'] != expected_policy
             or certificate['authorization'] != 'explicit-exact-sqlite-header-transition'
@@ -1072,12 +1073,32 @@ def validate_source_transition_certificate(certificate, *, physical_baseline,
         raise ValueError('source transition scope/authorization mismatch')
     _require_hash(certificate['continuity_proof_sha256'])
     receipt = certificate['native_copy_receipt_precondition']
-    _require_shape(receipt, ('policy', 'sessions', 'sha256'))
-    if (receipt['policy'] != 'current-epoch-exact-inventory'
-            or type(receipt['sessions']) is not int or receipt['sessions'] < 0
-            or (receipt['sessions'] == 0) != (receipt['sha256'] is None)):
-        raise ValueError('source transition native receipt precondition mismatch')
-    _require_hash(receipt['sha256'], optional=True)
+    if receipt.get('policy') == 'current-epoch-superset-inventory':
+        _require_shape(receipt, ('policy', 'sessions', 'sha256', 'operations'))
+        if (type(receipt['sessions']) is not int or receipt['sessions'] < 0
+                or (receipt['sessions'] == 0) != (receipt['sha256'] is None)
+                or type(receipt['operations']) is not dict
+                or len(receipt['operations']) > receipt['sessions']):
+            raise ValueError('source transition native receipt precondition mismatch')
+        _require_hash(receipt['sha256'], optional=True)
+        for sid, operations in receipt['operations'].items():
+            if not _valid_native(sid) or type(operations) is not dict or not operations:
+                raise ValueError('source transition native receipt precondition mismatch')
+            for op_id, op_digest in operations.items():
+                try:
+                    parsed = uuid.UUID(op_id) if type(op_id) is str else None
+                except (ValueError, AttributeError):
+                    parsed = None
+                if parsed is None or not parsed.int or str(parsed) != op_id:
+                    raise ValueError('source transition native receipt precondition mismatch')
+                _require_hash(op_digest)
+    else:
+        _require_shape(receipt, ('policy', 'sessions', 'sha256'))
+        if (receipt['policy'] != 'current-epoch-exact-inventory'
+                or type(receipt['sessions']) is not int or receipt['sessions'] < 0
+                or (receipt['sessions'] == 0) != (receipt['sha256'] is None)):
+            raise ValueError('source transition native receipt precondition mismatch')
+        _require_hash(receipt['sha256'], optional=True)
     _require_shape(certificate['old'], fields)
     _require_shape(certificate['new'], (*fields, 'structure_sha256'))
     if certificate['old'] != {k: old[k] for k in fields}:
@@ -1085,12 +1106,55 @@ def validate_source_transition_certificate(certificate, *, physical_baseline,
     new = certificate['new']
     _require_identity(new['identity'])
     _require_hash(new['structure_sha256'])
-    if (new['identity'] == old['identity'] or new['application_id'] != old['application_id']
+    if (new['application_id'] != old['application_id']
             or new['epoch'] != 'sqlite:' + digest({'inode': new['identity'], 'application_id': new['application_id']})
             or type(new['schema_version']) is not int or new['schema_version'] < 0
             or new['message_columns'] != old['message_columns']):
         raise ValueError('source transition replacement header mismatch')
     return certificate
+
+
+def validate_source_transition_certificate_set(certificates, *, physical_baseline,
+        source_unknown_policy, approved_transition_sha256s):
+    """Match every reviewed certificate to its own independently pinned digest.
+
+    The caller supplies both lists explicitly; nothing is looked up here.
+    Each certificate must match exactly one approved digest, every approved
+    digest must be consumed by exactly one certificate, and each profile may
+    appear at most once. Any profile without a certificate stays strict.
+    """
+    if certificates is None or approved_transition_sha256s is None:
+        raise ValueError('source transition requires certificates and approved digests together')
+    if not isinstance(certificates, (list, tuple)) or not isinstance(approved_transition_sha256s, (list, tuple)):
+        raise ValueError('source transition certificates and digests must be explicit lists')
+    if not certificates or not approved_transition_sha256s:
+        raise ValueError('source transition requires certificates and approved digests together')
+    from hindsight_incremental_merge import canonical_hash
+    approved = list(approved_transition_sha256s)
+    for value in approved:
+        _require_hash(value)
+    if len(set(approved)) != len(approved):
+        raise ValueError('duplicate approved source transition digest')
+    matched = {}
+    for certificate in certificates:
+        certificate_hash = canonical_hash(certificate)
+        if certificate_hash not in approved:
+            raise ValueError('source transition approved digest mismatch')
+        if certificate_hash in matched:
+            raise ValueError('duplicate source transition certificate')
+        matched[certificate_hash] = certificate
+    if set(matched) != set(approved):
+        raise ValueError('source transition approved digest unused')
+    by_profile = {}
+    for certificate in certificates:
+        validate_source_transition_certificate(certificate, physical_baseline=physical_baseline,
+            source_unknown_policy=source_unknown_policy,
+            approved_transition_sha256=canonical_hash(certificate))
+        profile = certificate['profile']
+        if profile in by_profile:
+            raise ValueError('duplicate source transition profile')
+        by_profile[profile] = certificate
+    return by_profile
 
 
 def _profile_anchors(profile):
@@ -1283,7 +1347,16 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
                     if {k: header.get(k) for k in expected_header} != expected_header:
                         raise SourceChangedError('source_changed: approved SQLite header transition drift')
                     receipt = header_transition['native_copy_receipt_precondition']
-                    if (header['native_copy_receipt_sessions'] != receipt['sessions']
+                    if receipt['policy'] == 'current-epoch-superset-inventory':
+                        for sid, operations in receipt['operations'].items():
+                            container = sessions.get(sid, {}).get('model_config', {}).get(_COPY_RECEIPTS_KEY)
+                            live = ({op['operation_id']: digest(op) for op in container['operations']}
+                                    if type(container) is dict else {})
+                            for op_id, op_digest in operations.items():
+                                if live.get(op_id) != op_digest:
+                                    raise SourceChangedError(
+                                        'source_changed: approved native receipt operation lost')
+                    elif (header['native_copy_receipt_sessions'] != receipt['sessions']
                             or header['copy_receipts_sha256'] != receipt['sha256']):
                         raise SourceChangedError('source_changed: approved native receipt inventory drift')
                 elif header['epoch'] != old_db['epoch'] or header['schema_version'] != old_db['schema_version']:
@@ -1397,7 +1470,7 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
 
 def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                            source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
-                           source_transition_certificate=None, approved_transition_sha256=None):
+                           source_transition_certificates=None, approved_transition_sha256s=None):
     home = checked_path(Path(hermes_home))
     if not isinstance(baseline, dict):
         raise ValueError('invalid physical baseline header')
@@ -1411,16 +1484,18 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
         policy_hash = digest(source_unknown_policy)
         for scope in source_unknown_policy['scopes']:
             unknown_rows[scope['profile']].extend(scope['rows'])
-    if source_transition_certificate is not None or approved_transition_sha256 is not None:
-        validate_source_transition_certificate(source_transition_certificate, physical_baseline=baseline,
-            source_unknown_policy=source_unknown_policy, approved_transition_sha256=approved_transition_sha256)
+    certs_by_profile = {}
+    if source_transition_certificates is not None or approved_transition_sha256s is not None:
+        certs_by_profile = validate_source_transition_certificate_set(source_transition_certificates,
+            physical_baseline=baseline, source_unknown_policy=source_unknown_policy,
+            approved_transition_sha256s=approved_transition_sha256s)
     current = {s['profile']: s for s in _discover_sources(home, profile_mode)}
     old_profiles = {p['profile']: p for p in baseline['profiles']}
     if not set(old_profiles) <= set(current):
         raise SourceChangedError('source_changed: legacy profile coverage lost')
     result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(
         profile, home, unknown_rows=unknown_rows[profile['profile']], policy_hash=policy_hash,
-        header_transition=source_transition_certificate if profile['profile'] == 'default' else None)]
+        header_transition=certs_by_profile.get(profile['profile']))]
     for name in sorted(set(current) - set(old_profiles)):
         # A genuinely new profile is strict, not silently turned into legacy.
         profile_home = Path(current[name]['state_db']).parent

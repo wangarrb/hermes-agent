@@ -1,7 +1,8 @@
 # Exact SQLite header transition candidate
 
-This is a source-reader candidate, not a deployed migration or production approval.
-The normal pipeline still supplies no transition and therefore fails closed.
+This source-reader mechanism is deployed with an explicit per-profile
+certificate set supplied by the cron wrappers (see Production wiring below).
+Without supplied certificates the reader still fails closed.
 No baseline, policy, ledger epoch, batch, seed, or source payload is rewritten.
 
 ## Explicit SDK entry
@@ -14,14 +15,17 @@ snapshots = scan_source_snapshots(
     profile_mode='all',
     physical_baseline=original_baseline,
     source_unknown_policy=original_policy,
-    source_transition_certificate=reviewed_certificate,
-    approved_transition_sha256=separately_approved_certificate_sha256,
+    source_transition_certificates=[reviewed_certificate, ...],
+    approved_transition_sha256s=[separately_approved_certificate_sha256, ...],
 )
 ```
 
-The digest must be supplied explicitly by the trusted caller after independent
-review. A certificate's own approval metadata cannot authorize it. There is no
-config flag, registration command, implicit lookup, or fallback to a new feed.
+Every certificate must match exactly one approved digest, every approved digest
+must be consumed by exactly one certificate, and at most one certificate may
+exist per profile. Any profile without a certificate stays strict. The digests
+must be supplied explicitly by the trusted caller after independent review. A
+certificate's own approval metadata cannot authorize it. There is no config
+flag, registration command, implicit lookup, or fallback to a new feed.
 
 `inspect_sqlite_transition_header(path)` reads prospective target metadata only;
 it neither proves continuity nor creates approval. Actual scanner comparison of
@@ -32,38 +36,47 @@ validation. The inspection connection is never used as a scanner trust fence.
 
 The exact schema is `hindsight-approved-sqlite-header-transition/1`:
 
-- `bank`, `hermes_home`, `profile` (only `default`), `state_db`;
+- `bank`, `hermes_home`, `profile` (any baseline profile; at most one
+  certificate per profile), `state_db`;
 - `physical_baseline_sha256`, `source_unknown_policy_sha256` (or null when no
   policy exists), bound to the original immutable inputs;
 - `authorization`: `explicit-exact-sqlite-header-transition`;
 - `approval_reference`: a review/approval identifier, and
   `continuity_proof_sha256`: the independently reviewed proof's hash;
-- `native_copy_receipt_precondition`: policy `current-epoch-exact-inventory`,
-  the exact container session count, and the validated inventory `sha256`
-  (`sessions: 0`, `sha256: null` when absent);
+- `native_copy_receipt_precondition`: either policy
+  `current-epoch-exact-inventory` with the exact container session count and
+  validated inventory `sha256` (`sessions: 0`, `sha256: null` when absent), or
+  policy `current-epoch-superset-inventory` adding `operations`
+  (`{session_id: {operation_id: operation_digest}}`); every pinned operation
+  must still exist unmodified, while later legitimate appends are admitted
+  after the same native receipt validation;
 - `old`: original `identity`, `epoch`, `schema_version`, `application_id`, and
   `message_columns`, exactly equal to the original descriptor;
 - `new`: those same fields plus `structure_sha256`, binding the current sorted
   SQLite schema objects (`type`, `name`, `tbl_name`, `sql`) in the scanner snapshot.
 
-The application ID and message columns cannot change. A new physical identity is
-required. The authorization covers that exact replacement only: rereading it is
-idempotent, while a third inode, schema-cookie change, or structure drift fails.
+The application ID and message columns cannot change. The new header may be a
+physical replacement (new identity) or an in-place schema rebuild (same
+identity, same epoch, changed schema cookie/structure). The authorization
+covers that exact new header only: rereading it is idempotent, while another
+identity, schema-cookie, or structure drift fails.
 
-The certificate changes only the default header equality comparison. The original
-scanner still verifies every baseline row hash, every baseline session identity,
-all approved-unknown exact records, native copy receipts, all JSON prefixes, and
-all other profiles. Missing or changed evidence fails the entire read. It returns
-the original physical feed epochs, and records the certificate digest in the
-source fence, preserving the existing ledger and future-arrival identities.
+The certificate changes only the covered profile's header equality comparison.
+The original scanner still verifies every baseline row hash, every baseline
+session identity, all approved-unknown exact records, native copy receipts, all
+JSON prefixes, and every other profile. Missing or changed evidence fails the
+entire read. It returns the original physical feed epochs, and records the
+certificate digest in the source fence, preserving the existing ledger and
+future-arrival identities.
 
 Native copy receipts retain their original strict physical-epoch validation.
-This candidate **does not translate old-epoch receipts preserved by a DB copy**;
-such a database still fails closed. Only absent receipts or an independently
-pinned exact inventory already valid for the new physical epoch can pass.
-The inventory count/hash is checked in that same scanner transaction after full
-native receipt validation. Later inventory additions require renewed explicit
-digest approval; ordinary message appends do not. No receipt is rewritten.
+This mechanism **does not translate old-epoch receipts preserved by a DB copy**;
+such a database still fails closed. Absent receipts pass; an independently
+pinned exact inventory passes; a superset inventory admits only later appends
+whose operations were validated for the current epoch while every pinned
+operation stays present. Later exact-inventory additions require renewed
+explicit digest approval; ordinary message appends do not. No receipt is
+rewritten.
 
 ## Fixture verification
 
@@ -83,22 +96,27 @@ loss or mutation, session loss or mutation, other profiles, JSON prefix changes,
 invalid native copy receipts, and a structurally valid old-epoch receipt. A
 valid separately approved new-epoch receipt keeps copied future input no-op.
 
-## Remaining production steps (not performed)
+## Production wiring
 
-1. Independently review the candidate and fixtures, then review the exact proof
-   and the finite proposed old/new header pair. Confirm the original exclusion
-   set stays fixed, including all existing policy rows; preserve later arrivals.
-2. Obtain explicit approval for the exact certificate digest and production
-   source-reader change. The three-session LLM consent is a separate scope.
-3. Design the owning caller's secure immutable certificate loading and explicit
-   approved-digest propagation. No production caller is wired by this candidate.
-4. Under the existing bank lock, verify exact approved inputs and run one complete
-   original all-profile read-only admission scan. Any failed guard stops the run.
-5. Only after those checks, invoke the existing approved-three runner with its
-   original external-data allowlist; keep other local sources from paid work.
+The owning callers supply the frozen set explicitly:
+
+- `hindsight_source_transitions.py` holds the independently pinned digests
+  (`APPROVED_SOURCE_TRANSITION_SHA256`) and loads the certificate files from
+  `$HERMES_HOME/hindsight/source-transitions/`. A present directory with a
+  missing or digest-mismatched certificate fails before any scan; an absent
+  directory supplies nothing.
+- `hindsight_daily_noagent.py` (also used by the weekly wrapper) loads that
+  set and passes it through `run_alias` → the pipeline CLI
+  (`--transition-certificate` / `--approved-transition-sha256`, repeatable)
+  → `run_incremental` → `scan_source_snapshots`. No production caller is
+  otherwise wired; direct CLI use must pass both explicitly.
+
+Certificate generation and review evidence live outside the repository under
+the parent's task evidence; the certificates themselves remain local private
+files. The original exclusions stay fixed and later arrivals are preserved.
 
 Never use `initialize`, replace the baseline, reset a cursor, edit ledger metadata,
-or choose an isolated feed to make the current production error disappear.
+or choose an isolated feed to make a production error disappear.
 
 ## Frozen external-input guard follow-up
 
