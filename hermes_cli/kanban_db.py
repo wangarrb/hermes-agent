@@ -665,6 +665,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    generation: int = 1
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -683,6 +684,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            generation=int(g("generation", 1)),
         )
 
 
@@ -901,7 +903,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    generation           INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2662,24 +2665,16 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    expected_generation: Optional[int] = None,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
-
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
-    proof of ownership (``expected_run_id``) or ``force=True`` (explicit
-    operator override) — otherwise :class:`LiveClaimError`, the same fence
-    :func:`request_review` applies. With no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    Completions from non-review statuses need evidence: a stripped ``result``
-    or ``summary``, or a stripped result already stored on the card. Empty or
-    whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
+    """Complete with native run/live-claim/parent/evidence and generation fences.
+    Default and explicit epochs fence acceptance publication, including force=True.
+    Review exemption, artifacts, run synthesis and hooks stay native.
     """
+    from hermes_cli.kanban_db_completion_fence import capture_generation, generation_matches
+    completion_generation = capture_generation(conn, task_id, expected_generation)
+    if completion_generation is None:
+        return False
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2691,13 +2686,17 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(
+        conn, task_id, expected_run_id, metadata, expected_generation=completion_generation,
+    )
     if acceptance is False:
         return False
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        if not generation_matches(conn, task_id, completion_generation):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -2723,8 +2722,9 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND generation = ?
                 """
-        params: tuple = (result, now, task_id)
+        params: tuple = (result, now, task_id, completion_generation)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
