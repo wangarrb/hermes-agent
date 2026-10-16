@@ -1858,22 +1858,10 @@ class GatewayAdapterLifecycleMixin:
     @staticmethod
     def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:
         """Salted, log-safe hash of an adapter's credential; None when none is discoverable
-        (conflict detection is then skipped)."""
-        # Many adapters (Discord) keep the token on `config`; without that fallback the check is skipped.
-        candidates = [
-            (adapter, attr) for attr in (
-                "token", "bot_token", "_token", "api_token", "_bot_token",
-                "_project_secret",  # Photon/Spectrum: project credentials, not a bot token
-                "_app_id",  # Feishu/Lark app_id — stable, log-safe, already the _app_lock_identity
-                "_client_id", "_bot_id",  # Teams / WeCom app-style id pairs
-            )
-        ] + [(getattr(adapter, "config", None), attr) for attr in ("token", "bot_token")]
-        for obj, attr in candidates:
-            val = getattr(obj, attr, None)
-            if isinstance(val, str) and val.strip():
-                import hashlib
-                return hashlib.sha256(("hermes-mux:" + val.strip()).encode("utf-8")).hexdigest()[:16]
-        return None
+        (conflict detection is then skipped). Canonical owner: :mod:`gateway.credential_claims` —
+        shared with the read-only profile readers, which must not import this module."""
+        from gateway.credential_claims import credential_fingerprint
+        return credential_fingerprint(adapter)
 
     def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
         """Create an adapter bound to this runner (every lifecycle path goes through here so

@@ -268,3 +268,157 @@ def test_canonical_loader_restores_real_scope_on_success_and_exception(
                 shared_channel_credentials(*homes)
             assert calls == list(homes[:fail_at])
     assert _snapshot(homes) == before
+
+
+# --------------------------------------------------------------------------- cold-caller regression
+#
+# G04-RI1: the shared-credential warning borrowed the migration helpers, so the
+# FIRST warning read in a process imported `gateway.run` and executed Gateway
+# start-up initialisation. Versus the official baseline that changed only PATH,
+# a730 changed 9 environment keys (HERMES_QUIET, HERMES_SCRATCH_DIR,
+# HERMES_TURN_LEASE_TIMEOUT, PATH, TELEGRAM_BOT_TOKEN, TEMP, TMP, TMPDIR,
+# _HERMES_GATEWAY) and added cache/scratch write attempts to the config-only
+# reads. These cases run the warning in a COLD subprocess and pin the repaired
+# boundary: no `gateway.run`, no environment change outside the official
+# baseline's PATH mutation, restored process state, and write attempts no larger
+# than one config-only read of each of the two homes.
+
+_COLD_CALLER_SCRIPT = r'''
+import json, os, pathlib, sys, time
+
+repo, root_arg = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+root = pathlib.Path(root_arg)
+default, role = root, root / "profiles" / "role"
+
+writes = []
+
+def _audit(event, args):
+    if event == "open":
+        flags = args[2]
+        if isinstance(flags, int) and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+            writes.append({"event": "open", "path": os.fsdecode(args[0])})
+    elif event in ("os.mkdir", "os.chmod", "os.remove", "os.rename", "os.rmdir", "os.utime"):
+        writes.append({"event": event, "path": os.fsdecode(args[0])})
+
+sys.addaudithook(_audit)
+env_before = dict(os.environ)
+modules_before = set(sys.modules)
+
+import hermes_constants as hc
+from agent import secret_scope as ss
+from hermes_cli import gateway_migrate as gm
+from hermes_cli.profile_channels import shared_channel_credentials
+
+marks = []
+
+def _mark(label):
+    marks.append({"label": label, "writes": len(writes)})
+
+_mark("imports")
+t0 = time.perf_counter()
+platforms = shared_channel_credentials(role, default)
+shared_seconds = time.perf_counter() - t0
+_mark("shared")
+
+def _count(fn):
+    n = len(writes)
+    fn()
+    return len(writes) - n
+
+calibration = _count(lambda: gm._profile_gateway_config(default)) + _count(lambda: gm._profile_gateway_config(role))
+_mark("calibration")
+
+env_after = dict(os.environ)
+changed = sorted(k for k in set(env_before) | set(env_after) if env_before.get(k) != env_after.get(k))
+added = sorted(m for m in set(sys.modules) - modules_before if m == "gateway.run" or m.startswith("gateway.run."))
+counts = {marks[i]["label"]: marks[i + 1]["writes"] - marks[i]["writes"] for i in range(len(marks) - 1)}
+print("COLD=" + json.dumps({
+    "platforms": platforms,
+    "shared_seconds": round(shared_seconds, 3),
+    "gateway_run_loaded": "gateway.run" in sys.modules,
+    "added_gateway_run": added,
+    "env_changed": changed,
+    "state_after": {
+        "override": hc.get_hermes_home_override(),
+        "scope": "installed" if ss.current_secret_scope() is not None else None,
+        "scope_home": ss.current_secret_scope_home(),
+        "multiplex_context": bool(ss._MULTIPLEX_CONTEXT.get()),
+        "multiplex_active": bool(ss._MULTIPLEX_ACTIVE),
+        "pinned": hc._PINNED_PROCESS_HERMES_HOME,
+        "auto_pinned": ss._AUTO_PINNED_HOME,
+    },
+    "shared_writes": counts.get("shared", 0),
+    "import_writes": counts.get("imports", 0),
+    "calibration_writes": calibration,
+    "outside_home_writes": sorted({w["path"] for w in writes if not w["path"].startswith(str(root))}),
+    "interpreter": sys.executable,
+}))
+'''
+
+
+def _run_cold_caller(homes, tmp_path):
+    import json as _json
+    import subprocess
+    import sys
+    repo = Path(__file__).resolve().parents[2]
+    runtime = tmp_path / "tmp"
+    runtime.mkdir(exist_ok=True)
+    env = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(homes[0]),
+               HERMES_RUNTIME_DIR=str(tmp_path / "runtime"),
+               HERMES_GATEWAY_LOCK_DIR=str(tmp_path / "locks"),
+               TMPDIR=str(runtime), TMP=str(runtime), TEMP=str(runtime),
+               XDG_CACHE_HOME=str(tmp_path / ".cache"), XDG_CONFIG_HOME=str(tmp_path / ".config"),
+               XDG_DATA_HOME=str(tmp_path / ".local" / "share"), XDG_STATE_HOME=str(tmp_path / ".local" / "state"),
+               PYTHONDONTWRITEBYTECODE="1")
+    env.pop("TELEGRAM_BOT_TOKEN", None)
+    proc = subprocess.run([sys.executable, "-B", "-c", _COLD_CALLER_SCRIPT, str(repo), str(homes[0])],
+                          env=env, cwd=str(repo), capture_output=True, text=True, timeout=240)
+    lines = [line for line in proc.stdout.splitlines() if line.startswith("COLD=")]
+    assert proc.returncode == 0 and lines, (proc.returncode, proc.stdout[-1500:], proc.stderr[-1500:])
+    return _json.loads(lines[-1][len("COLD="):])
+
+
+def test_cold_warning_caller_is_inert_and_matches_official_environment(homes, tmp_path):
+    """The cold warning path is a config-only read: no gateway.run, no environment
+    change beyond the official baseline's PATH mutation, no state leak, and no more
+    write attempts than one config-only read of each of the two homes."""
+    for home in homes:
+        _write(home, _raw({"enabled": True}), "env")
+    report = _run_cold_caller(homes, tmp_path)
+    assert report["platforms"] == ["telegram"]
+    assert report["gateway_run_loaded"] is False
+    assert report["added_gateway_run"] == []
+    assert set(report["env_changed"]) <= {"PATH"}, report["env_changed"]
+    assert report["state_after"] == {
+        "override": None, "scope": None, "scope_home": None, "multiplex_context": False,
+        "multiplex_active": False, "pinned": None, "auto_pinned": None,
+    }, report["state_after"]
+    assert report["outside_home_writes"] == []
+    assert report["shared_writes"] <= report["calibration_writes"] + 24, report
+
+
+def test_shared_warning_detail_reports_explicit_unknowns(homes):
+    """Inputs the inert reader cannot evaluate are reported unknown — never assumed
+    complete: a declared external secret source that was not hydrated in this process,
+    and a parked profile's plugin platforms (their credentials would need the plugin
+    discovery/activation the read-only warning deliberately does not perform)."""
+    from hermes_cli.profile_channels import shared_channel_credentials, shared_channel_credentials_detail
+    from hermes_cli.profiles import parked_marker_path
+
+    for home in homes:
+        _write(home, _raw({"enabled": True}), "env")
+    assert shared_channel_credentials_detail(homes[1], homes[0]) == {"platforms": ["telegram"], "unknown": []}
+    raw = yaml.safe_load((homes[0] / "config.yaml").read_text(encoding="utf-8")) or {}
+    raw["secrets"] = {"onepassword": {"enabled": True}}
+    (homes[0] / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+    marker = parked_marker_path(homes[1])
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("")
+    before = _snapshot(homes)
+    detail = shared_channel_credentials_detail(homes[1], homes[0])
+    assert detail["platforms"] == ["telegram"]
+    assert shared_channel_credentials(homes[1], homes[0]) == ["telegram"]
+    assert detail["unknown"] == ["declared-secret-sources-not-hydrated",
+                                 "parked-profile-plugin-platforms-not-evaluated"]
+    assert _snapshot(homes) == before

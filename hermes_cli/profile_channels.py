@@ -482,20 +482,30 @@ def shared_channel_credentials(profile_dir: Path, source_dir: Path) -> list[str]
     """Platforms with overlapping active connecting claims in the two profile homes.
 
     Reuse the migration preflight's effective Gateway config and credential fingerprints,
-    including typed enablement and credential precedence. Read each home's own secret
-    scope under task-local multiplex semantics; never borrow ambient launch credentials
-    or change the process-global multiplex mode.
+    including typed enablement and credential precedence, through the INERT reader
+    (:mod:`gateway.profile_config`): no ``gateway.run`` start-up import, no secret hydration,
+    no plugin activation. Read each home's own secret scope under task-local multiplex
+    semantics; never borrow ambient launch credentials or change the process-global multiplex
+    mode. See :func:`shared_channel_credentials_detail` for the unknowns this read reports.
     """
+    return shared_channel_credentials_detail(profile_dir, source_dir)["platforms"]
+
+
+def shared_channel_credentials_detail(profile_dir: Path, source_dir: Path) -> dict:
+    """Like :func:`shared_channel_credentials`, plus the explicit unknowns the read could not
+    evaluate (declared-but-unhydrated secret sources, parked-profile plugin platforms): a
+    warning must never silently assume its credential view is complete."""
     from agent.secret_scope import reset_multiplex_context, set_multiplex_context
-    from hermes_cli.gateway_migrate import _credential_claims, _profile_gateway_config
+    from gateway.profile_config import profile_effective_claims
 
     token = set_multiplex_context(True)
     try:
-        mine = _credential_claims(_profile_gateway_config(profile_dir))
-        theirs = _credential_claims(_profile_gateway_config(source_dir))
+        mine, mine_unknown = profile_effective_claims(profile_dir)
+        theirs, theirs_unknown = profile_effective_claims(source_dir)
     finally:
         reset_multiplex_context(token)
-    return sorted({mine[key] for key in mine.keys() & theirs.keys()})
+    return {"platforms": sorted({mine[key] for key in mine.keys() & theirs.keys()}),
+            "unknown": sorted({*mine_unknown, *theirs_unknown})}
 
 
 def shared_credential_warning(profile: str, platforms: list[str], source: str = "default") -> str:

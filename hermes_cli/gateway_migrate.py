@@ -428,8 +428,10 @@ def _write_multiplex_flag(default_home: Path, value: bool) -> None:
 
 def _profile_gateway_config(home: Path):
     """This profile's ``GatewayConfig`` read exactly the way the multiplexer reads it: under the
-    profile's own secret scope with multiplexing active, so a missing token stays missing instead of
-    borrowing the CLI process's ``os.environ`` (which holds the launch profile's ``.env``).
+    profile's own secret scope, so a missing token stays missing instead of borrowing the CLI
+    process's ``os.environ`` (which holds the launch profile's ``.env``). Thin delegate to
+    :func:`gateway.profile_config.load_profile_gateway_config` — the INERT owner: no ``gateway.run``
+    start-up import, no secret-source hydration, no plugin activation, no terminal scope.
 
     A PARKED profile stays in the inventory and the duplicate-credential guard (parking must not hide
     a conflict), but it is inert for the host: its config is read without discovering its plugins,
@@ -437,13 +439,8 @@ def _profile_gateway_config(home: Path):
     plugin-defined platforms fall out of the guard — their credentials cannot be evaluated without
     importing the plugin; builtin bot tokens still collide.
     """
-    from gateway.config import load_gateway_config
-    from gateway.run import _profile_runtime_scope
-    from hermes_cli.plugins_discovery import suppress_plugin_discovery
-    from hermes_cli.profiles import profile_is_parked
-    scope = suppress_plugin_discovery() if profile_is_parked(home) else contextlib.nullcontext()
-    with _profile_runtime_scope(home), scope:
-        return load_gateway_config()
+    from gateway.profile_config import load_profile_gateway_config
+    return load_profile_gateway_config(home)
 
 
 @contextlib.contextmanager
@@ -458,27 +455,19 @@ def _multiplex_read_mode() -> Iterator[None]:
 
 
 def _credential_probe(platform_config) -> SimpleNamespace:
-    """Config-shaped stand-in for ``GatewayRunner._adapter_credential_fingerprint`` (which probes
-    adapter attributes): token/api_key plus the id-style credentials adapters expose from ``extra``."""
-    extra = getattr(platform_config, "extra", None) or {}
-    return SimpleNamespace(
-        token=getattr(platform_config, "token", None) or getattr(platform_config, "api_key", None),
-        _app_id=extra.get("app_id"), _client_id=extra.get("client_id"), _bot_id=extra.get("bot_id"),
-        _project_secret=extra.get("project_secret"), config=platform_config,
-    )
+    """Config-shaped stand-in for the adapter attributes ``credential_fingerprint`` probes:
+    token/api_key plus the id-style credentials adapters expose from ``extra``. Thin delegate to
+    :func:`gateway.credential_claims.credential_probe`."""
+    from gateway.credential_claims import credential_probe
+    return credential_probe(platform_config)
 
 
 def _credential_claims(config) -> dict[tuple, str]:
-    """``(platform, fingerprint)`` for every enabled platform with a discoverable credential."""
-    from gateway.run import GatewayRunner
-    claims: dict[tuple, str] = {}
-    for platform, platform_config in config.platforms.items():
-        if not platform_config.enabled:
-            continue
-        fp = GatewayRunner._adapter_credential_fingerprint(_credential_probe(platform_config))
-        if fp is not None:
-            claims[(platform.value, fp)] = platform.value
-    return claims
+    """``(platform, fingerprint)`` for every enabled platform with a discoverable credential.
+    Thin delegate to :func:`gateway.credential_claims.effective_credential_claims` — the same
+    canonical claims the multiplexer computes, without importing ``gateway.run``."""
+    from gateway.credential_claims import effective_credential_claims
+    return effective_credential_claims(config)
 
 
 def _credential_key_names(platform_value: str) -> str:
