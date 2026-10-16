@@ -1461,8 +1461,35 @@ def _exclude_old_copy(record, sid, old_index, evidence, *, cutover_anchors,
     return False
 
 
+def _changed_artifact_sids(profile, current_fp, previous_fp):
+    """Sessions whose JSON view changed; strict=True forces the full read.
+
+    Removed views or files without a derivable session id keep the strict
+    full profile read (fail-safe).
+    """
+    current_artifacts = current_fp.get('artifacts') or {}
+    previous_artifacts = previous_fp.get('artifacts') or {}
+    if set(previous_artifacts) - set(current_artifacts):
+        return (), True  # membership loss: let the scan's checks handle it
+    frozen = {a['path']: a for a in profile['artifacts']}
+    sids = set()
+    for path_text, stat in current_artifacts.items():
+        if previous_artifacts.get(path_text) == stat:
+            continue
+        sid = (frozen.get(path_text) or {}).get('session_id')
+        if not sid:
+            base = Path(path_text).name
+            if base.startswith('session_') and base.endswith('.json'):
+                sid = base[len('session_'):-len('.json')]
+        if not sid:
+            return (), True  # unidentifiable view: strict full read
+        sids.add(sid)
+    return sids, False
+
+
 def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, header_transition=None,
-                           approved_successors=None, dirty_sessions=None, extra_scope_sids=()):
+                           approved_successors=None, dirty_sessions=None, extra_scope_sids=(),
+                           previous_artifacts=None):
     directory, db = Path(profile['sessions_dir']), Path(profile['state_db'])
     if profile['directory_identity'] is not None:
         if _location_identity(directory, directory=True) != profile['directory_identity']:
@@ -1490,6 +1517,13 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
             old_origins[record['origin_hash']].append((record['session_id'], record))
     for path_text in sorted(present):
         path = checked_path(Path(path_text), root=home)
+        if previous_artifacts is not None:
+            try:
+                stat_now = [path.stat().st_size, path.stat().st_mtime_ns, path.stat().st_ino]
+            except OSError:
+                stat_now = None
+            if stat_now is not None and previous_artifacts.get(path_text) == stat_now:
+                continue  # unchanged view: no read, no events
         current, data = _physical_artifact(path)
         old = frozen_files.get(path_text)
         if old is None or current['raw_hash'] != old['raw_hash']:
@@ -1748,8 +1782,6 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                 # Physical identity changed (new inode/device): full strict
                 # read so the epoch/transition checks still run.
                 dirty_sessions = None
-            elif not artifacts_unchanged:
-                dirty_sessions = None  # JSON view changed: full profile read
             else:
                 # Content-based diff only (never the file stat: WAL commits do
                 # not touch the main db file). Vanished sessions count as
@@ -1759,14 +1791,26 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                 vanished = sorted(set(previous_fp['sessions']) - set(current_fp['sessions']))
                 if vanished:
                     dirty = sorted(set(dirty) | set(vanished))
-                if not dirty:
-                    continue  # nothing changed
-                dirty_sessions = dirty
-                extra_scope_sids = tuple(previous_fp.get('scope_sids') or ())
+                strict = False
+                if not artifacts_unchanged:
+                    # Only the changed/added views' sessions become dirty; a
+                    # removed view or an unidentifiable one keeps the strict
+                    # full read (fail-safe).
+                    changed_sids, strict = _changed_artifact_sids(profile, current_fp, previous_fp)
+                    if not strict:
+                        dirty = sorted(set(dirty) | set(changed_sids))
+                if strict:
+                    dirty_sessions = None  # full strict read for this profile
+                elif not dirty:
+                    continue  # nothing changed: skip the profile entirely
+                else:
+                    dirty_sessions = dirty
+                    extra_scope_sids = tuple(previous_fp.get('scope_sids') or ())
         result.extend(_scan_physical_profile(profile, home, unknown_rows=unknown_rows[name],
             policy_hash=policy_hash, header_transition=certs_by_profile.get(name),
             approved_successors=successors_by_profile.get(name, {}),
-            dirty_sessions=dirty_sessions, extra_scope_sids=extra_scope_sids))
+            dirty_sessions=dirty_sessions, extra_scope_sids=extra_scope_sids,
+            previous_artifacts=(previous_fp or {}).get('artifacts') if incremental else None))
     for name in sorted(set(current) - set(old_profiles)):
         # A genuinely new profile is strict, not silently turned into legacy.
         profile_home = Path(current[name]['state_db']).parent

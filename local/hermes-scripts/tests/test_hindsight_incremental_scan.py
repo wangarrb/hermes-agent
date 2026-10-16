@@ -120,7 +120,8 @@ def test_json_view_change_forces_profile_read(fixture, monkeypatch):
     calls = spy_reader(src, monkeypatch)
     snapshots = src.scan_source_snapshots(home, physical_baseline=baseline,
         scan_fingerprints=current, scan_previous=seed)
-    assert calls and calls[-1]['row_filter'] is None  # JSON change: full profile read
+    # F7: only the changed view's session is dirty, not the whole profile.
+    assert calls and calls[-1]['row_filter'] == frozenset({'json-late'})
     messages = [m for s in snapshots for m in s['messages']]
     assert any(m['origin'] == 'late-json' for m in messages)
 
