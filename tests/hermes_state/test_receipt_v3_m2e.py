@@ -168,6 +168,17 @@ def _receipt_keys(path):
         conn.close()
 
 
+def _store_digest(path):
+    conn = sqlite3.connect(path)
+    try:
+        meta = conn.execute("SELECT key, value FROM state_meta ORDER BY key").fetchall()
+        sessions = conn.execute("SELECT id, model_config FROM sessions ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    return _canon_sha({"state_meta": [[key, value] for key, value in meta],
+                       "sessions": [[sid, config] for sid, config in sessions]})
+
+
 def _roster_entries(requests):
     return [{"owner_session_id": request["owner_session_id"], "token": request["token"],
              "old_generation": request["old_generation"],
@@ -482,6 +493,132 @@ def test_reader_snapshot_refuses_missing_checkpoint_and_orphan(tmp_path):
             m.read_receipt3_reader_snapshot(conn, SID_A)
     finally:
         conn.close()
+
+
+def test_reader_snapshot_refuses_orphaned_page_bytes(tmp_path):
+    """Named-collection scan: /p/ keys outside the header-named page set refuse.
+
+    r4 (protocol.storage page_stream): the header generation sequence and the
+    *exact* page_count with contiguous page ordinals are verified -- an extra
+    page component is refused, never ignored. Three orphan classes: a page key
+    of a generation with no stored operation at all, an out-of-range ordinal
+    with a junk body, and the same out-of-range ordinal carrying a canonical
+    (copied) page body.
+    """
+    m = _m()
+    store = _settle(tmp_path)
+    _write_initial_receipt(store)
+    page_keys = sorted(key for key in _receipt_keys(store) if "/p/" in key)
+    parsed = [m.parse_receipt3_page_key(key) for key in page_keys]
+    generation = parsed[0]["generation"]
+    last_ordinal = max(item["page_ordinal"] for item in parsed
+                       if item["generation"] == generation)
+    conn = sqlite3.connect(store)
+    try:
+        canonical_page = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (page_keys[0],)).fetchone()[0]
+    finally:
+        conn.close()
+    extra = m.encode_receipt3_page_key(SID_A, generation, last_ordinal + 1)
+    cases = [
+        ("a page for a generation with no stored operation",
+         m.encode_receipt3_page_key(SID_A, generation + 6, 0), "x"),
+        ("an out-of-range page ordinal with a junk body", extra, "x"),
+        ("an out-of-range page ordinal with a canonical page body", extra,
+         canonical_page),
+    ]
+    for index, (name, key, value) in enumerate(cases):
+        copy = tmp_path / f"orphan-page-{index}.db"
+        shutil.copyfile(store, copy)
+        _mutate(copy, "INSERT INTO state_meta (key, value) VALUES (?, ?)", (key, value))
+        conn = _connect(copy)
+        try:
+            with pytest.raises(ValueError):
+                m.read_receipt3_reader_snapshot(conn, SID_A)
+        finally:
+            conn.close()
+    # control: the untouched store still consumes.
+    conn = _connect(store)
+    try:
+        snapshot = m.read_receipt3_reader_snapshot(conn, SID_A)
+    finally:
+        conn.close()
+    assert snapshot["operations"][0]["generation"] == generation
+
+
+def test_reader_snapshot_refuses_memberless_epoch_bytes(tmp_path):
+    """Named-collection scan: /e/ keys outside the verified block starts refuse.
+
+    r4 amendments section 2: the range key carries the start generation and
+    every receipt3/ guard covers the new key; a checkpoint whose coordinates no
+    member epoch verifies (a member-less epoch ordinal) is refused, never
+    upserted into the index or ignored. Both a junk body and a canonical
+    (copied) checkpoint body under the member-less ordinal refuse.
+    """
+    m = _m()
+    store = _settle(tmp_path)
+    _write_initial_receipt(store)
+    head = _read_head(store, SID_A)
+    _continue_single(store, SID_A, head, FINAL_EPOCH)
+    checkpoint = [key for key in _receipt_keys(store) if "/e/" in key][0]
+    parsed = m.parse_receipt3_epoch_key(checkpoint)
+    conn = sqlite3.connect(store)
+    try:
+        canonical_checkpoint = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (checkpoint,)).fetchone()[0]
+    finally:
+        conn.close()
+    stray = m.encode_receipt3_epoch_key(SID_A, parsed["epoch_ordinal"] + 4,
+                                        parsed["start_generation"])
+    for index, value in enumerate(("x", canonical_checkpoint)):
+        copy = tmp_path / f"orphan-epoch-{index}.db"
+        shutil.copyfile(store, copy)
+        _mutate(copy, "INSERT INTO state_meta (key, value) VALUES (?, ?)", (stray, value))
+        conn = _connect(copy)
+        try:
+            with pytest.raises(ValueError):
+                m.read_receipt3_reader_snapshot(conn, SID_A)
+        finally:
+            conn.close()
+    # control: the untouched store still consumes with its one verified block.
+    conn = _connect(store)
+    try:
+        snapshot = m.read_receipt3_reader_snapshot(conn, SID_A)
+    finally:
+        conn.close()
+    assert snapshot["epochs"][0]["sealed_blocks"] == [{"start": 1, "end": 1}]
+
+
+def test_reader_snapshot_passed_conn_select_only(tmp_path):
+    """The snapshot reader is SELECT-only on the caller's connection.
+
+    protocol.independent_reader[0]: the caller supplies the
+    mode=ro/query_only connection and the single read snapshot transaction.
+    A read-only URI connection with query_only consumes the store fully; the
+    trace shows SELECT statements only (no BEGIN/COMMIT, no write verb) and
+    the stored bytes are unchanged afterwards.
+    """
+    m = _m()
+    store = _settle(tmp_path)
+    _write_initial_receipt(store)
+    head = _read_head(store, SID_A)
+    _continue_single(store, SID_A, head, FINAL_EPOCH)
+    before = _store_digest(store)
+    conn = sqlite3.connect("file:" + str(store) + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        snapshot = m.read_receipt3_reader_snapshot(conn, SID_A)
+    finally:
+        conn.close()
+    assert snapshot["head"]["generation"] == 2
+    assert snapshot["key_audit"]["findings"] == []
+    assert statements
+    assert all(statement.lstrip().upper().startswith("SELECT")
+               for statement in statements)
+    assert _store_digest(store) == before
 
 
 # ── capacity checkpoint plan (protocol.capacity.concrete_bounds.checkpoint) ──

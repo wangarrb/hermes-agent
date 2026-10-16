@@ -2430,6 +2430,11 @@ def receipt_design_disclosure() -> dict:
 # protocol.storage namespace). Everything here is read-only over the receipt3/
 # namespace and returns structured verdicts; nothing here writes, yields,
 # captures or POSTs source input, and nothing here is an authorization. The
+# snapshot reader consumes a *caller-supplied* connection with SELECT-only
+# statements: the read isolation contract (``mode=ro`` / ``PRAGMA query_only``
+# / one read snapshot transaction) belongs to the caller, per
+# ``protocol.independent_reader[0]`` ("one mode=ro/query_only/BEGIN snapshot");
+# nothing here opens a connection, begins a transaction or repairs. The
 # D prior/current gate returns the *proposed* ``BLOCK_SOURCE_CONTEXT_POLICY``
 # outcome for unknown/missing/drift context (not an existing error API, not
 # the already-approved F policy, no rollback of legal native writes).
@@ -2728,14 +2733,25 @@ def decide_source_context_policy(*, q_same, prior_contexts, current_contexts,
 def read_receipt3_reader_snapshot(conn, owner_session_id: str) -> dict:
     """Consume one owner's full receipt3 state as the standalone reader does.
 
-    Read-only and strict: the protected head (or its refusal), the journal
-    members (contiguity and stored head chain), the epoch-local range
-    checkpoints (replayed from the original member bytes, open/closed tail
-    rules), the token index (canonical records, recomputed result digest,
-    exact journal cross-links, every stored operation named exactly once), the
-    rebuildable row-state index, and the full-path prefix audit over every
-    stored receipt3/ key. Any non-canonical, colliding or orphaned byte
-    refuses; nothing is silently repaired.
+    SELECT-only over the caller's connection: every statement issued here is a
+    read on the connection handed in; this function opens no connection, issues
+    no ``BEGIN``/``COMMIT`` and writes nothing. The caller owns the read
+    isolation contract -- open the store ``mode=ro`` / ``PRAGMA query_only``
+    and hold one read snapshot transaction, i.e. the single
+    ``mode=ro/query_only/BEGIN snapshot`` of ``protocol.independent_reader[0]``
+    (the standalone physical source adapter's existing read contract).
+
+    Strict: the protected head (or its refusal), the journal members
+    (contiguity and stored head chain), the epoch-local range checkpoints
+    (replayed from the original member bytes, open/closed tail rules), the
+    token index (canonical records, recomputed result digest, exact journal
+    cross-links, every stored operation named exactly once), the rebuildable
+    row-state index, the full-path prefix audit over every stored receipt3/
+    key, and named-collection scans over the owner's ``receipt3/p/`` and
+    ``receipt3/e/`` spans (only the page keys named by a stored operation
+    header's page count and the checkpoint keys of a verified member block
+    start exist). Any non-canonical, colliding or orphaned byte refuses;
+    nothing is silently repaired.
     """
     if type(owner_session_id) is not str or not owner_session_id:
         _invalid()
@@ -2781,6 +2797,37 @@ def read_receipt3_reader_snapshot(conn, owner_session_id: str) -> dict:
                        "last_generation": group[-1]["header"]["generation"],
                        "sealed_blocks": [{"start": block["start"], "end": block["end"]}
                                          for block in blocks]})
+    # Named collections: inside the owner's page/epoch spans only the keys
+    # named by a stored operation header (page ordinals of its page count) and
+    # by a verified member block start (range checkpoints) exist; any other
+    # key in those spans is orphaned bytes and refuses (128-row batches,
+    # mirroring the recovery back-projection scan). r4 C01/storage: extra
+    # components and non-canonical encodings are refused, never ignored.
+    named_pages = set()
+    for member in members:
+        member_generation = member["header"]["generation"]
+        for ordinal in range(member["header"]["page_count"]):
+            named_pages.add(encode_receipt3_page_key(owner_session_id, member_generation,
+                                                     ordinal))
+    named_epochs = set()
+    for epoch in epochs:
+        for block in epoch["sealed_blocks"]:
+            named_epochs.add(encode_receipt3_epoch_key(
+                owner_session_id, epoch["epoch_ordinal"], block["start"]))
+    for prefix, named in ((_RECEIPT3_PAGE_PREFIX, named_pages),
+                          (_RECEIPT3_EPOCH_PREFIX, named_epochs)):
+        lo, hi = _receipt3_prefix_span(prefix, owner_session_id)
+        last = lo
+        while True:
+            rows = conn.execute(
+                "SELECT key FROM state_meta WHERE key > ? AND key < ? ORDER BY key LIMIT ?",
+                (last, hi, 128)).fetchall()
+            if not rows:
+                break
+            for (key,) in rows:
+                last = key
+                if key not in named:
+                    _invalid()   # orphaned page/checkpoint bytes refuse the snapshot
     lo, hi = _receipt3_prefix_span(_RECEIPT3_TOKEN_PREFIX, owner_session_id)
     tokens = []
     named = set()
