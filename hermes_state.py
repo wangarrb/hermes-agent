@@ -1636,7 +1636,17 @@ class SessionDB(
 
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
         """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
-        transaction — nesting BEGIN IMMEDIATE would deadlock)."""
+        transaction — nesting BEGIN IMMEDIATE would deadlock).
+
+        The ``receipt3/`` namespace is writer-owned protected evidence (receipt v3,
+        schema/3): only the native provenance helper may write it, on this same
+        connection inside its own approved transaction. The generic setter — with
+        or without ``cursor`` — must never act as that writer."""
+        if key == "receipt3" or key.startswith("receipt3/"):
+            raise ValueError(
+                "receipt3/ is the protected native-provenance namespace; "
+                "use the native receipt writer, not set_meta"
+            )
         sql = (
             "INSERT INTO state_meta (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
@@ -1693,13 +1703,188 @@ class SessionDB(
 
     def list_meta_prefix(self, prefix: str) -> list[tuple[str, str]]:
         """``[(key, value), ...]`` for state_meta keys starting with the literal
-        ``prefix`` (LIKE wildcards escaped) — e.g. ``loop:<session_id>`` rows."""
+        ``prefix`` (LIKE wildcards escaped) — e.g. ``loop:<session_id>`` rows.
+
+        The ``receipt3/`` namespace is refused here: it materializes the whole
+        match set and is not the bounded receipt reader (receipt v3, schema/3)."""
+        if prefix == "receipt3" or prefix.startswith("receipt3/"):
+            raise ValueError(
+                "receipt3/ is the protected native-provenance namespace; "
+                "the generic prefix scan is not the receipt reader"
+            )
         if not prefix:
             return []
         rows = self._read_all(
             "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'", (_escape_like(prefix) + "%",),
         )
         return [(row[0], row[1]) for row in rows]
+
+    @classmethod
+    def open_quiet_recovery_admission(cls, *, db_path, init_request) -> "QuietRecoveryHandle":
+        """Open the finite continuation-only quiet-recovery mode (receipt r4 C02).
+
+        This is the ONLY entry into recovery: a no-create ``mode=rw`` open of an
+        existing *settled* store that runs no schema init, no repair, no
+        generation mint and no usermerge (see :class:`QuietRecoveryHandle`). It
+        refuses here for: a foreign/empty store, or any store that is not the
+        settled Hermes schema. Only an approved epoch_continuation request may
+        ever reach it; the ordinary constructor and every generic writer must
+        not obtain this handle.
+        """
+        return QuietRecoveryHandle.open(db_path=Path(db_path), init_request=init_request)
+
+
+# ── quiet recovery admission (receipt v3, r4 C02 -- minimal native slice) ────
+# Cadence for the postcommit FTS defer: at most every N approved continuation
+# writes marks a deferred FTS due instead of executing usermerge/merge inside
+# the recovery handle (native values: every 50th PASSIVE checkpoint / 1000th
+# merge in the ordinary writer; this handle only ever defers).
+QUIET_RECOVERY_FTS_DEFER_EVERY = 1000
+
+_QUIET_REQUIRED_TABLES = frozenset({"state_meta", "sessions", "messages"})
+_QUIET_REQUIRED_REQUEST = frozenset({
+    "kind", "token", "proof_sha256", "old_epoch", "new_epoch", "old_generation",
+    "old_head_sha256", "old_head_token_sha256", "boundary_roster_sha256",
+    "alias_inventory_sha256",
+})
+
+
+def _validate_quiet_recovery_request(request) -> dict:
+    if not isinstance(request, dict) or set(request) != _QUIET_REQUIRED_REQUEST:
+        raise ValueError("recovery admission accepts only an approved epoch_continuation request")
+    if request["kind"] != "epoch_continuation":
+        raise ValueError("recovery admission accepts only an approved epoch_continuation request")
+    token = request["token"]
+    if not isinstance(token, str) or not token:
+        raise ValueError("continuation token must be a non-empty string")
+    for key in ("proof_sha256", "old_head_sha256", "old_head_token_sha256",
+                "boundary_roster_sha256", "alias_inventory_sha256"):
+        value = request[key]
+        if (not isinstance(value, str) or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)):
+            raise ValueError("continuation request fields must be lowercase sha256 hex")
+    for key in ("old_epoch", "new_epoch"):
+        value = request[key]
+        if (not isinstance(value, str) or not value.startswith("sqlite:")
+                or len(value) != 71 or any(c not in "0123456789abcdef" for c in value[7:])):
+            raise ValueError("continuation epochs must be sqlite:64lowerhex")
+    generation = request["old_generation"]
+    if type(generation) is not int or generation < 1:
+        raise ValueError("old_generation must be a positive int")
+    return request
+
+
+def _quiet_canonical(value) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8", "strict")
+
+
+class QuietRecoveryHandle:
+    """Continuation-only recovery handle: the single narrow write path.
+
+    Opened with a no-create ``mode=rw`` connection on an existing settled store;
+    it never runs the ordinary constructor's schema init, FTS repair, generation
+    mint or usermerge. Generic writers (set_meta/append_message) and FTS
+    maintenance entries (optimize_fts/rebuild_fts) refuse; only
+    :meth:`append_epoch_continuation` may write, inside its own BEGIN IMMEDIATE
+    transaction, token-idempotent (same token -> verified readback, different
+    bytes -> refused). At the cadence it only marks ``_fts_deferred_due`` --
+    ``_fts_enabled`` keeps its real value; the deferred pass runs after the
+    accepted recovery boundary, never inside the recoverer.
+    """
+
+    _quiet_recovery_admission = True
+
+    def __init__(self, *, db_path, conn, init_request):
+        self.db_path = db_path
+        self._conn = conn
+        self._init_request = init_request
+        self._write_count = 0
+        self._fts_enabled = True
+        self._fts_deferred_due = False
+        self._closed = False
+
+    @classmethod
+    def open(cls, *, db_path: Path, init_request: dict) -> "QuietRecoveryHandle":
+        request = _validate_quiet_recovery_request(init_request)
+        path = Path(db_path)
+        # mode=rw never creates a database: a missing store is refused before
+        # any connection exists.
+        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'")}
+            if not _QUIET_REQUIRED_TABLES <= tables:
+                raise ValueError(
+                    "quiet recovery requires an existing settled Hermes store; "
+                    "no schema init/repair/generation mint is performed here")
+            return cls(db_path=path, conn=conn, init_request=request)
+        except BaseException:
+            conn.close()
+            raise
+
+    # ── refusals: generic writers and maintenance never write here ──
+    def set_meta(self, *args, **kwargs):
+        raise RuntimeError("generic set_meta is not reachable on the quiet recovery handle")
+
+    def append_message(self, *args, **kwargs):
+        raise RuntimeError("generic message writes are not reachable on the quiet recovery handle")
+
+    def optimize_fts(self, *args, **kwargs):
+        raise RuntimeError("FTS optimize is deferred on the quiet recovery handle")
+
+    def rebuild_fts(self, *args, **kwargs):
+        raise RuntimeError("FTS rebuild is not reachable on the quiet recovery handle")
+
+    # ── the single approved write ──
+    def append_epoch_continuation(self, request: dict) -> dict:
+        request = _validate_quiet_recovery_request(request)
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        request_sha256 = hashlib.sha256(_quiet_canonical(request)).hexdigest()
+        token = request["token"]
+        key = "receipt3/t/" + token
+        existing = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if existing is not None:
+            stored = json.loads(existing[0])
+            if stored.get("request_sha256") != request_sha256:
+                raise ValueError(
+                    "continuation token already committed with different bytes; refusing")
+            return dict(stored["result"])  # verified readback: no second insert
+        result = {"token": token,
+                  "operation_sha256": hashlib.sha256(_quiet_canonical(
+                      {"kind": "epoch_continuation", "request_sha256": request_sha256,
+                       "new_epoch": request["new_epoch"],
+                       "old_generation": request["old_generation"]})).hexdigest(),
+                  "generation": request["old_generation"] + 1}
+        record = {"request_sha256": request_sha256, "result": result}
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (key, _quiet_canonical(record).decode("utf-8")))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        self._write_count += 1
+        if self._write_count % QUIET_RECOVERY_FTS_DEFER_EVERY == 0:
+            self._fts_deferred_due = True
+        return result
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            conn, self._conn = self._conn, None
+            if conn is None:
+                return
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class AsyncSessionDB:
