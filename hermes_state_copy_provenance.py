@@ -1,18 +1,30 @@
 """Content-free, writer-owned evidence for exact same-session message copies.
 
 Receipt v3 (schema/3) writer-owned provenance. This module is the single home of
-the ``receipt3/`` protected namespace in the SessionDB store; the initial slice
-implemented here is the C01 epoch range-checkpoint contract (receipt r4
-amendments, section 2):
+the ``receipt3/`` protected namespace in the SessionDB store:
 
-  * immutable epoch keys ``receipt3/e/<SIDhex>/<epochordinal20>/<start_generation20>``;
-  * ``epoch_range_checkpoint`` body validation (schema/3, count 1..1024,
-    ``end-start+1=count``, ``end<=start+1023``);
-  * epoch-local chunking from the actual first header generation ``s0``
-    (``start=s0+1024*k``), full blocks sealed with their last operation and a
-    non-empty partial tail sealed only on epoch exit -- never early, never empty;
-  * the frozen B framing of ``range_root_sha256`` over the checkpoint coordinate
-    followed by every member header/page C byte in order.
+  * C01 epoch range-checkpoint contract (receipt r4 amendments, section 2):
+    immutable epoch keys ``receipt3/e/<SIDhex>/<epochordinal20>/<start_generation20>``;
+    ``epoch_range_checkpoint`` body validation (schema/3, count 1..1024,
+    ``end-start+1=count``, ``end<=start+1023``); epoch-local chunking from the
+    actual first header generation ``s0`` (``start=s0+1024*k``), full blocks
+    sealed with their last operation and a non-empty partial tail sealed only
+    on epoch exit -- never early, never empty; the frozen B framing of
+    ``range_root_sha256`` over the checkpoint coordinate followed by every
+    member header/page C byte in order; member headers must carry the consumed
+    fields and agree with the checkpoint coordinate (owner_session_id, epoch,
+    epoch_ordinal) -- anything else is the canonical ValueError, never a
+    KeyError;
+  * Q01 native session contexts (``protocol.context_binding``) with the frozen
+    r4 four-kind whitelist (inplace_compaction | compression_child |
+    payload_repair | epoch_continuation); unknown kinds are refused instead of
+    silently projecting a single-owner context;
+  * the token-index key codec ``receipt3/t/<SIDhex>/<opuuid>`` (canonical
+    lower-case uuid4 operation id);
+  * the strict model_config marker projection: duplicate raw config keys are
+    refused (never last-wins) and damaged raw that mentions the protected
+    ``_message_copy_receipts_`` family is refused outright; unreadable raw
+    outside that family projects explicit NULLs.
 
 Only the native writer (inside its own ``_execute_write`` transaction) may call
 the builder; the generic ``SessionDB.set_meta``/``list_meta_prefix`` surfaces
@@ -28,6 +40,7 @@ from typing import NoReturn
 # Frozen codec primitives (design r2 "codec"; unchanged by r3/r4).
 _BYTES_PREFIX = b"hermes-copy-receipt-v2\0"
 _RECEIPT3_EPOCH_PREFIX = "receipt3/e/"
+_RECEIPT3_TOKEN_PREFIX = "receipt3/t/"
 _RANGE_SCHEMA = "hermes-receipt-range/3"
 _MAX_INT64 = 2**63 - 1
 _CHUNK = 1024
@@ -35,12 +48,21 @@ _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _EPOCH = re.compile(r"sqlite:[0-9a-f]{64}\Z")
 _SID_HEX = re.compile(r"(?:[0-9a-f]{2})+\Z")
 _INT20 = re.compile(r"[0-9]{20}\Z")
+_UUID4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
 
 _RANGE_BODY_KEYS = {
     "schema_version", "owner_session_id", "epoch", "epoch_ordinal",
     "start_generation", "end_generation", "before_head_sha256",
     "end_head_sha256", "operation_count", "page_count", "range_root_sha256",
 }
+
+# Member operation headers the range builder consumes: every consumed field is
+# required (canonical ValueError when missing, never a KeyError) and the
+# coordinate fields must agree with the checkpoint (M07 repair).
+_MEMBER_HEADER_KEYS = frozenset({
+    "owner_session_id", "epoch", "epoch_ordinal", "generation", "page_count",
+    "previous_head_sha256", "operation_sha256",
+})
 
 
 def C(x) -> bytes:
@@ -102,6 +124,12 @@ def _decode_sid_hex(text: str) -> str:
     return session_id
 
 
+def _canonical_uuid4(token: str) -> str:
+    if type(token) is not str or not _UUID4.fullmatch(token):
+        _invalid()
+    return token
+
+
 # ── receipt3/e key codec ────────────────────────────────────────────────────
 
 def encode_receipt3_epoch_key(owner_session_id: str, epoch_ordinal: int, start_generation: int) -> str:
@@ -132,6 +160,32 @@ def parse_receipt3_epoch_key(key: str) -> dict:
     return {"session_id": _decode_sid_hex(parts[2]),
             "epoch_ordinal": _decode_int20(parts[3]),
             "start_generation": _decode_int20(parts[4])}
+
+
+# ── receipt3/t token-index key codec (I03 repair: protocol.storage) ─────────
+
+def encode_receipt3_token_key(owner_session_id: str, token: str) -> str:
+    """``receipt3/t/<SIDhex>/<opuuid>`` -- the fixed token-index namespace.
+
+    The owner component is mandatory: two owners carrying the same token are
+    distinct operations, and the key-range reader must be able to page the
+    index per owner without a bare-token key ever existing.
+    """
+    if type(owner_session_id) is not str or not owner_session_id:
+        _invalid()
+    _canonical_uuid4(token)
+    return _RECEIPT3_TOKEN_PREFIX + owner_session_id.encode("utf-8").hex() + "/" + token
+
+
+def parse_receipt3_token_key(key: str) -> dict:
+    """Parse an exact receipt3/t key; every non-canonical form is refused."""
+    if type(key) is not str:
+        _invalid()
+    parts = key.split("/")
+    if len(parts) != 4 or parts[0] != "receipt3" or parts[1] != "t":
+        _invalid()
+    return {"session_id": _decode_sid_hex(parts[2]),
+            "operation_id": _canonical_uuid4(parts[3])}
 
 
 # ── epoch_range_checkpoint body validation ──────────────────────────────────
@@ -176,7 +230,10 @@ def build_epoch_range_checkpoint(*, owner_session_id: str, epoch: str, epoch_ord
     with its last operation at any time; a non-empty partial tail seals only with
     ``epoch_exit`` (the continuation transaction that leaves the epoch); an empty
     range is never created. Member headers/pages are the original C-source bytes;
-    the range root replays them in order.
+    the range root replays them in order. Member headers must carry every
+    consumed field and agree with the checkpoint coordinate (owner_session_id,
+    epoch, epoch_ordinal) or the canonical ValueError is raised (never a
+    KeyError).
     """
     _positive_int64(s0)
     _positive_int64(epoch_ordinal)
@@ -195,9 +252,19 @@ def build_epoch_range_checkpoint(*, owner_session_id: str, epoch: str, epoch_ord
         pages = member["pages"]
         if type(header) is not dict or type(pages) is not list:
             _invalid()
-        if header.get("epoch") != epoch:
+        if not _MEMBER_HEADER_KEYS <= set(header):
+            _invalid()  # missing consumed fields: canonical ValueError, never KeyError
+        if type(header["owner_session_id"]) is not str or not header["owner_session_id"]:
+            _invalid()
+        if header["owner_session_id"] != owner_session_id:
+            _invalid()  # key/body/headers agree on the owner
+        if header["epoch"] != epoch:
             _invalid()  # a range never crosses its epoch
-        if type(header.get("page_count")) is not int or header["page_count"] != len(pages):
+        _positive_int64(header["epoch_ordinal"])
+        if header["epoch_ordinal"] != epoch_ordinal:
+            _invalid()  # key/body/headers agree on the epoch ordinal
+        _positive_int64(header["generation"])
+        if type(header["page_count"]) is not int or header["page_count"] != len(pages):
             _invalid()
         for page in pages:
             if type(page) is not dict:
@@ -244,6 +311,10 @@ def build_epoch_range_checkpoint(*, owner_session_id: str, epoch: str, epoch_ord
 
 _NATIVE_BINDING_FIELDS = ("id", "started_at", "parent_session_id", "source")
 _LINEAGE_MARKERS = ("_delegate_from", "_branched_from", "_reset_from")
+# The frozen r4 operation-header kind whitelist (M05 repair): an unknown kind is
+# refused instead of silently projecting a single-owner context.
+_KINDS = frozenset({"inplace_compaction", "compression_child", "payload_repair",
+                    "epoch_continuation"})
 
 
 def sql_value_tag(value):
@@ -289,22 +360,50 @@ def sql_value_decode(tag):
     _invalid()
 
 
+class _DuplicateConfigKey(ValueError):
+    """Raised by the strict projection hook when one raw config key repeats."""
+
+
+def _unique_config_object(pairs):
+    """object_pairs_hook that refuses duplicate keys (never last-wins)."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateConfigKey(key)
+        obj[key] = value
+    return obj
+
+
 def _projected_markers(conn, session_id):
     """The existing model_config JSON projection of the three lineage markers.
 
-    Only the permitted TEXT scalar is taken (anything else projects explicit
-    NULL); no full config ever leaves this projection.
+    Strict projection (M06 repair): duplicate raw config keys are refused
+    outright, and damaged raw that mentions the protected
+    ``_message_copy_receipts_`` family is refused because a truncated
+    head/bank must never be projected as "no markers". Unreadable raw outside
+    that family keeps the narrow tolerance (the markers project explicit
+    NULL). Only the permitted TEXT scalar is taken (anything else projects
+    explicit NULL); no full config ever leaves this projection.
     """
     row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
     if row is None:
         _invalid()
     raw = row[0]
-    try:
-        config = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
-    except (ValueError, TypeError):
-        config = {}
-    if not isinstance(config, dict):
-        config = {}
+    config = {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw, object_pairs_hook=_unique_config_object)
+        except _DuplicateConfigKey:
+            _invalid()
+        except (ValueError, TypeError):
+            if "_message_copy_receipts_" in raw:
+                _invalid()
+            parsed = None
+        if parsed is not None:
+            if isinstance(parsed, dict):
+                config = parsed
+            elif "_message_copy_receipts_" in raw:
+                _invalid()
     markers = []
     for marker in _LINEAGE_MARKERS:
         value = config.get(marker)
@@ -315,7 +414,13 @@ def _projected_markers(conn, session_id):
 def observe_native_session_contexts(conn, *, owner_session_id: str, actor_session_id: str,
                                     kind: str, domain_sha256: str) -> list[dict]:
     """Typed prior image for the header: 1 subject owner, or owner+actor for a
-    compression child -- sorted by session_id strict UTF-8 bytes."""
+    compression child -- sorted by session_id strict UTF-8 bytes.
+
+    The kind must be one of the frozen r4 four (``_KINDS``); anything else is
+    refused before any row is read.
+    """
+    if type(kind) is not str or kind not in _KINDS:
+        _invalid()
     if kind == "compression_child":
         if owner_session_id == actor_session_id:
             _invalid()

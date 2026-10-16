@@ -28,6 +28,7 @@ from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
 
 from hermes_state_common import (
+    SCHEMA_VERSION,
     TITLE_SOURCE_DERIVED as _TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM as _TITLE_SOURCE_LLM,
     TITLE_SOURCE_USER as _TITLE_SOURCE_USER,
     escape_like as _escape_like, _placeholders,
@@ -54,7 +55,8 @@ from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
-from hermes_state_schema import SessionSchemaMixin
+from hermes_state_schema import SessionSchemaMixin, _MESSAGE_UID_BACKFILL_DONE
+from hermes_state_copy_provenance import encode_receipt3_token_key
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
@@ -1741,12 +1743,30 @@ class SessionDB(
 # merge in the ordinary writer; this handle only ever defers).
 QUIET_RECOVERY_FTS_DEFER_EVERY = 1000
 
-_QUIET_REQUIRED_TABLES = frozenset({"state_meta", "sessions", "messages"})
+_QUIET_REQUIRED_TABLES = frozenset({"state_meta", "sessions", "messages", "schema_version"})
 _QUIET_REQUIRED_REQUEST = frozenset({
-    "kind", "token", "proof_sha256", "old_epoch", "new_epoch", "old_generation",
-    "old_head_sha256", "old_head_token_sha256", "boundary_roster_sha256",
-    "alias_inventory_sha256",
+    "kind", "token", "owner_session_id", "proof_sha256", "old_epoch", "new_epoch",
+    "old_generation", "old_head_sha256", "old_head_token_sha256",
+    "boundary_roster_sha256", "alias_inventory_sha256",
 })
+# The epoch-transition bindings of the approved init request. Every committed
+# continuation must carry exactly these values; only the token and the
+# per-operation oldraw coordinates (old_generation/old_head_sha256/
+# old_head_token_sha256) stay free per operation.
+_QUIET_BOUND_BINDINGS = (
+    "kind", "owner_session_id", "proof_sha256", "old_epoch", "new_epoch",
+    "boundary_roster_sha256", "alias_inventory_sha256",
+)
+
+
+class _QuietTokenReplay(Exception):
+    """Raised inside the write callback when the token is already committed with
+    the same bytes: the transaction rolls back and the stored result is returned
+    without counting a second operation."""
+
+    def __init__(self, result):
+        super().__init__("epoch continuation token already committed")
+        self.result = result
 
 
 def _validate_quiet_recovery_request(request) -> dict:
@@ -1754,9 +1774,19 @@ def _validate_quiet_recovery_request(request) -> dict:
         raise ValueError("recovery admission accepts only an approved epoch_continuation request")
     if request["kind"] != "epoch_continuation":
         raise ValueError("recovery admission accepts only an approved epoch_continuation request")
+    owner_session_id = request["owner_session_id"]
+    if not isinstance(owner_session_id, str) or not owner_session_id:
+        raise ValueError("continuation owner_session_id must be a non-empty string")
     token = request["token"]
     if not isinstance(token, str) or not token:
-        raise ValueError("continuation token must be a non-empty string")
+        raise ValueError("continuation token must be a canonical uuid4 string")
+    try:
+        parsed_token = uuid.UUID(token)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("continuation token must be a canonical uuid4 string") from None
+    if (parsed_token.version != 4 or parsed_token.variant != uuid.RFC_4122
+            or str(parsed_token) != token):
+        raise ValueError("continuation token must be a canonical uuid4 string")
     for key in ("proof_sha256", "old_head_sha256", "old_head_token_sha256",
                 "boundary_roster_sha256", "alias_inventory_sha256"):
         value = request[key]
@@ -1774,6 +1804,90 @@ def _validate_quiet_recovery_request(request) -> dict:
     return request
 
 
+def _quiet_result_from_record(record: dict) -> dict:
+    if type(record) is not dict or not {"operation_id", "operation_sha256",
+                                        "operation_generation"} <= set(record):
+        raise ValueError("stored continuation token record is unreadable; refusing")
+    return {"token": record["operation_id"],
+            "operation_sha256": record["operation_sha256"],
+            "generation": record["operation_generation"]}
+
+
+def _quiet_protected_head(raw) -> Optional[dict]:
+    """The owner's stored protected head (``model_config._message_copy_receipts_v2``)
+    or None when absent; unreadable shapes refuse the continuation."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        config = json.loads(raw)
+    except (ValueError, TypeError):
+        raise ValueError(
+            "owner model_config is not readable; refusing the continuation") from None
+    if not isinstance(config, dict):
+        raise ValueError("owner model_config is not an object; refusing the continuation")
+    head = config.get("_message_copy_receipts_v2")
+    if head is None:
+        return None
+    if not isinstance(head, dict):
+        raise ValueError("stored protected head is not an object; refusing the continuation")
+    return head
+
+
+def _quiet_fts_match_probe(conn: sqlite3.Connection, table: str):
+    """SELECT-only FTS5 MATCH probe. True: the index answers; False: the table is
+    absent; None: present but not verifiable -- fail closed."""
+    try:
+        conn.execute(f"SELECT count(*) FROM {table} WHERE {table} MATCH ?",
+                     ("receiptprobe",)).fetchone()
+        return True
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        return None
+    except sqlite3.DatabaseError:
+        return None
+
+
+def _quiet_settled_admission_checks(conn: sqlite3.Connection):
+    """Fail-closed SELECT-only settled-store checks (receipt r4 C02); returns the
+    probed ``(fts_enabled, trigram_available)`` real values, refuses otherwise."""
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table'")}
+    if not _QUIET_REQUIRED_TABLES <= tables:
+        raise ValueError(
+            "quiet recovery requires an existing settled Hermes store; "
+            "no schema init/repair/generation mint is performed here")
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    if row is None or row[0] != SCHEMA_VERSION:
+        raise ValueError(
+            "quiet recovery requires the settled schema version; an unsettled "
+            "store is refined through the ordinary path first, never here")
+    row = conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (_MESSAGE_UID_BACKFILL_DONE,)).fetchone()
+    if row is None or row[0] != "1":
+        raise ValueError("quiet recovery requires the finished message_uid backfill")
+    row = conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (_STATE_DB_GENERATION_KEY,)).fetchone()
+    if row is None or not str(row[0] or "").strip():
+        raise ValueError("quiet recovery requires an existing db_file_generation stamp")
+    row = conn.execute(
+        "SELECT count(*) FROM state_meta WHERE key LIKE 'fts\\_rebuild\\_%' ESCAPE '\\' "
+        "OR key LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\'").fetchone()
+    if row[0]:
+        raise ValueError(
+            "quiet recovery refuses a store with pending FTS rebuild/trash markers")
+    if SessionDB._db_needs_fts_storage_upgrade(conn.cursor()):
+        raise ValueError(
+            "quiet recovery refuses a store whose FTS storage layout is not settled")
+    fts_enabled = _quiet_fts_match_probe(conn, "messages_fts")
+    if fts_enabled is not True:
+        raise ValueError("quiet recovery requires a working base FTS index")
+    trigram_available = _quiet_fts_match_probe(conn, "messages_fts_trigram")
+    if trigram_available is None:
+        raise ValueError("quiet recovery cannot verify the trigram FTS index; refusing")
+    return fts_enabled, trigram_available
+
+
 def _quiet_canonical(value) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), allow_nan=False).encode("utf-8", "strict")
@@ -1782,44 +1896,68 @@ def _quiet_canonical(value) -> bytes:
 class QuietRecoveryHandle:
     """Continuation-only recovery handle: the single narrow write path.
 
-    Opened with a no-create ``mode=rw`` connection on an existing settled store;
-    it never runs the ordinary constructor's schema init, FTS repair, generation
+    Opened with a no-create ``mode=rw`` connection on an existing settled store
+    (fail-closed settled checks in :func:`_quiet_settled_admission_checks`); it
+    never runs the ordinary constructor's schema init, FTS repair, generation
     mint or usermerge. Generic writers (set_meta/append_message) and FTS
-    maintenance entries (optimize_fts/rebuild_fts) refuse; only
-    :meth:`append_epoch_continuation` may write, inside its own BEGIN IMMEDIATE
-    transaction, token-idempotent (same token -> verified readback, different
-    bytes -> refused). At the cadence it only marks ``_fts_deferred_due`` --
-    ``_fts_enabled`` keeps its real value; the deferred pass runs after the
-    accepted recovery boundary, never inside the recoverer.
+    maintenance entries (optimize_fts/rebuild_fts) refuse. Only
+    :meth:`append_epoch_continuation` may write, and it runs on the EXISTING
+    ``SessionDB._execute_write`` transaction core (the same function object)
+    through the quiet hook set below -- no reopen, no checkpoint, no
+    usermerge/merge, no fail-open repair -- binding the approved transition
+    and the owner's stored protected head (oldraw CAS). It is token-idempotent
+    (same token -> verified readback, no second insert, no count; same key
+    with different bytes -> refused). At the cadence it only marks
+    ``_fts_deferred_due``; ``_fts_enabled``/``_trigram_available`` keep their
+    probed real values.
     """
 
     _quiet_recovery_admission = True
 
-    def __init__(self, *, db_path, conn, init_request):
+    # Constants the shared SessionDB transaction core reads on this handle.
+    _WRITE_PATIENCE_S = SessionDB._WRITE_PATIENCE_S
+    _COMPRESSION_BUSY_WAIT_S = SessionDB._COMPRESSION_BUSY_WAIT_S
+    _WRITE_RETRY_SLOW_AFTER_S = SessionDB._WRITE_RETRY_SLOW_AFTER_S
+    _WRITE_RETRY_MIN_S = SessionDB._WRITE_RETRY_MIN_S
+    _WRITE_RETRY_MAX_S = SessionDB._WRITE_RETRY_MAX_S
+    _WRITE_RETRY_SLOW_MIN_S = SessionDB._WRITE_RETRY_SLOW_MIN_S
+    _WRITE_RETRY_SLOW_MAX_S = SessionDB._WRITE_RETRY_SLOW_MAX_S
+    _CHECKPOINT_EVERY_N_WRITES = SessionDB._CHECKPOINT_EVERY_N_WRITES
+    _FTS_MERGE_EVERY_N_WRITES = QUIET_RECOVERY_FTS_DEFER_EVERY
+    # The EXISTING transaction core and shared helpers -- never a private copy.
+    _execute_write = SessionDB._execute_write
+    _sleep_before_write_retry = SessionDB._sleep_before_write_retry
+    _is_structural_corruption_error = SessionDB._is_structural_corruption_error
+    _is_fts_write_corruption_error = SessionDB._is_fts_write_corruption_error
+
+    def __init__(self, *, db_path, conn, init_request, fts_enabled, trigram_available):
         self.db_path = db_path
         self._conn = conn
         self._init_request = init_request
+        self._db_file_identity = _stat_db_file_identity(db_path)
+        self._db_replaced = False
+        self._db_corrupt = False
+        self._db_corrupt_reason = "unspecified"
+        self._lock = threading.RLock()
         self._write_count = 0
-        self._fts_enabled = True
+        self._fts_enabled = fts_enabled
+        self._trigram_available = trigram_available
         self._fts_deferred_due = False
         self._closed = False
 
     @classmethod
     def open(cls, *, db_path: Path, init_request: dict) -> "QuietRecoveryHandle":
         request = _validate_quiet_recovery_request(init_request)
-        path = Path(db_path)
-        # mode=rw never creates a database: a missing store is refused before
-        # any connection exists.
-        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=5.0)
+        path = Path(db_path).resolve()
+        # ``as_uri()`` percent-encodes the path (?/#/% stay path bytes); mode=rw
+        # never creates a database, so a missing store is refused before any
+        # connection exists.
+        conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5.0)
         try:
             conn.row_factory = sqlite3.Row
-            tables = {row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table'")}
-            if not _QUIET_REQUIRED_TABLES <= tables:
-                raise ValueError(
-                    "quiet recovery requires an existing settled Hermes store; "
-                    "no schema init/repair/generation mint is performed here")
-            return cls(db_path=path, conn=conn, init_request=request)
+            fts_enabled, trigram_available = _quiet_settled_admission_checks(conn)
+            return cls(db_path=path, conn=conn, init_request=request,
+                       fts_enabled=fts_enabled, trigram_available=trigram_available)
         except BaseException:
             conn.close()
             raise
@@ -1837,43 +1975,116 @@ class QuietRecoveryHandle:
     def rebuild_fts(self, *args, **kwargs):
         raise RuntimeError("FTS rebuild is not reachable on the quiet recovery handle")
 
+    # ── quiet hook set for the shared SessionDB._execute_write core ──
+    def _raise_if_db_replaced(self) -> None:
+        """Quiet inode fence: the path must still name the file this handle opened."""
+        if self._db_replaced:
+            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
+        recorded = self._db_file_identity
+        if recorded is not None and _stat_db_file_identity(self.db_path) != recorded:
+            self._db_replaced = True
+            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
+
+    def _raise_if_db_corrupt(self, *, storage: bool = False) -> None:
+        if self._db_corrupt:
+            raise self._corrupt_error()
+        if storage and storage_state(self.db_path) == STORAGE_CORRUPT:
+            self._halt_db_corrupt(sqlite3.DatabaseError(
+                "database disk image is malformed (reported earlier in this process: "
+                f"{storage_corrupt_reason(self.db_path)})"))
+
+    def _corrupt_error(self, prefix: str = "") -> StateDbCorruptError:
+        return StateDbCorruptError(f"{prefix}{_STATE_DB_CORRUPT_MSG} (cause: {self._db_corrupt_reason})")
+
+    def _halt_db_corrupt(self, exc: BaseException) -> None:
+        """Quiet quarantine: sticky local flags and raise; no process-wide publish."""
+        self._db_corrupt = True
+        self._db_corrupt_reason = str(exc)
+        logger.error(
+            "quiet recovery handle for %s saw structural corruption (%s); "
+            "quarantining this handle: no further continuation writes.", self.db_path, exc,
+        )
+        err = self._corrupt_error()
+        for attr in ("sqlite_errorcode", "sqlite_errorname"):
+            if getattr(exc, attr, None) is not None:
+                setattr(err, attr, getattr(exc, attr))
+        raise err from exc
+
+    def _reopen_after_close_locked(self, context: str = "write") -> None:
+        raise RuntimeError(
+            "quiet recovery handle is closed; it never reopens after close()")
+
+    def _try_wal_checkpoint(self) -> None:
+        """Quiet mode never checkpoints; the post-release pass owns that."""
+
+    def _try_incremental_merge_fts(self) -> None:
+        """Quiet mode never merges: mark the postcommit FTS defer instead."""
+        self._fts_deferred_due = True
+
+    def _enter_fts_fail_open(self, exc, *, deadline=None, patience_s=None) -> bool:
+        return False  # no fail-open repair inside the recoverer
+
     # ── the single approved write ──
     def append_epoch_continuation(self, request: dict) -> dict:
         request = _validate_quiet_recovery_request(request)
-        conn = self._conn
-        if conn is None:
+        if self._closed or self._conn is None:
             raise RuntimeError("quiet recovery handle is closed")
-        request_sha256 = hashlib.sha256(_quiet_canonical(request)).hexdigest()
-        token = request["token"]
-        key = "receipt3/t/" + token
-        existing = conn.execute(
-            "SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if existing is not None:
-            stored = json.loads(existing[0])
-            if stored.get("request_sha256") != request_sha256:
+        for field in _QUIET_BOUND_BINDINGS:
+            if request[field] != self._init_request[field]:
                 raise ValueError(
-                    "continuation token already committed with different bytes; refusing")
-            return dict(stored["result"])  # verified readback: no second insert
-        result = {"token": token,
-                  "operation_sha256": hashlib.sha256(_quiet_canonical(
-                      {"kind": "epoch_continuation", "request_sha256": request_sha256,
-                       "new_epoch": request["new_epoch"],
-                       "old_generation": request["old_generation"]})).hexdigest(),
-                  "generation": request["old_generation"] + 1}
-        record = {"request_sha256": request_sha256, "result": result}
-        conn.execute("BEGIN IMMEDIATE")
-        try:
+                    "continuation does not match the approved init request transition")
+        owner_session_id = request["owner_session_id"]
+        token = request["token"]
+        key = encode_receipt3_token_key(owner_session_id, token)
+        request_sha256 = hashlib.sha256(_quiet_canonical(request)).hexdigest()
+
+        def _do(conn: sqlite3.Connection) -> dict:
+            existing = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            if existing is not None:
+                stored_existing = json.loads(existing[0])
+                if stored_existing.get("request_sha256") != request_sha256:
+                    raise ValueError(
+                        "continuation token already committed with different bytes; refusing")
+                raise _QuietTokenReplay(_quiet_result_from_record(stored_existing))
+            # oldraw / protected-head CAS: the owner row must exist; a stored head
+            # must match the old coordinates exactly; absent = first receipt.
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (owner_session_id,)).fetchone()
+            if row is None:
+                raise ValueError(
+                    "continuation owner session is not part of this settled store")
+            head = _quiet_protected_head(row[0])
+            if head is not None:
+                if (head.get("owner_session_id") != owner_session_id
+                        or head.get("active_epoch") != request["old_epoch"]
+                        or head.get("generation") != request["old_generation"]
+                        or head.get("head_sha256") != request["old_head_sha256"]
+                        or hashlib.sha256(_quiet_canonical(head)).hexdigest()
+                        != request["old_head_token_sha256"]):
+                    raise ValueError(
+                        "continuation does not match the stored protected head (oldraw CAS)")
+            operation_generation = request["old_generation"] + 1
+            operation_sha256 = hashlib.sha256(_quiet_canonical(
+                {"kind": "epoch_continuation", "request_sha256": request_sha256,
+                 "new_epoch": request["new_epoch"],
+                 "old_generation": request["old_generation"]})).hexdigest()
+            result = {"token": token, "operation_sha256": operation_sha256,
+                      "generation": operation_generation}
+            record = {"owner_session_id": owner_session_id, "operation_id": token,
+                      "request_sha256": request_sha256,
+                      "operation_generation": operation_generation,
+                      "operation_sha256": operation_sha256,
+                      "result_sha256": hashlib.sha256(_quiet_canonical(result)).hexdigest()}
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?)",
                 (key, _quiet_canonical(record).decode("utf-8")))
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        self._write_count += 1
-        if self._write_count % QUIET_RECOVERY_FTS_DEFER_EVERY == 0:
-            self._fts_deferred_due = True
-        return result
+            return result
+
+        try:
+            return self._execute_write(_do)
+        except _QuietTokenReplay as replay:
+            return replay.result
 
     def close(self) -> None:
         if not self._closed:

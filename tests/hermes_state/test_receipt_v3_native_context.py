@@ -4,6 +4,9 @@ RED contract from docs/schema31-receipt-v2-design-r4-amendments.md section 4
 and the effective r4 machine spec (protocol.context_binding,
 record_shapes.operation_header.native_session_contexts):
 
+  * the kind must be one of the frozen r4 four
+    (inplace_compaction|compression_child|payload_repair|epoch_continuation);
+    an unknown kind is refused instead of silently projecting a single owner;
   * single owner -> exactly 1 context item, compression child -> exactly the
     owner+actor 2 items, sorted by session_id strict UTF-8 bytes;
   * each closed item is {session_id, native_binding_fields, lineage_markers,
@@ -12,6 +15,10 @@ record_shapes.operation_header.native_session_contexts):
     [source, SQL(v)]] read from the real sessions row and lineage_markers is
     [[_delegate_from, SQL(v|null)], [_branched_from, ...], [_reset_from, ...]]
     from the existing model_config projection (explicit null when absent);
+  * the projection is strict: duplicate raw config keys are refused and
+    damaged raw that mentions the protected ``_message_copy_receipts_`` family
+    is refused outright (a truncated head must never project as "no markers");
+    unreadable raw outside that family projects explicit nulls;
   * context_sha256 = H("native-session-context",
     {domain_sha256, native_binding_fields, lineage_markers});
   * the reader reconstructs the original four values from the typed preimage
@@ -83,8 +90,19 @@ def _set_markers(db, sid, **markers):
     db._conn.commit()
 
 
+def _set_raw_config(db, sid, raw):
+    db._conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (raw, sid))
+    db._conn.commit()
+
+
 def _four(row):
     return [row["id"], row["started_at"], row["parent_session_id"], row["source"]]
+
+
+def _observe(db, kind="inplace_compaction", owner="owner-01", actor="owner-01"):
+    return _m().observe_native_session_contexts(
+        db._conn, owner_session_id=owner, actor_session_id=actor,
+        kind=kind, domain_sha256=DOMAIN)
 
 
 def test_single_owner_context_is_one_typed_item(db):
@@ -199,3 +217,60 @@ def test_operation_sha256_is_order_independent_and_covers_every_field(db):
         mutated = dict(header)
         mutated[field] = value
         assert m.seal_operation_header(mutated)["operation_sha256"] != op_sha, field
+
+
+# ── kind whitelist and strict config projection (repair of M05/M06) ─────────
+
+def test_unknown_kinds_are_refused(db):
+    _seed_owner(db)
+    for kind in ("unknown_kind", "", 1, None):
+        with pytest.raises(ValueError):
+            _observe(db, kind=kind)
+
+
+def test_all_four_r4_kinds_are_accepted(db):
+    _seed_owner(db)
+    db.create_session("child-02", "cli", model="m")
+    for kind in ("inplace_compaction", "payload_repair", "epoch_continuation"):
+        contexts = _observe(db, kind=kind)
+        assert [c["session_id"] for c in contexts] == ["owner-01"]
+    contexts = _observe(db, kind="compression_child", actor="child-02")
+    assert [c["session_id"] for c in contexts] == sorted(
+        ["owner-01", "child-02"], key=lambda s: s.encode("utf-8"))
+
+
+def test_duplicate_raw_config_keys_are_refused(db):
+    _seed_owner(db)
+    _set_raw_config(db, "owner-01", '{"_delegate_from": "a", "_delegate_from": "b"}')
+    with pytest.raises(ValueError):
+        _observe(db)
+
+
+def test_damaged_raw_concealing_the_protected_family_is_refused(db):
+    _seed_owner(db)
+    _set_raw_config(
+        db, "owner-01",
+        '{"_message_copy_receipts_v2": {"schema_version": "hermes-message-copy')
+    with pytest.raises(ValueError):
+        _observe(db)
+
+
+def test_damaged_raw_outside_the_family_projects_explicit_nulls(db):
+    _seed_owner(db)
+    _set_raw_config(db, "owner-01", "not json {")
+    m = _m()
+    item = _observe(db)[0]
+    assert [m.sql_value_decode(value) for _, value in item["lineage_markers"]] == [None, None, None]
+    # The rest of the closed item is still fully typed and readable.
+    assert [name for name, _ in item["native_binding_fields"]] == [
+        "id", "started_at", "parent_session_id", "source"]
+
+
+def test_valid_raw_with_the_protected_family_still_projects_markers(db):
+    _seed_owner(db)
+    _set_raw_config(db, "owner-01", json.dumps(
+        {"_message_copy_receipts_v2": {"generation": 1}, "_delegate_from": "x"}))
+    m = _m()
+    item = _observe(db)[0]
+    markers = {name: m.sql_value_decode(value) for name, value in item["lineage_markers"]}
+    assert markers == {"_delegate_from": "x", "_branched_from": None, "_reset_from": None}

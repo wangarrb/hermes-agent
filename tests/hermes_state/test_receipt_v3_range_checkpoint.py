@@ -13,6 +13,10 @@ record_shapes.epoch_range_checkpoint):
     generation ``s0`` of that epoch (not global ``g%1024``); a full block seals
     with its last operation, a non-empty partial tail seals only on epoch exit,
     an empty range is never created;
+  * member operation headers must carry every consumed field and agree with
+    the checkpoint coordinate (owner_session_id/epoch/epoch_ordinal); a
+    missing or inconsistent header is the canonical ValueError, never a
+    KeyError;
   * ``range_root_sha256`` uses the frozen B framing over the checkpoint
     coordinate followed by every member header/page C bytes in order,
     recomputed independently here;
@@ -178,11 +182,12 @@ def test_checkpoint_body_rejects_missing_field():
         m.validate_epoch_range_checkpoint(body)
 
 
-def _member(generation: int, *, epoch: str = EPOCH, pages: int = 1, prev: str | None = None):
+def _member(generation: int, *, epoch: str = EPOCH, ordinal: int = 1, pages: int = 1,
+            prev: str | None = None):
     """One synthetic sealed member: an operation header plus its ordered pages."""
     header = {"schema_version": "hermes-receipt-operation/3", "domain_sha256": "d" * 64,
               "owner_session_id": SID, "actor_session_id": SID, "epoch": epoch,
-              "epoch_ordinal": 1, "generation": generation,
+              "epoch_ordinal": ordinal, "generation": generation,
               "operation_id": "00000000-0000-4000-8000-" + f"{generation:012d}",
               "request_sha256": hashlib.sha256(f"req-{generation}".encode()).hexdigest(),
               "previous_head_sha256": prev,
@@ -196,7 +201,7 @@ def _member(generation: int, *, epoch: str = EPOCH, pages: int = 1, prev: str | 
 def test_chunking_uses_epoch_local_s0_and_sealing_rules():
     m = _m()
     s0 = 2058
-    block = [_member(g) for g in range(s0, s0 + 1024)]
+    block = [_member(g, ordinal=3) for g in range(s0, s0 + 1024)]
     key, body = m.build_epoch_range_checkpoint(
         owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3, s0=s0,
         members=block, epoch_exit=False)
@@ -209,7 +214,7 @@ def test_chunking_uses_epoch_local_s0_and_sealing_rules():
     assert body["page_count"] == 1024
 
     # Second full block of the same epoch: s0+1024*k alignment, distinct key.
-    block2 = [_member(g) for g in range(s0 + 1024, s0 + 2048)]
+    block2 = [_member(g, ordinal=3) for g in range(s0 + 1024, s0 + 2048)]
     key2, body2 = m.build_epoch_range_checkpoint(
         owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3, s0=s0,
         members=block2, epoch_exit=False)
@@ -220,11 +225,11 @@ def test_chunking_uses_epoch_local_s0_and_sealing_rules():
     with pytest.raises(ValueError):
         m.build_epoch_range_checkpoint(
             owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3, s0=s0,
-            members=[_member(g) for g in range(s0, s0 + 10)], epoch_exit=False)
+            members=[_member(g, ordinal=3) for g in range(s0, s0 + 10)], epoch_exit=False)
     # Epoch exit seals exactly one non-empty partial tail.
     key3, body3 = m.build_epoch_range_checkpoint(
         owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3, s0=s0,
-        members=[_member(g) for g in range(s0, s0 + 10)], epoch_exit=True)
+        members=[_member(g, ordinal=3) for g in range(s0, s0 + 10)], epoch_exit=True)
     assert (key3, body3["operation_count"]) == (f"receipt3/e/{sid_hex(SID)}/{enc(3)}/{enc(2058)}", 10)
     # No empty range, no start that is not s0+1024*k, no epoch crossing.
     with pytest.raises(ValueError):
@@ -232,10 +237,10 @@ def test_chunking_uses_epoch_local_s0_and_sealing_rules():
                                        s0=s0, members=[], epoch_exit=True)
     with pytest.raises(ValueError):
         m.build_epoch_range_checkpoint(owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3,
-                                       s0=s0, members=[_member(g) for g in range(s0 + 1, s0 + 11)],
+                                       s0=s0, members=[_member(g, ordinal=3) for g in range(s0 + 1, s0 + 11)],
                                        epoch_exit=True)
     other_epoch = "sqlite:" + "b" * 64
-    crossing = [_member(s0), _member(s0 + 1, epoch=other_epoch)]
+    crossing = [_member(s0, ordinal=3), _member(s0 + 1, epoch=other_epoch, ordinal=3)]
     with pytest.raises(ValueError):
         m.build_epoch_range_checkpoint(owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3,
                                        s0=s0, members=crossing, epoch_exit=True)
@@ -243,7 +248,39 @@ def test_chunking_uses_epoch_local_s0_and_sealing_rules():
     with pytest.raises(ValueError):
         m.build_epoch_range_checkpoint(
             owner_session_id=SID, epoch=EPOCH, epoch_ordinal=3, s0=s0,
-            members=[_member(g) for g in range(s0, s0 + 1025)], epoch_exit=False)
+            members=[_member(g, ordinal=3) for g in range(s0, s0 + 1025)], epoch_exit=False)
+
+
+def test_builder_rejects_inconsistent_or_incomplete_member_headers():
+    m = _m()
+    s0 = 1
+
+    def _block():
+        return [_member(g) for g in range(s0, s0 + 3)]
+
+    def _build(members):
+        return m.build_epoch_range_checkpoint(
+            owner_session_id=SID, epoch=EPOCH, epoch_ordinal=1, s0=s0,
+            members=members, epoch_exit=True)
+
+    # owner_session_id must agree with the checkpoint coordinate.
+    wrong_owner = _block()
+    wrong_owner[1]["header"]["owner_session_id"] = "other-01"
+    with pytest.raises(ValueError):
+        _build(wrong_owner)
+    # epoch_ordinal must agree with the checkpoint coordinate.
+    wrong_ordinal = _block()
+    wrong_ordinal[1]["header"]["epoch_ordinal"] = 2
+    with pytest.raises(ValueError):
+        _build(wrong_ordinal)
+    # Every consumed member-header field is required: the canonical ValueError,
+    # never a KeyError.
+    for missing in ("owner_session_id", "epoch", "epoch_ordinal", "generation",
+                    "page_count", "previous_head_sha256", "operation_sha256"):
+        incomplete = _block()
+        del incomplete[1]["header"][missing]
+        with pytest.raises(ValueError):
+            _build(incomplete)
 
 
 def test_range_root_uses_b_framing_independent_recompute():
