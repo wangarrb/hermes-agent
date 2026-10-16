@@ -1468,7 +1468,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     # Strip image parts for non-vision models on BOTH paths (registered
     # providers with profiles used to bypass it).
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
-        tools=tools_for_api, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
+        tools=tools_for_api, provider_name=agent.provider, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
         max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
@@ -1498,7 +1498,6 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
-        provider_name=agent.provider,
     )
 
 
