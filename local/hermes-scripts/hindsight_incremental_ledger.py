@@ -525,6 +525,47 @@ class IncrementalLedger:
                 raise LedgerIntegrityError('compaction successors readback mismatch')
             return reference
 
+    SCAN_FINGERPRINTS_SCHEMA = 'hindsight-incremental-scan-store/1'
+
+    def load_scan_fingerprints(self) -> dict | None:
+        """Incremental scan store sidecar; absent or invalid means a seed run.
+
+        The store only ever accelerates change detection; losing it costs one
+        full profile pass, never correctness.
+        """
+        path = self.bank_dir / 'scan-fingerprints.json'
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if (not isinstance(value, dict) or value.get('schema_version') != self.SCAN_FINGERPRINTS_SCHEMA
+                or value.get('bank') != self.bank or not isinstance(value.get('profiles'), dict)):
+            return None
+        return value['profiles']
+
+    def save_scan_fingerprints(self, profiles: dict) -> None:
+        """Atomic sidecar write of the per-source fingerprints."""
+        if not isinstance(profiles, dict):
+            raise ValueError('invalid scan fingerprints')
+        payload = {'schema_version': self.SCAN_FINGERPRINTS_SCHEMA, 'bank': self.bank,
+                   'profiles': profiles}
+        text = canonical_json(payload)
+        path = self.bank_dir / 'scan-fingerprints.json'
+        fd, name = tempfile.mkstemp(prefix='.scan-fp-', dir=str(self.bank_dir))
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(text)
+            os.chmod(name, 0o600)
+            os.replace(name, path)
+        except BaseException:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+            raise
+
     def initialization_manifest(self) -> dict:
         """Read-only audit of the non-success baseline/seed inventory."""
         with self._connection() as con:

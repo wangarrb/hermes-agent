@@ -444,23 +444,93 @@ def _discover_sources(home: Path, profile_mode: str) -> list[dict]:
 _NO_SOURCE_UNKNOWN_POLICY = object()
 
 
+def compute_scan_fingerprints(hermes_home, *, physical_baseline):
+    """Cheap per-source fingerprints for the incremental scan; never reads rows.
+
+    Per profile: the db file identity (dev, ino, size, mtime_ns) plus one
+    aggregate pass over the messages table (per-session max id and count) and
+    the sessions-table binding hash. Any failure yields an empty entry, which
+    the scan treats as changed (fail-safe: at most an extra profile read).
+    """
+    home = checked_path(Path(hermes_home))
+    fingerprints = {}
+    for profile in physical_baseline['profiles']:
+        db = Path(profile['state_db'])
+        entry = {'db': None, 'sessions': {}}
+        try:
+            st = db.stat()
+            entry['db'] = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
+            artifacts = {}
+            directory = Path(profile['sessions_dir'])
+            if directory.exists():
+                for path in directory.glob('session_*.json'):
+                    try:
+                        ast = path.stat()
+                        artifacts[str(path)] = [ast.st_size, ast.st_mtime_ns, ast.st_ino]
+                    except OSError:
+                        pass
+            entry['artifacts'] = artifacts
+            if db.exists():
+                con = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
+                con.row_factory = sqlite3.Row
+                try:
+                    con.execute('PRAGMA query_only=ON')
+                    con.execute('BEGIN')
+                    sessions = {}
+                    for record in con.execute(
+                            'SELECT session_id, MAX(id) AS max_id, COUNT(*) AS row_count '
+                            'FROM messages GROUP BY session_id'):
+                        sessions[record['session_id']] = [record['max_id'], record['row_count'], None]
+                    session_columns = {r[1] for r in con.execute('PRAGMA table_info(sessions)')}
+                    selected = 'id, started_at, parent_session_id, end_reason, source'
+                    if 'model_config' in session_columns:
+                        selected += ', model_config'
+                    for record in con.execute('SELECT ' + selected + ' FROM sessions'):
+                        row = dict(record)
+                        sid = row['id']
+                        binding = _native_session_binding(row)
+                        if sid in sessions:
+                            sessions[sid][2] = binding
+                        else:
+                            sessions[sid] = [0, 0, binding]
+                    entry['sessions'] = sessions
+                    con.rollback()
+                finally:
+                    con.close()
+        except (OSError, sqlite3.Error):
+            entry = {'db': None, 'sessions': {}, 'artifacts': {}}
+        fingerprints[profile['profile']] = entry
+    return fingerprints
+
+
 def scan_source_snapshots(hermes_home: Path, *, profile_mode: str = 'all',
                           physical_baseline: dict | None = None,
                           source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
                           source_transition_certificates: list | None = None,
                           approved_transition_sha256s: list | None = None,
-                          source_compaction_successors: dict | None = None) -> list[dict]:
-    """Read a finite source view, never infer historical completion or CDC."""
+                          source_compaction_successors: dict | None = None,
+                          scan_fingerprints: dict | None = None,
+                          scan_previous: dict | None = None) -> list[dict]:
+    """Read a finite source view, never infer historical completion or CDC.
+
+    ``scan_fingerprints`` (current) with ``scan_previous`` (last stored)
+    switches the physical scan to incremental mode: unchanged sources are
+    never read; changed sources keep the full strict path.
+    """
     if physical_baseline is not None:
         return _scan_physical_sources(hermes_home, profile_mode, physical_baseline,
                                       source_unknown_policy=source_unknown_policy,
                                       source_transition_certificates=source_transition_certificates,
                                       approved_transition_sha256s=approved_transition_sha256s,
-                                      source_compaction_successors=source_compaction_successors)
+                                      source_compaction_successors=source_compaction_successors,
+                                      scan_fingerprints=scan_fingerprints,
+                                      scan_previous=scan_previous)
     if source_transition_certificates is not None or approved_transition_sha256s is not None:
         raise ValueError('source transition requires original physical baseline')
     if source_compaction_successors is not None:
         raise ValueError('compaction successors require original physical baseline')
+    if scan_fingerprints is not None or scan_previous is not None:
+        raise ValueError('scan fingerprints require original physical baseline')
     if source_unknown_policy is not _NO_SOURCE_UNKNOWN_POLICY:
         raise ValueError('source unknown policy requires original physical baseline')
     home = checked_path(Path(hermes_home))
@@ -797,8 +867,12 @@ def inspect_sqlite_transition_header(path: Path):
     return header
 
 
-def _read_physical_db(path: Path, *, consume=None, include_structure=False):
-    """Stream all roles in one mode=ro/query_only snapshot; never SessionDB."""
+def _read_physical_db(path: Path, *, consume=None, include_structure=False, row_filter=None):
+    """Stream all roles in one mode=ro/query_only snapshot; never SessionDB.
+
+    ``row_filter`` (a set of session ids) streams only those sessions' rows —
+    the incremental scan's changed closure. None streams everything.
+    """
     identity = _location_identity(path)
     for suffix in ('-wal', '-shm', '-journal'):
         checked_path(Path(str(path) + suffix))
@@ -834,7 +908,14 @@ def _read_physical_db(path: Path, *, consume=None, include_structure=False):
             if consume is not None:
                 consume(None, sessions, {**header, 'copy_roots': copy_roots,
                         'copy_sources': copy_sources, 'copy_receipts_sha256': receipt_hash})
-            for record in con.execute('SELECT * FROM messages ORDER BY id'):
+            if row_filter is None:
+                rows_cursor = con.execute('SELECT * FROM messages ORDER BY id')
+            else:
+                chunk = sorted(str(sid) for sid in row_filter)
+                rows_cursor = con.execute(
+                    'SELECT * FROM messages WHERE session_id IN ('
+                    + ','.join('?' for _ in chunk) + ') ORDER BY id', chunk)
+            for record in rows_cursor:
                 row = dict(record)
                 if consume is None:
                     header['rows'].append(_physical_record(row, sqlite_row=True))
@@ -1237,11 +1318,13 @@ def _profile_anchors(profile):
     return sids
 
 
-def _physical_snapshots(profile, views=None, *, fence_hash=None):
+def _physical_snapshots(profile, views=None, *, fence_hash=None, only_sids=None, extra_scope_sids=()):
     views = {} if views is None else views
     anchors = _profile_anchors(profile)
     keys = {sid: f"{profile['profile']}:cutover-session:{sid}" for sid in anchors}
     keys.update({sid: f"{profile['profile']}:hermes:{sid}" for sid in views if sid not in anchors})
+    for sid in extra_scope_sids:
+        keys.setdefault(sid, f"{profile['profile']}:hermes:{sid}")
     if not anchors:
         keys[None] = f"{profile['profile']}:physical:empty"
     scope = sorted(keys.values())
@@ -1250,6 +1333,8 @@ def _physical_snapshots(profile, views=None, *, fence_hash=None):
     fence = digest(profile) if fence_hash is None else fence_hash
     snapshots = []
     for sid, key in sorted(keys.items(), key=lambda item: item[1]):
+        if only_sids is not None and sid not in only_sids:
+            continue
         snapshot = {'source_key': key, 'source_epoch': profile['feed_epoch'],
             'epoch_scope': f"{profile['profile']}:physical-feed", 'scope_source_keys': scope,
             'profile': profile['profile'], 'kind': 'source', 'cleaning_version': CLEANING_VERSION,
@@ -1345,7 +1430,7 @@ def _exclude_old_copy(record, sid, old_index, evidence, *, cutover_anchors,
 
 
 def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, header_transition=None,
-                           approved_successors=None):
+                           approved_successors=None, dirty_sessions=None, extra_scope_sids=()):
     directory, db = Path(profile['sessions_dir']), Path(profile['state_db'])
     if profile['directory_identity'] is not None:
         if _location_identity(directory, directory=True) != profile['directory_identity']:
@@ -1404,6 +1489,27 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
     expected_unknown = {r['id']: r for r in unknown_rows}
     copy_roots, copy_sources = {}, set()
     evidence = _physical_lineage({}, lineage_artifacts, anchors)
+    # Incremental mode: close the dirty set over cutover roots so every
+    # affected root's snapshot keeps its complete member event set. Unknown
+    # or broken lineage over-includes (fail-safe: at most extra reads).
+    closure = None
+    if dirty_sessions is not None:
+        closure = set(dirty_sessions)
+        affected = set()
+        for sid in dirty_sessions:
+            try:
+                affected.add(_cutover_root(sid, evidence, anchors))
+            except SourceChangedError:
+                affected.add(sid)
+        for sid in set(evidence):
+            if sid in closure:
+                continue
+            try:
+                if _cutover_root(sid, evidence, anchors) in affected:
+                    closure.add(sid)
+            except SourceChangedError:
+                closure.add(sid)
+        closure = frozenset(closure)
 
     def check_origin(record, sid):
         for old_sid, old in old_origins.get(record['origin_hash'], []) if record['origin_hash'] else ():
@@ -1502,12 +1608,16 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
         if not old_db:
             raise SourceChangedError('source_changed: new SQLite feed needs explicit epoch binding')
         if header_transition is None:
-            _read_physical_db(db, consume=consume)
+            _read_physical_db(db, consume=consume, row_filter=closure)
         else:
-            _read_physical_db(db, consume=consume, include_structure=True)
-    if seen_old != set(expected_rows):
+            _read_physical_db(db, consume=consume, include_structure=True, row_filter=closure)
+    expected_dirty = expected_rows if closure is None else {
+        rid: record for rid, record in expected_rows.items() if record['session_id'] in closure}
+    if seen_old != set(expected_dirty):
         raise SourceChangedError('source_changed: legacy SQLite row coverage lost')
-    if seen_unknown != set(expected_unknown):
+    expected_unknown_dirty = expected_unknown if closure is None else {
+        rid: record for rid, record in expected_unknown.items() if record['session_id'] in closure}
+    if seen_unknown != set(expected_unknown_dirty):
         raise SourceChangedError('source_changed: approved unknown SQLite row coverage lost')
     for sid, data, current, records in artifacts:
         messages = data['messages']
@@ -1541,13 +1651,15 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
     if policy_hash is not None:
         fence = digest({'source': fence, 'source_unknown_policy': policy_hash,
                         'unknown_rows': list(unknown_rows)})
-    return _physical_snapshots(profile, views, fence_hash=fence)
+    return _physical_snapshots(profile, views, fence_hash=fence, only_sids=closure,
+                               extra_scope_sids=extra_scope_sids)
 
 
 def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                            source_unknown_policy=_NO_SOURCE_UNKNOWN_POLICY,
                            source_transition_certificates=None, approved_transition_sha256s=None,
-                           source_compaction_successors=None):
+                           source_compaction_successors=None,
+                           scan_fingerprints=None, scan_previous=None):
     home = checked_path(Path(hermes_home))
     if not isinstance(baseline, dict):
         raise ValueError('invalid physical baseline header')
@@ -1576,10 +1688,36 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
     old_profiles = {p['profile']: p for p in baseline['profiles']}
     if not set(old_profiles) <= set(current):
         raise SourceChangedError('source_changed: legacy profile coverage lost')
-    result = [snapshot for profile in baseline['profiles'] for snapshot in _scan_physical_profile(
-        profile, home, unknown_rows=unknown_rows[profile['profile']], policy_hash=policy_hash,
-        header_transition=certs_by_profile.get(profile['profile']),
-        approved_successors=successors_by_profile.get(profile['profile'], {}))]
+    incremental = scan_fingerprints is not None
+    result = []
+    for profile in baseline['profiles']:
+        name = profile['profile']
+        dirty_sessions = None
+        extra_scope_sids = ()
+        if incremental:
+            current_fp = scan_fingerprints.get(name)
+            previous_fp = (scan_previous or {}).get(name)
+            artifacts_unchanged = (current_fp is not None and previous_fp is not None
+                                   and current_fp.get('artifacts') == previous_fp.get('artifacts'))
+            if previous_fp is None or current_fp is None or current_fp.get('db') is None:
+                dirty_sessions = None  # seed/fail-safe: full profile read
+            elif current_fp['db'] == previous_fp.get('db'):
+                if artifacts_unchanged:
+                    continue  # db and JSON views both unchanged: no read at all
+                dirty_sessions = None  # JSON view changed: full profile read
+            elif not artifacts_unchanged:
+                dirty_sessions = None  # JSON view changed: full profile read
+            else:
+                dirty = sorted(sid for sid, fp in current_fp['sessions'].items()
+                               if previous_fp['sessions'].get(sid) != fp)
+                if not dirty:
+                    continue  # nothing changed
+                dirty_sessions = dirty
+                extra_scope_sids = tuple(previous_fp.get('scope_sids') or ())
+        result.extend(_scan_physical_profile(profile, home, unknown_rows=unknown_rows[name],
+            policy_hash=policy_hash, header_transition=certs_by_profile.get(name),
+            approved_successors=successors_by_profile.get(name, {}),
+            dirty_sessions=dirty_sessions, extra_scope_sids=extra_scope_sids))
     for name in sorted(set(current) - set(old_profiles)):
         # A genuinely new profile is strict, not silently turned into legacy.
         profile_home = Path(current[name]['state_db']).parent

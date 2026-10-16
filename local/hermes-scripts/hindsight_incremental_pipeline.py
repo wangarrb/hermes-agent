@@ -236,7 +236,24 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                             'profiles': sorted(str(certificate.get('profile', 'unknown'))
                                                for certificate in source_transition_certificates
                                                if isinstance(certificate, dict))}
+                scan_mode = knobs.get('scan_mode', 'incremental')
+                scan_fingerprints = None
+                if scan_mode not in {'incremental', 'full'}:
+                    raise ValueError('invalid scan_mode')
+                if scan_mode == 'incremental' and 'physical_baseline' in reader_options:
+                    from hindsight_incremental_sources import compute_scan_fingerprints
+                    scan_fingerprints = compute_scan_fingerprints(
+                        Path(config['hermes_home']),
+                        physical_baseline=reader_options['physical_baseline'])
+                    reader_options['scan_fingerprints'] = scan_fingerprints
+                    reader_options['scan_previous'] = ledger.load_scan_fingerprints()
                 snapshots = source_reader(Path(config['hermes_home']), **reader_options)
+                if scan_fingerprints is not None:
+                    for entry in scan_fingerprints.values():
+                        entry['scope_sids'] = sorted(entry['sessions'].keys())
+                    ledger.save_scan_fingerprints(scan_fingerprints)
+                report['scan_mode'] = scan_mode
+                report['profiles_with_output'] = sorted({s['profile'] for s in snapshots})
             if not execute:
                 pending = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
                 report.update(status='plan', captured_pending_units=len(pending),
@@ -729,6 +746,8 @@ def main(argv=None):
         help='reviewed SQLite header transition certificate JSON file (repeatable)')
     parser.add_argument('--approved-transition-sha256', action='append', default=None,
         help='independently pinned canonical certificate digest (repeatable)')
+    parser.add_argument('--full-scan', action='store_true',
+        help='force the legacy full source scan (diagnostic; the default is incremental)')
     args = parser.parse_args(argv)
     config = load_config(args.config, require_exists=True)
     if args.bank is not None:
@@ -741,6 +760,8 @@ def main(argv=None):
         config['incremental']['include_wiki'] = True
     if args.resume_only:
         config['incremental']['resume_only'] = True
+    if args.full_scan:
+        config['incremental']['scan_mode'] = 'full'
     for value, key, ceiling in [(args.max_units, 'max_pending_units', MAX_PENDING_UNITS_CEILING),
                                  (args.max_chars, 'max_pending_chars', MAX_PENDING_CHARS_CEILING)]:
         if value is not None:
