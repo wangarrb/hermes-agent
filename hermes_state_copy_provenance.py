@@ -29,18 +29,31 @@ the ``receipt3/`` protected namespace in the SessionDB store:
   * the strict model_config marker projection: duplicate raw config keys are
     refused (never last-wins) and damaged raw that mentions the protected
     ``_message_copy_receipts_`` family is refused outright; unreadable raw
-    outside that family projects explicit NULLs.
+    outside that family projects explicit NULLs;
+  * the C02 step 6 acceptance machinery (receipt r4 ``protocol.recovery``):
+    the identity-aware durable-table joint (``joint_formula`` /
+    ``identity_modes``) over EVERY table including ``sqlite_schema``, FTS
+    virtual tables and all shadows, the exact identity-aware inverse-delta
+    verification against the original old latest, the independent read-only
+    copy comparison (steps 2/3) and the frozen proof/roster (step 3);
+  * the ``receipt3/r/<birth_epoch64hex>/<rowid20>`` row-state index codec
+    (``protocol.storage`` namespace), its strict body shape, its reader-side
+    derivation (``read_row_state_index``) and the identity-preserving
+    same-transaction upsert (``writer_timeline[4]``: never INSERT OR REPLACE).
 
 Only the native writer (inside its own ``_execute_write`` transaction) may call
 the builder; the generic ``SessionDB.set_meta``/``list_meta_prefix`` surfaces
-refuse the reserved namespace.
+refuse the reserved namespace. The joint/inverse/proof readers open their own
+independent ``mode=ro``/``query_only`` connections and never write.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import sqlite3
 import uuid
+from pathlib import Path
 from typing import NoReturn
 
 # Frozen codec primitives (design r2 "codec"; unchanged by r3/r4).
@@ -1364,3 +1377,801 @@ def read_partial_recovery_state(conn, owner_session_id: str, *,
         for block in _read_range_blocks(conn, owner_session_id, epoch_ordinal):
             _replay_block(block, by_generation, owner_session_id, epoch_ordinal)
     return committed
+
+
+# ── receipt3/r row-state index (r4 protocol.storage / record_shapes) ─────────
+
+_RECEIPT3_ROW_PREFIX = "receipt3/r/"
+
+_ROW_INDEX_KEYS = frozenset({"row_ref", "latest_state", "event"})
+_PAYLOAD_STATE_KEYS = frozenset({"row_ref", "columns", "payload_sha256", "feed_input_sha256"})
+_PAYLOAD_STATE_COLUMN_COUNT = 20
+
+
+def encode_receipt3_row_index_key(birth_epoch: str, row_id: int) -> str:
+    """``receipt3/r/<birth_epoch64hex>/<rowid20>`` -- the mutable row-state index.
+
+    The epoch component is the 64 hex characters without the ``sqlite:``
+    prefix (the same routing-reversible convention as the SID component); the
+    row component is the actual ROWID in the same 20-digit encoding as ``G``.
+    """
+    _epoch_string(birth_epoch)
+    row_id = _positive_int64(row_id)
+    return f"{_RECEIPT3_ROW_PREFIX}{birth_epoch.split(':', 1)[1]}/{_int20(row_id)}"
+
+
+def parse_receipt3_row_index_key(key: str) -> dict:
+    """Parse an exact receipt3/r key; non-canonical forms are refused."""
+    if type(key) is not str:
+        _invalid()
+    parts = key.split("/")
+    if len(parts) != 4 or parts[0] != "receipt3" or parts[1] != "r":
+        _invalid()
+    suffix = parts[2]
+    if type(suffix) is not str or not _HEX.fullmatch(suffix):
+        _invalid()
+    return {"birth_epoch": "sqlite:" + suffix, "row_id": _decode_int20(parts[3])}
+
+
+def _validate_payload_state(state) -> None:
+    """Exact shape of one payload_state (record_shapes.payload_state): the
+    ordered 20-column digest list plus P and the raw-floor Q hash."""
+    if type(state) is not dict or set(state) != _PAYLOAD_STATE_KEYS:
+        _invalid()
+    _validate_row_ref(state["row_ref"])
+    columns = state["columns"]
+    if type(columns) is not list or len(columns) != _PAYLOAD_STATE_COLUMN_COUNT:
+        _invalid()
+    names = []
+    for column in columns:
+        if (type(column) is not list or len(column) != 2
+                or type(column[0]) is not str or not column[0]):
+            _invalid()
+        _sha256_hex(column[1])
+        names.append(column[0])
+    if len(set(names)) != _PAYLOAD_STATE_COLUMN_COUNT:
+        _invalid()   # the manifest is exactly 20 distinct columns, never a repeat
+    _sha256_hex(state["payload_sha256"])
+    _sha256_hex(state["feed_input_sha256"])
+
+
+def validate_row_state_index_entry(entry) -> None:
+    """Exact shape of one receipt3/r row-state index body (record_shapes.row_index).
+
+    The event is either the committed member coordinate ``[owner, generation,
+    page, item]`` or an exact activation anchor reference; the payload state
+    must describe the same row the entry does.
+    """
+    if type(entry) is not dict or set(entry) != _ROW_INDEX_KEYS:
+        _invalid()
+    _validate_row_ref(entry["row_ref"])
+    _validate_payload_state(entry["latest_state"])
+    event = entry["event"]
+    if type(event) is list:
+        if len(event) != 4:
+            _invalid()
+        owner, generation, page, index = event
+        if type(owner) is not str or not owner:
+            _invalid()
+        _positive_int64(generation)
+        if type(page) is not int or not 0 <= page <= _MAX_INT64:
+            _invalid()
+        if type(index) is not int or not 0 <= index <= _MAX_INT64:
+            _invalid()
+    elif type(event) is dict:
+        if set(event) != {"activation_proof_sha256", "context_session_id"}:
+            _invalid()
+        _sha256_hex(event["activation_proof_sha256"])
+        if type(event["context_session_id"]) is not str or not event["context_session_id"]:
+            _invalid()
+    else:
+        _invalid()
+    if entry["latest_state"]["row_ref"] != entry["row_ref"]:
+        _invalid()   # the payload state must describe the indexed row itself
+
+
+def _owner_member_row_ref_events(members: list) -> dict:
+    """Derive the per-row latest committed item event from stored member bytes.
+
+    One entry per distinct row named by a committed ``native_result`` item of
+    this owner (the item's row must belong to the operating owner); the event
+    is that row's latest coordinate, ranked by (epoch_ordinal, generation,
+    page_ordinal, item_ordinal).
+    """
+    derived = {}
+    for member in members:
+        header = member["header"]
+        for page in member["pages"]:
+            for index, item in enumerate(page["items"]):
+                if item["kind"] != "native_result" or item["row_ref"] is None:
+                    continue
+                ref = item["row_ref"]
+                if ref["owner_session_id"] != header["owner_session_id"]:
+                    _invalid()   # a result row belongs to the operating owner
+                key = encode_receipt3_row_index_key(ref["birth_epoch"], ref["row_id"])
+                rank = (header["epoch_ordinal"], header["generation"],
+                        page["page_ordinal"], index)
+                event = [header["owner_session_id"], header["generation"],
+                         page["page_ordinal"], index]
+                if key not in derived or rank > derived[key]["rank"]:
+                    derived[key] = {"rank": rank, "row_ref": ref, "event": event}
+    return derived
+
+
+def read_row_state_index(conn, owner_session_id: str) -> list[dict]:
+    """Reader-side derivation of one owner's ``receipt3/r`` row-state inventory.
+
+    The index is a rebuildable accelerator that points to the exact latest
+    committed item for a row and is NEVER acceptance evidence by itself. Every
+    stored entry must parse canonically, carry the full row_ref/latest_state/
+    event shape, describe exactly the row its key names, and equal the
+    inventory derived here from the stored journal bytes. A missing entry, an
+    orphaned entry, a non-canonical key or a non-canonical/damaged body
+    refuses. The ``receipt3/r`` namespace carries no owner component, so
+    entries are attributed by the owner inside their own body: another owner's
+    entry is still held to the full canonical shape but is not part of this
+    owner's inventory (its own request/inverse judges it). The P/V/Q values
+    themselves are recomputed by the standalone reader's copy-observation
+    machinery, which is a separate surface from this inventory derivation.
+    """
+    if type(owner_session_id) is not str or not owner_session_id:
+        _invalid()
+    derived = _owner_member_row_ref_events(read_journal_members(conn, owner_session_id))
+    lo = _RECEIPT3_ROW_PREFIX
+    hi = lo[:-1] + "0"
+    stored = {}
+    last = lo
+    while True:
+        rows = conn.execute(
+            "SELECT key, value FROM state_meta WHERE key > ? AND key < ? ORDER BY key LIMIT ?",
+            (last, hi, 128)).fetchall()
+        if not rows:
+            break
+        for key, _value in rows:
+            last = key
+            parse_receipt3_row_index_key(key)
+            entry, _raw = _read_canonical(conn, key)
+            validate_row_state_index_entry(entry)
+            if encode_receipt3_row_index_key(entry["row_ref"]["birth_epoch"],
+                                             entry["row_ref"]["row_id"]) != key:
+                _invalid()   # strict key/body coordinate equality
+            if entry["row_ref"]["owner_session_id"] != owner_session_id:
+                continue     # validated, but another owner's slice: not this inventory
+            stored[key] = entry
+    if set(stored) != set(derived):
+        _invalid()   # exact inventory: no orphan entry, no missing entry
+    result = []
+    for key in sorted(derived):
+        entry = stored[key]
+        expected = derived[key]
+        if entry["row_ref"] != expected["row_ref"] or entry["event"] != expected["event"]:
+            _invalid()   # the index must point to the exact latest committed item
+        result.append({"key": key, "row_ref": entry["row_ref"],
+                       "latest_state": entry["latest_state"], "event": entry["event"]})
+    return result
+
+
+def upsert_receipt3_row_index_tx(conn, entry: dict) -> str:
+    """Writer-side identity-preserving upsert of one receipt3/r index entry.
+
+    Caller holds the transaction (same-tx rule, ``writer_timeline[4]``). A new
+    row inserts under the immutable key; an existing row is refreshed ONLY
+    with an in-place UPDATE -- the actual ROWID of the stored index row is
+    never swapped (no INSERT OR REPLACE) -- and the stored event must not
+    regress (the index points to the exact latest committed item). Returns the
+    immutable key. An anchor-event refresh is refused in this revision.
+    """
+    validate_row_state_index_entry(entry)
+    ref = entry["row_ref"]
+    key = encode_receipt3_row_index_key(ref["birth_epoch"], ref["row_id"])
+    body = C(entry).decode("utf-8")
+    existing = conn.execute(
+        "SELECT rowid, value FROM state_meta WHERE key = ?", (key,)).fetchone()
+    if existing is None:
+        conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)", (key, body))
+        return key
+    previous, _raw = _read_canonical(conn, key)
+    validate_row_state_index_entry(previous)
+    if previous["row_ref"] != ref:
+        _invalid()
+    if type(entry["event"]) is not list or type(previous["event"]) is not list:
+        _invalid()   # anchor-event refreshes are a separate approval surface
+    old_rank = (previous["event"][1], previous["event"][2], previous["event"][3])
+    new_rank = (entry["event"][1], entry["event"][2], entry["event"][3])
+    if new_rank <= old_rank:
+        _invalid()   # the index only advances, never regresses or repeats
+    conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (body, key))
+    identity = conn.execute("SELECT rowid FROM state_meta WHERE key = ?", (key,)).fetchone()[0]
+    if identity != existing[0]:
+        _invalid()   # an in-place refresh must keep the actual ROWID
+    return key
+
+
+# ── C02 step 6 (r4): durable-table joint + identity-aware inverse deltas ────
+#
+# protocol.recovery.joint_formula / identity_modes: the step 6 acceptance is a
+# byte-exact identity-aware joint over EVERY durable table. J(row) =
+# C([I(row), [[c, SQL(row[c])] for c in cols_T]]) with the stored column
+# manifest in declaration order and SQL() the exact typed value tag; the
+# COMPLETE J byte strings are sorted (duplicates and multiplicity kept) and
+# length-framed as B("joint-table", [C({table, columns, identity_mode,
+# table_structure_sha256}), *sorted_J]); the row count is bound separately.
+# The identity I(row) is the actual engine identity: the unshadowed
+# rowid/_rowid_/oid for ordinary rowid tables (for a declared INTEGER PRIMARY
+# KEY alias both the actual ROWID and the id column are included and must
+# agree), ALL PK components in declared PK ordinal for WITHOUT ROWID tables,
+# and the actual virtual rowid for pinned FTS5 virtual tables. A table whose
+# three rowid aliases are all shadowed is refused instead of assuming its PK
+# is the rowid. ``sqlite_schema`` is enumerated as its own structural
+# inventory table (table/index/trigger/view definitions plus their actual row
+# identity) and every FTS shadow table rides the same rules.
+
+_JOINT_TABLE_LABEL = "joint-table"
+_JOINT_STRUCTURE_LABEL = "joint-table-structure"
+_JOINT_FULL_LABEL = "full-table-joint"
+_REVERSAL_LABEL = "quiet-recovery-reversal"
+_RECOVERY_PROOF_LABEL = "quiet-recovery-proof"
+_RECOVERY_ROSTER_LABEL = "quiet-recovery-roster"
+
+_ROWID_ALIASES = ("rowid", "_rowid_", "oid")
+_SQLITE_SCHEMA_DDL = ("CREATE TABLE sqlite_schema(type text,name text,tbl_name text,"
+                      "rootpage integer,sql text)")
+_ALIAS_IDENTITY_MODE = "messages_INTEGER_PRIMARY_KEY_ALIAS"
+
+
+def _open_read_only(path) -> sqlite3.Connection:
+    """One independent mode=ro / query_only connection (never creates a file)."""
+    conn = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _joint_spec(conn, table: str) -> dict:
+    """One durable table's binding: stored column manifest (declaration order),
+    actual identity mode, rowid alias/PK coordinates and structure digest."""
+    row = None
+    xinfo = []
+    if table == "sqlite_schema":
+        manifest = [[0, "type", "TEXT", 0, None, 0], [1, "name", "TEXT", 0, None, 0],
+                    [2, "tbl_name", "TEXT", 0, None, 0], [3, "rootpage", "INT", 0, None, 0],
+                    [4, "sql", "TEXT", 0, None, 0]]
+    else:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (table,)).fetchone()
+        if row is None or type(row[0]) is not str or not row[0]:
+            _invalid()
+        lower = row[0].lower()
+        if re.match(r"\s*create\s+virtual\s+table", lower) and "using fts5" not in lower:
+            _invalid()   # only the pinned FTS5 module is bound; unknown modules refuse
+        xinfo = [tuple(entry) for entry in conn.execute(
+            f"PRAGMA table_xinfo({_quote_identifier(table)})")]
+        for (_cid, _name, _decl, _notnull, _dflt, _pk, hidden) in xinfo:
+            if hidden not in (0, 1):
+                _invalid()   # generated columns are not in this revision
+        manifest = [list(entry[:6]) for entry in xinfo if entry[6] == 0]
+        if not manifest:
+            _invalid()
+    columns = [entry[1] for entry in manifest]
+    if table == "sqlite_schema":
+        sql_text = _SQLITE_SCHEMA_DDL
+    else:
+        if row is None:
+            _invalid()
+        sql_text = row[0]
+    declared_names = [entry[1] for entry in manifest]
+    without_rowid = bool(re.search(r"without\s+rowid", sql_text.lower()))
+    fts_virtual = "using fts5" in sql_text.lower()
+    pk_columns = [entry[1] for entry in sorted(
+        (entry for entry in manifest if entry[5] > 0), key=lambda entry: entry[5])]
+    rowid_alias = None
+    identity_mode = None
+    declared_all = (declared_names if table == "sqlite_schema"
+                    else [entry[1] for entry in xinfo])
+    for candidate in _ROWID_ALIASES:
+        if candidate not in declared_all:
+            rowid_alias = candidate
+            break
+    if fts_virtual:
+        # The pinned FTS5 vtab exposes the actual virtual rowid through the
+        # ordinary engine names; the declared visible columns are the manifest.
+        identity_mode = "FTS_virtual"
+        if rowid_alias is None:
+            _invalid()   # all three engine rowid aliases are shadowed
+    elif without_rowid:
+        if not pk_columns:
+            _invalid()   # a WITHOUT ROWID table without a PK is never bound
+        identity_mode = "WITHOUT_ROWID"
+    else:
+        if rowid_alias is None:
+            _invalid()   # all three rowid aliases are shadowed; never assume the PK
+        if len(pk_columns) == 1:
+            decl = next(entry[2] for entry in manifest if entry[1] == pk_columns[0])
+            if type(decl) is str and decl.strip().upper() == "INTEGER":
+                identity_mode = _ALIAS_IDENTITY_MODE
+        if identity_mode is None:
+            identity_mode = "ordinary_rowid_nonalias"
+    if identity_mode is None:
+        _invalid()
+    structure_sha256 = H(_JOINT_STRUCTURE_LABEL, {
+        "table": table, "sql": sql_text, "columns": manifest,
+        "without_rowid": without_rowid, "fts_virtual": fts_virtual})
+    return {"table": table, "columns": columns, "identity_mode": identity_mode,
+            "pk_columns": pk_columns, "rowid_alias": rowid_alias,
+            "without_rowid": without_rowid, "fts_virtual": fts_virtual,
+            "declared_names": declared_names, "structure_sha256": structure_sha256}
+
+
+def _iter_table_rows(conn, spec: dict):
+    """Yield ``(identity_object, stored_values)`` for every row of one table."""
+    table = spec["table"]
+    columns = spec["columns"]
+    if spec["identity_mode"] == "WITHOUT_ROWID":
+        select = ", ".join(_quote_identifier(column) for column in columns)
+        for raw in conn.execute(f"SELECT {select} FROM {_quote_identifier(table)}"):
+            values = list(raw)
+            by_name = dict(zip(columns, values))
+            identity = [[column, sql_value_tag(by_name[column])]
+                        for column in spec["pk_columns"]]
+            yield identity, values
+        return
+    alias = spec["rowid_alias"]
+    select = ", ".join([alias] + [_quote_identifier(column) for column in columns])
+    for raw in conn.execute(f"SELECT {select} FROM {_quote_identifier(table)}"):
+        rowid = raw[0]
+        if type(rowid) is not int:
+            _invalid()
+        values = list(raw[1:])
+        identity = [[alias, sql_value_tag(rowid)]]
+        if spec["identity_mode"] == _ALIAS_IDENTITY_MODE:
+            pk_column = spec["pk_columns"][0]
+            pk_value = values[columns.index(pk_column)]
+            if pk_value != rowid:
+                _invalid()   # the declared INTEGER PRIMARY KEY must alias the ROWID
+            identity.append([pk_column, sql_value_tag(pk_value)])
+        yield identity, values
+
+
+def _row_joint_bytes(identity, columns, values) -> bytes:
+    return C([identity, [[column, sql_value_tag(value)]
+                         for column, value in zip(columns, values)]])
+
+
+def _table_inventory(conn, table: str) -> dict:
+    """The full-row inventory of one table: spec + (identity bytes, J bytes,
+    raw values, actual rowid) per stored row."""
+    spec = _joint_spec(conn, table)
+    rows = []
+    for identity, values in _iter_table_rows(conn, spec):
+        rowid = None
+        if spec["identity_mode"] != "WITHOUT_ROWID":
+            rowid = sql_value_decode(identity[0][1])
+        rows.append({"identity": C(identity), "rowid": rowid,
+                     "joint": _row_joint_bytes(identity, spec["columns"], values),
+                     "values": dict(zip(spec["columns"], values))})
+    return {"spec": spec, "rows": rows}
+
+
+def _inventory_joint(inventory: dict) -> str:
+    """The r4 table joint digest of one inventory: the complete sorted J byte
+    strings length-framed under the structure binding (count bound separately)."""
+    spec = inventory["spec"]
+    binding = C({"table": spec["table"], "columns": spec["columns"],
+                 "identity_mode": spec["identity_mode"],
+                 "table_structure_sha256": spec["structure_sha256"]})
+    return B(_JOINT_TABLE_LABEL, [binding,
+                                  *sorted(row["joint"] for row in inventory["rows"])])
+
+
+def _full_joint_digest(joints: dict) -> str:
+    """The combined digest over per-table (name, row_count, joint) triples."""
+    return B(_JOINT_FULL_LABEL, [
+        C([name, joints[name]["row_count"], joints[name]["joint_sha256"]])
+        for name in sorted(joints)])
+
+
+def _joint_table_names(conn) -> list:
+    return sorted({row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table'")} | {"sqlite_schema"})
+
+
+def table_joint(conn, table: str) -> dict:
+    """One durable table's r4 joint: sorted complete row J bytes, length-framed
+    with the structure binding; the row count is bound separately."""
+    inventory = _table_inventory(conn, table)
+    return {"table": table, "columns": inventory["spec"]["columns"],
+            "identity_mode": inventory["spec"]["identity_mode"],
+            "table_structure_sha256": inventory["spec"]["structure_sha256"],
+            "row_count": len(inventory["rows"]),
+            "joint_sha256": _inventory_joint(inventory)}
+
+
+def full_table_joint(conn) -> dict:
+    """Every durable table's joint plus the combined digest.
+
+    ``sqlite_schema`` is enumerated as its own structural inventory row table;
+    FTS virtual tables and every shadow/config/sequence/meta table ride the
+    same rules -- no hardcoded three-table shortcut.
+    """
+    names = _joint_table_names(conn)
+    tables = {name: table_joint(conn, name) for name in names}
+    return {"tables": tables, "table_count": len(names),
+            "joint_sha256": _full_joint_digest(tables)}
+
+
+def _structured_row_summary(spec: dict, row: dict) -> dict:
+    """A compact, content-free descriptor of one changed row."""
+    summary = {"table": spec["table"]}
+    if row["rowid"] is not None:
+        summary["rowid"] = row["rowid"]
+    if spec["table"] == "state_meta":
+        summary["key"] = row["values"].get("key")
+    elif spec["table"] == "sessions":
+        summary["session_id"] = row["values"].get("id")
+    return summary
+
+
+def _classify_added_delta_key(key, *, owner_session_id: str, named: dict):
+    """One added state_meta key must be exactly one named continuation delta:
+    a token/journal/checkpoint key of the committed set or a derived row-index
+    entry; anything else is a stray mutation and refuses."""
+    if type(key) is not str or not key:
+        _invalid()
+    if key in named["journal"]:
+        return "journal"
+    if key.startswith(_RECEIPT3_EPOCH_PREFIX):
+        parsed = parse_receipt3_epoch_key(key)
+        if parsed["session_id"] != owner_session_id:
+            _invalid()
+        # Every checkpoint of this owner was already replayed from the stored
+        # member bytes by read_partial_recovery_state before this point.
+        return "checkpoint"
+    if key.startswith(_RECEIPT3_ROW_PREFIX):
+        parse_receipt3_row_index_key(key)
+        if key not in named["row_index"]:
+            _invalid()
+        return "row_index"
+    _invalid()
+
+
+def _config_head(raw):
+    """The stored protected head inside one sessions.model_config value; a
+    damaged raw that carries receipt config is refused, never read as 'none'."""
+    if raw is None:
+        return None
+    if type(raw) is not str or not raw.strip():
+        _invalid()
+    try:
+        config = json.loads(raw, object_pairs_hook=_unique_config_object)
+    except _DuplicateConfigKey:
+        _invalid()
+    except (ValueError, TypeError):
+        _invalid()
+    if not isinstance(config, dict):
+        _invalid()
+    head = config.get("_message_copy_receipts_v2")
+    return None if head is None else head
+
+
+def verify_inverse_recovery_joint(source_path, replacement_path, *,
+                                  owner_session_id: str, approved_transition: dict) -> dict:
+    """C02 step 6 (r4): the independent read-only full-table joint acceptance.
+
+    While quiet is still in force, this reader re-verifies the committed
+    continuation set from the stored bytes, derives the exact request-named
+    delta (named journal/pages/checkpoints, token index, derived row index and
+    the protected head bytes) and refuses ANY other durable difference --
+    removals and identity swaps included, since a refresh must be an in-place
+    UPDATE that keeps the actual ROWID. It then applies the exact inverse
+    (dropping the added keys, restoring the old index values and the old head
+    bytes) and requires every durable table's joint to equal the original old
+    latest joint -- sqlite_schema, FTS virtual tables, every shadow, config and
+    sequence included. Any stray mutation invalidates the admission.
+    """
+    if type(owner_session_id) is not str or not owner_session_id:
+        _invalid()
+    if type(approved_transition) is not dict or set(approved_transition) != _CONTINUATION_KEYS:
+        _invalid()
+    source_conn = _open_read_only(source_path)
+    replacement_conn = _open_read_only(replacement_path)
+    try:
+        source_names = _joint_table_names(source_conn)
+        replacement_names = _joint_table_names(replacement_conn)
+        if source_names != replacement_names:
+            _invalid()   # a created/dropped table is a structural mutation
+        source = {name: _table_inventory(source_conn, name) for name in source_names}
+        replacement = {name: _table_inventory(replacement_conn, name) for name in source_names}
+        for name in source_names:
+            source_spec, replacement_spec = source[name]["spec"], replacement[name]["spec"]
+            if (source_spec["structure_sha256"] != replacement_spec["structure_sha256"]
+                    or source_spec["columns"] != replacement_spec["columns"]
+                    or source_spec["identity_mode"] != replacement_spec["identity_mode"]):
+                _invalid()   # the structure binding must be bit-identical
+        committed = read_partial_recovery_state(
+            replacement_conn, owner_session_id, approved_transition=approved_transition)
+        named = {"journal": set(), "row_index": set()}
+        for item in committed:
+            named["journal"].add(encode_receipt3_token_key(owner_session_id, item["token"]))
+            named["journal"].add(encode_receipt3_operation_key(owner_session_id,
+                                                               item["generation"]))
+            member = read_operation(replacement_conn, owner_session_id, item["generation"])
+            for ordinal in range(len(member["pages"])):
+                named["journal"].add(encode_receipt3_page_key(
+                    owner_session_id, item["generation"], ordinal))
+        for entry in read_row_state_index(replacement_conn, owner_session_id):
+            named["row_index"].add(entry["key"])
+        added, updated, removed = [], [], []
+        for name in source_names:
+            source_rows = {row["identity"]: row for row in source[name]["rows"]}
+            replacement_rows = {row["identity"]: row for row in replacement[name]["rows"]}
+            for identity, row in replacement_rows.items():
+                if identity not in source_rows:
+                    added.append((name, identity, row))
+                elif source_rows[identity]["joint"] != row["joint"]:
+                    updated.append((name, identity, source_rows[identity], row))
+            for identity, row in source_rows.items():
+                if identity not in replacement_rows:
+                    removed.append((name, identity, row))
+        if removed:
+            _invalid()   # nothing is deleted by a continuation; an INSERT OR
+            # REPLACE identity swap shows up exactly here as a remove+add pair
+        added_keys = []
+        for name, _identity, row in added:
+            if name != "state_meta":
+                _invalid()   # only the reserved receipt3/ delta may appear
+            key = row["values"].get("key")
+            _classify_added_delta_key(key, owner_session_id=owner_session_id, named=named)
+            added_keys.append(key)
+        updated_rows = []
+        for name, _identity, old_row, new_row in updated:
+            if name == "state_meta":
+                old_key = old_row["values"].get("key")
+                new_key = new_row["values"].get("key")
+                if old_key != new_key or type(old_key) is not str \
+                        or not old_key.startswith(_RECEIPT3_ROW_PREFIX):
+                    _invalid()
+                if old_key not in named["row_index"]:
+                    _invalid()   # only a derived row-index entry may refresh in place
+                old_entry, _raw = _read_canonical(replacement_conn, old_key)
+                validate_row_state_index_entry(old_entry)
+                if encode_receipt3_row_index_key(
+                        old_entry["row_ref"]["birth_epoch"],
+                        old_entry["row_ref"]["row_id"]) != old_key:
+                    _invalid()
+                new_entry = json.loads(new_row["values"]["value"],
+                                       object_pairs_hook=_unique_config_object) \
+                    if type(new_row["values"]["value"]) is str else None
+                validate_row_state_index_entry(new_entry)
+                if (new_entry["row_ref"] != old_entry["row_ref"]
+                        or C(new_entry).decode("utf-8") != new_row["values"]["value"]):
+                    _invalid()
+                updated_rows.append({"table": name, "key": old_key, "kind": "row_index"})
+            elif name == "sessions":
+                old_values, new_values = old_row["values"], new_row["values"]
+                if old_values.get("id") != owner_session_id:
+                    _invalid()   # only the approved owner's row may advance
+                changed = [column for column in old_values
+                           if old_values[column] != new_values[column]]
+                if changed != ["model_config"]:
+                    _invalid()   # exactly the protected head column advances
+                if not committed:
+                    _invalid()   # a head advance without a committed operation
+                last = committed[-1]
+                old_head = _config_head(old_values["model_config"])
+                if old_head is not None:
+                    validate_receipt3_head(old_head)
+                    if (old_head["owner_session_id"] != owner_session_id
+                            or old_head["active_epoch"] != approved_transition["old_epoch"]
+                            or old_head["generation"] != approved_transition["old_generation"]
+                            or old_head["head_sha256"] != approved_transition["old_head_sha256"]
+                            or hashlib.sha256(C(old_head)).hexdigest()
+                            != approved_transition["old_head_token_sha256"]):
+                        _invalid()   # the inverse restores exactly these frozen bytes
+                elif approved_transition["old_generation"] != 0:
+                    _invalid()
+                new_head = _config_head(new_values["model_config"])
+                if new_head is None:
+                    _invalid()
+                validate_receipt3_head(new_head)
+                if (new_head["owner_session_id"] != owner_session_id
+                        or new_head["active_epoch"] != approved_transition["new_epoch"]
+                        or new_head["generation"] != last["generation"]
+                        or new_head["head_sha256"] != last["operation_sha256"]):
+                    _invalid()
+                updated_rows.append({"table": name, "rowid": new_row["rowid"],
+                                     "session_id": owner_session_id, "kind": "protected_head"})
+            else:
+                _invalid()   # only the reserved state_meta/head surfaces may change
+        # The exact inverse: drop the added keys, substitute the old values for
+        # every in-place update (the actual ROWID is proven above), then require
+        # every durable table's joint to equal the original old latest joint.
+        source_digest = _full_joint_digest(
+            {name: {"row_count": len(source[name]["rows"]),
+                    "joint_sha256": _inventory_joint(source[name])}
+             for name in source_names})
+        reconstructed = {}
+        for name in source_names:
+            added_identities = {identity for table, identity, _row in added if table == name}
+            updated_source = {identity: old_row
+                              for table, identity, old_row, _new in updated if table == name}
+            inverted = []
+            for identity, row in ((r["identity"], r) for r in replacement[name]["rows"]):
+                if identity in added_identities:
+                    continue
+                if identity in updated_source:
+                    row = updated_source[identity]
+                inverted.append(row["joint"])
+            spec = replacement[name]["spec"]
+            joint = B(_JOINT_TABLE_LABEL, [
+                C({"table": spec["table"], "columns": spec["columns"],
+                   "identity_mode": spec["identity_mode"],
+                   "table_structure_sha256": spec["structure_sha256"]}),
+                *sorted(inverted)])
+            if joint != _inventory_joint(source[name]):
+                _invalid()   # not exactly invertible back to the old latest joint
+            reconstructed[name] = {"row_count": len(inverted), "joint_sha256": joint}
+        report = {"owner_session_id": owner_session_id,
+                  "table_count": len(source_names),
+                  "source_joint_sha256": source_digest,
+                  "reconstructed_joint_sha256": _full_joint_digest(reconstructed),
+                  "added_keys": sorted(added_keys),
+                  "updated_rows": updated_rows,
+                  "removed_rows": [],
+                  "committed": [{"token": item["token"], "generation": item["generation"],
+                                 "operation_sha256": item["operation_sha256"]}
+                                for item in committed]}
+        if report["reconstructed_joint_sha256"] != report["source_joint_sha256"]:
+            _invalid()
+        report["reversal_sha256"] = H(_REVERSAL_LABEL, {
+            "owner_session_id": owner_session_id,
+            "source_joint_sha256": report["source_joint_sha256"],
+            "added_keys": report["added_keys"],
+            "updated_rows": updated_rows})
+        return report
+    finally:
+        source_conn.close()
+        replacement_conn.close()
+
+
+# ── C02 steps 2/3 (r4): copy comparison + frozen proof/roster ────────────────
+
+def verify_independent_copy_joint(source_path, replacement_path) -> dict:
+    """r4 C02 steps 2/3: independent readonly comparison of the frozen old
+    latest against the selected replacement -- complete joint/schema/sequence/
+    header. Run BEFORE any constructor and again after the quiet open: any
+    logical persistent delta refuses. Sequence rows and protected heads are
+    bound by the same durable-table joint (sqlite_sequence and sessions are
+    ordinary durable tables); byte-completeness of the copy itself is the
+    copy method's obligation, not asserted here.
+    """
+    source_conn = _open_read_only(source_path)
+    replacement_conn = _open_read_only(replacement_path)
+    try:
+        source = full_table_joint(source_conn)
+        replacement = full_table_joint(replacement_conn)
+    finally:
+        source_conn.close()
+        replacement_conn.close()
+    if list(source["tables"]) != list(replacement["tables"]):
+        _invalid()
+    for name in source["tables"]:
+        if (source["tables"][name]["table_structure_sha256"]
+                != replacement["tables"][name]["table_structure_sha256"]
+                or source["tables"][name]["columns"] != replacement["tables"][name]["columns"]
+                or source["tables"][name]["identity_mode"]
+                != replacement["tables"][name]["identity_mode"]):
+            _invalid()
+    if source["joint_sha256"] != replacement["joint_sha256"]:
+        _invalid()   # a logical persistent delta between the same old latest
+    return {"joint_sha256": source["joint_sha256"], "table_count": source["table_count"],
+            "schema_sha256": source["tables"]["sqlite_schema"]["joint_sha256"]}
+
+
+def _validate_recovery_init_request(init_request, owner_session_id: str) -> dict:
+    """Local strict validation of the frozen quiet-recovery init request shape."""
+    required = {"kind", "token", "owner_session_id", "proof_sha256", "old_epoch",
+                "new_epoch", "old_generation", "old_head_sha256",
+                "old_head_token_sha256", "boundary_roster_sha256",
+                "alias_inventory_sha256"}
+    if type(init_request) is not dict or set(init_request) != required:
+        _invalid()
+    if init_request["kind"] != "epoch_continuation":
+        _invalid()
+    if init_request["owner_session_id"] != owner_session_id:
+        _invalid()
+    _canonical_uuid4(init_request["token"])
+    _sha256_hex(init_request["proof_sha256"])
+    _epoch_string(init_request["old_epoch"])
+    _epoch_string(init_request["new_epoch"])
+    if init_request["old_epoch"] == init_request["new_epoch"]:
+        _invalid()
+    old_generation = init_request["old_generation"]
+    if type(old_generation) is not int or not 0 <= old_generation <= _MAX_INT64:
+        _invalid()
+    if init_request["old_head_sha256"] is not None:
+        _sha256_hex(init_request["old_head_sha256"])
+    elif old_generation != 0:
+        _invalid()
+    _sha256_hex(init_request["old_head_token_sha256"])
+    _sha256_hex(init_request["boundary_roster_sha256"])
+    _sha256_hex(init_request["alias_inventory_sha256"])
+    return {name: init_request[name] for name in sorted(required)}
+
+
+def _file_sha256(path) -> str:
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _file_identity(path) -> dict:
+    stat = Path(path).stat()
+    return {"st_dev": stat.st_dev, "st_ino": stat.st_ino, "st_size": stat.st_size}
+
+
+def freeze_recovery_proof(path, *, owner_session_id: str, init_request: dict) -> dict:
+    """r4 C02 step 3: freeze the selected replacement inode's proof together
+    with the finite roster/init request.
+
+    The proof binds the full-table joint, the actual file identity and the
+    frozen request; the exact certificate/pin approval over these bytes stays
+    a separate non-author decision (never taken here). While no continuation
+    exists yet the proof must re-verify unchanged -- including after the quiet
+    admission open, which may not leave any logical persistent delta.
+    """
+    if type(owner_session_id) is not str or not owner_session_id:
+        _invalid()
+    request = _validate_recovery_init_request(init_request, owner_session_id)
+    conn = _open_read_only(path)
+    try:
+        joint = full_table_joint(conn)
+    finally:
+        conn.close()
+    proof = {"owner_session_id": owner_session_id,
+             "init_request_sha256": hashlib.sha256(C(request)).hexdigest(),
+             "roster_sha256": H(_RECOVERY_ROSTER_LABEL,
+                                {"owners": [owner_session_id]}),
+             "joint_sha256": joint["joint_sha256"],
+             "table_count": joint["table_count"],
+             "file_sha256": _file_sha256(path),
+             "file_identity": _file_identity(path)}
+    proof["recovery_proof_sha256"] = H(_RECOVERY_PROOF_LABEL, proof)
+    return proof
+
+
+def verify_frozen_proof(path, proof) -> dict:
+    """Re-verify one frozen proof against the same inode (steps 2/3 window:
+    before any constructor and again after the quiet open). Any joint, file or
+    request change refuses; the proof is not a substitute for the step 6
+    inverse acceptance once continuations exist.
+    """
+    if type(proof) is not dict or "recovery_proof_sha256" not in proof:
+        _invalid()
+    frozen = {key: value for key, value in proof.items() if key != "recovery_proof_sha256"}
+    if proof["recovery_proof_sha256"] != H(_RECOVERY_PROOF_LABEL, frozen):
+        _invalid()   # the proof bytes themselves do not verify
+    if set(frozen) != {"owner_session_id", "init_request_sha256", "roster_sha256",
+                       "joint_sha256", "table_count", "file_sha256", "file_identity"}:
+        _invalid()
+    _sha256_hex(frozen["init_request_sha256"])
+    _sha256_hex(frozen["joint_sha256"])
+    _sha256_hex(frozen["file_sha256"])
+    conn = _open_read_only(path)
+    try:
+        joint = full_table_joint(conn)
+    finally:
+        conn.close()
+    if (joint["joint_sha256"] != frozen["joint_sha256"]
+            or joint["table_count"] != frozen["table_count"]
+            or _file_sha256(path) != frozen["file_sha256"]
+            or _file_identity(path) != frozen["file_identity"]):
+        _invalid()   # the frozen inode no longer matches its proof
+    return {"verified": True, "owner_session_id": frozen["owner_session_id"],
+            "joint_sha256": joint["joint_sha256"], "table_count": joint["table_count"]}
