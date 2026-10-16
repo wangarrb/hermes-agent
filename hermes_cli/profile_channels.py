@@ -478,50 +478,24 @@ def clone_channels_refusal(source_dir: Path, source_label: str) -> Optional[str]
     )
 
 
-def _config_platform_tokens(config_path: Path) -> dict[str, str]:
-    """``{platform: token}`` from ``platforms.<p>.token|api_key`` (both nesting spellings)."""
-    tokens: dict[str, str] = {}
-    if not config_path.is_file():
-        return tokens
-    from hermes_cli.config import read_user_config_raw
-    raw = read_user_config_raw(config_path)
-    gateway: dict = raw["gateway"] if isinstance(raw.get("gateway"), dict) else {}
-    for section in (raw.get("platforms"), gateway.get("platforms")):
-        if not isinstance(section, dict):
-            continue
-        for pid, block in section.items():
-            if isinstance(block, dict):
-                token = block.get("token") or block.get("api_key")
-                if isinstance(token, str) and token.strip():
-                    tokens[str(pid)] = token.strip()
-    return tokens
-
-
 def shared_channel_credentials(profile_dir: Path, source_dir: Path) -> list[str]:
-    """Platforms whose CONNECTING credential (bot token / app id / account) in ``profile_dir`` is
-    byte-identical to ``source_dir``'s — the bots that will collide. Pure file reads: no secret
-    manager, no gateway config load, so ``hermes profile list`` can afford it per profile."""
-    wanted = credential_env_keys()
-    mine = _env_values(profile_dir / ".env", wanted)
-    theirs = _env_values(source_dir / ".env", wanted)
-    shared = {wanted[key] for key in mine if theirs.get(key) == mine[key]}
-    mine_cfg = _config_platform_tokens(profile_dir / "config.yaml")
-    theirs_cfg = _config_platform_tokens(source_dir / "config.yaml")
-    shared.update(pid for pid, token in mine_cfg.items() if theirs_cfg.get(pid) == token)
-    if shared:
-        # A retained token is not an active bot claim when either profile explicitly
-        # disables that adapter. Match gateway_migrate._credential_claims rather than
-        # warning about a collision the multiplexer correctly ignores.
-        from hermes_cli.config import read_user_config_raw
-        mine_path, theirs_path = profile_dir / "config.yaml", source_dir / "config.yaml"
-        mine_raw = read_user_config_raw(mine_path) if mine_path.is_file() else {}
-        theirs_raw = read_user_config_raw(theirs_path) if theirs_path.is_file() else {}
-        shared = {
-            pid for pid in shared
-            if _explicit_enabled(mine_raw, pid) is not False
-            and _explicit_enabled(theirs_raw, pid) is not False
-        }
-    return sorted(shared)
+    """Platforms with overlapping active connecting claims in the two profile homes.
+
+    Reuse the migration preflight's effective Gateway config and credential fingerprints,
+    including typed enablement and credential precedence. Read each home's own secret
+    scope under task-local multiplex semantics; never borrow ambient launch credentials
+    or change the process-global multiplex mode.
+    """
+    from agent.secret_scope import reset_multiplex_context, set_multiplex_context
+    from hermes_cli.gateway_migrate import _credential_claims, _profile_gateway_config
+
+    token = set_multiplex_context(True)
+    try:
+        mine = _credential_claims(_profile_gateway_config(profile_dir))
+        theirs = _credential_claims(_profile_gateway_config(source_dir))
+    finally:
+        reset_multiplex_context(token)
+    return sorted({mine[key] for key in mine.keys() & theirs.keys()})
 
 
 def shared_credential_warning(profile: str, platforms: list[str], source: str = "default") -> str:
