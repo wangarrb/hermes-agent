@@ -234,7 +234,8 @@ def test_journal_key_codecs_roundtrip_and_rejections():
 
 def test_journal_page_shape_and_limits():
     m = _m()
-    item = {"kind": "native_result", "input_ordinal": 0, "row_ref": None,
+    item = {"kind": "native_result", "input_ordinal": 0,
+            "row_ref": {"birth_epoch": EPOCH, "row_id": 1, "owner_session_id": SID},
             "disposition": "inserted", "result_count": None}
     page = m.build_journal_page(owner_session_id=SID, epoch=EPOCH, generation=4,
                                 page_ordinal=0, items=[item])
@@ -267,12 +268,26 @@ def _pages_root(header, pages) -> str:
     return B("journal-content", parts)
 
 
+def _context(sid: str = SID, domain: str = "d" * 64):
+    """One full-form typed native-session-context item (M2B reader contract)."""
+    binding = [["id", {"sql_text": sid}], ["started_at", {"sql_integer": 1}],
+               ["parent_session_id", {"sql_null": True}], ["source", {"sql_text": "cli"}]]
+    markers = [["_delegate_from", {"sql_null": True}], ["_branched_from", {"sql_null": True}],
+               ["_reset_from", {"sql_null": True}]]
+    return {"session_id": sid, "native_binding_fields": binding, "lineage_markers": markers,
+            "context_sha256": H("native-session-context",
+                                {"domain_sha256": domain, "native_binding_fields": binding,
+                                 "lineage_markers": markers})}
+
+
 def _member(generation: int, *, epoch: str = EPOCH, ordinal: int = 1, pages: int = 1,
             prev: str | None = None):
-    """One synthetic sealed member: a full journal header plus valid pages.
+    """One synthetic sealed member: a full-form journal header plus valid pages.
 
-    The header is self-hashed exactly like the writer's builder (H("operation",
-    all fields minus the hash itself) so the read-back path can verify it.
+    The header carries every field of the r4 shape (group, typed
+    native_session_contexts, the recomputed result digest) and is self-hashed
+    exactly like the writer's builder (H("operation", all fields minus the hash
+    itself) so the full-form read-back path can verify it.
     """
     header = {"schema_version": "hermes-receipt-operation/3", "domain_sha256": "d" * 64,
               "owner_session_id": SID, "actor_session_id": SID, "epoch": epoch,
@@ -280,15 +295,25 @@ def _member(generation: int, *, epoch: str = EPOCH, ordinal: int = 1, pages: int
               "operation_id": "00000000-0000-4000-8000-" + f"{generation:012d}",
               "request_sha256": hashlib.sha256(f"req-{generation}".encode()).hexdigest(),
               "previous_head_sha256": prev,
+              "group": {"group_id": "11111111-1111-4111-8111-" + f"{generation:012d}",
+                        "members": [{"owner_session_id": SID,
+                                     "operation_id": "00000000-0000-4000-8000-"
+                                                     + f"{generation:012d}",
+                                     "ordinal": 0}]},
               "kind": "inplace_compaction", "base_fence_sha256": "e" * 64,
               "page_count": pages, "item_count": pages, "pages_root_sha256": "",
-              "result_sha256": "0" * 64, "continuation": None}
+              "result_sha256": "", "continuation": None,
+              "native_session_contexts": [_context()]}
     page_bodies = [{"schema_version": "hermes-receipt-page/3", "owner_session_id": SID,
                     "epoch": epoch, "generation": generation, "page_ordinal": index,
                     "items": [{"kind": "native_result", "input_ordinal": index,
-                               "row_ref": None, "disposition": "inserted",
-                               "result_count": None}]}
+                               "row_ref": {"birth_epoch": epoch, "row_id": index + 1,
+                                           "owner_session_id": SID},
+                               "disposition": "inserted", "result_count": None}]}
                    for index in range(pages)]
+    header["result_sha256"] = B("native-result", [
+        C(item) for page in page_bodies for item in page["items"]
+        if item["kind"] == "native_result"])
     header["pages_root_sha256"] = _pages_root(header, page_bodies)
     header["operation_sha256"] = H("operation", dict(header))
     return {"header": header, "pages": page_bodies}
@@ -898,3 +923,124 @@ def test_continuation_replay_and_failed_seal_are_transaction_atomic(tmp_path):
         assert handle._write_count == 1
     finally:
         handle.close()
+
+
+# ── milestone 2B: full-form reader validation of member headers and items ────
+
+def test_member_header_full_form_reader_validation(tmp_path):
+    """read_operation validates the exact member-header form: every field of the
+    r4 shape, the typed contexts with their recomputed hash, the group member
+    order, and the result digest recomputed from the actual page items."""
+    m = _m()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(SID, "cli", model="m")
+        member = _member(4, prev="a" * 64)
+        _seed_member(db, member)
+        read = m.read_operation(db._conn, SID, 4)
+        assert read["header"]["operation_sha256"] == member["header"]["operation_sha256"]
+        assert read["pages"][0]["items"][0]["row_ref"]["row_id"] == 1
+
+        base = member["header"]
+        pages = member["pages"]
+
+        def _seed(header, page_bodies=None):
+            db._conn.execute("DELETE FROM state_meta WHERE key LIKE 'receipt3/%'")
+            db._conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                             (f"receipt3/o/{sid_hex(SID)}/{enc(4)}", C(header).decode("utf-8")))
+            for page in (pages if page_bodies is None else page_bodies):
+                db._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                    (f"receipt3/p/{sid_hex(SID)}/{enc(4)}/{enc(page['page_ordinal'])}",
+                     C(page).decode("utf-8")))
+            db._conn.commit()
+
+        def _sealed(header):
+            header = dict(header)
+            header["operation_sha256"] = H("operation", {
+                key: value for key, value in header.items()
+                if key != "operation_sha256"})
+            return header
+
+        def _member_json(**overrides):
+            return dict(base["group"]["members"][0], **overrides)
+
+        context = base["native_session_contexts"][0]
+        tampered = [
+            {key: value for key, value in base.items() if key != "group"},   # missing field
+            dict(base, extra=1),                                             # unknown field
+            dict(base, group={"group_id": base["group"]["group_id"],         # unsorted ordinals
+                              "members": [_member_json(ordinal=1), _member_json(ordinal=0)]}),
+            dict(base, actor_session_id=""),                                 # empty actor
+            dict(base, native_session_contexts=[                             # bad context hash
+                dict(context, context_sha256="f" * 64)]),
+            dict(base, native_session_contexts=[                             # id != session_id
+                dict(context, native_binding_fields=[
+                    ["id", {"sql_text": "other-odd"}]
+                    if name == "id" else [name, tag]
+                    for name, tag in context["native_binding_fields"]])]),
+            dict(base, result_sha256="0" * 64),                              # result digest mismatch
+        ]
+        for header in tampered:
+            _seed(_sealed(header))
+            with pytest.raises(ValueError):
+                m.read_operation(db._conn, SID, 4)
+        # An incoherent item (aggregate with a coordinate) is refused through the
+        # same reader -- pages, root and result digest are all rebuilt so only
+        # the item semantics can refuse it.
+        bad_pages = [dict(pages[0], items=[{"kind": "native_result", "input_ordinal": 3,
+                                            "row_ref": None, "disposition": "aggregate",
+                                            "result_count": None}])]
+        bad_header = dict(base)
+        bad_header["pages_root_sha256"] = _pages_root(bad_header, bad_pages)
+        bad_header["result_sha256"] = B("native-result",
+                                       [C(item) for item in bad_pages[0]["items"]])
+        _seed(_sealed(bad_header), bad_pages)
+        with pytest.raises(ValueError):
+            m.read_operation(db._conn, SID, 4)
+        # The same full-form rules apply through read_journal_members.
+        _seed(_sealed(tampered[1]))
+        with pytest.raises(ValueError):
+            m.read_journal_members(db._conn, SID)
+    finally:
+        db.close()
+
+
+def test_journal_page_full_item_shapes():
+    m = _m()
+    good = {"kind": "native_result", "input_ordinal": 0,
+            "row_ref": {"birth_epoch": EPOCH, "row_id": 1, "owner_session_id": SID},
+            "disposition": "inserted", "result_count": None}
+    m.build_journal_page(owner_session_id=SID, epoch=EPOCH, generation=4,
+                         page_ordinal=0, items=[good])                   # accepted
+    copy_item = {"kind": "copy", "source": "payload_state",
+                 "source_previous_event": [SID, 3, 0, 1], "target": "payload_state",
+                 "mode": "inplace_compaction",
+                 "observation": "source_pre_insert_to_target_final; "
+                                "writer enforces insert P equality",
+                 "native_request_sha256": "a" * 64}
+    m.build_journal_page(owner_session_id=SID, epoch=EPOCH, generation=4,
+                         page_ordinal=0, items=[copy_item])              # accepted
+    derivation_item = {"kind": "derivation", "writer_kind": "set_user_message_content",
+                       "before": "payload_state", "after": "payload_state",
+                       "previous_event": {"owner_session_id": SID, "generation": 3,
+                                          "context_session_id": "ctx"},
+                       "feed_class": "same", "native_request_sha256": "b" * 64,
+                       "context_before_ref": {"activation_proof_sha256": "c" * 64,
+                                              "context_session_id": "ctx"}}
+    m.build_journal_page(owner_session_id=SID, epoch=EPOCH, generation=4,
+                         page_ordinal=0, items=[derivation_item])        # accepted
+    for bad in (
+        {"kind": "native_result", "input_ordinal": 0, "row_ref": None,
+         "disposition": "aggregate", "result_count": None},              # aggregate with a coordinate
+        {"kind": "native_result", "input_ordinal": None, "row_ref": None,
+         "disposition": "inserted", "result_count": None},               # a result without its row
+        {"kind": "native_result", "input_ordinal": 0,
+         "row_ref": {"birth_epoch": EPOCH, "row_id": 1, "owner_session_id": SID},
+         "disposition": "inserted", "result_count": None, "x": 1},       # unknown key
+        {"kind": "copy", "source": "payload_state"},                     # incomplete copy item
+        {"kind": "derivation", "blob": "x"},                             # incomplete derivation item
+    ):
+        with pytest.raises(ValueError):
+            m.build_journal_page(owner_session_id=SID, epoch=EPOCH, generation=4,
+                                 page_ordinal=0, items=[bad])

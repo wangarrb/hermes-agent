@@ -57,9 +57,11 @@ from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _MESSAGE_UID_BACKFILL_DONE
 from hermes_state_copy_provenance import (
+    _CONTINUATION_KEYS as _RECEIPT3_CONTINUATION_KEYS,
     _DOMAIN_SHA256 as _RECEIPT3_DOMAIN, build_epoch_continuation_header, build_journal_page,
     encode_receipt3_operation_key, encode_receipt3_page_key, encode_receipt3_token_key,
-    observe_native_session_contexts, read_operation, seal_epoch_blocks, validate_receipt3_head,
+    observe_native_session_contexts, read_operation, read_partial_recovery_state,
+    seal_epoch_blocks, validate_receipt3_head,
 )
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
@@ -2015,6 +2017,15 @@ class QuietRecoveryHandle:
     _WRITE_RETRY_SLOW_MAX_S = SessionDB._WRITE_RETRY_SLOW_MAX_S
     _CHECKPOINT_EVERY_N_WRITES = SessionDB._CHECKPOINT_EVERY_N_WRITES
     _FTS_MERGE_EVERY_N_WRITES = QUIET_RECOVERY_FTS_DEFER_EVERY
+    # The native bounded FTS maintenance pass invoked once at the explicit exit
+    # (r4 C02 step 7: 500 pages/index, 4 commands/pass) -- the EXISTING bounded
+    # merge implementation, never a private copy.
+    _FTS_MERGE_MAX_PAGES_PER_INDEX = SessionDB._FTS_MERGE_MAX_PAGES_PER_INDEX
+    _FTS_MERGE_COMMANDS_PER_PASS = SessionDB._FTS_MERGE_COMMANDS_PER_PASS
+    _FTS_TABLES = SessionDB._FTS_TABLES
+    _present_fts_tables = SessionDB._present_fts_tables
+    _fts_table_exists = SessionDB._fts_table_exists
+    _merge_fts_incrementally = SessionDB._merge_fts_incrementally
     # The EXISTING transaction core and shared helpers -- never a private copy.
     _execute_write = SessionDB._execute_write
     _sleep_before_write_retry = SessionDB._sleep_before_write_retry
@@ -2034,6 +2045,7 @@ class QuietRecoveryHandle:
         self._fts_enabled = fts_enabled
         self._trigram_available = trigram_available
         self._fts_deferred_due = False
+        self._fts_usermerge_floor_applied = False
         self._closed = False
 
     @classmethod
@@ -2253,6 +2265,139 @@ class QuietRecoveryHandle:
             return self._execute_write(_do)
         except _QuietTokenReplay as replay:
             return replay.result
+
+    # ── C02 step 5: quiet reopen + partial-crash named-only back-projection ──
+
+    @classmethod
+    def resume(cls, *, db_path, init_request) -> "QuietRecoveryHandle":
+        """Re-enter the finite quiet mode after a crash or a close (r4 C02 step 5).
+
+        The only re-entry is quiet admission again: :meth:`open` re-runs the
+        settled no-create ``mode=rw`` checks, and the ordinary constructor,
+        the ordinary writer and any automatic reopen stay structurally unable
+        to continue. The partial state is then re-read strictly (read-only):
+        every committed token of the approved owner must read back exactly --
+        canonical record, verified result, verified journal bytes carrying the
+        frozen transition -- no orphaned journal bytes may exist, and the
+        stored protected head must match the committed continuation or, before
+        any commit, still carry the frozen old coordinates. Restarting the
+        in-memory counters is not a reset of persisted state: the FTS defer
+        flag is deliberately not persisted, and the post-release pass covers
+        the missed maintenance (step 7).
+        """
+        handle = cls.open(db_path=db_path, init_request=init_request)
+        try:
+            handle.verify_partial_recovery_state()
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+
+    def enumerate_committed_continuations(self, owner_session_id=None) -> list:
+        """Strict read-only enumeration of the owner's completed continuations
+        under this frozen admission (default: the approved request's owner)."""
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if owner_session_id is None:
+            owner_session_id = self._init_request["owner_session_id"]
+        approved = {name: self._init_request[name] for name in _RECEIPT3_CONTINUATION_KEYS}
+        return read_partial_recovery_state(
+            self._conn, owner_session_id, approved_transition=approved)
+
+    def verify_partial_recovery_state(self) -> dict:
+        """Fail-closed read-only verification of the owner's partial recovery
+        state; returns ``{"owner_session_id", "committed", "head"}``."""
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        owner_session_id = self._init_request["owner_session_id"]
+        committed = self.enumerate_committed_continuations(owner_session_id)
+        if len(committed) > 1:
+            raise ValueError(
+                "more than one committed continuation for this frozen "
+                "transition; refusing the reopen")
+        row = self._conn.execute(
+            "SELECT model_config FROM sessions WHERE id = ?", (owner_session_id,)).fetchone()
+        if row is None:
+            raise ValueError("continuation owner session is not part of this settled store")
+        head = _quiet_protected_head(row[0])
+        if committed:
+            last = committed[-1]
+            if head is None or (head["owner_session_id"] != owner_session_id
+                                or head["active_epoch"] != self._init_request["new_epoch"]
+                                or head["generation"] != last["generation"]
+                                or head["head_sha256"] != last["operation_sha256"]):
+                raise ValueError(
+                    "protected head does not match the committed continuation; refusing")
+        elif head is None:
+            if self._init_request["old_generation"] != 0:
+                raise ValueError(
+                    "continuation claims stored history but the owner carries "
+                    "no protected head; refusing")
+        elif (head["owner_session_id"] != owner_session_id
+                or head["active_epoch"] != self._init_request["old_epoch"]
+                or head["generation"] != self._init_request["old_generation"]
+                or head["head_sha256"] != self._init_request["old_head_sha256"]
+                or hashlib.sha256(_quiet_canonical(head)).hexdigest()
+                != self._init_request["old_head_token_sha256"]):
+            raise ValueError(
+                "stored protected head no longer carries the frozen old "
+                "coordinates; refusing the reopen")
+        return {"owner_session_id": owner_session_id, "committed": committed, "head": head}
+
+    def final_readback_binding(self) -> dict:
+        """The final readback binding recorded before the explicit exit (r4 C02
+        step 7): one canonical digest over the enumerated completed set and the
+        protected head; the independent acceptance decides on exactly these
+        bytes."""
+        state = self.verify_partial_recovery_state()
+        message = {"owner_session_id": state["owner_session_id"],
+                   "committed": state["committed"], "head": state["head"]}
+        return {"owner_session_id": state["owner_session_id"],
+                "committed": state["committed"], "head": state["head"],
+                "readback_sha256": hashlib.sha256(_quiet_canonical(message)).hexdigest()}
+
+    def exit_quiet(self, *, accepted_readback_sha256: str) -> dict:
+        """Explicitly exit the finite quiet mode after the independent
+        acceptance (r4 C02 step 7).
+
+        The accepted final readback binding is re-checked first (a mismatch
+        refuses the exit and runs nothing). Then exactly one native bounded FTS
+        pass runs -- the existing bounded merge (500 pages/index, 4 commands
+        per pass) -- AFTER the accepted recovery boundary, as normal
+        maintenance: even when a crash lost the in-memory defer flag, the pass
+        is scheduled here; its failure is reported and can never replay a
+        committed continuation. The handle then closes and the ordinary
+        handle/writer path reopens; the counters are not zeroed for anyone and
+        the FTS flags keep their probed values.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if (not isinstance(accepted_readback_sha256, str) or len(accepted_readback_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in accepted_readback_sha256)):
+            raise ValueError("the accepted final readback binding must be lowercase sha256 hex")
+        binding = self.final_readback_binding()
+        if binding["readback_sha256"] != accepted_readback_sha256:
+            raise ValueError(
+                "final readback binding does not match the accepted bytes; "
+                "quiet mode is not exited")
+        fts_pass = {"executed": 0, "failed": None}
+        if self._fts_enabled:
+            try:
+                fts_pass["executed"] = self._merge_fts_incrementally(
+                    max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX,
+                    max_commands=self._FTS_MERGE_COMMANDS_PER_PASS)
+            except Exception as exc:
+                # The accepted boundary stands; a maintenance failure is
+                # reported, never allowed to replay a committed continuation.
+                fts_pass["failed"] = f"{type(exc).__name__}: {exc}"[:200]
+        report = {"owner_session_id": binding["owner_session_id"],
+                  "write_count": self._write_count,
+                  "fts_deferred_due_at_exit": self._fts_deferred_due,
+                  "fts_enabled": self._fts_enabled,
+                  "trigram_available": self._trigram_available,
+                  "readback": binding, "fts_pass": fts_pass}
+        self.close()
+        return report
 
     def close(self) -> None:
         if not self._closed:

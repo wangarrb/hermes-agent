@@ -318,8 +318,106 @@ def validate_receipt3_head(head: dict) -> None:
     _sha256_hex(head["activation_proof_sha256"])
 
 
+def _validate_row_ref(row_ref) -> None:
+    """Exact shape of one actual row reference (record_shapes.row_ref)."""
+    if type(row_ref) is not dict or set(row_ref) != {
+            "birth_epoch", "row_id", "owner_session_id"}:
+        _invalid()
+    _epoch_string(row_ref["birth_epoch"])
+    _positive_int64(row_ref["row_id"])
+    if type(row_ref["owner_session_id"]) is not str or not row_ref["owner_session_id"]:
+        _invalid()
+
+
+def _validate_reference(ref) -> None:
+    """One immutable prior-context reference: a stored member coordinate or an
+    approved boundary anchor (record_shapes.derivation_item)."""
+    if type(ref) is not dict:
+        _invalid()
+    keys = set(ref)
+    if keys == {"owner_session_id", "generation", "context_session_id"}:
+        if type(ref["owner_session_id"]) is not str or not ref["owner_session_id"]:
+            _invalid()
+        _positive_int64(ref["generation"])
+    elif keys == {"activation_proof_sha256", "context_session_id"}:
+        _sha256_hex(ref["activation_proof_sha256"])
+    else:
+        _invalid()
+    if type(ref["context_session_id"]) is not str or not ref["context_session_id"]:
+        _invalid()
+
+
+def _validate_item(item) -> None:
+    """Full exact shape of one journal-page item (record_shapes.copy_item /
+    derivation_item / native_result_item); unknown keys and inconsistent
+    dispositions are refused, never silently projected."""
+    if type(item) is not dict:
+        _invalid()
+    kind = item.get("kind")
+    if kind == "native_result":
+        if set(item) != {"kind", "input_ordinal", "row_ref", "disposition", "result_count"}:
+            _invalid()
+        disposition = item["disposition"]
+        if disposition not in ("inserted", "repaired", "adopted", "aggregate"):
+            _invalid()
+        input_ordinal = item["input_ordinal"]
+        if input_ordinal is not None and (type(input_ordinal) is not int
+                                          or not 0 <= input_ordinal <= _MAX_INT64):
+            _invalid()
+        row_ref = item["row_ref"]
+        if row_ref is not None:
+            _validate_row_ref(row_ref)
+        if (disposition == "aggregate") != (input_ordinal is None and row_ref is None):
+            _invalid()   # aggregate ⇔ both coordinates null; a result carries a row ref
+        result_count = item["result_count"]
+        if result_count is not None and (type(result_count) is not int
+                                         or not -_MAX_INT64 <= result_count <= _MAX_INT64):
+            _invalid()
+    elif kind == "copy":
+        if set(item) != {"kind", "source", "source_previous_event", "target", "mode",
+                         "observation", "native_request_sha256"}:
+            _invalid()
+        if item["source"] != "payload_state" or item["target"] != "payload_state":
+            _invalid()
+        if item["mode"] not in ("inplace_compaction", "compression_child"):
+            _invalid()
+        if item["observation"] != ("source_pre_insert_to_target_final; "
+                                   "writer enforces insert P equality"):
+            _invalid()
+        _sha256_hex(item["native_request_sha256"])
+        event = item["source_previous_event"]
+        if event is not None:
+            if type(event) is not list or len(event) != 4:
+                _invalid()
+            owner, generation, page, index = event
+            if type(owner) is not str or not owner:
+                _invalid()
+            _positive_int64(generation)
+            if type(page) is not int or not 0 <= page <= _MAX_INT64:
+                _invalid()
+            if type(index) is not int or not 0 <= index <= _MAX_INT64:
+                _invalid()
+    elif kind == "derivation":
+        if set(item) != {"kind", "writer_kind", "before", "after", "previous_event",
+                         "feed_class", "native_request_sha256", "context_before_ref"}:
+            _invalid()
+        if item["writer_kind"] not in ("cas_owned_repair", "legacy_blank_content_repair",
+                                       "set_user_message_content", "approved_core_repair"):
+            _invalid()
+        if item["before"] != "payload_state" or item["after"] != "payload_state":
+            _invalid()
+        if item["feed_class"] not in ("same", "changed"):
+            _invalid()
+        _sha256_hex(item["native_request_sha256"])
+        _validate_reference(item["previous_event"])
+        _validate_reference(item["context_before_ref"])
+    else:
+        _invalid()
+
+
 def validate_journal_page(body: dict) -> None:
-    """Strict page shape: exact fields, 1..8 items, canonical <= 65536 bytes."""
+    """Strict page shape: exact fields, 1..8 fully-shaped items, canonical
+    <= 65536 bytes."""
     if type(body) is not dict or set(body) != _PAGE_KEYS:
         _invalid()
     if body["schema_version"] != _PAGE_SCHEMA:
@@ -335,8 +433,7 @@ def validate_journal_page(body: dict) -> None:
     if type(items) is not list or not 1 <= len(items) <= 8:
         _invalid()
     for item in items:
-        if type(item) is not dict or item.get("kind") not in _ITEM_KINDS:
-            _invalid()
+        _validate_item(item)
     if len(C(body)) > _MAX_PAGE_BYTES:
         _invalid()
 
@@ -360,6 +457,45 @@ def journal_pages_root(owner_session_id: str, epoch: str, generation: int, pages
                 "generation": generation})]
     parts.extend(C(page) for page in pages)
     return B("journal-content", parts)
+
+
+def _validate_native_session_context(context, domain_sha256: str) -> None:
+    """Full exact shape of one typed native-session-context item: the ordered
+    typed preimage, the strict marker projection and the recomputed context
+    hash (record_shapes.operation_header.native_session_contexts)."""
+    if type(context) is not dict or set(context) != {
+            "session_id", "native_binding_fields", "lineage_markers", "context_sha256"}:
+        _invalid()
+    if type(context["session_id"]) is not str or not context["session_id"]:
+        _invalid()
+    binding = context["native_binding_fields"]
+    if type(binding) is not list or len(binding) != len(_NATIVE_BINDING_FIELDS):
+        _invalid()
+    for entry in binding:
+        if type(entry) is not list or len(entry) != 2 or type(entry[0]) is not str:
+            _invalid()
+    if [entry[0] for entry in binding] != list(_NATIVE_BINDING_FIELDS):
+        _invalid()
+    values = [sql_value_decode(tag) for _, tag in binding]
+    if values[0] != context["session_id"]:
+        _invalid()   # the id binding must equal the subject session_id
+    markers = context["lineage_markers"]
+    if type(markers) is not list or len(markers) != len(_LINEAGE_MARKERS):
+        _invalid()
+    for entry in markers:
+        if type(entry) is not list or len(entry) != 2 or type(entry[0]) is not str:
+            _invalid()
+    if [entry[0] for entry in markers] != list(_LINEAGE_MARKERS):
+        _invalid()
+    for _, tag in markers:
+        value = sql_value_decode(tag)
+        if value is not None and type(value) is not str:
+            _invalid()   # markers are exact permitted TEXT scalars or explicit null
+    if context["context_sha256"] != H("native-session-context", {
+            "domain_sha256": domain_sha256,
+            "native_binding_fields": binding,
+            "lineage_markers": markers}):
+        _invalid()
 
 
 def validate_operation_header(header: dict) -> None:
@@ -433,18 +569,7 @@ def validate_operation_header(header: dict) -> None:
         _invalid()
     seen = []
     for context in contexts:
-        if type(context) is not dict or set(context) != {
-                "session_id", "native_binding_fields", "lineage_markers", "context_sha256"}:
-            _invalid()
-        if type(context["session_id"]) is not str or not context["session_id"]:
-            _invalid()
-        if type(context["native_binding_fields"]) is not list \
-                or len(context["native_binding_fields"]) != len(_NATIVE_BINDING_FIELDS):
-            _invalid()
-        if type(context["lineage_markers"]) is not list \
-                or len(context["lineage_markers"]) != len(_LINEAGE_MARKERS):
-            _invalid()
-        _sha256_hex(context["context_sha256"])
+        _validate_native_session_context(context, header["domain_sha256"])
         seen.append(context["session_id"])
     if seen != sorted(seen, key=lambda sid: sid.encode("utf-8")) or len(set(seen)) != len(seen):
         _invalid()
@@ -837,37 +962,37 @@ def _read_canonical(conn, key: str):
 def read_operation(conn, owner_session_id: str, generation: int) -> dict:
     """Read back one journal operation: header + pages + the original bytes.
 
-    Every named key, coordinate, page ordinal, the page/item counts, the framed
-    pages root and the self-hashed operation id are re-verified; a missing or
+    The stored header is validated to its full exact form (every field, the
+    typed contexts and the self-hash); every named key, coordinate, page
+    ordinal, the page/item counts, the framed pages root and the result digest
+    recomputed from the actual page items are re-verified; a missing or
     non-canonical entry is the canonical ValueError.
     """
     key = encode_receipt3_operation_key(owner_session_id, generation)
     header, header_bytes = _read_canonical(conn, key)
-    if (type(header) is not dict or header.get("owner_session_id") != owner_session_id
-            or header.get("generation") != generation):
+    validate_operation_header(header)
+    if header["owner_session_id"] != owner_session_id or header["generation"] != generation:
         _invalid()
-    page_count = header.get("page_count")
-    if type(page_count) is not int or page_count < 0:
-        _invalid()
-    _epoch_string(header.get("epoch"))
+    page_count = header["page_count"]
     pages, page_bytes = [], []
     for ordinal in range(page_count):
         page, raw = _read_canonical(
             conn, encode_receipt3_page_key(owner_session_id, generation, ordinal))
         validate_journal_page(page)
         if (page["owner_session_id"] != owner_session_id or page["generation"] != generation
-                or page["page_ordinal"] != ordinal or page["epoch"] != header.get("epoch")):
+                or page["page_ordinal"] != ordinal or page["epoch"] != header["epoch"]):
             _invalid()
         pages.append(page)
         page_bytes.append(raw)
-    if sum(len(page["items"]) for page in pages) != header.get("item_count"):
+    if sum(len(page["items"]) for page in pages) != header["item_count"]:
         _invalid()
-    if journal_pages_root(owner_session_id, header.get("epoch"), generation, pages) \
-            != header.get("pages_root_sha256"):
+    if journal_pages_root(owner_session_id, header["epoch"], generation, pages) \
+            != header["pages_root_sha256"]:
         _invalid()
-    sealed = {name: value for name, value in header.items() if name != "operation_sha256"}
-    if header.get("operation_sha256") != H("operation", sealed):
-        _invalid()
+    result_items = [item for page in pages for item in page["items"]
+                    if item["kind"] == "native_result"]
+    if header["result_sha256"] != B("native-result", [C(item) for item in result_items]):
+        _invalid()   # the result digest must recompute from the actual page items
     return {"header": header, "pages": pages, "header_bytes": header_bytes,
             "page_bytes": page_bytes}
 
@@ -1127,3 +1252,115 @@ def seal_epoch_blocks(conn, *, owner_session_id: str, epoch: str, epoch_ordinal:
         sealed.append({"key": key, "body": body})
         previous_end = body["end_generation"]
     return sealed
+
+
+# ── C02 step 5: read-only named-only back-projection of a partial recovery ──
+
+_TOKEN_RECORD_KEYS = frozenset({
+    "owner_session_id", "operation_id", "request_sha256", "operation_generation",
+    "operation_sha256", "result_sha256"})
+
+
+def read_partial_recovery_state(conn, owner_session_id: str, *,
+                                approved_transition: dict) -> list[dict]:
+    """Read-only rebuild of one owner's named-only recovery back-projection.
+
+    Receipt r4 C02 step 5: after a crash the recovery re-reads what is actually
+    committed before an owner is continued. Every ``receipt3/t/<SIDhex>/<opuuid>``
+    record must be canonical, verify its own result digest and name a journal
+    entry that verifies exactly against it -- including the frozen
+    *approved_transition* continuation block; every ``receipt3/o|p`` key of the
+    owner must be named by a committed record (no orphaned journal bytes), and
+    every ``receipt3/e`` checkpoint must replay from the original stored member
+    bytes. Anything else raises the canonical ValueError: a partial state is
+    never silently repaired, truncated or rebaselined. Returns the committed
+    operations ordered by generation.
+    """
+    if type(owner_session_id) is not str or not owner_session_id:
+        _invalid()
+    if type(approved_transition) is not dict or set(approved_transition) != _CONTINUATION_KEYS:
+        _invalid()
+    committed = []
+    members_by_generation = {}
+    lo, hi = _receipt3_prefix_span(_RECEIPT3_TOKEN_PREFIX, owner_session_id)
+    last = lo
+    while True:
+        rows = conn.execute(
+            "SELECT key, value FROM state_meta WHERE key > ? AND key < ? ORDER BY key LIMIT ?",
+            (last, hi, 128)).fetchall()
+        if not rows:
+            break
+        for key, _value in rows:
+            last = key
+            parsed = parse_receipt3_token_key(key)
+            if parsed["session_id"] != owner_session_id:
+                _invalid()
+            stored, _raw = _read_canonical(conn, key)
+            if type(stored) is not dict or set(stored) != _TOKEN_RECORD_KEYS:
+                _invalid()
+            if (stored["owner_session_id"] != owner_session_id
+                    or stored["operation_id"] != parsed["operation_id"]):
+                _invalid()
+            _sha256_hex(stored["request_sha256"])
+            _sha256_hex(stored["operation_sha256"])
+            _sha256_hex(stored["result_sha256"])
+            generation = _positive_int64(stored["operation_generation"])
+            result = {"token": stored["operation_id"],
+                      "operation_sha256": stored["operation_sha256"],
+                      "generation": generation}
+            if stored["result_sha256"] != hashlib.sha256(C(result)).hexdigest():
+                _invalid()   # the stored result digest must recompute exactly
+            member = read_operation(conn, owner_session_id, generation)
+            header = member["header"]
+            if (header["kind"] != "epoch_continuation"
+                    or header["operation_id"] != stored["operation_id"]
+                    or header["request_sha256"] != stored["request_sha256"]
+                    or header["operation_sha256"] != stored["operation_sha256"]
+                    or header["continuation"] != approved_transition):
+                _invalid()
+            members_by_generation[generation] = member
+            committed.append({"token": stored["operation_id"], "generation": generation,
+                              "operation_sha256": stored["operation_sha256"],
+                              "request_sha256": stored["request_sha256"]})
+    committed.sort(key=lambda item: (item["generation"], item["token"]))
+    # No orphaned journal bytes: every o|p key of the owner is named by a
+    # committed record (and every committed record's keys are present --
+    # read_operation above already refused a missing key).
+    named = set()
+    for item in committed:
+        member = members_by_generation[item["generation"]]
+        named.add(encode_receipt3_operation_key(owner_session_id, item["generation"]))
+        for ordinal in range(len(member["pages"])):
+            named.add(encode_receipt3_page_key(owner_session_id, item["generation"], ordinal))
+    for prefix in (_RECEIPT3_OPERATION_PREFIX, _RECEIPT3_PAGE_PREFIX):
+        lo, hi = _receipt3_prefix_span(prefix, owner_session_id)
+        last = lo
+        while True:
+            rows = conn.execute(
+                "SELECT key FROM state_meta WHERE key > ? AND key < ? ORDER BY key LIMIT ?",
+                (last, hi, 128)).fetchall()
+            if not rows:
+                break
+            for (key,) in rows:
+                last = key
+                if key not in named:
+                    _invalid()   # orphaned journal bytes refuse the partial state
+    # Every epoch checkpoint of the owner replays from the original member bytes.
+    lo, hi = _receipt3_prefix_span(_RECEIPT3_EPOCH_PREFIX, owner_session_id)
+    epochs = set()
+    last = lo
+    while True:
+        rows = conn.execute(
+            "SELECT key FROM state_meta WHERE key > ? AND key < ? ORDER BY key LIMIT ?",
+            (last, hi, 128)).fetchall()
+        if not rows:
+            break
+        for (key,) in rows:
+            last = key
+            epochs.add(parse_receipt3_epoch_key(key)["epoch_ordinal"])
+    for epoch_ordinal in sorted(epochs):
+        members = read_journal_members(conn, owner_session_id, epoch_ordinal=epoch_ordinal)
+        by_generation = {member["header"]["generation"]: member for member in members}
+        for block in _read_range_blocks(conn, owner_session_id, epoch_ordinal):
+            _replay_block(block, by_generation, owner_session_id, epoch_ordinal)
+    return committed

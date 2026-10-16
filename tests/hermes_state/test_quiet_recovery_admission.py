@@ -479,3 +479,205 @@ def test_first_receipt_g0_continuation_and_missing_head_downgrade_refusal(tmp_pa
         assert handle._write_count == 0
     finally:
         handle.close()
+
+
+# ── milestone 2B: quiet reopen + post-release bounded FTS pass ───────────────
+
+def _ro_receipt_rows(path):
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return sorted((row[0], row[1]) for row in conn.execute(
+            "SELECT key, value FROM state_meta WHERE key LIKE 'receipt3/%'"))
+    finally:
+        conn.close()
+
+
+def test_quiet_reopen_resumes_partial_crash_and_enumerates_completed_tokens(tmp_path):
+    path = _settle(tmp_path)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    crashed = SessionDB.open_quiet_recovery_admission(db_path=path, init_request=dict(approved))
+    first = crashed.append_epoch_continuation(dict(approved))
+    # The crash: the connection dies with the process; the handle never runs
+    # close() or any exit-time maintenance, and no counter or due flag was
+    # persisted anywhere.
+    crashed._conn.close()
+    del crashed
+    # Re-entry is quiet admission again, never the ordinary constructor.
+    handle = hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    try:
+        committed = handle.enumerate_committed_continuations()
+        assert [entry["token"] for entry in committed] == [approved["token"]]
+        assert [entry["generation"] for entry in committed] == [2]
+        assert committed[0]["operation_sha256"] == first["operation_sha256"]
+        state = handle.verify_partial_recovery_state()
+        assert state["head"] is not None and state["head"]["generation"] == 2
+        assert state["head"]["head_sha256"] == first["operation_sha256"]
+        # A restarted in-memory counter is not a reset of persisted recovery
+        # state: nothing about the committed bytes changed.
+        assert handle._write_count == 0 and handle._fts_deferred_due is False
+        snapshot = _receipt_snapshot(handle)
+        assert handle.append_epoch_continuation(dict(approved)) == first
+        assert _receipt_snapshot(handle) == snapshot
+        assert handle._write_count == 0
+    finally:
+        handle.close()
+    # A clean close resumes the same way: the recovery only ends at exit_quiet().
+    handle = hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    try:
+        assert handle.enumerate_committed_continuations()[0]["token"] == approved["token"]
+    finally:
+        handle.close()
+
+
+def test_quiet_reopen_before_any_commit_continues_the_remaining_owner(tmp_path):
+    path = _settle(tmp_path)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    crashed = SessionDB.open_quiet_recovery_admission(db_path=path, init_request=dict(approved))
+    crashed._conn.close()          # crash before any commit: nothing was written
+    del crashed
+    handle = hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    try:
+        assert handle.enumerate_committed_continuations() == []
+        state = handle.verify_partial_recovery_state()
+        assert state["head"]["generation"] == 1        # still the frozen old head
+        result = handle.append_epoch_continuation(dict(approved))   # the owner continues
+        assert result["generation"] == 2 and handle._write_count == 1
+        assert handle.enumerate_committed_continuations()[0]["token"] == approved["token"]
+    finally:
+        handle.close()
+
+
+def test_quiet_reopen_refuses_inconsistent_partial_state(tmp_path):
+    # (a) a committed continuation whose journal page bytes are gone
+    a = tmp_path / "a"
+    a.mkdir()
+    path = _settle(a)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    handle = SessionDB.open_quiet_recovery_admission(db_path=path, init_request=dict(approved))
+    handle.append_epoch_continuation(dict(approved))
+    handle.close()
+    _mutate(path, "DELETE FROM state_meta WHERE key LIKE 'receipt3/p/%'")
+    with pytest.raises(ValueError):
+        hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    # (b) a committed continuation whose protected head was erased
+    b = tmp_path / "b"
+    b.mkdir()
+    path = _settle(b)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    handle = SessionDB.open_quiet_recovery_admission(db_path=path, init_request=dict(approved))
+    handle.append_epoch_continuation(dict(approved))
+    handle.close()
+    _mutate(path, "UPDATE sessions SET model_config = '{}' WHERE id = ?", (SID,))
+    with pytest.raises(ValueError):
+        hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    # (c) orphaned receipt3/o bytes without any committed token
+    c = tmp_path / "c"
+    c.mkdir()
+    path = _settle(c)
+    _mutate(path, "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+            (f"receipt3/o/{SID.encode('utf-8').hex()}/00000000000000000001", "{}"))
+    with pytest.raises(ValueError):
+        hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=_continuation_request())
+    # (d) the resumed request no longer matches the committed operation's frozen
+    # transition block
+    d = tmp_path / "d"
+    d.mkdir()
+    path = _settle(d)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    handle = SessionDB.open_quiet_recovery_admission(db_path=path, init_request=dict(approved))
+    handle.append_epoch_continuation(dict(approved))
+    handle.close()
+    with pytest.raises(ValueError):
+        hermes_state.QuietRecoveryHandle.resume(
+            db_path=path, init_request=dict(approved, proof_sha256="9" * 64))
+    # (e) before any commit, a head that no longer carries the frozen coordinates
+    e = tmp_path / "e"
+    e.mkdir()
+    path = _settle(e)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    _mutate(path, "UPDATE sessions SET model_config = ? WHERE id = ?",
+            (json.dumps({"_message_copy_receipts_v2": _head(generation=7)}), SID))
+    with pytest.raises(ValueError):
+        hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+
+
+def test_post_release_fts_pass_runs_at_exit_after_the_accepted_boundary(tmp_path):
+    path = _settle(tmp_path)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    handle = hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    try:
+        handle.append_epoch_continuation(dict(approved))
+        binding = handle.final_readback_binding()
+        message = {"owner_session_id": binding["owner_session_id"],
+                   "committed": binding["committed"], "head": binding["head"]}
+        assert binding["readback_sha256"] == hashlib.sha256(_canonical(message)).hexdigest()
+        assert binding["committed"][0]["token"] == approved["token"]
+        snapshot = _receipt_snapshot(handle)
+        assert handle._fts_deferred_due is False     # no due flag was persisted anywhere
+        # The acceptance gate: a wrong binding refuses the exit and runs nothing.
+        with pytest.raises(ValueError):
+            handle.exit_quiet(accepted_readback_sha256="0" * 64)
+        assert handle._closed is False
+        assert handle._fts_usermerge_floor_applied is False
+        assert _receipt_snapshot(handle) == snapshot
+        report = handle.exit_quiet(accepted_readback_sha256=binding["readback_sha256"])
+    finally:
+        if not handle._closed:
+            handle.close()
+    assert handle._closed is True
+    # Exactly one native bounded pass ran (500 pages/index, 4 commands/pass),
+    # AFTER the accepted boundary: it touches only FTS maintenance state.
+    assert report["fts_pass"]["failed"] is None
+    assert report["fts_pass"]["executed"] >= 1
+    assert report["write_count"] == 1                # the counter is not zeroed
+    assert report["fts_enabled"] is True and report["trigram_available"] is True
+    assert report["readback"]["readback_sha256"] == binding["readback_sha256"]
+    # Committed continuation bytes are untouched by the pass; ordinary handles reopen.
+    assert _ro_receipt_rows(path) == snapshot
+    db = SessionDB(db_path=path)
+    try:
+        db.set_meta("post/release", "ok")
+    finally:
+        db.close()
+
+
+def test_post_release_fts_pass_failure_never_replays_committed_continuations(tmp_path):
+    path = _settle(tmp_path)
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
+    handle = hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    first = handle.append_epoch_continuation(dict(approved))
+    snapshot = _receipt_snapshot(handle)
+    binding = handle.final_readback_binding()
+    # The bounded pass fails for real (the connection refuses writes): the
+    # failure is reported, the accepted boundary stands, and no committed
+    # continuation may be replayed.
+    handle._conn.execute("PRAGMA query_only = ON")
+    report = handle.exit_quiet(accepted_readback_sha256=binding["readback_sha256"])
+    assert handle._closed is True
+    assert report["fts_pass"]["failed"] is not None
+    assert report["fts_pass"]["executed"] == 0
+    assert _ro_receipt_rows(path) == snapshot
+    # The committed token still replays exactly through a fresh quiet reopen.
+    reopened = hermes_state.QuietRecoveryHandle.resume(db_path=path, init_request=dict(approved))
+    try:
+        assert reopened.append_epoch_continuation(dict(approved)) == first
+        assert reopened._write_count == 0
+        assert _ro_receipt_rows(path) == snapshot
+    finally:
+        reopened.close()
