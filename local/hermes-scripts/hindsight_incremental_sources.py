@@ -488,7 +488,13 @@ def compute_scan_fingerprints(hermes_home, *, physical_baseline):
                     for record in con.execute('SELECT ' + selected + ' FROM sessions'):
                         row = dict(record)
                         sid = row['id']
-                        binding = _native_session_binding(row)
+                        # Bind end_reason and the config projection (copy
+                        # receipts) so receipt-only changes mark the session
+                        # dirty, not just the legacy native binding.
+                        binding = digest({'id': sid, 'started_at': row.get('started_at'),
+                            'parent_session_id': row.get('parent_session_id'),
+                            'source': row.get('source'), 'end_reason': row.get('end_reason'),
+                            'config': _native_config_projection(row.get('model_config'))})
                         if sid in sessions:
                             sessions[sid][2] = binding
                         else:
@@ -865,6 +871,32 @@ def inspect_sqlite_transition_header(path: Path):
     if _location_identity(path) != identity:
         raise SourceChangedError('source_changed: SQLite replaced during transition inspection')
     return header
+
+
+def _read_physical_sessions(path: Path):
+    """Cheap pre-read of the sessions table (same projection as the reader).
+
+    Used by the incremental closure so lineage comes from the sessions table
+    plus artifacts, never artifact-only evidence. Never streams message rows.
+    """
+    con = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute('PRAGMA query_only=ON')
+        con.execute('BEGIN')
+        session_columns = {r[1] for r in con.execute('PRAGMA table_info(sessions)')}
+        selected = 'id, started_at, parent_session_id, end_reason, source'
+        if 'model_config' in session_columns:
+            selected += ', model_config'
+        sessions = {}
+        for record in con.execute('SELECT ' + selected + ' FROM sessions'):
+            row = dict(record)
+            row['model_config'] = _native_config_projection(row.pop('model_config', None))
+            sessions[row['id']] = row
+        con.rollback()
+    finally:
+        con.close()
+    return sessions
 
 
 def _read_physical_db(path: Path, *, consume=None, include_structure=False, row_filter=None):
@@ -1490,25 +1522,35 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
     copy_roots, copy_sources = {}, set()
     evidence = _physical_lineage({}, lineage_artifacts, anchors)
     # Incremental mode: close the dirty set over cutover roots so every
-    # affected root's snapshot keeps its complete member event set. Unknown
-    # or broken lineage over-includes (fail-safe: at most extra reads).
+    # affected root's snapshot keeps its complete member event set. The
+    # closure is derived from the SESSIONS TABLE plus the artifacts (a
+    # pre-read, cheap), never artifact-only lineage. Any lineage failure
+    # falls back to a super-closure over all evidence sessions (true
+    # fail-safe: at most a full read, never a missed capture).
     closure = None
     if dirty_sessions is not None:
+        base_evidence = _physical_lineage(_read_physical_sessions(db), lineage_artifacts, anchors)
         closure = set(dirty_sessions)
+        failed = False
         affected = set()
         for sid in dirty_sessions:
             try:
-                affected.add(_cutover_root(sid, evidence, anchors))
+                affected.add(_cutover_root(sid, base_evidence, anchors))
             except SourceChangedError:
-                affected.add(sid)
-        for sid in set(evidence):
-            if sid in closure:
-                continue
-            try:
-                if _cutover_root(sid, evidence, anchors) in affected:
-                    closure.add(sid)
-            except SourceChangedError:
-                closure.add(sid)
+                failed = True
+                break
+        if not failed:
+            for sid in set(base_evidence):
+                if sid in closure:
+                    continue
+                try:
+                    if _cutover_root(sid, base_evidence, anchors) in affected:
+                        closure.add(sid)
+                except SourceChangedError:
+                    failed = True
+                    break
+        if failed:
+            closure = set(base_evidence) | set(dirty_sessions)
         closure = frozenset(closure)
 
     def check_origin(record, sid):
@@ -1639,6 +1681,7 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
             if _exclude_old_copy(record, sid, old_index, evidence, cutover_anchors=anchors):
                 continue
             if (current['path'] not in frozen_files and sid in anchors and not record['origin_hash']
+                    and (closure is None or sid in closure)
                     and (sid, record['export_hash']) not in current_db_exports):
                 raise SourceChangedError('source_changed: new late export lacks native/exact copy binding')
             msg = _message(raw, codex=data.get('platform') == 'backfill-codex' or sid.startswith('codex-'))
@@ -1701,15 +1744,21 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                                    and current_fp.get('artifacts') == previous_fp.get('artifacts'))
             if previous_fp is None or current_fp is None or current_fp.get('db') is None:
                 dirty_sessions = None  # seed/fail-safe: full profile read
-            elif current_fp['db'] == previous_fp.get('db'):
-                if artifacts_unchanged:
-                    continue  # db and JSON views both unchanged: no read at all
-                dirty_sessions = None  # JSON view changed: full profile read
+            elif previous_fp.get('db') is None or current_fp['db'][:2] != previous_fp['db'][:2]:
+                # Physical identity changed (new inode/device): full strict
+                # read so the epoch/transition checks still run.
+                dirty_sessions = None
             elif not artifacts_unchanged:
                 dirty_sessions = None  # JSON view changed: full profile read
             else:
+                # Content-based diff only (never the file stat: WAL commits do
+                # not touch the main db file). Vanished sessions count as
+                # dirty so their loss fails closed via the ledger check.
                 dirty = sorted(sid for sid, fp in current_fp['sessions'].items()
                                if previous_fp['sessions'].get(sid) != fp)
+                vanished = sorted(set(previous_fp['sessions']) - set(current_fp['sessions']))
+                if vanished:
+                    dirty = sorted(set(dirty) | set(vanished))
                 if not dirty:
                     continue  # nothing changed
                 dirty_sessions = dirty

@@ -135,3 +135,46 @@ def test_ledger_scan_store_roundtrip(tmp_path):
     assert ledger.load_scan_fingerprints() == profiles
     (ledger.bank_dir / 'scan-fingerprints.json').write_text('{not json')
     assert ledger.load_scan_fingerprints() is None  # invalid store: seed run
+
+
+def test_compression_successor_without_export_matches_full(fixture, monkeypatch):
+    # Two post-baseline sessions in one compression chain, no JSON exports:
+    # the closure must come from the sessions table, not artifact-only lineage.
+    src, home, db, baseline = fixture
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO sessions VALUES ('chain-a',200,NULL,'compression','cli',NULL)")
+        con.execute("INSERT INTO sessions VALUES ('chain-b',300,'chain-a',NULL,'cli',NULL)")
+        con.execute("INSERT INTO messages VALUES (2,'chain-a','user',200,'Chain A fact',1,0,'chain-a-e1',x'02')")
+        con.execute("INSERT INTO messages VALUES (3,'chain-b','user',300,'Chain B fact',1,0,'chain-b-e1',x'03')")
+    seed = src.compute_scan_fingerprints(home, physical_baseline=baseline)
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO messages VALUES (4,'chain-b','assistant',301,"
+                    "'Chain B new fact',1,0,'chain-b-e2',x'04')")
+    full = src.scan_source_snapshots(home, physical_baseline=baseline)
+    current = src.compute_scan_fingerprints(home, physical_baseline=baseline)
+    incremental = src.scan_source_snapshots(home, physical_baseline=baseline,
+        scan_fingerprints=current, scan_previous=seed)
+    full_by_key = {s['source_key']: s['messages'] for s in full}
+    inc_by_key = {s['source_key']: s['messages'] for s in incremental}
+    assert inc_by_key  # the dirty chain must produce output
+    for key, messages in inc_by_key.items():
+        assert key in full_by_key, key
+        assert messages == full_by_key[key], key
+
+
+def test_vanished_session_is_reported_for_fail_closed_capture(fixture):
+    src, home, db, baseline = fixture
+    with sqlite3.connect(db) as con:
+        con.execute("INSERT INTO sessions VALUES ('post-baseline',400,NULL,NULL,'cli',NULL)")
+        con.execute("INSERT INTO messages VALUES (2,'post-baseline','user',400,'Ephemeral fact',1,0,'eph-e1',x'02')")
+    seed = src.compute_scan_fingerprints(home, physical_baseline=baseline)
+    for entry in seed.values():  # the pipeline stores the full scope
+        entry['scope_sids'] = sorted(entry['sessions'].keys())
+    with sqlite3.connect(db) as con:
+        con.execute("DELETE FROM messages WHERE session_id='post-baseline'")
+        con.execute("DELETE FROM sessions WHERE id='post-baseline'")
+    current = src.compute_scan_fingerprints(home, physical_baseline=baseline)
+    snapshots = src.scan_source_snapshots(home, physical_baseline=baseline,
+        scan_fingerprints=current, scan_previous=seed)
+    vanished = [s for s in snapshots if s['source_key'].endswith('post-baseline')]
+    assert vanished and not vanished[0]['messages']  # empty -> ledger capture fails closed

@@ -248,10 +248,6 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     reader_options['scan_fingerprints'] = scan_fingerprints
                     reader_options['scan_previous'] = ledger.load_scan_fingerprints()
                 snapshots = source_reader(Path(config['hermes_home']), **reader_options)
-                if scan_fingerprints is not None:
-                    for entry in scan_fingerprints.values():
-                        entry['scope_sids'] = sorted(entry['sessions'].keys())
-                    ledger.save_scan_fingerprints(scan_fingerprints)
                 report['scan_mode'] = scan_mode
                 report['profiles_with_output'] = sorted({s['profile'] for s in snapshots})
             if not execute:
@@ -263,6 +259,10 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
             captured = []
             for snapshot in snapshots:
                 captured.extend(ledger.capture_snapshot(snapshot))
+            if scan_fingerprints is not None:
+                for entry in scan_fingerprints.values():
+                    entry['scope_sids'] = sorted(entry['sessions'].keys())
+                ledger.save_scan_fingerprints(scan_fingerprints)
             _record(report, 'capture', new_batches=len(captured), sources=len(snapshots))
             initial = ledger.pending_batches(now=clock(), max_units=max_units, max_chars=max_chars)
             if not initial:

@@ -543,7 +543,11 @@ class IncrementalLedger:
         if (not isinstance(value, dict) or value.get('schema_version') != self.SCAN_FINGERPRINTS_SCHEMA
                 or value.get('bank') != self.bank or not isinstance(value.get('profiles'), dict)):
             return None
-        return value['profiles']
+        profiles = value['profiles']
+        for entry in profiles.values():
+            if not isinstance(entry, dict) or not isinstance(entry.get('sessions'), dict):
+                return None
+        return profiles
 
     def save_scan_fingerprints(self, profiles: dict) -> None:
         """Atomic sidecar write of the per-source fingerprints."""
@@ -557,8 +561,15 @@ class IncrementalLedger:
         try:
             with os.fdopen(fd, 'w') as handle:
                 handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.chmod(name, 0o600)
             os.replace(name, path)
+            dir_fd = os.open(str(self.bank_dir), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except BaseException:
             try:
                 os.unlink(name)
