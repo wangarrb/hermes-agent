@@ -43,7 +43,13 @@ the ``receipt3/`` protected namespace in the SessionDB store:
 
 Only the native writer (inside its own ``_execute_write`` transaction) may call
 the builder; the generic ``SessionDB.set_meta``/``list_meta_prefix`` surfaces
-refuse the reserved namespace. The joint/inverse/proof readers open their own
+refuse the reserved namespace. * the M2D design binding (receipt r4 amendments section 5): effective r4
+    metadata, the ``r4_expected``-over-``r3_expected`` expected precedence
+    resolver over the 40-row acceptance disposition, and the accurate
+    disclosure fields -- auditable design metadata explicitly NOT protocol
+    record bytes (see the M2D section at the end of this module).
+
+The joint/inverse/proof readers open their own
 independent ``mode=ro``/``query_only`` connections and never write.
 """
 from __future__ import annotations
@@ -2175,3 +2181,224 @@ def verify_frozen_proof(path, proof) -> dict:
         _invalid()   # the frozen inode no longer matches its proof
     return {"verified": True, "owner_session_id": frozen["owner_session_id"],
             "joint_sha256": joint["joint_sha256"], "table_count": joint["table_count"]}
+
+
+# ---------------------------------------------------------------------------
+# M2D design binding: effective r4 metadata, gate-expected precedence and the
+# accurate disclosure (receipt r4 amendments section 5 rows "版本/优先级/审查
+# 状态", "受影响 expected 增补" and "准确披露"; gates inventory section 2
+# A1-A3). Attribution, annotated per evidence:
+#
+#   * acceptance-apparatus side: ``resolve_gate_expected`` /
+#     ``verify_r4_gate_binding`` implement the frozen expected precedence
+#     ("r4_expected if present is the effective expectation; all historical
+#     r3_expected retained") for the acceptance runner; the operator-side
+#     apparatus script operator/schema31_receipt_impl/r4_gate_binding.py
+#     re-derives every pinned value below from the frozen JSON bytes and
+#     compares (immutability, derivation and writer_timeline deltas);
+#   * product-code side: the pinned binding data lives here because the
+#     official test sandbox exposes only the worktree -- the acceptance
+#     tests must exercise the resolver against the real frozen bytes
+#     without reading the repository reports/ tree (same home as the M2C
+#     step-6 acceptance machinery).
+#
+# These values are auditable design/acceptance metadata, explicitly NOT
+# protocol record bytes ("auditable derivation metadata, not protocol
+# record"): none of them enters any receipt3/ key, operation header, page,
+# token key, protected head or the wire schema. r4 is a design-document
+# revision, not a wire/schema/domain/epoch revision (protocol.precedence);
+# the protocol revision itself is unchanged (_PROTOCOL_REVISION == 3).
+# ---------------------------------------------------------------------------
+RECEIPT_DESIGN_ARTIFACT_VERSION = "schema31-receipt-v2-design/4"
+RECEIPT_DESIGN_REVISION = "review-candidate-r4-focused-amendments"
+RECEIPT_DESIGN_STATUS = "READY_FOR_FOCUSED_INDEPENDENT_DESIGN_REVIEW"
+RECEIPT_DESIGN_PRECEDENCE = "Exact named owner SHA > r4 amendments and this self-contained effective r4 JSON (contradiction stops) > unaffected pinned r3 MD SHA 22729cadf86090464e67f3a14b04b5b031b0190c940a95d1388e977980d56018. r1/r2 only exact previously enumerated unchanged references; no fallback hybrid. r4 is a design-document revision, not a wire/schema/domain/epoch revision. All historical r3_expected retained; per-row r4_expected, if present, is the effective expectation."
+RECEIPT_DESIGN_EXPECTED_PRECEDENCE = "r4_expected if present else original unchanged r3_expected; all original inputs/hashes/owner/status/disposition retained"
+RECEIPT_DESIGN_AMENDMENT_LINEAGE = {
+    "base_json_sha256": "5d2af1296bf6ea7dd018b01c32d7b2b670b54a6ba98cc99215345397ac726ade",
+    "shared_r3_md_sha256": "22729cadf86090464e67f3a14b04b5b031b0190c940a95d1388e977980d56018",
+    "amendments_sha256": "7b49d7e90f2d8782d24ba4708f484b728f8d62623afbebfec228b116ca3ad879",
+    "only_findings": ('R3-C01', 'R3-C02', 'R3-Q01'),
+    "owner_approved_at_authoring": False,
+    "implementation_at_authoring": False,
+    "runtime_pass_at_authoring": False,
+}
+# The ten adapted gates: (acceptance_disposition index, gate id, r4_adaptation_reason).
+R4_ADAPTED_GATES = (
+    (17, "A18", "R3-C01/Q01"),
+    (22, "A23", "R3-C02"),
+    (24, "A25", "R3-C02"),
+    (26, "A27", "R3-C01/C02"),
+    (29, "A30", "R3-Q01"),
+    (33, "B02", "R3-Q01"),
+    (35, "B04", "R3-Q01"),
+    (36, "B05", "R3-C02"),
+    (37, "B06", "R3-C01"),
+    (38, "B07", "R3-C02"),
+)
+R4_ADAPTED_GATE_INDICES = tuple(index for index, _gate_id, _reason in R4_ADAPTED_GATES)
+R4_GATE_ROWS = 40
+R4_GATE_RETAINED_FIELDS = ("id", "name", "disposition", "original_input", "r1_input_sha256",
+                           "r2_expected_sha256", "r3_expected", "reason", "authority_sha256", "status")
+# r4 amendments section 5 C02 row: only writer_timeline[0] and [5] were
+# overridden; entries [1..4] stay byte-identical to the r3 base (checked by
+# the apparatus script against both frozen JSONs).
+R4_WRITER_TIMELINE_OVERRIDDEN_INDICES = (0, 5)
+R4_WRITER_TIMELINE_UNCHANGED_INDICES = (1, 2, 3, 4)
+R4_DISCLOSURE_PINS = {
+    "source_json_sha256": "70fec4785772aabd1ca075fe8c1d65e3fbc6da1e9c216bb74fbd26bc7fac54f1",
+    "base_json_sha256": "5d2af1296bf6ea7dd018b01c32d7b2b670b54a6ba98cc99215345397ac726ade",
+    "amendments_sha256": "7b49d7e90f2d8782d24ba4708f484b728f8d62623afbebfec228b116ca3ad879",
+    "gates_inventory_sha256": "a0e0cfd8b94e8ed08e0e39ab1777bd157c4190e2f7f53a4adfd5e839c79ef7a7",
+    "known_published_gap_sha256": "d6758d684fdd23f569233096477008bb4dbba57c19668f3382e2d9b282eaf836",
+    "remaining_policy_gates_sha256": "d239797e8dd41e29c86625e40f75fd6202998b61cefe25ab689773c97ac1d432",
+    "finding_disposition_I02_normative_sections_sha256": "59818fc04ab9487cb7b46f557b37f693812e0bd7457f49a8c13c2653241fb796",
+    "remaining_policy_gates_count": 7,
+}
+# Owner state as decided 2026-10-17 (reports/owner-decisions-20261017-batch.json,
+# sha256 pinned): F and context policies approved as conservative pause plus
+# isolated implementation per the r4 design, with explicit limits. This overlay
+# records the decision; it is not an authorization to change any data and it
+# does not advance any pinned r4 design byte (r4 expectations/disclosure stay
+# exactly as frozen).
+R4_OWNER_STATUS = {
+    "decided_on": "2026-10-17",
+    "owner_decision_path": "reports/owner-decisions-20261017-batch.json",
+    "owner_decision_sha256": "d052ad48922b37171efc0eb5b9a1dcc4ef1919975bcd2113d817e04bd9304a6d",
+    "F_policy": "APPROVED_AS_CONSERVATIVE_PAUSE",
+    "context_policy": "APPROVED_AS_CONSERVATIVE_PAUSE",
+    "isolated_implementation_per_r4_design": "AUTHORIZED",
+    "limits": ("no DB migration", "no activation", "no production writes",
+               "no legacy bridge/certificate/pin/ledger activation"),
+    "native_runtime_gates": "REQUIRED_NOT_RUN",
+}
+R4_STILL_OPEN = (
+    "owner exact r4 design approval form / any certificate or pin: separate decision, not issued",
+    "quiet native recovery seam drain/activation surfaces stay sandbox-only; separate approval needed",
+    "finite measured resource maxima / provisioned reserve / maintenance budget: not approved",
+    "legacy bridge + certificate/pin/source/ledger activation, migration, production, publication: NOT AUTHORIZED",
+    "all 39 native runtime gates: REQUIRED_NOT_RUN (a real run needs separate implementation+copy-write approval)",
+)
+
+
+def receipt_design_binding() -> dict:
+    """A1 binding view: version / precedence / derivation metadata.
+
+    Returns the effective-r4 metadata with an explicit annotation that none
+    of it is protocol record bytes; the acceptance runner resolves gate
+    expectations through ``resolve_gate_expected`` below.
+    """
+    return {
+        "artifact_version": RECEIPT_DESIGN_ARTIFACT_VERSION,
+        "revision": RECEIPT_DESIGN_REVISION,
+        "status": RECEIPT_DESIGN_STATUS,
+        "precedence": RECEIPT_DESIGN_PRECEDENCE,
+        "expected_precedence": RECEIPT_DESIGN_EXPECTED_PRECEDENCE,
+        "amendment_lineage": dict(RECEIPT_DESIGN_AMENDMENT_LINEAGE),
+        "gate_rows": R4_GATE_ROWS,
+        "adapted_gate_count": len(R4_ADAPTED_GATES),
+        "adapted_gate_indices": R4_ADAPTED_GATE_INDICES,
+        "wire_or_schema_revision": False,
+        "protocol_record": False,
+        "source_json_sha256": R4_DISCLOSURE_PINS["source_json_sha256"],
+    }
+
+
+def resolve_gate_expected(row: dict) -> dict:
+    """A1/A2 acceptance binding: the effective expectation of one gate row.
+
+    Precedence (``protocol.precedence`` / ``amendment_lineage
+    .expected_precedence``): ``r4_expected`` if present is the effective
+    expectation, otherwise the original unchanged ``r3_expected``. The
+    historical fields are retained and returned untouched. Shape violations
+    refuse with the canonical ValueError (never KeyError/TypeError): a
+    non-dict row or missing id, a missing/empty/non-string ``r3_expected``,
+    a present-but-empty/non-string ``r4_expected``, or a missing
+    ``r4_adaptation_reason`` while ``r4_expected`` is present.
+    """
+    if type(row) is not dict or "id" not in row:
+        _invalid()
+    r3 = row.get("r3_expected")
+    if type(r3) is not str or not r3:
+        _invalid()
+    retained = {key: row[key] for key in R4_GATE_RETAINED_FIELDS if key in row}
+    if "r4_expected" not in row:
+        return {"id": row["id"], "effective_expected": r3, "adapted": False,
+                "r4_adaptation_reason": None, "retained": retained}
+    r4 = row["r4_expected"]
+    if type(r4) is not str or not r4:
+        _invalid()
+    reason = row.get("r4_adaptation_reason")
+    if type(reason) is not str or not reason:
+        _invalid()
+    return {"id": row["id"], "effective_expected": r4, "adapted": True,
+            "r4_adaptation_reason": reason, "retained": retained}
+
+
+def verify_r4_gate_binding(rows) -> dict:
+    """A2 derivation check over the full 40-row effective disposition.
+
+    Exactly the ten ``R4_ADAPTED_GATES`` indices carry ``r4_expected`` (gate
+    identity and pinned ``r4_adaptation_reason`` must agree); every
+    ``r4_expected`` extends its retained ``r3_expected`` prefix
+    (``r4 == r3 + " " + extra``, supplement-only, never a rewrite); every
+    other row resolves through the unchanged ``r3_expected``. Anything else
+    refuses -- an unadapted row may not invent an expectation and an adapted
+    row may not drop or reorder one.
+    """
+    if type(rows) not in (list, tuple) or len(rows) != R4_GATE_ROWS:
+        _invalid()
+    pinned = {index: (gate_id, reason) for index, gate_id, reason in R4_ADAPTED_GATES}
+    seen, ids = set(), []
+    for index, row in enumerate(rows):
+        resolved = resolve_gate_expected(row)
+        ids.append(resolved["id"])
+        if not resolved["adapted"]:
+            if index in pinned:
+                _invalid()   # a pinned adapted gate must carry its r4_expected
+            continue
+        if index not in pinned:
+            _invalid()       # an unlisted row may not invent an r4_expected
+        gate_id, reason = pinned[index]
+        if resolved["id"] != gate_id or resolved["r4_adaptation_reason"] != reason:
+            _invalid()       # adapted identity or reason drifted
+        r3 = resolved["retained"]["r3_expected"]
+        if not resolved["effective_expected"].startswith(r3 + " "):
+            _invalid()       # r4_expected must extend, never rewrite, r3_expected
+        seen.add(index)
+    if seen != set(pinned) or len(set(ids)) != R4_GATE_ROWS:
+        _invalid()
+    return {"rows": R4_GATE_ROWS, "adapted_indices": sorted(seen),
+            "adapted_ids": [pinned[i][0] for i in sorted(seen)],
+            "fallback_count": R4_GATE_ROWS - len(seen)}
+
+
+def receipt_design_disclosure() -> dict:
+    """A3: the accurate disclosure (frozen r4 bytes + owner-status overlay).
+
+    The frozen r4 text is kept verbatim as the authoring-time record (its
+    sha256 pins are checked against the frozen JSON by the apparatus script
+    and by the acceptance tests); the owner-status overlay records what the
+    owner has since approved (2026-10-17: F and context conservative pause
+    policies plus isolated implementation per the r4 design). Unwitnessed
+    history stays unclaimed, unexecuted runtime gates stay
+    REQUIRED_NOT_RUN, and this disclosure is never an authorization.
+    """
+    return {
+        "artifact_version": RECEIPT_DESIGN_ARTIFACT_VERSION,
+        "frozen_r4": {
+            "known_published_gap_sha256": R4_DISCLOSURE_PINS["known_published_gap_sha256"],
+            "remaining_policy_gates_count": R4_DISCLOSURE_PINS["remaining_policy_gates_count"],
+            "remaining_policy_gates_sha256": R4_DISCLOSURE_PINS["remaining_policy_gates_sha256"],
+            "finding_disposition_I02_normative_sections_sha256":
+                R4_DISCLOSURE_PINS["finding_disposition_I02_normative_sections_sha256"],
+            "source_json_sha256": R4_DISCLOSURE_PINS["source_json_sha256"],
+        },
+        "owner_status": dict(R4_OWNER_STATUS),
+        "still_open": tuple(R4_STILL_OPEN),
+        "truthfulness": ("unwitnessed earlier context/history is never claimed as verified; "
+                         "unexecuted runtime gates stay REQUIRED_NOT_RUN; policy approval is not "
+                         "an implementation, activation or certification decision"),
+        "disclosure_only": True,
+        "protocol_record": False,
+    }
