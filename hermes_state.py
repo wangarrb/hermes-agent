@@ -56,7 +56,11 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin, _MESSAGE_UID_BACKFILL_DONE
-from hermes_state_copy_provenance import encode_receipt3_token_key
+from hermes_state_copy_provenance import (
+    _DOMAIN_SHA256 as _RECEIPT3_DOMAIN, build_epoch_continuation_header, build_journal_page,
+    encode_receipt3_operation_key, encode_receipt3_page_key, encode_receipt3_token_key,
+    observe_native_session_contexts, read_operation, seal_epoch_blocks, validate_receipt3_head,
+)
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
@@ -1749,6 +1753,12 @@ _QUIET_REQUIRED_REQUEST = frozenset({
     "old_generation", "old_head_sha256", "old_head_token_sha256",
     "boundary_roster_sha256", "alias_inventory_sha256",
 })
+# Exact stored token-record shape (attempt_token_index): the read-back path
+# verifies these bytes, never a relaxed subset.
+_QUIET_RECORD_KEYS = frozenset({
+    "owner_session_id", "operation_id", "request_sha256", "operation_generation",
+    "operation_sha256", "result_sha256",
+})
 # The epoch-transition bindings of the approved init request. Every committed
 # continuation must carry exactly these values; only the token and the
 # per-operation oldraw coordinates (old_generation/old_head_sha256/
@@ -1789,6 +1799,8 @@ def _validate_quiet_recovery_request(request) -> dict:
         raise ValueError("continuation token must be a canonical uuid4 string")
     for key in ("proof_sha256", "old_head_sha256", "old_head_token_sha256",
                 "boundary_roster_sha256", "alias_inventory_sha256"):
+        if key == "old_head_sha256":
+            continue  # gated on old_generation below (null only for a first receipt)
         value = request[key]
         if (not isinstance(value, str) or len(value) != 64
                 or any(c not in "0123456789abcdef" for c in value)):
@@ -1799,38 +1811,117 @@ def _validate_quiet_recovery_request(request) -> dict:
                 or len(value) != 71 or any(c not in "0123456789abcdef" for c in value[7:])):
             raise ValueError("continuation epochs must be sqlite:64lowerhex")
     generation = request["old_generation"]
-    if type(generation) is not int or generation < 1:
-        raise ValueError("old_generation must be a positive int")
+    if type(generation) is not int or generation < 0:
+        raise ValueError("old_generation must be a nonnegative int")
+    old_head_sha256 = request["old_head_sha256"]
+    if generation == 0:
+        if old_head_sha256 is not None:
+            raise ValueError(
+                "a first continuation (old_generation 0) carries a null old head")
+    elif (not isinstance(old_head_sha256, str) or len(old_head_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in old_head_sha256)):
+        raise ValueError("continuation request fields must be lowercase sha256 hex")
     return request
 
 
 def _quiet_result_from_record(record: dict) -> dict:
-    if type(record) is not dict or not {"operation_id", "operation_sha256",
-                                        "operation_generation"} <= set(record):
+    """Exact read-back of one stored token record: exactly the frozen six fields,
+    and the stored result digest must recompute from the returned result."""
+    if type(record) is not dict or set(record) != _QUIET_RECORD_KEYS:
         raise ValueError("stored continuation token record is unreadable; refusing")
-    return {"token": record["operation_id"],
-            "operation_sha256": record["operation_sha256"],
-            "generation": record["operation_generation"]}
+    result = {"token": record["operation_id"],
+              "operation_sha256": record["operation_sha256"],
+              "generation": record["operation_generation"]}
+    if record["result_sha256"] != hashlib.sha256(_quiet_canonical(result)).hexdigest():
+        raise ValueError("stored continuation result bytes no longer verify; refusing")
+    return result
 
 
-def _quiet_protected_head(raw) -> Optional[dict]:
-    """The owner's stored protected head (``model_config._message_copy_receipts_v2``)
-    or None when absent; unreadable shapes refuse the continuation."""
-    if not isinstance(raw, str) or not raw.strip():
-        return None
+def _quiet_unique_config_object(pairs):
+    """Strict config decode: a duplicate raw key refuses the continuation."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate model_config keys refuse the continuation")
+        obj[key] = value
+    return obj
+
+
+def _quiet_config_object(raw):
+    """Strictly decode the owner's model_config text; returns ``(config, text)``."""
+    text = "" if raw is None else raw
+    if not isinstance(text, str):
+        raise ValueError("owner model_config is not readable; refusing the continuation")
+    if not text.strip():
+        return {}, ""
     try:
-        config = json.loads(raw)
-    except (ValueError, TypeError):
+        config = json.loads(text, object_pairs_hook=_quiet_unique_config_object)
+    except ValueError:
         raise ValueError(
             "owner model_config is not readable; refusing the continuation") from None
     if not isinstance(config, dict):
         raise ValueError("owner model_config is not an object; refusing the continuation")
+    return config, text
+
+
+def _quiet_protected_head(raw) -> Optional[dict]:
+    """The owner's stored protected head (``model_config._message_copy_receipts_v2``)
+    or None when absent; unreadable or off-shape heads refuse the continuation."""
+    config, _text = _quiet_config_object(raw)
     head = config.get("_message_copy_receipts_v2")
     if head is None:
         return None
-    if not isinstance(head, dict):
-        raise ValueError("stored protected head is not an object; refusing the continuation")
+    validate_receipt3_head(head)
     return head
+
+
+def _quiet_install_protected_head(raw, head: dict) -> str:
+    """Write the new protected head into the raw model_config text by replacing
+    only the head value bytes: every other lexeme of the stored config (the v1
+    tokens included) keeps its exact bytes. With no head present the key is
+    spliced into the existing object; a duplicate or damaged head region
+    refuses."""
+    validate_receipt3_head(head)
+    head_text = _quiet_canonical(head).decode("utf-8")
+    token = '"_message_copy_receipts_v2"'
+    text = "" if raw is None else raw
+    if not isinstance(text, str) or not text.strip():
+        return "{" + token + ":" + head_text + "}"
+    occurrences = []
+    start = 0
+    while True:
+        index = text.find(token, start)
+        if index < 0:
+            break
+        occurrences.append(index)
+        start = index + 1
+    if len(occurrences) > 1:
+        raise ValueError("duplicate protected head keys refuse the continuation")
+    if occurrences:
+        index = occurrences[0]
+        if not text[:index].rstrip().endswith(("{", ",")):
+            raise ValueError(
+                "damaged model_config around the protected head; refusing")
+        rest = text[index + len(token):]
+        stripped = rest.lstrip()
+        if not stripped.startswith(":"):
+            raise ValueError(
+                "damaged model_config around the protected head; refusing")
+        value_start = index + len(token) + (len(rest) - len(stripped)) + 1
+        while value_start < len(text) and text[value_start] in " \t\r\n":
+            value_start += 1
+        try:
+            _value, value_end = json.JSONDecoder().raw_decode(text, value_start)
+        except ValueError:
+            raise ValueError(
+                "damaged model_config around the protected head; refusing") from None
+        return text[:value_start] + head_text + text[value_end:]
+    end = text.rstrip().rfind("}")
+    if end < 0:
+        raise ValueError("owner model_config is not an object; refusing the continuation")
+    body = text[:end]
+    separator = "" if body.rstrip().endswith("{") else ","
+    return body + separator + token + ":" + head_text + text[end:]
 
 
 def _quiet_fts_match_probe(conn: sqlite3.Connection, table: str):
@@ -2043,12 +2134,25 @@ class QuietRecoveryHandle:
                 "SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
             if existing is not None:
                 stored_existing = json.loads(existing[0])
+                if existing[0] != _quiet_canonical(stored_existing).decode("utf-8"):
+                    raise ValueError(
+                        "stored continuation token record is not canonical; refusing")
                 if stored_existing.get("request_sha256") != request_sha256:
                     raise ValueError(
                         "continuation token already committed with different bytes; refusing")
-                raise _QuietTokenReplay(_quiet_result_from_record(stored_existing))
+                # Exact readback: the stored result is only returned after the
+                # record and the journal bytes it names still verify.
+                replayed = _quiet_result_from_record(stored_existing)
+                journal = read_operation(conn, owner_session_id,
+                                         stored_existing["operation_generation"])
+                if journal["header"]["operation_sha256"] != stored_existing["operation_sha256"]:
+                    raise ValueError(
+                        "stored continuation journal no longer matches its token record; refusing")
+                raise _QuietTokenReplay(replayed)
             # oldraw / protected-head CAS: the owner row must exist; a stored head
-            # must match the old coordinates exactly; absent = first receipt.
+            # must match the old coordinates exactly; absent = a first receipt,
+            # and only with old_generation 0 -- a missing head never downgrades
+            # an existing journal to "no evidence".
             row = conn.execute(
                 "SELECT model_config FROM sessions WHERE id = ?", (owner_session_id,)).fetchone()
             if row is None:
@@ -2056,19 +2160,83 @@ class QuietRecoveryHandle:
                     "continuation owner session is not part of this settled store")
             head = _quiet_protected_head(row[0])
             if head is not None:
-                if (head.get("owner_session_id") != owner_session_id
-                        or head.get("active_epoch") != request["old_epoch"]
-                        or head.get("generation") != request["old_generation"]
-                        or head.get("head_sha256") != request["old_head_sha256"]
+                if (head["owner_session_id"] != owner_session_id
+                        or head["active_epoch"] != request["old_epoch"]
+                        or head["generation"] != request["old_generation"]
+                        or head["head_sha256"] != request["old_head_sha256"]
                         or hashlib.sha256(_quiet_canonical(head)).hexdigest()
                         != request["old_head_token_sha256"]):
                     raise ValueError(
                         "continuation does not match the stored protected head (oldraw CAS)")
+                old_ordinal = head["epoch_ordinal"]
+                domain_sha256 = head["domain_sha256"]
+                v1_binding_sha256 = head["v1_binding_sha256"]
+            else:
+                if request["old_generation"] != 0:
+                    raise ValueError(
+                        "continuation claims stored history but the owner carries "
+                        "no protected head; refusing")
+                journal_lo = "receipt3/o/" + owner_session_id.encode("utf-8").hex() + "/"
+                if conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key >= ? AND key < ? LIMIT 1",
+                        (journal_lo, journal_lo[:-1] + ":")).fetchone() is not None:
+                    raise ValueError(
+                        "continuation owner already carries journal entries but "
+                        "no protected head; refusing")
+                old_ordinal = None
+                domain_sha256 = _RECEIPT3_DOMAIN
+                v1_binding_sha256 = None
             operation_generation = request["old_generation"] + 1
-            operation_sha256 = hashlib.sha256(_quiet_canonical(
-                {"kind": "epoch_continuation", "request_sha256": request_sha256,
-                 "new_epoch": request["new_epoch"],
-                 "old_generation": request["old_generation"]})).hexdigest()
+            epoch_ordinal = 1 if old_ordinal is None else old_ordinal + 1
+            # Q01 typed context observation on this same connection, inside the
+            # transaction (the header carries the observed projection).
+            contexts = observe_native_session_contexts(
+                conn, owner_session_id=owner_session_id, actor_session_id=owner_session_id,
+                kind="epoch_continuation", domain_sha256=domain_sha256)
+            page = build_journal_page(
+                owner_session_id=owner_session_id, epoch=request["new_epoch"],
+                generation=operation_generation, page_ordinal=0,
+                items=[{"kind": "native_result", "input_ordinal": None, "row_ref": None,
+                        "disposition": "aggregate", "result_count": None}])
+            header = build_epoch_continuation_header(
+                request=request, request_sha256=request_sha256, domain_sha256=domain_sha256,
+                epoch=request["new_epoch"], epoch_ordinal=epoch_ordinal,
+                generation=operation_generation,
+                previous_head_sha256=request["old_head_sha256"],
+                pages=[page], native_session_contexts=contexts)
+            operation_sha256 = header["operation_sha256"]
+            # Insert-only journal entries under their immutable named keys.
+            for named_key, value in (
+                    (encode_receipt3_operation_key(owner_session_id, operation_generation),
+                     _quiet_canonical(header)),
+                    (encode_receipt3_page_key(owner_session_id, operation_generation, 0),
+                     _quiet_canonical(page))):
+                if conn.execute("SELECT 1 FROM state_meta WHERE key = ?", (named_key,)).fetchone():
+                    raise ValueError("receipt3 journal entry already exists; refusing")
+                conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                             (named_key, value.decode("utf-8")))
+            # Range checkpoints, same transaction: seal the old epoch's exit tail
+            # (read back from the stored member bytes), then apply the
+            # completed-full-block rule to the new epoch. Insert-or-verified
+            # bytes only -- never an overwrite.
+            if old_ordinal is not None:
+                seal_epoch_blocks(
+                    conn, owner_session_id=owner_session_id, epoch=request["old_epoch"],
+                    epoch_ordinal=old_ordinal, up_to_generation=request["old_generation"],
+                    epoch_exit=True)
+            seal_epoch_blocks(
+                conn, owner_session_id=owner_session_id, epoch=request["new_epoch"],
+                epoch_ordinal=epoch_ordinal, up_to_generation=operation_generation,
+                epoch_exit=False)
+            new_head = {"schema_version": "hermes-message-copy-receipts/3",
+                        "protocol_revision": 3, "domain_sha256": domain_sha256,
+                        "owner_session_id": owner_session_id,
+                        "active_epoch": request["new_epoch"], "epoch_ordinal": epoch_ordinal,
+                        "generation": operation_generation, "head_sha256": operation_sha256,
+                        "v1_binding_sha256": v1_binding_sha256,
+                        "activation_proof_sha256": request["proof_sha256"]}
+            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?",
+                         (_quiet_install_protected_head(row[0], new_head), owner_session_id))
             result = {"token": token, "operation_sha256": operation_sha256,
                       "generation": operation_generation}
             record = {"owner_session_id": owner_session_id, "operation_id": token,

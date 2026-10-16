@@ -39,10 +39,11 @@ independent implementation review of 15a03d07:
     ``_fts_enabled``/``_trigram_available`` keep their probed real values.
 
 Named C02 approval-surface items that stay deferred (not silently claimed):
-the real continuation payload (operation header/journal/pages/range
-checkpoint/new protected head under oldraw CAS), the certificate/pin binding
-of the finite roster, quiet reopen/partial-crash flows and the post-release
-bounded FTS pass.
+the certificate/pin binding of the finite roster, quiet reopen/partial-crash
+flows and the post-release bounded FTS pass. The real continuation payload
+(operation header/journal/pages/range checkpoint/new protected head under
+oldraw CAS) is implemented by milestone 2A and asserted here and in
+test_receipt_v3_range_checkpoint.py.
 
 RED against the 15a03d07 minimal slice: these repaired expectations are not
 met by it. Real SQLite fixtures only; no mocks.
@@ -122,6 +123,26 @@ def _continuation_request(**overrides):
                "alias_inventory_sha256": "5" * 64}
     request.update(overrides)
     return request
+
+
+def _matching_request(head, **overrides):
+    """An approved request whose oldraw coordinates match *head* exactly."""
+    request = _continuation_request(old_epoch=head["active_epoch"],
+                                    old_generation=head["generation"],
+                                    old_head_sha256=head["head_sha256"],
+                                    old_head_token_sha256=_canon_sha(head))
+    request.update(overrides)
+    return request
+
+
+def _receipt_snapshot(handle):
+    return sorted((row[0], row[1]) for row in handle._conn.execute(
+        "SELECT key, value FROM state_meta WHERE key LIKE 'receipt3/%'"))
+
+
+def _head_raw(handle, sid=SID):
+    return handle._conn.execute(
+        "SELECT model_config FROM sessions WHERE id = ?", (sid,)).fetchone()[0]
 
 
 def _read_quiet(path, request=None):
@@ -233,9 +254,11 @@ def test_generic_writers_and_fts_maintenance_refuse_on_the_quiet_handle(tmp_path
         handle.close()
 
 
-def test_approved_continuation_write_is_token_idempotent_and_counted(tmp_path):
+def test_approved_continuation_write_persists_journal_head_and_is_token_idempotent(tmp_path):
     path = _settle(tmp_path)
-    approved = _continuation_request()
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
     handle, _request = _read_quiet(path, approved)
     try:
         before = handle._write_count
@@ -250,13 +273,38 @@ def test_approved_continuation_write_is_token_idempotent_and_counted(tmp_path):
             "SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()[0])
         assert stored["owner_session_id"] == SID
         assert stored["operation_id"] == approved["token"]
+        assert stored["operation_sha256"] == first["operation_sha256"]
         assert handle._conn.execute(
             "SELECT count(*) FROM state_meta WHERE key = ?",
             ("receipt3/t/" + approved["token"],)).fetchone()[0] == 0
+        # The real journal entry and its ordered page land under the named keys.
+        op = json.loads(handle._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (f"receipt3/o/{sid_hex}/00000000000000000002",)).fetchone()[0])
+        assert op["kind"] == "epoch_continuation" and op["generation"] == 2
+        assert op["previous_head_sha256"] == head["head_sha256"]
+        assert op["continuation"] == {name: approved[name] for name in (
+            "proof_sha256", "old_epoch", "new_epoch", "old_generation", "old_head_sha256",
+            "old_head_token_sha256", "boundary_roster_sha256", "alias_inventory_sha256")}
+        page = json.loads(handle._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (f"receipt3/p/{sid_hex}/00000000000000000002/00000000000000000000",)).fetchone()[0])
+        assert page["page_ordinal"] == 0 and page["generation"] == 2
+        assert page["epoch"] == NEW_EPOCH
+        # The protected head advances in the same transaction.
+        new_head = json.loads(_head_raw(handle))["_message_copy_receipts_v2"]
+        assert (new_head["active_epoch"], new_head["epoch_ordinal"],
+                new_head["generation"]) == (NEW_EPOCH, 2, 2)
+        assert new_head["head_sha256"] == first["operation_sha256"]
+        assert new_head["v1_binding_sha256"] is None       # preserved from the old head
+        assert new_head["activation_proof_sha256"] == approved["proof_sha256"]
+        snapshot, raw_before = _receipt_snapshot(handle), _head_raw(handle)
         # Same token: verified readback, no second insert, counter unchanged.
         replay = handle.append_epoch_continuation(dict(approved))
         assert replay == first
         assert handle._write_count == before + 1
+        assert _receipt_snapshot(handle) == snapshot
+        assert _head_raw(handle) == raw_before
         # Same key (token) with different bytes: refused, still no write.
         with pytest.raises((ValueError, RuntimeError)):
             handle.append_epoch_continuation(dict(
@@ -360,23 +408,29 @@ def test_quiet_write_runs_on_the_sessiondb_transaction_core_and_fences_replaceme
 def test_cadence_hit_marks_postcommit_fts_defer_without_running_usermerge(tmp_path):
     path = _settle(tmp_path)
     threshold = getattr(hermes_state, "QUIET_RECOVERY_FTS_DEFER_EVERY", 1000)
-    approved = _continuation_request()
+    head = _head()
+    _seed_head(path, head)
+    approved = _matching_request(head)
     handle, _request = _read_quiet(path, approved)
     try:
         assert handle._fts_enabled is True
-        first = handle.append_epoch_continuation(dict(approved))
-        assert first.get("token") == approved["token"]
-        assert getattr(handle, "_fts_deferred_due", False) is False
-        # Walk one committed approved-transition operation exactly onto the cadence boundary.
+        # Walk one committed approved-transition operation exactly onto the cadence
+        # boundary (earlier owners' continuations share one recovery handle in the
+        # real flow, so the counter is advanced to the boundary here).
         handle._write_count = threshold - 1
         fts_before = {name: count for name, count in handle._conn.execute(
             "SELECT name, (SELECT count(*) FROM sqlite_schema WHERE name = t.name) "
             "FROM sqlite_schema t WHERE name LIKE 'messages_fts%'")}
-        # A fresh token (new operation of the approved transition) walks onto the cadence.
-        handle.append_epoch_continuation(dict(approved, token=str(uuid.uuid4())))
+        first = handle.append_epoch_continuation(dict(approved))
+        assert first.get("token") == approved["token"]
         assert handle._write_count == threshold
         assert handle._fts_deferred_due is True          # deferred, not executed
         assert handle._fts_enabled is True               # real value stays on
+        # This was a full real payload write (journal entry + page + head).
+        assert handle._conn.execute(
+            "SELECT count(*) FROM state_meta WHERE key LIKE 'receipt3/o/%'").fetchone()[0] == 1
+        assert handle._conn.execute(
+            "SELECT count(*) FROM state_meta WHERE key LIKE 'receipt3/p/%'").fetchone()[0] == 1
         fts_after = {name: count for name, count in handle._conn.execute(
             "SELECT name, (SELECT count(*) FROM sqlite_schema WHERE name = t.name) "
             "FROM sqlite_schema t WHERE name LIKE 'messages_fts%'")}
@@ -384,5 +438,44 @@ def test_cadence_hit_marks_postcommit_fts_defer_without_running_usermerge(tmp_pa
         # While the defer is due, FTS write entries stay refused.
         with pytest.raises((RuntimeError, ValueError, PermissionError)):
             handle.rebuild_fts()
+    finally:
+        handle.close()
+
+
+def test_first_receipt_g0_continuation_and_missing_head_downgrade_refusal(tmp_path):
+    # A boundary owner with no stored receipt may continue from g0: the first
+    # receipt is g1 (previous_head_sha256 null only here) and installs the head.
+    path = _settle(tmp_path)
+    request = _continuation_request(old_generation=0, old_head_sha256=None)
+    handle, _request = _read_quiet(path, request)
+    try:
+        result = handle.append_epoch_continuation(dict(request))
+        assert result["generation"] == 1
+        sid_hex = SID.encode("utf-8").hex()
+        op = json.loads(handle._conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (f"receipt3/o/{sid_hex}/00000000000000000001",)).fetchone()[0])
+        assert op["previous_head_sha256"] is None
+        assert op["kind"] == "epoch_continuation"
+        head = json.loads(_head_raw(handle))["_message_copy_receipts_v2"]
+        assert (head["active_epoch"], head["epoch_ordinal"], head["generation"]) == (
+            NEW_EPOCH, 1, 1)
+        assert head["head_sha256"] == result["operation_sha256"]
+    finally:
+        handle.close()
+    # A missing head may never downgrade an existing journal to "no evidence":
+    # the owner already carries a receipt3/o entry, so the first-receipt claim is
+    # refused.
+    other = tmp_path / "other"
+    other.mkdir()
+    path2 = _settle(other)
+    _mutate(path2, "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+            (f"receipt3/o/{SID.encode('utf-8').hex()}/00000000000000000001", "{}"))
+    request2 = _continuation_request(old_generation=0, old_head_sha256=None)
+    handle, _request = _read_quiet(path2, request2)
+    try:
+        with pytest.raises((ValueError, RuntimeError)):
+            handle.append_epoch_continuation(dict(request2))
+        assert handle._write_count == 0
     finally:
         handle.close()
