@@ -59,9 +59,11 @@ from hermes_state_schema import SessionSchemaMixin, _MESSAGE_UID_BACKFILL_DONE
 from hermes_state_copy_provenance import (
     _CONTINUATION_KEYS as _RECEIPT3_CONTINUATION_KEYS,
     _DOMAIN_SHA256 as _RECEIPT3_DOMAIN, build_epoch_continuation_header, build_journal_page,
-    encode_receipt3_operation_key, encode_receipt3_page_key, encode_receipt3_token_key,
+    boundary_roster_digest, encode_receipt3_operation_key, encode_receipt3_page_key,
+    encode_receipt3_token_key, final_all_owner_readback,
     observe_native_session_contexts, read_operation, read_partial_recovery_state,
-    seal_epoch_blocks, validate_receipt3_head,
+    seal_epoch_blocks, validate_boundary_roster, validate_receipt3_head,
+    verify_frozen_proof, verify_independent_copy_joint, verify_roster_continuation_inventory,
 )
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
@@ -2047,6 +2049,11 @@ class QuietRecoveryHandle:
         self._fts_deferred_due = False
         self._fts_usermerge_floor_applied = False
         self._closed = False
+        # C02 step 3/4 boundary-roster admission: the single-owner admission
+        # approves exactly its frozen owner; a roster admission approves the
+        # finite roster (validated module-side against the approved anchors).
+        self._approved_owners = (init_request["owner_session_id"],)
+        self._roster_requests = None
 
     @classmethod
     def open(cls, *, db_path: Path, init_request: dict) -> "QuietRecoveryHandle":
@@ -2064,6 +2071,51 @@ class QuietRecoveryHandle:
         except BaseException:
             conn.close()
             raise
+
+    @classmethod
+    def open_roster(cls, *, db_path: Path, requests, approved_anchors) -> "QuietRecoveryHandle":
+        """C02 steps 3/4: enter the finite quiet mode for an approved boundary
+        roster (every boundary owner -- g0, v1-only or no-receipt included).
+
+        The same settled no-create admission runs once for the whole roster
+        (one store, one finite recovery mode); every request must carry the
+        exact same frozen transition frame, the roster member set must equal
+        the approved anchor scope exactly (never enlarged by the replacement,
+        never narrowed), and the frozen request digest must match the
+        canonical roster digest. The partial state of ALL owners is verified
+        read-only before any continuation can be written.
+        """
+        if type(requests) not in (list, tuple) or not requests:
+            raise ValueError("a roster admission requires at least one continuation request")
+        validated = [_validate_quiet_recovery_request(dict(request)) for request in requests]
+        frame = validated[0]
+        for request in validated[1:]:
+            for bound_field in ("kind", "proof_sha256", "old_epoch", "new_epoch",
+                                "boundary_roster_sha256", "alias_inventory_sha256"):
+                if request[bound_field] != frame[bound_field]:
+                    raise ValueError(
+                        "roster continuations do not share one approved transition frame")
+        roster_entries = [{"owner_session_id": request["owner_session_id"],
+                           "token": request["token"],
+                           "old_generation": request["old_generation"],
+                           "old_head_sha256": request["old_head_sha256"],
+                           "old_head_token_sha256": request["old_head_token_sha256"]}
+                          for request in validated]
+        roster = validate_boundary_roster(roster_entries,
+                                          approved_anchors=list(approved_anchors))
+        if roster["roster_sha256"] != frame["boundary_roster_sha256"]:
+            raise ValueError(
+                "approved boundary roster digest does not match the frozen request")
+        handle = cls.open(db_path=db_path, init_request=frame)
+        try:
+            handle._approved_owners = tuple(roster["owners"])
+            handle._roster_requests = {request["owner_session_id"]: request
+                                       for request in validated}
+            handle.verify_roster_recovery_state()
+        except BaseException:
+            handle.close()
+            raise
+        return handle
 
     # ── refusals: generic writers and maintenance never write here ──
     def set_meta(self, *args, **kwargs):
@@ -2133,6 +2185,11 @@ class QuietRecoveryHandle:
         if self._closed or self._conn is None:
             raise RuntimeError("quiet recovery handle is closed")
         for field in _QUIET_BOUND_BINDINGS:
+            if field == "owner_session_id":
+                if request[field] not in self._approved_owners:
+                    raise ValueError(
+                        "continuation owner is not part of the approved boundary roster")
+                continue
             if request[field] != self._init_request[field]:
                 raise ValueError(
                     "continuation does not match the approved init request transition")
@@ -2398,6 +2455,196 @@ class QuietRecoveryHandle:
                   "readback": binding, "fts_pass": fts_pass}
         self.close()
         return report
+
+    # ── C02 steps 1-4 orchestration + final ALL-owner readback ──
+    _C02_FENCE_KEYS = frozenset({"kind", "approved", "holders", "fence_id"})
+
+    def append_roster_continuations(self) -> dict:
+        """C02 step 4: one epoch continuation per approved boundary owner.
+
+        Each owner's continuation runs on its own token/head CAS (the existing
+        single approved write path), in canonical owner order; a partial
+        failure leaves the committed set to the read-only back-projection
+        (step 5), never a silent repair.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if self._roster_requests is None:
+            raise RuntimeError("this admission is not a boundary roster admission")
+        results = {}
+        for owner in self._approved_owners:
+            results[owner] = self.append_epoch_continuation(self._roster_requests[owner])
+        return results
+
+    def _roster_transition_blocks(self) -> dict:
+        requests = self._roster_requests
+        if requests is None:
+            requests = {self._init_request["owner_session_id"]: self._init_request}
+        return {owner: {name: request[name] for name in _RECEIPT3_CONTINUATION_KEYS}
+                for owner, request in requests.items()}
+
+    def verify_roster_recovery_state(self, *, complete: bool = False) -> dict:
+        """Fail-closed read-only verification of the roster's recovery state.
+
+        Every approved owner's committed continuation set (0 or 1 while the
+        roster is incomplete, exactly 1 for the final ALL readback) is re-read
+        strictly against its own frozen transition block, no continuation
+        outside the roster may exist, and each protected head must match the
+        committed continuation or still carry that owner's frozen old
+        coordinates. Returns the per-owner entries and the canonical
+        ALL-owner readback digest.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if type(complete) is not bool:
+            raise ValueError("complete must be a bool")
+        requests = self._roster_requests
+        if requests is None:
+            requests = {self._init_request["owner_session_id"]: self._init_request}
+        inventory = verify_roster_continuation_inventory(
+            self._conn, list(self._approved_owners), self._roster_transition_blocks(),
+            complete=complete)
+        owners = []
+        for owner in self._approved_owners:
+            request = requests[owner]
+            committed = inventory["owners"][owner]
+            row = self._conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (owner,)).fetchone()
+            if row is None:
+                raise ValueError(
+                    "continuation owner session is not part of this settled store")
+            head = _quiet_protected_head(row[0])
+            if committed:
+                last = committed[-1]
+                if head is None or (head["owner_session_id"] != owner
+                                    or head["active_epoch"] != request["new_epoch"]
+                                    or head["generation"] != last["generation"]
+                                    or head["head_sha256"] != last["operation_sha256"]):
+                    raise ValueError(
+                        "protected head does not match the committed continuation; refusing")
+            elif head is None:
+                if request["old_generation"] != 0:
+                    raise ValueError(
+                        "continuation claims stored history but the owner carries "
+                        "no protected head; refusing")
+            elif (head["owner_session_id"] != owner
+                    or head["active_epoch"] != request["old_epoch"]
+                    or head["generation"] != request["old_generation"]
+                    or head["head_sha256"] != request["old_head_sha256"]
+                    or hashlib.sha256(_quiet_canonical(head)).hexdigest()
+                    != request["old_head_token_sha256"]):
+                raise ValueError(
+                    "stored protected head no longer carries the frozen old "
+                    "coordinates; refusing")
+            owners.append({"owner_session_id": owner, "committed": committed, "head": head})
+        return {"owners": owners, "readback_sha256": final_all_owner_readback(owners),
+                "complete": all(len(entry["committed"]) == 1 for entry in owners)}
+
+    def final_roster_readback_binding(self) -> dict:
+        """The final ALL-owner readback binding recorded before the explicit
+        quiet exit (r4 C02 step 7, roster form)."""
+        state = self.verify_roster_recovery_state(complete=True)
+        return {"owners": state["owners"], "readback_sha256": state["readback_sha256"]}
+
+    def exit_roster_quiet(self, *, accepted_readback_sha256: str) -> dict:
+        """Explicitly exit the finite quiet mode after the independent
+        acceptance of the ALL-owner readback (r4 C02 step 7, roster form).
+
+        The accepted binding is re-checked first (a mismatch refuses the exit
+        and runs nothing); then exactly one native bounded FTS pass runs AFTER
+        the accepted boundary, exactly as in the single-owner exit.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if (not isinstance(accepted_readback_sha256, str) or len(accepted_readback_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in accepted_readback_sha256)):
+            raise ValueError("the accepted final readback binding must be lowercase sha256 hex")
+        binding = self.final_roster_readback_binding()
+        if binding["readback_sha256"] != accepted_readback_sha256:
+            raise ValueError(
+                "final all-owner readback binding does not match the accepted bytes; "
+                "quiet mode is not exited")
+        fts_pass = {"executed": 0, "failed": None}
+        if self._fts_enabled:
+            try:
+                fts_pass["executed"] = self._merge_fts_incrementally(
+                    max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX,
+                    max_commands=self._FTS_MERGE_COMMANDS_PER_PASS)
+            except Exception as exc:
+                fts_pass["failed"] = f"{type(exc).__name__}: {exc}"[:200]
+        report = {"owner_session_ids": [entry["owner_session_id"] for entry in binding["owners"]],
+                  "write_count": self._write_count,
+                  "fts_deferred_due_at_exit": self._fts_deferred_due,
+                  "fts_enabled": self._fts_enabled,
+                  "trigram_available": self._trigram_available,
+                  "readback": binding, "fts_pass": fts_pass}
+        self.close()
+        return report
+
+    @classmethod
+    def run_c02_recovery_orchestration(cls, *, original_path, replacement_path, fence,
+                                       requests, approved_anchors, proof=None):
+        """C02 steps 1-4 full orchestration + the final ALL-owner readback.
+
+        Step 1 validates the external holder-drain fence attestation (an
+        approved orchestration input -- it is never manufactured here and no
+        pane is killed); step 2 runs the independent read-only full-table joint
+        between the original latest and the selected byte/data-complete
+        replacement; step 3 enters the roster quiet admission on the
+        replacement, re-measures the joint read-only AFTER the open and
+        re-verifies the frozen proof (whose roster digest must equal the frozen
+        request digest); step 4 writes exactly one epoch continuation per
+        boundary owner under its own token/head CAS; then the final ALL-owner
+        readback binding (complete roster) is read back read-only. Returns
+        ``(handle, report)`` -- the caller owns the independent acceptance and
+        the explicit exit; the original file is never opened for writing.
+        """
+        if type(fence) is not dict or set(fence) != set(cls._C02_FENCE_KEYS):
+            raise ValueError("external holder-drain fence attestation is required")
+        if fence["kind"] != "external_holder_drain_fence" or fence["approved"] is not True:
+            raise ValueError(
+                "the quiet recovery orchestration requires an approved external fence")
+        if type(fence["holders"]) is not list or not fence["holders"] \
+                or not all(isinstance(holder, str) and holder for holder in fence["holders"]):
+            raise ValueError("the fence attestation must list every drained holder")
+        if not isinstance(fence["fence_id"], str) or not fence["fence_id"]:
+            raise ValueError("the fence attestation requires a fence_id")
+        steps = {"step1_fence": {"fence_id": fence["fence_id"],
+                                 "holders": len(fence["holders"]), "approved": True}}
+        copy_report = verify_independent_copy_joint(original_path, replacement_path)
+        steps["step2"] = {"joint_sha256": copy_report["joint_sha256"],
+                          "table_count": copy_report["table_count"]}
+        handle = cls.open_roster(db_path=Path(replacement_path), requests=list(requests),
+                                 approved_anchors=list(approved_anchors))
+        try:
+            post_open = verify_independent_copy_joint(original_path, replacement_path)
+            if post_open["joint_sha256"] != copy_report["joint_sha256"]:
+                raise ValueError(
+                    "the quiet admission open changed the replacement joint; refusing")
+            if proof is not None:
+                verified = verify_frozen_proof(replacement_path, proof)
+                if proof.get("roster_sha256") != handle._init_request["boundary_roster_sha256"]:
+                    raise ValueError("the frozen proof does not bind this boundary roster")
+                steps["step3_proof"] = verified
+            pre_commit = handle.verify_roster_recovery_state()
+            steps["step3"] = {"post_open_joint_sha256": post_open["joint_sha256"],
+                              "owners": len(pre_commit["owners"]),
+                              "complete": pre_commit["complete"]}
+            results = handle.append_roster_continuations()
+            steps["step4"] = {owner: results[owner]["generation"]
+                              for owner in sorted(results, key=lambda name: name.encode("utf-8"))}
+            readback = handle.verify_roster_recovery_state(complete=True)
+            steps["all_readback"] = {"owners": len(readback["owners"]),
+                                     "readback_sha256": readback["readback_sha256"],
+                                     "complete": readback["complete"]}
+        except BaseException:
+            handle.close()
+            raise
+        report = {"steps": steps, "readback": readback,
+                  "original_path": str(original_path), "replacement_path": str(replacement_path),
+                  "fence_sha256": hashlib.sha256(_quiet_canonical(fence)).hexdigest(),
+                  "writes": "continuations-only", "exit": "not_taken"}
+        return handle, report
 
     def close(self) -> None:
         if not self._closed:

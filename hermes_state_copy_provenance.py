@@ -2122,19 +2122,35 @@ def _file_identity(path) -> dict:
     return {"st_dev": stat.st_dev, "st_ino": stat.st_ino, "st_size": stat.st_size}
 
 
-def freeze_recovery_proof(path, *, owner_session_id: str, init_request: dict) -> dict:
+def freeze_recovery_proof(path, *, owner_session_id: str, init_request: dict,
+                          roster_owners=None) -> dict:
     """r4 C02 step 3: freeze the selected replacement inode's proof together
     with the finite roster/init request.
 
     The proof binds the full-table joint, the actual file identity and the
-    frozen request; the exact certificate/pin approval over these bytes stays
-    a separate non-author decision (never taken here). While no continuation
-    exists yet the proof must re-verify unchanged -- including after the quiet
-    admission open, which may not leave any logical persistent delta.
+    frozen request; ``roster_owners`` generalizes the roster digest to the
+    finite approved boundary roster (default: the single frozen owner). The
+    exact certificate/pin approval over these bytes stays a separate
+    non-author decision (never taken here). While no continuation exists yet
+    the proof must re-verify unchanged -- including after the quiet admission
+    open, which may not leave any logical persistent delta.
     """
     if type(owner_session_id) is not str or not owner_session_id:
         _invalid()
     request = _validate_recovery_init_request(init_request, owner_session_id)
+    if roster_owners is None:
+        roster = [owner_session_id]
+    else:
+        if type(roster_owners) not in (list, tuple) or not roster_owners:
+            _invalid()
+        roster = []
+        for name in roster_owners:
+            if type(name) is not str or not name or name in roster:
+                _invalid()
+            roster.append(name)
+        if owner_session_id not in roster:
+            _invalid()
+        roster.sort()
     conn = _open_read_only(path)
     try:
         joint = full_table_joint(conn)
@@ -2143,7 +2159,7 @@ def freeze_recovery_proof(path, *, owner_session_id: str, init_request: dict) ->
     proof = {"owner_session_id": owner_session_id,
              "init_request_sha256": hashlib.sha256(C(request)).hexdigest(),
              "roster_sha256": H(_RECOVERY_ROSTER_LABEL,
-                                {"owners": [owner_session_id]}),
+                                {"owners": roster}),
              "joint_sha256": joint["joint_sha256"],
              "table_count": joint["table_count"],
              "file_sha256": _file_sha256(path),
@@ -2402,3 +2418,754 @@ def receipt_design_disclosure() -> dict:
         "disclosure_only": True,
         "protocol_record": False,
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# M2E: standalone reader consumption · C02 orchestration inputs · capacity
+# checkpoint plan · full-path prefix-collision audit (receipt r4)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Reader-side surface of the effective r4 design (protocol.independent_reader,
+# protocol.context_binding, protocol.capacity.concrete_bounds.checkpoint,
+# protocol.storage namespace). Everything here is read-only over the receipt3/
+# namespace and returns structured verdicts; nothing here writes, yields,
+# captures or POSTs source input, and nothing here is an authorization. The
+# D prior/current gate returns the *proposed* ``BLOCK_SOURCE_CONTEXT_POLICY``
+# outcome for unknown/missing/drift context (not an existing error API, not
+# the already-approved F policy, no rollback of legal native writes).
+
+BLOCK_SOURCE_CONTEXT_POLICY = "BLOCK_SOURCE_CONTEXT_POLICY"
+ADMIT_D_SAME_SOURCE = "ADMIT_D_SAME_SOURCE"
+STANDALONE_RECOMPUTE_VERSION = "standalone-lineage/1"
+
+_RECEIPT3_FAMILIES = (
+    ("e", parse_receipt3_epoch_key),
+    ("o", parse_receipt3_operation_key),
+    ("p", parse_receipt3_page_key),
+    ("t", parse_receipt3_token_key),
+    ("r", parse_receipt3_row_index_key),
+)
+_READER_CONTEXT_KEYS = frozenset({
+    "session_id", "native_binding_fields", "lineage_markers", "context_sha256"})
+
+
+def _reader_context_record(context) -> dict:
+    """Strict shape check of one typed context projection for the reader side."""
+    if type(context) is not dict or set(context) != _READER_CONTEXT_KEYS:
+        _invalid()
+    values = native_binding_values_from_context(context)
+    markers = context["lineage_markers"]
+    if type(markers) is not list or len(markers) != len(_LINEAGE_MARKERS):
+        _invalid()
+    if [entry[0] for entry in markers] != list(_LINEAGE_MARKERS):
+        _invalid()
+    marker_values = {}
+    for name, tag in markers:
+        value = sql_value_decode(tag)
+        if value is not None and type(value) is not str:
+            _invalid()   # markers are exact permitted TEXT scalars or explicit null
+        marker_values[name] = value
+    _sha256_hex(context["context_sha256"])
+    return {"session_id": context["session_id"], "values": values, "markers": marker_values}
+
+
+def compare_context_projections(prior_contexts, current_contexts) -> dict:
+    """D prior/current typed context comparison (r4 C01/Q01 reader side).
+
+    Both sides are exact typed context projections (four SQL-typed binding
+    fields in order + the three marker scalars + the recomputed context hash).
+    Equality is exact projection equality; a session present on only one side
+    is reported as missing (prior-only) or extra (current-only). Qsame never
+    enters this comparison: a current-value self-comparison cannot establish
+    the prior context.
+    """
+    if type(prior_contexts) is not list or type(current_contexts) is not list:
+        _invalid()
+    prior, current = {}, {}
+    for record in prior_contexts:
+        parsed = _reader_context_record(record)
+        if parsed["session_id"] in prior:
+            _invalid()
+        prior[parsed["session_id"]] = record
+    for record in current_contexts:
+        parsed = _reader_context_record(record)
+        if parsed["session_id"] in current:
+            _invalid()
+        current[parsed["session_id"]] = record
+    missing = sorted(set(prior) - set(current), key=lambda s: s.encode("utf-8"))
+    extra = sorted(set(current) - set(prior), key=lambda s: s.encode("utf-8"))
+    drift = sorted((sid for sid in set(prior) & set(current) if prior[sid] != current[sid]),
+                   key=lambda s: s.encode("utf-8"))
+    return {"equal": not (missing or extra or drift), "missing": missing, "extra": extra,
+            "drift": drift, "prior_sessions": sorted(prior, key=lambda s: s.encode("utf-8")),
+            "current_sessions": sorted(current, key=lambda s: s.encode("utf-8"))}
+
+
+def resolve_context_before_ref(snapshot_operations, ref, *, current_header) -> dict:
+    """Resolve one immutable ``context_before_ref`` to its typed projection.
+
+    A stored-member coordinate resolves from the referenced operation header's
+    ``native_session_contexts`` (never from the current header: self-reference
+    refuses). An approved activation proof reference cannot be resolved from
+    receipt bytes alone -- it requires the approved boundary inventory passed
+    as *approved_activation_contexts*; without it the reference is missing.
+    """
+    _validate_reference(ref)
+    if type(current_header) is not dict:
+        _invalid()
+    approved_activation_contexts = snapshot_operations.get("approved_activation_contexts") \
+        if type(snapshot_operations) is dict else None
+    operations = snapshot_operations.get("operations") if type(snapshot_operations) is dict \
+        else snapshot_operations
+    context_session_id = ref["context_session_id"]
+    if "generation" in ref:
+        if (ref["owner_session_id"] == current_header.get("owner_session_id")
+                and ref["generation"] == current_header.get("generation")):
+            _invalid()   # a prior-context reference never points at the current header
+        match = None
+        for operation in operations or []:
+            header = operation["header"]
+            if (header["owner_session_id"] == ref["owner_session_id"]
+                    and header["generation"] == ref["generation"]):
+                match = header
+                break
+        if match is None:
+            return {"resolved": False, "basis": "stored_member",
+                    "context": None, "reason": "missing_prior_member"}
+        for context in match["native_session_contexts"]:
+            if context["session_id"] == context_session_id:
+                return {"resolved": True, "basis": "stored_member", "context": context,
+                        "reason": None}
+        return {"resolved": False, "basis": "stored_member",
+                "context": None, "reason": "missing_context_session"}
+    inventory = approved_activation_contexts or []
+    for context in inventory:
+        if context.get("session_id") == context_session_id:
+            return {"resolved": True, "basis": "approved_activation_inventory",
+                    "context": context, "reason": None}
+    return {"resolved": False, "basis": "approved_activation_inventory",
+            "context": None, "reason": "missing_approved_activation_context"}
+
+
+def recompute_session_feed_facts(contexts, *, approved_scope) -> dict:
+    """Recompute namespace/cron/eligibility facts from immutable contexts.
+
+    Original standalone-lineage recomputation (``STANDALONE_RECOMPUTE_VERSION``)
+    over the immutable typed preimages only: the physical lineage walks the
+    ``parent_session_id`` edges, a non-null ``_reset_from`` marks the cutover
+    root, and ``_delegate_from``/``_branched_from`` are mandatory independent
+    marker edges. Every edge must resolve inside the observed contexts or the
+    approved scope/anchors -- an unresolvable edge is *never* guessed and the
+    fact is unqualified. The cron surface comes from the immutable ``source``
+    preimage (a current value or a writer feed class can never self-establish
+    it). The recomputed namespace qualification is the reader's own; the
+    (namespace, cron, eligibility) values remain the original standalone
+    adapter's and are never rebased here.
+    """
+    if type(contexts) is not list or type(approved_scope) is not dict:
+        _invalid()
+    anchors = approved_scope.get("session_ids")
+    if type(anchors) is not list or not all(type(name) is str and name for name in anchors):
+        _invalid()
+    anchor_set = set(anchors)
+    records = {}
+    for context in contexts:
+        parsed = _reader_context_record(context)
+        session_id = parsed["session_id"]
+        if session_id in records:
+            _invalid()
+        records[session_id] = parsed
+    facts = {}
+    for session_id in sorted(records, key=lambda s: s.encode("utf-8")):
+        parsed = records[session_id]
+        values = parsed["values"]
+        markers = parsed["markers"]
+        reasons = []
+        chain = [session_id]
+        root = session_id
+        cutover = markers["_reset_from"]
+        if cutover is not None:
+            if cutover not in records and cutover not in anchor_set:
+                reasons.append("missing_cutover_anchor")
+            root = cutover
+        else:
+            seen = {session_id}
+            current = session_id
+            while True:
+                parent = records[current]["values"][2]
+                if parent is None:
+                    root = current
+                    break
+                if parent in seen:
+                    reasons.append("cycle")
+                    root = current
+                    break
+                if parent in records:
+                    seen.add(parent)
+                    chain.append(parent)
+                    current = parent
+                    continue
+                if parent in anchor_set:
+                    root = parent
+                    break
+                reasons.append("missing_parent_edge")
+                root = current
+                break
+        for marker in ("_delegate_from", "_branched_from"):
+            value = markers[marker]
+            if value is not None and value not in records and value not in anchor_set:
+                reasons.append("missing_marker_edge:" + marker)
+        surface_source = values[3]
+        if surface_source is None:
+            reasons.append("unknown_surface")
+        qualified = not reasons
+        facts[session_id] = {
+            "session_id": session_id, "root_session_id": root, "parent_chain": chain,
+            "surface_source": surface_source, "is_cron_surface": surface_source == "cron",
+            "namespace_qualified": qualified, "eligibility_qualified": qualified,
+            "reasons": reasons,
+        }
+    return {"recompute_version": STANDALONE_RECOMPUTE_VERSION, "facts": facts,
+            "all_qualified": all(fact["namespace_qualified"] for fact in facts.values())}
+
+
+def verify_compression_edge_closure(edge, *, approved_boundary_facts=(),
+                                    native_child_operations=()) -> dict:
+    """Verify one traversed compression edge's closure fact (r4 context_binding).
+
+    An edge is proven only by (a) an approved boundary fact carrying the same
+    parent/child pair, or (b) a trusted native ``compression_child`` operation
+    whose owner is the actual child and whose actor is the actual parent,
+    carrying the same-transaction ``end_reason='compression'`` closure fact.
+    A current mutable ``end_reason``/markers value alone can never self-sign a
+    compression edge, and a later legal parent closure does not retroactively
+    prove an unrecorded edge.
+    """
+    if type(edge) is not dict or type(edge.get("parent_session_id")) is not str \
+            or not edge["parent_session_id"] \
+            or type(edge.get("child_session_id")) is not str or not edge["child_session_id"]:
+        _invalid()
+    parent = edge["parent_session_id"]
+    child = edge["child_session_id"]
+    if type(approved_boundary_facts) not in (list, tuple) \
+            or type(native_child_operations) not in (list, tuple):
+        _invalid()
+    for fact in approved_boundary_facts:
+        if type(fact) is not dict or set(fact) != {"parent_session_id", "child_session_id"}:
+            _invalid()
+        if fact["parent_session_id"] == parent and fact["child_session_id"] == child:
+            return {"proven": True, "basis": "approved_boundary_fact", "refusal": None}
+    for operation in native_child_operations:
+        if type(operation) is not dict or set(operation) != {
+                "kind", "owner_session_id", "actor_session_id", "closure_end_reason"}:
+            _invalid()
+        if operation["kind"] != "compression_child":
+            _invalid()
+        if (operation["owner_session_id"] == child and operation["actor_session_id"] == parent
+                and operation["closure_end_reason"] == "compression"):
+            return {"proven": True, "basis": "native_compression_child_closure",
+                    "refusal": None}
+    return {"proven": False, "basis": None,
+            "refusal": "no approved boundary fact and no same-transaction native "
+                       "compression_child closure for this edge; a current end_reason "
+                       "value never self-signs"}
+
+
+def decide_source_context_policy(*, q_same, prior_contexts, current_contexts,
+                                 relations=(), approved_scope=None,
+                                 approved_boundary_facts=(),
+                                 native_child_operations=()) -> dict:
+    """D admission gate for the standalone reader (r4 C01/Q01).
+
+    Returns the *proposed* outcome only. ``ADMIT_D_SAME_SOURCE`` requires: a
+    comparable prior context exists (a first protection can never attest an
+    earlier capture), prior/current typed projections are exactly equal, every
+    traversed compression edge has a closure fact, every reliance edge
+    recomputes qualified under the approved scope, and Q is unchanged.
+    Anything else returns ``BLOCK_SOURCE_CONTEXT_POLICY``: the physical-feed
+    scope yields/captures/POSTs nothing, legal native values are preserved and
+    are never rolled back, and no rebaseline/new namespace/rePOST is proposed.
+    """
+    if type(q_same) is not bool or type(relations) not in (list, tuple):
+        _invalid()
+    reasons = []
+    checks = {"q_same": q_same, "prior_present": prior_contexts is not None}
+    if prior_contexts is None:
+        reasons.append("no_comparable_prior_context: first protection cannot attest "
+                       "an earlier capture")
+    else:
+        comparison = compare_context_projections(prior_contexts, current_contexts)
+        checks["context_equal"] = comparison["equal"]
+        checks["missing"] = comparison["missing"]
+        checks["extra"] = comparison["extra"]
+        checks["drift"] = comparison["drift"]
+        if not comparison["equal"]:
+            reasons.append("context_unknown_missing_or_drift")
+    if approved_scope is not None and prior_contexts is not None:
+        facts = recompute_session_feed_facts(current_contexts, approved_scope=approved_scope)
+        checks["all_qualified"] = facts["all_qualified"]
+        if not facts["all_qualified"]:
+            reasons.append("unresolvable_lineage_edges")
+    edge_results = []
+    for edge in relations:
+        result = verify_compression_edge_closure(
+            edge, approved_boundary_facts=approved_boundary_facts,
+            native_child_operations=native_child_operations)
+        edge_results.append({"edge": dict(edge), "proven": result["proven"],
+                             "basis": result["basis"]})
+        if not result["proven"]:
+            reasons.append("unproven_compression_edge")
+    if edge_results:
+        checks["relations"] = edge_results
+    if not q_same:
+        reasons.append("protected_Q_change_pending_correction_policy")
+    decision = ADMIT_D_SAME_SOURCE if not reasons else BLOCK_SOURCE_CONTEXT_POLICY
+    return {"decision": decision, "reasons": reasons, "checks": checks,
+            "q_same_sufficient": False, "writes": "none", "proposed": True,
+            "preserves_native_values": True}
+
+
+def read_receipt3_reader_snapshot(conn, owner_session_id: str) -> dict:
+    """Consume one owner's full receipt3 state as the standalone reader does.
+
+    Read-only and strict: the protected head (or its refusal), the journal
+    members (contiguity and stored head chain), the epoch-local range
+    checkpoints (replayed from the original member bytes, open/closed tail
+    rules), the token index (canonical records, recomputed result digest,
+    exact journal cross-links, every stored operation named exactly once), the
+    rebuildable row-state index, and the full-path prefix audit over every
+    stored receipt3/ key. Any non-canonical, colliding or orphaned byte
+    refuses; nothing is silently repaired.
+    """
+    if type(owner_session_id) is not str or not owner_session_id:
+        _invalid()
+    row = conn.execute(
+        "SELECT model_config FROM sessions WHERE id = ?", (owner_session_id,)).fetchone()
+    if row is None:
+        _invalid()
+    head = _config_head(row[0])
+    if head is not None:
+        validate_receipt3_head(head)
+    members = read_journal_members(conn, owner_session_id)
+    if head is None:
+        if members:
+            _invalid()   # journal bytes without a head: never downgraded to "no evidence"
+    else:
+        if not members:
+            _invalid()
+        last = members[-1]["header"]
+        if (head["owner_session_id"] != owner_session_id
+                or head["active_epoch"] != last["epoch"]
+                or head["epoch_ordinal"] != last["epoch_ordinal"]
+                or head["generation"] != last["generation"]
+                or head["head_sha256"] != last["operation_sha256"]):
+            _invalid()
+    operations = []
+    by_ordinal = {}
+    for member in members:
+        header = member["header"]
+        operations.append({"generation": header["generation"], "epoch": header["epoch"],
+                           "epoch_ordinal": header["epoch_ordinal"],
+                           "operation_sha256": header["operation_sha256"], "header": header})
+        by_ordinal.setdefault(header["epoch_ordinal"], []).append(member)
+    ordinals = sorted(by_ordinal)
+    epochs = []
+    for index, ordinal in enumerate(ordinals):
+        group = by_ordinal[ordinal]
+        epoch_exit = index < len(ordinals) - 1
+        blocks = verify_epoch_range_checkpoints(
+            conn, owner_session_id=owner_session_id, epoch_ordinal=ordinal,
+            last_generation=group[-1]["header"]["generation"], epoch_exit=epoch_exit)
+        epochs.append({"epoch_ordinal": ordinal, "epoch": group[0]["header"]["epoch"],
+                       "first_generation": group[0]["header"]["generation"],
+                       "last_generation": group[-1]["header"]["generation"],
+                       "sealed_blocks": [{"start": block["start"], "end": block["end"]}
+                                         for block in blocks]})
+    lo, hi = _receipt3_prefix_span(_RECEIPT3_TOKEN_PREFIX, owner_session_id)
+    tokens = []
+    named = set()
+    rows = conn.execute(
+        "SELECT key FROM state_meta WHERE key > ? AND key < ? ORDER BY key", (lo, hi)).fetchall()
+    for (key,) in rows:
+        parsed = parse_receipt3_token_key(key)
+        record, _raw = _read_canonical(conn, key)
+        if type(record) is not dict or set(record) != _TOKEN_RECORD_KEYS:
+            _invalid()
+        if (record["owner_session_id"] != owner_session_id
+                or record["operation_id"] != parsed["operation_id"]):
+            _invalid()
+        result = {"token": record["operation_id"],
+                  "operation_sha256": record["operation_sha256"],
+                  "generation": record["operation_generation"]}
+        if record["result_sha256"] != hashlib.sha256(C(result)).hexdigest():
+            _invalid()
+        journal = read_operation(conn, owner_session_id, record["operation_generation"])
+        if (journal["header"]["operation_sha256"] != record["operation_sha256"]
+                or journal["header"]["operation_id"] != record["operation_id"]
+                or journal["header"]["request_sha256"] != record["request_sha256"]):
+            _invalid()
+        named.add(record["operation_generation"])
+        tokens.append({"token": parsed["operation_id"], "generation": record["operation_generation"],
+                       "operation_sha256": record["operation_sha256"],
+                       "result_sha256": record["result_sha256"]})
+    if named != {operation["generation"] for operation in operations}:
+        _invalid()   # every stored operation is named exactly once; no orphaned bytes
+    index = read_row_state_index(conn, owner_session_id)
+    audit_keys = [audit_row[0] for audit_row in conn.execute(
+        "SELECT key FROM state_meta WHERE key >= 'receipt3' AND key < 'receipt4' ORDER BY key")]
+    audit = audit_receipt3_key_paths(audit_keys)
+    if audit["findings"]:
+        _invalid()
+    return {"owner_session_id": owner_session_id, "head": head,
+            "operations": operations, "epochs": epochs, "tokens": tokens,
+            "row_index": index, "key_audit": audit}
+
+
+def capacity_checkpoint_plan(*, owner_session_id: str, epoch: str, epoch_ordinal: int,
+                             first_generation: int, last_generation: int,
+                             epoch_exit: bool) -> dict:
+    """The capacity checkpoint plan of one owner epoch (r4 protocol.capacity).
+
+    Immutable epoch-local 1..1024-op ranges: ``start = s0 + 1024*k`` with
+    ``s0`` the actual first header generation of that epoch; a full block seals
+    with its last operation, the single non-empty partial tail seals only on
+    epoch exit, and while the epoch is open the tail stays directly replayed
+    (never sealed early). This plan is a pure function of the coordinate facts
+    -- bounded memory, O(K) sealed locators for K operations, zero overwrite.
+    """
+    if type(epoch) is not str or not _EPOCH.fullmatch(epoch):
+        _invalid()
+    _positive_int64(epoch_ordinal)
+    _positive_int64(first_generation)
+    _positive_int64(last_generation)
+    if last_generation < first_generation or type(epoch_exit) is not bool:
+        _invalid()
+    sealed = []
+    start = first_generation
+    while start + _CHUNK - 1 <= last_generation:
+        sealed.append({"start": start, "end": start + _CHUNK - 1,
+                       "operation_count": _CHUNK, "sealed": True})
+        start += _CHUNK
+    open_tail = None
+    if start <= last_generation:
+        tail = {"start": start, "end": last_generation,
+                "operation_count": last_generation - start + 1}
+        if epoch_exit:
+            tail["sealed"] = True
+            sealed.append(tail)
+        else:
+            tail["sealed"] = False
+            open_tail = tail
+    return {"owner_session_id": owner_session_id, "epoch": epoch,
+            "epoch_ordinal": epoch_ordinal, "first_generation": first_generation,
+            "last_generation": last_generation, "epoch_exit": epoch_exit,
+            "interval": _CHUNK, "sealed_blocks": sealed, "open_tail": open_tail,
+            "sealed_count": len(sealed), "alignment": "first_generation+1024*k"}
+
+
+def verify_capacity_checkpoint_plan(conn, *, owner_session_id: str,
+                                    epoch_ordinal: int) -> dict:
+    """Exact set equality between one epoch's stored checkpoints and the plan.
+
+    The plan is recomputed from the stored member coordinates and the actual
+    open/closed epoch status; a missing, extra, misaligned or wrongly-sealed
+    range refuses. Old headers/pages/checkpoints are read only -- retained,
+    never overwritten, truncated or re-based.
+    """
+    _positive_int64(epoch_ordinal)
+    all_members = read_journal_members(conn, owner_session_id)
+    members = [member for member in all_members
+               if member["header"]["epoch_ordinal"] == epoch_ordinal]
+    blocks = _read_range_blocks(conn, owner_session_id, epoch_ordinal)
+    if not members:
+        if blocks:
+            _invalid()   # orphaned range bytes without the original journal
+        return {"owner_session_id": owner_session_id, "epoch_ordinal": epoch_ordinal,
+                "sealed_blocks": 0, "open_tail": None, "verify": "empty_epoch"}
+    epoch_exit = any(member["header"]["epoch_ordinal"] > epoch_ordinal
+                     for member in all_members)
+    plan = capacity_checkpoint_plan(
+        owner_session_id=owner_session_id, epoch=members[0]["header"]["epoch"],
+        epoch_ordinal=epoch_ordinal,
+        first_generation=members[0]["header"]["generation"],
+        last_generation=members[-1]["header"]["generation"], epoch_exit=epoch_exit)
+    stored = [{"start": block["start"], "end": block["end"],
+               "operation_count": block["body"]["operation_count"]} for block in blocks]
+    expected = [{"start": block["start"], "end": block["end"],
+                 "operation_count": block["operation_count"]}
+                for block in plan["sealed_blocks"]]
+    if stored != expected:
+        _invalid()   # the stored sealed set must equal the capacity plan exactly
+    return {"owner_session_id": owner_session_id, "epoch_ordinal": epoch_ordinal,
+            "sealed_blocks": len(stored), "open_tail": plan["open_tail"],
+            "verify": "capacity_plan_exact"}
+
+
+def _family_accepts(parser, key) -> bool:
+    try:
+        parser(key)
+        return True
+    except (ValueError, TypeError, KeyError, IndexError):
+        return False
+
+
+def audit_receipt3_key_paths(keys) -> dict:
+    """Full-path prefix-collision audit over a key list (r4 storage namespace).
+
+    Every stored key inside the reserved ``receipt3/`` namespace must parse
+    under exactly ONE family codec (e/o/p/t/r); zero is unparsed, two or more
+    is a collision; the bare reserved name ``receipt3`` is a finding. Keys that
+    merely start with ``receipt3`` without the reserved ``receipt3/`` boundary
+    (e.g. ``receipt30/...``) cannot be reached by any reserved-prefix scan and
+    are reported as informational lookalikes, never as collisions.
+    """
+    if type(keys) not in (list, tuple):
+        _invalid()
+    counts = {family: 0 for family, _parser in _RECEIPT3_FAMILIES}
+    findings, lookalikes = [], []
+    accepted_total = 0
+    for key in keys:
+        if type(key) is not str:
+            findings.append({"key": None, "finding": "not_text",
+                             "key_type": type(key).__name__})
+            continue
+        if key == "receipt3":
+            findings.append({"key": key, "finding": "bare_reserved_name"})
+            continue
+        if key.startswith("receipt3/"):
+            accepted = [family for family, parser in _RECEIPT3_FAMILIES
+                        if _family_accepts(parser, key)]
+            if not accepted:
+                findings.append({"key": key, "finding": "unparsed"})
+            elif len(accepted) > 1:
+                findings.append({"key": key, "finding": "collision",
+                                 "families": accepted})
+            else:
+                counts[accepted[0]] += 1
+                accepted_total += 1
+        elif key.startswith("receipt3"):
+            lookalikes.append(key)
+    return {"keys": len(keys), "accepted": accepted_total, "families": counts,
+            "findings": findings, "lookalikes": lookalikes,
+            "reserved_prefix": "receipt3/", "families_count": len(_RECEIPT3_FAMILIES)}
+
+
+def receipt3_prefix_spans(owner_session_ids) -> dict:
+    """Per-owner prefix spans of the four owner-indexed families + disjointness.
+
+    Detects genuine encoded-span overlaps (two owners whose hex encodings
+    produce overlapping key ranges -- reads under such a span see a foreign
+    coordinate and refuse, fail-closed). Returns the spans, the overlapping
+    pairs and the disjointness verdict; it never raises on overlap because the
+    audit must surface the condition, not hide it.
+    """
+    spans = []
+    for owner in owner_session_ids:
+        if type(owner) is not str or not owner:
+            _invalid()
+        for family, prefix in (("e", _RECEIPT3_EPOCH_PREFIX),
+                               ("o", _RECEIPT3_OPERATION_PREFIX),
+                               ("p", _RECEIPT3_PAGE_PREFIX),
+                               ("t", _RECEIPT3_TOKEN_PREFIX)):
+            lo, hi = _receipt3_prefix_span(prefix, owner)
+            spans.append({"owner_session_id": owner, "family": family, "lo": lo, "hi": hi})
+    spans.sort(key=lambda span: span["lo"])
+    overlaps = [{"left": left["lo"], "right": right["lo"]}
+                for left, right in zip(spans, spans[1:]) if right["lo"] < left["hi"]]
+    return {"spans": spans, "overlaps": overlaps,
+            "pairwise_disjoint": not overlaps}
+
+
+def boundary_roster_digest(owners) -> str:
+    """The frozen boundary-roster digest: sorted owner ids under the recovery
+    roster label (same label/algorithm as the frozen proof's ``roster_sha256``,
+    generalized to the finite approved roster)."""
+    if type(owners) not in (list, tuple) or not owners:
+        _invalid()
+    names = []
+    for owner in owners:
+        if type(owner) is not str or not owner or owner in names:
+            _invalid()
+        names.append(owner)
+    return H(_RECOVERY_ROSTER_LABEL, {"owners": sorted(names)})
+
+
+def validate_boundary_roster(roster, *, approved_anchors) -> dict:
+    """Strict validation of the finite boundary roster (r4 C02 step 3/4).
+
+    Every boundary owner -- including a g0, v1-only or no-receipt owner --
+    appears exactly once with its own immutable old coordinates and token; the
+    member set must equal the approved anchor scope exactly (no expansion and
+    no omission: the original anchor membership is not enlarged by the
+    replacement roster). Returns the canonical entries and the frozen digest
+    the continuation requests must carry as ``boundary_roster_sha256``.
+    """
+    if type(roster) is not list or not roster:
+        _invalid()
+    if type(approved_anchors) not in (list, tuple):
+        _invalid()
+    entries, seen = [], []
+    for entry in roster:
+        if type(entry) is not dict or set(entry) != {
+                "owner_session_id", "token", "old_generation", "old_head_sha256",
+                "old_head_token_sha256"}:
+            _invalid()
+        owner = entry["owner_session_id"]
+        if type(owner) is not str or not owner or owner in seen:
+            _invalid()   # duplicate owners refuse: one continuation per boundary owner
+        seen.append(owner)
+        _canonical_uuid4(entry["token"])
+        generation = entry["old_generation"]
+        if type(generation) is not int or not 0 <= generation <= _MAX_INT64:
+            _invalid()
+        if generation == 0:
+            if entry["old_head_sha256"] is not None:
+                _invalid()   # a first receipt (g0) carries a null old head
+        else:
+            _sha256_hex(entry["old_head_sha256"])
+        _sha256_hex(entry["old_head_token_sha256"])
+        entries.append({name: entry[name] for name in sorted(entry)})
+    anchors = list(approved_anchors)
+    if len(set(anchors)) != len(anchors) or set(anchors) != set(seen):
+        _invalid()   # membership changes in neither direction
+    entries.sort(key=lambda entry: entry["owner_session_id"].encode("utf-8"))
+    owners = [entry["owner_session_id"] for entry in entries]
+    return {"owners": owners, "entries": entries,
+            "roster_sha256": boundary_roster_digest(owners)}
+
+
+def verify_roster_continuation_inventory(conn, approved_owners, approved_transitions,
+                                         *, complete: bool) -> dict:
+    """Strict read-only inventory of committed continuations across a roster.
+
+    Scans every stored ``receipt3/t`` key: a token whose owner is outside the
+    approved roster refuses (an unnamed continuation never rides along). Every
+    stored token record of an approved owner is verified strictly as a named
+    receipt (canonical bytes, recomputed result digest, exact journal
+    cross-links, no orphaned ``receipt3/o|p`` bytes, every ``receipt3/e``
+    checkpoint replayed from the stored member bytes). The completed set of
+    THE frozen transition is the subset whose journal header carries exactly
+    that transition block; older continuation records (other approved epochs)
+    are background history -- verified, never counted, never orphans. Exactly
+    one frozen-transition record per owner for the final ALL readback, at most
+    one otherwise.
+    """
+    if type(approved_owners) not in (list, tuple) or not approved_owners \
+            or type(approved_transitions) is not dict or type(complete) is not bool:
+        _invalid()
+    approved = list(approved_owners)
+    if len(set(approved)) != len(approved):
+        _invalid()
+    token_rows = conn.execute(
+        "SELECT key FROM state_meta WHERE key >= 'receipt3/t/' AND key < 'receipt3/u' "
+        "ORDER BY key").fetchall()
+    for (key,) in token_rows:
+        owner = parse_receipt3_token_key(key)["session_id"]
+        if owner not in approved:
+            _invalid()   # a continuation token outside the approved roster refuses
+    owners = {}
+    for owner in approved:
+        transition = approved_transitions.get(owner)
+        if type(transition) is not dict or set(transition) != _CONTINUATION_KEYS:
+            _invalid()
+        committed = []
+        named = set()
+        lo, hi = _receipt3_prefix_span(_RECEIPT3_TOKEN_PREFIX, owner)
+        last = lo
+        while True:
+            rows = conn.execute(
+                "SELECT key, value FROM state_meta WHERE key > ? AND key < ? "
+                "ORDER BY key LIMIT ?", (last, hi, 128)).fetchall()
+            if not rows:
+                break
+            for key, _value in rows:
+                last = key
+                parsed = parse_receipt3_token_key(key)
+                if parsed["session_id"] != owner:
+                    _invalid()
+                stored, _raw = _read_canonical(conn, key)
+                if type(stored) is not dict or set(stored) != _TOKEN_RECORD_KEYS:
+                    _invalid()
+                if (stored["owner_session_id"] != owner
+                        or stored["operation_id"] != parsed["operation_id"]):
+                    _invalid()
+                _sha256_hex(stored["request_sha256"])
+                _sha256_hex(stored["operation_sha256"])
+                _sha256_hex(stored["result_sha256"])
+                generation = _positive_int64(stored["operation_generation"])
+                result = {"token": stored["operation_id"],
+                          "operation_sha256": stored["operation_sha256"],
+                          "generation": generation}
+                if stored["result_sha256"] != hashlib.sha256(C(result)).hexdigest():
+                    _invalid()   # the stored result digest must recompute exactly
+                member = read_operation(conn, owner, generation)
+                header = member["header"]
+                if (header["operation_id"] != stored["operation_id"]
+                        or header["request_sha256"] != stored["request_sha256"]
+                        or header["operation_sha256"] != stored["operation_sha256"]):
+                    _invalid()
+                named.add(encode_receipt3_operation_key(owner, generation))
+                for ordinal in range(len(member["pages"])):
+                    named.add(encode_receipt3_page_key(owner, generation, ordinal))
+                if (header["kind"] == "epoch_continuation"
+                        and header["continuation"] == transition):
+                    committed.append({"token": stored["operation_id"],
+                                      "generation": generation,
+                                      "operation_sha256": stored["operation_sha256"],
+                                      "request_sha256": stored["request_sha256"]})
+        committed.sort(key=lambda item: (item["generation"], item["token"]))
+        for prefix in (_RECEIPT3_OPERATION_PREFIX, _RECEIPT3_PAGE_PREFIX):
+            lo, hi = _receipt3_prefix_span(prefix, owner)
+            last = lo
+            while True:
+                rows = conn.execute(
+                    "SELECT key FROM state_meta WHERE key > ? AND key < ? "
+                    "ORDER BY key LIMIT ?", (last, hi, 128)).fetchall()
+                if not rows:
+                    break
+                for (key,) in rows:
+                    last = key
+                    if key not in named:
+                        _invalid()   # orphaned journal bytes refuse the readback
+        lo, hi = _receipt3_prefix_span(_RECEIPT3_EPOCH_PREFIX, owner)
+        epochs = set()
+        last = lo
+        while True:
+            rows = conn.execute(
+                "SELECT key FROM state_meta WHERE key > ? AND key < ? "
+                "ORDER BY key LIMIT ?", (last, hi, 128)).fetchall()
+            if not rows:
+                break
+            for (key,) in rows:
+                last = key
+                epochs.add(parse_receipt3_epoch_key(key)["epoch_ordinal"])
+        for epoch_ordinal in sorted(epochs):
+            members = read_journal_members(conn, owner, epoch_ordinal=epoch_ordinal)
+            by_generation = {member["header"]["generation"]: member for member in members}
+            for block in _read_range_blocks(conn, owner, epoch_ordinal):
+                _replay_block(block, by_generation, owner, epoch_ordinal)
+        if len(committed) > 1:
+            _invalid()   # more than one committed continuation for one frozen transition
+        if complete and len(committed) != 1:
+            _invalid()   # the ALL readback requires every boundary owner committed
+        owners[owner] = committed
+    return {"owners": owners, "complete": all(len(value) == 1 for value in owners.values())}
+
+
+def final_all_owner_readback(records) -> str:
+    """One canonical digest over the final ALL-owner readback entries (sorted
+    per-owner committed sets + protected heads) -- the bytes an independent
+    acceptance decides on before the explicit quiet exit."""
+    if type(records) is not list or not records:
+        _invalid()
+    by_owner = {}
+    for record in records:
+        if type(record) is not dict or set(record) != {
+                "owner_session_id", "committed", "head"}:
+            _invalid()
+        owner = record["owner_session_id"]
+        if type(owner) is not str or not owner or owner in by_owner:
+            _invalid()
+        by_owner[owner] = record
+    ordered = [by_owner[owner] for owner in sorted(by_owner, key=lambda s: s.encode("utf-8"))]
+    return H("all-owner-readback", {"owners": ordered})
