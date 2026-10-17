@@ -28,6 +28,7 @@ from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
 
 from hermes_state_common import (
+    SCHEMA_VERSION,
     TITLE_SOURCE_DERIVED as _TITLE_SOURCE_DERIVED, TITLE_SOURCE_LLM as _TITLE_SOURCE_LLM,
     TITLE_SOURCE_USER as _TITLE_SOURCE_USER,
     escape_like as _escape_like, _placeholders,
@@ -54,7 +55,16 @@ from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
-from hermes_state_schema import SessionSchemaMixin
+from hermes_state_schema import SessionSchemaMixin, _MESSAGE_UID_BACKFILL_DONE
+from hermes_state_copy_provenance import (
+    _CONTINUATION_KEYS as _RECEIPT3_CONTINUATION_KEYS,
+    _DOMAIN_SHA256 as _RECEIPT3_DOMAIN, build_epoch_continuation_header, build_journal_page,
+    boundary_roster_digest, encode_receipt3_operation_key, encode_receipt3_page_key,
+    encode_receipt3_token_key, final_all_owner_readback,
+    observe_native_session_contexts, read_operation, read_partial_recovery_state,
+    seal_epoch_blocks, validate_boundary_roster, validate_receipt3_head,
+    verify_frozen_proof, verify_independent_copy_joint, verify_roster_continuation_inventory,
+)
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
@@ -1636,7 +1646,17 @@ class SessionDB(
 
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
         """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
-        transaction — nesting BEGIN IMMEDIATE would deadlock)."""
+        transaction — nesting BEGIN IMMEDIATE would deadlock).
+
+        The ``receipt3/`` namespace is writer-owned protected evidence (receipt v3,
+        schema/3): only the native provenance helper may write it, on this same
+        connection inside its own approved transaction. The generic setter — with
+        or without ``cursor`` — must never act as that writer."""
+        if key == "receipt3" or key.startswith("receipt3/"):
+            raise ValueError(
+                "receipt3/ is the protected native-provenance namespace; "
+                "use the native receipt writer, not set_meta"
+            )
         sql = (
             "INSERT INTO state_meta (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
@@ -1693,13 +1713,949 @@ class SessionDB(
 
     def list_meta_prefix(self, prefix: str) -> list[tuple[str, str]]:
         """``[(key, value), ...]`` for state_meta keys starting with the literal
-        ``prefix`` (LIKE wildcards escaped) — e.g. ``loop:<session_id>`` rows."""
+        ``prefix`` (LIKE wildcards escaped) — e.g. ``loop:<session_id>`` rows.
+
+        The ``receipt3/`` namespace is refused here: it materializes the whole
+        match set and is not the bounded receipt reader (receipt v3, schema/3)."""
+        if prefix == "receipt3" or prefix.startswith("receipt3/"):
+            raise ValueError(
+                "receipt3/ is the protected native-provenance namespace; "
+                "the generic prefix scan is not the receipt reader"
+            )
         if not prefix:
             return []
         rows = self._read_all(
             "SELECT key, value FROM state_meta WHERE key LIKE ? ESCAPE '\\'", (_escape_like(prefix) + "%",),
         )
         return [(row[0], row[1]) for row in rows]
+
+    @classmethod
+    def open_quiet_recovery_admission(cls, *, db_path, init_request) -> "QuietRecoveryHandle":
+        """Open the finite continuation-only quiet-recovery mode (receipt r4 C02).
+
+        This is the ONLY entry into recovery: a no-create ``mode=rw`` open of an
+        existing *settled* store that runs no schema init, no repair, no
+        generation mint and no usermerge (see :class:`QuietRecoveryHandle`). It
+        refuses here for: a foreign/empty store, or any store that is not the
+        settled Hermes schema. Only an approved epoch_continuation request may
+        ever reach it; the ordinary constructor and every generic writer must
+        not obtain this handle.
+        """
+        return QuietRecoveryHandle.open(db_path=Path(db_path), init_request=init_request)
+
+
+# ── quiet recovery admission (receipt v3, r4 C02 -- minimal native slice) ────
+# Cadence for the postcommit FTS defer: at most every N approved continuation
+# writes marks a deferred FTS due instead of executing usermerge/merge inside
+# the recovery handle (native values: every 50th PASSIVE checkpoint / 1000th
+# merge in the ordinary writer; this handle only ever defers).
+QUIET_RECOVERY_FTS_DEFER_EVERY = 1000
+
+_QUIET_REQUIRED_TABLES = frozenset({"state_meta", "sessions", "messages", "schema_version"})
+_QUIET_REQUIRED_REQUEST = frozenset({
+    "kind", "token", "owner_session_id", "proof_sha256", "old_epoch", "new_epoch",
+    "old_generation", "old_head_sha256", "old_head_token_sha256",
+    "boundary_roster_sha256", "alias_inventory_sha256",
+})
+# Exact stored token-record shape (attempt_token_index): the read-back path
+# verifies these bytes, never a relaxed subset.
+_QUIET_RECORD_KEYS = frozenset({
+    "owner_session_id", "operation_id", "request_sha256", "operation_generation",
+    "operation_sha256", "result_sha256",
+})
+# The epoch-transition bindings of the approved init request. Every committed
+# continuation must carry exactly these values; only the token and the
+# per-operation oldraw coordinates (old_generation/old_head_sha256/
+# old_head_token_sha256) stay free per operation.
+_QUIET_BOUND_BINDINGS = (
+    "kind", "owner_session_id", "proof_sha256", "old_epoch", "new_epoch",
+    "boundary_roster_sha256", "alias_inventory_sha256",
+)
+
+
+class _QuietTokenReplay(Exception):
+    """Raised inside the write callback when the token is already committed with
+    the same bytes: the transaction rolls back and the stored result is returned
+    without counting a second operation."""
+
+    def __init__(self, result):
+        super().__init__("epoch continuation token already committed")
+        self.result = result
+
+
+def _validate_quiet_recovery_request(request) -> dict:
+    if not isinstance(request, dict) or set(request) != _QUIET_REQUIRED_REQUEST:
+        raise ValueError("recovery admission accepts only an approved epoch_continuation request")
+    if request["kind"] != "epoch_continuation":
+        raise ValueError("recovery admission accepts only an approved epoch_continuation request")
+    owner_session_id = request["owner_session_id"]
+    if not isinstance(owner_session_id, str) or not owner_session_id:
+        raise ValueError("continuation owner_session_id must be a non-empty string")
+    token = request["token"]
+    if not isinstance(token, str) or not token:
+        raise ValueError("continuation token must be a canonical uuid4 string")
+    try:
+        parsed_token = uuid.UUID(token)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("continuation token must be a canonical uuid4 string") from None
+    if (parsed_token.version != 4 or parsed_token.variant != uuid.RFC_4122
+            or str(parsed_token) != token):
+        raise ValueError("continuation token must be a canonical uuid4 string")
+    for key in ("proof_sha256", "old_head_sha256", "old_head_token_sha256",
+                "boundary_roster_sha256", "alias_inventory_sha256"):
+        if key == "old_head_sha256":
+            continue  # gated on old_generation below (null only for a first receipt)
+        value = request[key]
+        if (not isinstance(value, str) or len(value) != 64
+                or any(c not in "0123456789abcdef" for c in value)):
+            raise ValueError("continuation request fields must be lowercase sha256 hex")
+    for key in ("old_epoch", "new_epoch"):
+        value = request[key]
+        if (not isinstance(value, str) or not value.startswith("sqlite:")
+                or len(value) != 71 or any(c not in "0123456789abcdef" for c in value[7:])):
+            raise ValueError("continuation epochs must be sqlite:64lowerhex")
+    generation = request["old_generation"]
+    if type(generation) is not int or generation < 0:
+        raise ValueError("old_generation must be a nonnegative int")
+    old_head_sha256 = request["old_head_sha256"]
+    if generation == 0:
+        if old_head_sha256 is not None:
+            raise ValueError(
+                "a first continuation (old_generation 0) carries a null old head")
+    elif (not isinstance(old_head_sha256, str) or len(old_head_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in old_head_sha256)):
+        raise ValueError("continuation request fields must be lowercase sha256 hex")
+    return request
+
+
+def _quiet_result_from_record(record: dict) -> dict:
+    """Exact read-back of one stored token record: exactly the frozen six fields,
+    and the stored result digest must recompute from the returned result."""
+    if type(record) is not dict or set(record) != _QUIET_RECORD_KEYS:
+        raise ValueError("stored continuation token record is unreadable; refusing")
+    result = {"token": record["operation_id"],
+              "operation_sha256": record["operation_sha256"],
+              "generation": record["operation_generation"]}
+    if record["result_sha256"] != hashlib.sha256(_quiet_canonical(result)).hexdigest():
+        raise ValueError("stored continuation result bytes no longer verify; refusing")
+    return result
+
+
+def _quiet_unique_config_object(pairs):
+    """Strict config decode: a duplicate raw key refuses the continuation."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate model_config keys refuse the continuation")
+        obj[key] = value
+    return obj
+
+
+def _quiet_config_object(raw):
+    """Strictly decode the owner's model_config text; returns ``(config, text)``."""
+    text = "" if raw is None else raw
+    if not isinstance(text, str):
+        raise ValueError("owner model_config is not readable; refusing the continuation")
+    if not text.strip():
+        return {}, ""
+    try:
+        config = json.loads(text, object_pairs_hook=_quiet_unique_config_object)
+    except ValueError:
+        raise ValueError(
+            "owner model_config is not readable; refusing the continuation") from None
+    if not isinstance(config, dict):
+        raise ValueError("owner model_config is not an object; refusing the continuation")
+    return config, text
+
+
+def _quiet_protected_head(raw) -> Optional[dict]:
+    """The owner's stored protected head (``model_config._message_copy_receipts_v2``)
+    or None when absent; unreadable or off-shape heads refuse the continuation."""
+    config, _text = _quiet_config_object(raw)
+    head = config.get("_message_copy_receipts_v2")
+    if head is None:
+        return None
+    validate_receipt3_head(head)
+    return head
+
+
+def _quiet_install_protected_head(raw, head: dict) -> str:
+    """Write the new protected head into the raw model_config text by replacing
+    only the head value bytes: every other lexeme of the stored config (the v1
+    tokens included) keeps its exact bytes. With no head present the key is
+    spliced into the existing object; a duplicate or damaged head region
+    refuses."""
+    validate_receipt3_head(head)
+    head_text = _quiet_canonical(head).decode("utf-8")
+    token = '"_message_copy_receipts_v2"'
+    text = "" if raw is None else raw
+    if not isinstance(text, str) or not text.strip():
+        return "{" + token + ":" + head_text + "}"
+    occurrences = []
+    start = 0
+    while True:
+        index = text.find(token, start)
+        if index < 0:
+            break
+        occurrences.append(index)
+        start = index + 1
+    if len(occurrences) > 1:
+        raise ValueError("duplicate protected head keys refuse the continuation")
+    if occurrences:
+        index = occurrences[0]
+        if not text[:index].rstrip().endswith(("{", ",")):
+            raise ValueError(
+                "damaged model_config around the protected head; refusing")
+        rest = text[index + len(token):]
+        stripped = rest.lstrip()
+        if not stripped.startswith(":"):
+            raise ValueError(
+                "damaged model_config around the protected head; refusing")
+        value_start = index + len(token) + (len(rest) - len(stripped)) + 1
+        while value_start < len(text) and text[value_start] in " \t\r\n":
+            value_start += 1
+        try:
+            _value, value_end = json.JSONDecoder().raw_decode(text, value_start)
+        except ValueError:
+            raise ValueError(
+                "damaged model_config around the protected head; refusing") from None
+        return text[:value_start] + head_text + text[value_end:]
+    end = text.rstrip().rfind("}")
+    if end < 0:
+        raise ValueError("owner model_config is not an object; refusing the continuation")
+    body = text[:end]
+    separator = "" if body.rstrip().endswith("{") else ","
+    return body + separator + token + ":" + head_text + text[end:]
+
+
+def _quiet_fts_match_probe(conn: sqlite3.Connection, table: str):
+    """SELECT-only FTS5 MATCH probe. True: the index answers; False: the table is
+    absent; None: present but not verifiable -- fail closed."""
+    try:
+        conn.execute(f"SELECT count(*) FROM {table} WHERE {table} MATCH ?",
+                     ("receiptprobe",)).fetchone()
+        return True
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        return None
+    except sqlite3.DatabaseError:
+        return None
+
+
+def _quiet_settled_admission_checks(conn: sqlite3.Connection):
+    """Fail-closed SELECT-only settled-store checks (receipt r4 C02); returns the
+    probed ``(fts_enabled, trigram_available)`` real values, refuses otherwise."""
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table'")}
+    if not _QUIET_REQUIRED_TABLES <= tables:
+        raise ValueError(
+            "quiet recovery requires an existing settled Hermes store; "
+            "no schema init/repair/generation mint is performed here")
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    if row is None or row[0] != SCHEMA_VERSION:
+        raise ValueError(
+            "quiet recovery requires the settled schema version; an unsettled "
+            "store is refined through the ordinary path first, never here")
+    row = conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (_MESSAGE_UID_BACKFILL_DONE,)).fetchone()
+    if row is None or row[0] != "1":
+        raise ValueError("quiet recovery requires the finished message_uid backfill")
+    row = conn.execute(
+        "SELECT value FROM state_meta WHERE key = ?", (_STATE_DB_GENERATION_KEY,)).fetchone()
+    if row is None or not str(row[0] or "").strip():
+        raise ValueError("quiet recovery requires an existing db_file_generation stamp")
+    row = conn.execute(
+        "SELECT count(*) FROM state_meta WHERE key LIKE 'fts\\_rebuild\\_%' ESCAPE '\\' "
+        "OR key LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\'").fetchone()
+    if row[0]:
+        raise ValueError(
+            "quiet recovery refuses a store with pending FTS rebuild/trash markers")
+    if SessionDB._db_needs_fts_storage_upgrade(conn.cursor()):
+        raise ValueError(
+            "quiet recovery refuses a store whose FTS storage layout is not settled")
+    fts_enabled = _quiet_fts_match_probe(conn, "messages_fts")
+    if fts_enabled is not True:
+        raise ValueError("quiet recovery requires a working base FTS index")
+    trigram_available = _quiet_fts_match_probe(conn, "messages_fts_trigram")
+    if trigram_available is None:
+        raise ValueError("quiet recovery cannot verify the trigram FTS index; refusing")
+    return fts_enabled, trigram_available
+
+
+def _quiet_canonical(value) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8", "strict")
+
+
+class QuietRecoveryHandle:
+    """Continuation-only recovery handle: the single narrow write path.
+
+    Opened with a no-create ``mode=rw`` connection on an existing settled store
+    (fail-closed settled checks in :func:`_quiet_settled_admission_checks`); it
+    never runs the ordinary constructor's schema init, FTS repair, generation
+    mint or usermerge. Generic writers (set_meta/append_message) and FTS
+    maintenance entries (optimize_fts/rebuild_fts) refuse. Only
+    :meth:`append_epoch_continuation` may write, and it runs on the EXISTING
+    ``SessionDB._execute_write`` transaction core (the same function object)
+    through the quiet hook set below -- no reopen, no checkpoint, no
+    usermerge/merge, no fail-open repair -- binding the approved transition
+    and the owner's stored protected head (oldraw CAS). It is token-idempotent
+    (same token -> verified readback, no second insert, no count; same key
+    with different bytes -> refused). At the cadence it only marks
+    ``_fts_deferred_due``; ``_fts_enabled``/``_trigram_available`` keep their
+    probed real values.
+    """
+
+    _quiet_recovery_admission = True
+
+    # Constants the shared SessionDB transaction core reads on this handle.
+    _WRITE_PATIENCE_S = SessionDB._WRITE_PATIENCE_S
+    _COMPRESSION_BUSY_WAIT_S = SessionDB._COMPRESSION_BUSY_WAIT_S
+    _WRITE_RETRY_SLOW_AFTER_S = SessionDB._WRITE_RETRY_SLOW_AFTER_S
+    _WRITE_RETRY_MIN_S = SessionDB._WRITE_RETRY_MIN_S
+    _WRITE_RETRY_MAX_S = SessionDB._WRITE_RETRY_MAX_S
+    _WRITE_RETRY_SLOW_MIN_S = SessionDB._WRITE_RETRY_SLOW_MIN_S
+    _WRITE_RETRY_SLOW_MAX_S = SessionDB._WRITE_RETRY_SLOW_MAX_S
+    _CHECKPOINT_EVERY_N_WRITES = SessionDB._CHECKPOINT_EVERY_N_WRITES
+    _FTS_MERGE_EVERY_N_WRITES = QUIET_RECOVERY_FTS_DEFER_EVERY
+    # The native bounded FTS maintenance pass invoked once at the explicit exit
+    # (r4 C02 step 7: 500 pages/index, 4 commands/pass) -- the EXISTING bounded
+    # merge implementation, never a private copy.
+    _FTS_MERGE_MAX_PAGES_PER_INDEX = SessionDB._FTS_MERGE_MAX_PAGES_PER_INDEX
+    _FTS_MERGE_COMMANDS_PER_PASS = SessionDB._FTS_MERGE_COMMANDS_PER_PASS
+    _FTS_TABLES = SessionDB._FTS_TABLES
+    _present_fts_tables = SessionDB._present_fts_tables
+    _fts_table_exists = SessionDB._fts_table_exists
+    _merge_fts_incrementally = SessionDB._merge_fts_incrementally
+    # The EXISTING transaction core and shared helpers -- never a private copy.
+    _execute_write = SessionDB._execute_write
+    _sleep_before_write_retry = SessionDB._sleep_before_write_retry
+    _is_structural_corruption_error = SessionDB._is_structural_corruption_error
+    _is_fts_write_corruption_error = SessionDB._is_fts_write_corruption_error
+
+    def __init__(self, *, db_path, conn, init_request, fts_enabled, trigram_available):
+        self.db_path = db_path
+        self._conn = conn
+        self._init_request = init_request
+        self._db_file_identity = _stat_db_file_identity(db_path)
+        self._db_replaced = False
+        self._db_corrupt = False
+        self._db_corrupt_reason = "unspecified"
+        self._lock = threading.RLock()
+        self._write_count = 0
+        self._fts_enabled = fts_enabled
+        self._trigram_available = trigram_available
+        self._fts_deferred_due = False
+        self._fts_usermerge_floor_applied = False
+        self._closed = False
+        # C02 step 3/4 boundary-roster admission: the single-owner admission
+        # approves exactly its frozen owner; a roster admission approves the
+        # finite roster (validated module-side against the approved anchors).
+        self._approved_owners = (init_request["owner_session_id"],)
+        self._roster_requests = None
+
+    @classmethod
+    def open(cls, *, db_path: Path, init_request: dict) -> "QuietRecoveryHandle":
+        request = _validate_quiet_recovery_request(init_request)
+        path = Path(db_path).resolve()
+        # ``as_uri()`` percent-encodes the path (?/#/% stay path bytes); mode=rw
+        # never creates a database, so a missing store is refused before any
+        # connection exists.
+        conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            fts_enabled, trigram_available = _quiet_settled_admission_checks(conn)
+            return cls(db_path=path, conn=conn, init_request=request,
+                       fts_enabled=fts_enabled, trigram_available=trigram_available)
+        except BaseException:
+            conn.close()
+            raise
+
+    @classmethod
+    def open_roster(cls, *, db_path: Path, requests, approved_anchors) -> "QuietRecoveryHandle":
+        """C02 steps 3/4: enter the finite quiet mode for an approved boundary
+        roster (every boundary owner -- g0, v1-only or no-receipt included).
+
+        The same settled no-create admission runs once for the whole roster
+        (one store, one finite recovery mode); every request must carry the
+        exact same frozen transition frame, the roster member set must equal
+        the approved anchor scope exactly (never enlarged by the replacement,
+        never narrowed), and the frozen request digest must match the
+        canonical roster digest. The partial state of ALL owners is verified
+        read-only before any continuation can be written.
+        """
+        if type(requests) not in (list, tuple) or not requests:
+            raise ValueError("a roster admission requires at least one continuation request")
+        validated = [_validate_quiet_recovery_request(dict(request)) for request in requests]
+        frame = validated[0]
+        for request in validated[1:]:
+            for bound_field in ("kind", "proof_sha256", "old_epoch", "new_epoch",
+                                "boundary_roster_sha256", "alias_inventory_sha256"):
+                if request[bound_field] != frame[bound_field]:
+                    raise ValueError(
+                        "roster continuations do not share one approved transition frame")
+        roster_entries = [{"owner_session_id": request["owner_session_id"],
+                           "token": request["token"],
+                           "old_generation": request["old_generation"],
+                           "old_head_sha256": request["old_head_sha256"],
+                           "old_head_token_sha256": request["old_head_token_sha256"]}
+                          for request in validated]
+        roster = validate_boundary_roster(roster_entries,
+                                          approved_anchors=list(approved_anchors))
+        if roster["roster_sha256"] != frame["boundary_roster_sha256"]:
+            raise ValueError(
+                "approved boundary roster digest does not match the frozen request")
+        handle = cls.open(db_path=db_path, init_request=frame)
+        try:
+            handle._approved_owners = tuple(roster["owners"])
+            handle._roster_requests = {request["owner_session_id"]: request
+                                       for request in validated}
+            handle.verify_roster_recovery_state()
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+
+    # ── refusals: generic writers and maintenance never write here ──
+    def set_meta(self, *args, **kwargs):
+        raise RuntimeError("generic set_meta is not reachable on the quiet recovery handle")
+
+    def append_message(self, *args, **kwargs):
+        raise RuntimeError("generic message writes are not reachable on the quiet recovery handle")
+
+    def optimize_fts(self, *args, **kwargs):
+        raise RuntimeError("FTS optimize is deferred on the quiet recovery handle")
+
+    def rebuild_fts(self, *args, **kwargs):
+        raise RuntimeError("FTS rebuild is not reachable on the quiet recovery handle")
+
+    # ── quiet hook set for the shared SessionDB._execute_write core ──
+    def _raise_if_db_replaced(self) -> None:
+        """Quiet inode fence: the path must still name the file this handle opened."""
+        if self._db_replaced:
+            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
+        recorded = self._db_file_identity
+        if recorded is not None and _stat_db_file_identity(self.db_path) != recorded:
+            self._db_replaced = True
+            raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
+
+    def _raise_if_db_corrupt(self, *, storage: bool = False) -> None:
+        if self._db_corrupt:
+            raise self._corrupt_error()
+        if storage and storage_state(self.db_path) == STORAGE_CORRUPT:
+            self._halt_db_corrupt(sqlite3.DatabaseError(
+                "database disk image is malformed (reported earlier in this process: "
+                f"{storage_corrupt_reason(self.db_path)})"))
+
+    def _corrupt_error(self, prefix: str = "") -> StateDbCorruptError:
+        return StateDbCorruptError(f"{prefix}{_STATE_DB_CORRUPT_MSG} (cause: {self._db_corrupt_reason})")
+
+    def _halt_db_corrupt(self, exc: BaseException) -> None:
+        """Quiet quarantine: sticky local flags and raise; no process-wide publish."""
+        self._db_corrupt = True
+        self._db_corrupt_reason = str(exc)
+        logger.error(
+            "quiet recovery handle for %s saw structural corruption (%s); "
+            "quarantining this handle: no further continuation writes.", self.db_path, exc,
+        )
+        err = self._corrupt_error()
+        for attr in ("sqlite_errorcode", "sqlite_errorname"):
+            if getattr(exc, attr, None) is not None:
+                setattr(err, attr, getattr(exc, attr))
+        raise err from exc
+
+    def _reopen_after_close_locked(self, context: str = "write") -> None:
+        raise RuntimeError(
+            "quiet recovery handle is closed; it never reopens after close()")
+
+    def _try_wal_checkpoint(self) -> None:
+        """Quiet mode never checkpoints; the post-release pass owns that."""
+
+    def _try_incremental_merge_fts(self) -> None:
+        """Quiet mode never merges: mark the postcommit FTS defer instead."""
+        self._fts_deferred_due = True
+
+    def _enter_fts_fail_open(self, exc, *, deadline=None, patience_s=None) -> bool:
+        return False  # no fail-open repair inside the recoverer
+
+    # ── the single approved write ──
+    def append_epoch_continuation(self, request: dict) -> dict:
+        request = _validate_quiet_recovery_request(request)
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        for field in _QUIET_BOUND_BINDINGS:
+            if field == "owner_session_id":
+                if request[field] not in self._approved_owners:
+                    raise ValueError(
+                        "continuation owner is not part of the approved boundary roster")
+                continue
+            if request[field] != self._init_request[field]:
+                raise ValueError(
+                    "continuation does not match the approved init request transition")
+        owner_session_id = request["owner_session_id"]
+        token = request["token"]
+        key = encode_receipt3_token_key(owner_session_id, token)
+        request_sha256 = hashlib.sha256(_quiet_canonical(request)).hexdigest()
+
+        def _do(conn: sqlite3.Connection) -> dict:
+            existing = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            if existing is not None:
+                stored_existing = json.loads(existing[0])
+                if existing[0] != _quiet_canonical(stored_existing).decode("utf-8"):
+                    raise ValueError(
+                        "stored continuation token record is not canonical; refusing")
+                if stored_existing.get("request_sha256") != request_sha256:
+                    raise ValueError(
+                        "continuation token already committed with different bytes; refusing")
+                # Exact readback: the stored result is only returned after the
+                # record and the journal bytes it names still verify.
+                replayed = _quiet_result_from_record(stored_existing)
+                journal = read_operation(conn, owner_session_id,
+                                         stored_existing["operation_generation"])
+                if journal["header"]["operation_sha256"] != stored_existing["operation_sha256"]:
+                    raise ValueError(
+                        "stored continuation journal no longer matches its token record; refusing")
+                raise _QuietTokenReplay(replayed)
+            # oldraw / protected-head CAS: the owner row must exist; a stored head
+            # must match the old coordinates exactly; absent = a first receipt,
+            # and only with old_generation 0 -- a missing head never downgrades
+            # an existing journal to "no evidence".
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (owner_session_id,)).fetchone()
+            if row is None:
+                raise ValueError(
+                    "continuation owner session is not part of this settled store")
+            head = _quiet_protected_head(row[0])
+            if head is not None:
+                if (head["owner_session_id"] != owner_session_id
+                        or head["active_epoch"] != request["old_epoch"]
+                        or head["generation"] != request["old_generation"]
+                        or head["head_sha256"] != request["old_head_sha256"]
+                        or hashlib.sha256(_quiet_canonical(head)).hexdigest()
+                        != request["old_head_token_sha256"]):
+                    raise ValueError(
+                        "continuation does not match the stored protected head (oldraw CAS)")
+                old_ordinal = head["epoch_ordinal"]
+                domain_sha256 = head["domain_sha256"]
+                v1_binding_sha256 = head["v1_binding_sha256"]
+            else:
+                if request["old_generation"] != 0:
+                    raise ValueError(
+                        "continuation claims stored history but the owner carries "
+                        "no protected head; refusing")
+                journal_lo = "receipt3/o/" + owner_session_id.encode("utf-8").hex() + "/"
+                if conn.execute(
+                        "SELECT 1 FROM state_meta WHERE key >= ? AND key < ? LIMIT 1",
+                        (journal_lo, journal_lo[:-1] + ":")).fetchone() is not None:
+                    raise ValueError(
+                        "continuation owner already carries journal entries but "
+                        "no protected head; refusing")
+                old_ordinal = None
+                domain_sha256 = _RECEIPT3_DOMAIN
+                v1_binding_sha256 = None
+            operation_generation = request["old_generation"] + 1
+            epoch_ordinal = 1 if old_ordinal is None else old_ordinal + 1
+            # Q01 typed context observation on this same connection, inside the
+            # transaction (the header carries the observed projection).
+            contexts = observe_native_session_contexts(
+                conn, owner_session_id=owner_session_id, actor_session_id=owner_session_id,
+                kind="epoch_continuation", domain_sha256=domain_sha256)
+            page = build_journal_page(
+                owner_session_id=owner_session_id, epoch=request["new_epoch"],
+                generation=operation_generation, page_ordinal=0,
+                items=[{"kind": "native_result", "input_ordinal": None, "row_ref": None,
+                        "disposition": "aggregate", "result_count": None}])
+            header = build_epoch_continuation_header(
+                request=request, request_sha256=request_sha256, domain_sha256=domain_sha256,
+                epoch=request["new_epoch"], epoch_ordinal=epoch_ordinal,
+                generation=operation_generation,
+                previous_head_sha256=request["old_head_sha256"],
+                pages=[page], native_session_contexts=contexts)
+            operation_sha256 = header["operation_sha256"]
+            # Insert-only journal entries under their immutable named keys.
+            for named_key, value in (
+                    (encode_receipt3_operation_key(owner_session_id, operation_generation),
+                     _quiet_canonical(header)),
+                    (encode_receipt3_page_key(owner_session_id, operation_generation, 0),
+                     _quiet_canonical(page))):
+                if conn.execute("SELECT 1 FROM state_meta WHERE key = ?", (named_key,)).fetchone():
+                    raise ValueError("receipt3 journal entry already exists; refusing")
+                conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                             (named_key, value.decode("utf-8")))
+            # Range checkpoints, same transaction: seal the old epoch's exit tail
+            # (read back from the stored member bytes), then apply the
+            # completed-full-block rule to the new epoch. Insert-or-verified
+            # bytes only -- never an overwrite.
+            if old_ordinal is not None:
+                seal_epoch_blocks(
+                    conn, owner_session_id=owner_session_id, epoch=request["old_epoch"],
+                    epoch_ordinal=old_ordinal, up_to_generation=request["old_generation"],
+                    epoch_exit=True)
+            seal_epoch_blocks(
+                conn, owner_session_id=owner_session_id, epoch=request["new_epoch"],
+                epoch_ordinal=epoch_ordinal, up_to_generation=operation_generation,
+                epoch_exit=False)
+            new_head = {"schema_version": "hermes-message-copy-receipts/3",
+                        "protocol_revision": 3, "domain_sha256": domain_sha256,
+                        "owner_session_id": owner_session_id,
+                        "active_epoch": request["new_epoch"], "epoch_ordinal": epoch_ordinal,
+                        "generation": operation_generation, "head_sha256": operation_sha256,
+                        "v1_binding_sha256": v1_binding_sha256,
+                        "activation_proof_sha256": request["proof_sha256"]}
+            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?",
+                         (_quiet_install_protected_head(row[0], new_head), owner_session_id))
+            result = {"token": token, "operation_sha256": operation_sha256,
+                      "generation": operation_generation}
+            record = {"owner_session_id": owner_session_id, "operation_id": token,
+                      "request_sha256": request_sha256,
+                      "operation_generation": operation_generation,
+                      "operation_sha256": operation_sha256,
+                      "result_sha256": hashlib.sha256(_quiet_canonical(result)).hexdigest()}
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (key, _quiet_canonical(record).decode("utf-8")))
+            return result
+
+        try:
+            return self._execute_write(_do)
+        except _QuietTokenReplay as replay:
+            return replay.result
+
+    # ── C02 step 5: quiet reopen + partial-crash named-only back-projection ──
+
+    @classmethod
+    def resume(cls, *, db_path, init_request) -> "QuietRecoveryHandle":
+        """Re-enter the finite quiet mode after a crash or a close (r4 C02 step 5).
+
+        The only re-entry is quiet admission again: :meth:`open` re-runs the
+        settled no-create ``mode=rw`` checks, and the ordinary constructor,
+        the ordinary writer and any automatic reopen stay structurally unable
+        to continue. The partial state is then re-read strictly (read-only):
+        every committed token of the approved owner must read back exactly --
+        canonical record, verified result, verified journal bytes carrying the
+        frozen transition -- no orphaned journal bytes may exist, and the
+        stored protected head must match the committed continuation or, before
+        any commit, still carry the frozen old coordinates. Restarting the
+        in-memory counters is not a reset of persisted state: the FTS defer
+        flag is deliberately not persisted, and the post-release pass covers
+        the missed maintenance (step 7).
+        """
+        handle = cls.open(db_path=db_path, init_request=init_request)
+        try:
+            handle.verify_partial_recovery_state()
+        except BaseException:
+            handle.close()
+            raise
+        return handle
+
+    def enumerate_committed_continuations(self, owner_session_id=None) -> list:
+        """Strict read-only enumeration of the owner's completed continuations
+        under this frozen admission (default: the approved request's owner)."""
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if owner_session_id is None:
+            owner_session_id = self._init_request["owner_session_id"]
+        approved = {name: self._init_request[name] for name in _RECEIPT3_CONTINUATION_KEYS}
+        return read_partial_recovery_state(
+            self._conn, owner_session_id, approved_transition=approved)
+
+    def verify_partial_recovery_state(self) -> dict:
+        """Fail-closed read-only verification of the owner's partial recovery
+        state; returns ``{"owner_session_id", "committed", "head"}``."""
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        owner_session_id = self._init_request["owner_session_id"]
+        committed = self.enumerate_committed_continuations(owner_session_id)
+        if len(committed) > 1:
+            raise ValueError(
+                "more than one committed continuation for this frozen "
+                "transition; refusing the reopen")
+        row = self._conn.execute(
+            "SELECT model_config FROM sessions WHERE id = ?", (owner_session_id,)).fetchone()
+        if row is None:
+            raise ValueError("continuation owner session is not part of this settled store")
+        head = _quiet_protected_head(row[0])
+        if committed:
+            last = committed[-1]
+            if head is None or (head["owner_session_id"] != owner_session_id
+                                or head["active_epoch"] != self._init_request["new_epoch"]
+                                or head["generation"] != last["generation"]
+                                or head["head_sha256"] != last["operation_sha256"]):
+                raise ValueError(
+                    "protected head does not match the committed continuation; refusing")
+        elif head is None:
+            if self._init_request["old_generation"] != 0:
+                raise ValueError(
+                    "continuation claims stored history but the owner carries "
+                    "no protected head; refusing")
+        elif (head["owner_session_id"] != owner_session_id
+                or head["active_epoch"] != self._init_request["old_epoch"]
+                or head["generation"] != self._init_request["old_generation"]
+                or head["head_sha256"] != self._init_request["old_head_sha256"]
+                or hashlib.sha256(_quiet_canonical(head)).hexdigest()
+                != self._init_request["old_head_token_sha256"]):
+            raise ValueError(
+                "stored protected head no longer carries the frozen old "
+                "coordinates; refusing the reopen")
+        return {"owner_session_id": owner_session_id, "committed": committed, "head": head}
+
+    def final_readback_binding(self) -> dict:
+        """The final readback binding recorded before the explicit exit (r4 C02
+        step 7): one canonical digest over the enumerated completed set and the
+        protected head; the independent acceptance decides on exactly these
+        bytes."""
+        state = self.verify_partial_recovery_state()
+        message = {"owner_session_id": state["owner_session_id"],
+                   "committed": state["committed"], "head": state["head"]}
+        return {"owner_session_id": state["owner_session_id"],
+                "committed": state["committed"], "head": state["head"],
+                "readback_sha256": hashlib.sha256(_quiet_canonical(message)).hexdigest()}
+
+    def exit_quiet(self, *, accepted_readback_sha256: str) -> dict:
+        """Explicitly exit the finite quiet mode after the independent
+        acceptance (r4 C02 step 7).
+
+        The accepted final readback binding is re-checked first (a mismatch
+        refuses the exit and runs nothing). Then exactly one native bounded FTS
+        pass runs -- the existing bounded merge (500 pages/index, 4 commands
+        per pass) -- AFTER the accepted recovery boundary, as normal
+        maintenance: even when a crash lost the in-memory defer flag, the pass
+        is scheduled here; its failure is reported and can never replay a
+        committed continuation. The handle then closes and the ordinary
+        handle/writer path reopens; the counters are not zeroed for anyone and
+        the FTS flags keep their probed values.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if (not isinstance(accepted_readback_sha256, str) or len(accepted_readback_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in accepted_readback_sha256)):
+            raise ValueError("the accepted final readback binding must be lowercase sha256 hex")
+        binding = self.final_readback_binding()
+        if binding["readback_sha256"] != accepted_readback_sha256:
+            raise ValueError(
+                "final readback binding does not match the accepted bytes; "
+                "quiet mode is not exited")
+        fts_pass = {"executed": 0, "failed": None}
+        if self._fts_enabled:
+            try:
+                fts_pass["executed"] = self._merge_fts_incrementally(
+                    max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX,
+                    max_commands=self._FTS_MERGE_COMMANDS_PER_PASS)
+            except Exception as exc:
+                # The accepted boundary stands; a maintenance failure is
+                # reported, never allowed to replay a committed continuation.
+                fts_pass["failed"] = f"{type(exc).__name__}: {exc}"[:200]
+        report = {"owner_session_id": binding["owner_session_id"],
+                  "write_count": self._write_count,
+                  "fts_deferred_due_at_exit": self._fts_deferred_due,
+                  "fts_enabled": self._fts_enabled,
+                  "trigram_available": self._trigram_available,
+                  "readback": binding, "fts_pass": fts_pass}
+        self.close()
+        return report
+
+    # ── C02 steps 1-4 orchestration + final ALL-owner readback ──
+    _C02_FENCE_KEYS = frozenset({"kind", "approved", "holders", "fence_id"})
+
+    def append_roster_continuations(self) -> dict:
+        """C02 step 4: one epoch continuation per approved boundary owner.
+
+        Each owner's continuation runs on its own token/head CAS (the existing
+        single approved write path), in canonical owner order; a partial
+        failure leaves the committed set to the read-only back-projection
+        (step 5), never a silent repair.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if self._roster_requests is None:
+            raise RuntimeError("this admission is not a boundary roster admission")
+        results = {}
+        for owner in self._approved_owners:
+            results[owner] = self.append_epoch_continuation(self._roster_requests[owner])
+        return results
+
+    def _roster_transition_blocks(self) -> dict:
+        requests = self._roster_requests
+        if requests is None:
+            requests = {self._init_request["owner_session_id"]: self._init_request}
+        return {owner: {name: request[name] for name in _RECEIPT3_CONTINUATION_KEYS}
+                for owner, request in requests.items()}
+
+    def verify_roster_recovery_state(self, *, complete: bool = False) -> dict:
+        """Fail-closed read-only verification of the roster's recovery state.
+
+        Every approved owner's committed continuation set (0 or 1 while the
+        roster is incomplete, exactly 1 for the final ALL readback) is re-read
+        strictly against its own frozen transition block, no continuation
+        outside the roster may exist, and each protected head must match the
+        committed continuation or still carry that owner's frozen old
+        coordinates. Returns the per-owner entries and the canonical
+        ALL-owner readback digest.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if type(complete) is not bool:
+            raise ValueError("complete must be a bool")
+        requests = self._roster_requests
+        if requests is None:
+            requests = {self._init_request["owner_session_id"]: self._init_request}
+        inventory = verify_roster_continuation_inventory(
+            self._conn, list(self._approved_owners), self._roster_transition_blocks(),
+            complete=complete)
+        owners = []
+        for owner in self._approved_owners:
+            request = requests[owner]
+            committed = inventory["owners"][owner]
+            row = self._conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (owner,)).fetchone()
+            if row is None:
+                raise ValueError(
+                    "continuation owner session is not part of this settled store")
+            head = _quiet_protected_head(row[0])
+            if committed:
+                last = committed[-1]
+                if head is None or (head["owner_session_id"] != owner
+                                    or head["active_epoch"] != request["new_epoch"]
+                                    or head["generation"] != last["generation"]
+                                    or head["head_sha256"] != last["operation_sha256"]):
+                    raise ValueError(
+                        "protected head does not match the committed continuation; refusing")
+            elif head is None:
+                if request["old_generation"] != 0:
+                    raise ValueError(
+                        "continuation claims stored history but the owner carries "
+                        "no protected head; refusing")
+            elif (head["owner_session_id"] != owner
+                    or head["active_epoch"] != request["old_epoch"]
+                    or head["generation"] != request["old_generation"]
+                    or head["head_sha256"] != request["old_head_sha256"]
+                    or hashlib.sha256(_quiet_canonical(head)).hexdigest()
+                    != request["old_head_token_sha256"]):
+                raise ValueError(
+                    "stored protected head no longer carries the frozen old "
+                    "coordinates; refusing")
+            owners.append({"owner_session_id": owner, "committed": committed, "head": head})
+        return {"owners": owners, "readback_sha256": final_all_owner_readback(owners),
+                "complete": all(len(entry["committed"]) == 1 for entry in owners)}
+
+    def final_roster_readback_binding(self) -> dict:
+        """The final ALL-owner readback binding recorded before the explicit
+        quiet exit (r4 C02 step 7, roster form)."""
+        state = self.verify_roster_recovery_state(complete=True)
+        return {"owners": state["owners"], "readback_sha256": state["readback_sha256"]}
+
+    def exit_roster_quiet(self, *, accepted_readback_sha256: str) -> dict:
+        """Explicitly exit the finite quiet mode after the independent
+        acceptance of the ALL-owner readback (r4 C02 step 7, roster form).
+
+        The accepted binding is re-checked first (a mismatch refuses the exit
+        and runs nothing); then exactly one native bounded FTS pass runs AFTER
+        the accepted boundary, exactly as in the single-owner exit.
+        """
+        if self._closed or self._conn is None:
+            raise RuntimeError("quiet recovery handle is closed")
+        if (not isinstance(accepted_readback_sha256, str) or len(accepted_readback_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in accepted_readback_sha256)):
+            raise ValueError("the accepted final readback binding must be lowercase sha256 hex")
+        binding = self.final_roster_readback_binding()
+        if binding["readback_sha256"] != accepted_readback_sha256:
+            raise ValueError(
+                "final all-owner readback binding does not match the accepted bytes; "
+                "quiet mode is not exited")
+        fts_pass = {"executed": 0, "failed": None}
+        if self._fts_enabled:
+            try:
+                fts_pass["executed"] = self._merge_fts_incrementally(
+                    max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX,
+                    max_commands=self._FTS_MERGE_COMMANDS_PER_PASS)
+            except Exception as exc:
+                fts_pass["failed"] = f"{type(exc).__name__}: {exc}"[:200]
+        report = {"owner_session_ids": [entry["owner_session_id"] for entry in binding["owners"]],
+                  "write_count": self._write_count,
+                  "fts_deferred_due_at_exit": self._fts_deferred_due,
+                  "fts_enabled": self._fts_enabled,
+                  "trigram_available": self._trigram_available,
+                  "readback": binding, "fts_pass": fts_pass}
+        self.close()
+        return report
+
+    @classmethod
+    def run_c02_recovery_orchestration(cls, *, original_path, replacement_path, fence,
+                                       requests, approved_anchors, proof=None):
+        """C02 steps 1-4 full orchestration + the final ALL-owner readback.
+
+        Step 1 validates the external holder-drain fence attestation (an
+        approved orchestration input -- it is never manufactured here and no
+        pane is killed); step 2 runs the independent read-only full-table joint
+        between the original latest and the selected byte/data-complete
+        replacement; step 3 enters the roster quiet admission on the
+        replacement, re-measures the joint read-only AFTER the open and
+        re-verifies the frozen proof (whose roster digest must equal the frozen
+        request digest); step 4 writes exactly one epoch continuation per
+        boundary owner under its own token/head CAS; then the final ALL-owner
+        readback binding (complete roster) is read back read-only. Returns
+        ``(handle, report)`` -- the caller owns the independent acceptance and
+        the explicit exit; the original file is never opened for writing.
+        """
+        if type(fence) is not dict or set(fence) != set(cls._C02_FENCE_KEYS):
+            raise ValueError("external holder-drain fence attestation is required")
+        if fence["kind"] != "external_holder_drain_fence" or fence["approved"] is not True:
+            raise ValueError(
+                "the quiet recovery orchestration requires an approved external fence")
+        if type(fence["holders"]) is not list or not fence["holders"] \
+                or not all(isinstance(holder, str) and holder for holder in fence["holders"]):
+            raise ValueError("the fence attestation must list every drained holder")
+        if not isinstance(fence["fence_id"], str) or not fence["fence_id"]:
+            raise ValueError("the fence attestation requires a fence_id")
+        steps = {"step1_fence": {"fence_id": fence["fence_id"],
+                                 "holders": len(fence["holders"]), "approved": True}}
+        copy_report = verify_independent_copy_joint(original_path, replacement_path)
+        steps["step2"] = {"joint_sha256": copy_report["joint_sha256"],
+                          "table_count": copy_report["table_count"]}
+        handle = cls.open_roster(db_path=Path(replacement_path), requests=list(requests),
+                                 approved_anchors=list(approved_anchors))
+        try:
+            post_open = verify_independent_copy_joint(original_path, replacement_path)
+            if post_open["joint_sha256"] != copy_report["joint_sha256"]:
+                raise ValueError(
+                    "the quiet admission open changed the replacement joint; refusing")
+            if proof is not None:
+                verified = verify_frozen_proof(replacement_path, proof)
+                if proof.get("roster_sha256") != handle._init_request["boundary_roster_sha256"]:
+                    raise ValueError("the frozen proof does not bind this boundary roster")
+                steps["step3_proof"] = verified
+            pre_commit = handle.verify_roster_recovery_state()
+            steps["step3"] = {"post_open_joint_sha256": post_open["joint_sha256"],
+                              "owners": len(pre_commit["owners"]),
+                              "complete": pre_commit["complete"]}
+            results = handle.append_roster_continuations()
+            steps["step4"] = {owner: results[owner]["generation"]
+                              for owner in sorted(results, key=lambda name: name.encode("utf-8"))}
+            readback = handle.verify_roster_recovery_state(complete=True)
+            steps["all_readback"] = {"owners": len(readback["owners"]),
+                                     "readback_sha256": readback["readback_sha256"],
+                                     "complete": readback["complete"]}
+        except BaseException:
+            handle.close()
+            raise
+        report = {"steps": steps, "readback": readback,
+                  "original_path": str(original_path), "replacement_path": str(replacement_path),
+                  "fence_sha256": hashlib.sha256(_quiet_canonical(fence)).hexdigest(),
+                  "writes": "continuations-only", "exit": "not_taken"}
+        return handle, report
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            conn, self._conn = self._conn, None
+            if conn is None:
+                return
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class AsyncSessionDB:
