@@ -464,6 +464,64 @@ class ArrivalRuntime:
         state['trigger_unknown'] = False
         self._save_lease(self.ledger, lease)
 
+    def reconcile_scope_operations(self, batch):
+        """Prove ownership of pre-existing observations via operations history.
+
+        The server's own auto-consolidation (a default-on feature) can
+        consolidate this scope's memories outside the pipeline's manual
+        trigger - e.g. after the in-window config patch is lost to a restart,
+        or via the maintenance sweep. Completed operations remain queryable
+        with their payload, so the producing operation can be discovered and
+        recorded (with provenance) instead of failing closed. Without a
+        matching operation nothing is recorded: verification still fails
+        closed on truly orphaned observations.
+        """
+        with self.ledger.locked():
+            lease = self._load_lease(self.ledger)
+            if lease is None:
+                return False
+            scope = self._scope(batch)
+            state = (lease.get('scopes') or {}).get(scope[0])
+            if state is None:
+                return False
+            if state.get('consolidation_operation_ids'):
+                return True  # already recorded; nothing to reconcile
+            budget = self._budget()
+            retain_id = state.get('retain_operation_id')
+            if not _name(retain_id):
+                return False  # no anchor for the search window: refuse to guess
+            anchor = self._request('GET', 'operations/' + quote(retain_id, safe=''), budget=budget)
+            floor = anchor.get('created_at') if isinstance(anchor, dict) else None
+            if not isinstance(floor, str) or not floor:
+                raise RemoteCallError('native_operations_unreadable')
+            matched = set()
+            for status in ('pending', 'processing', 'completed'):
+                for row in self._page('operations', {'status': status, 'type': 'consolidation'},
+                                      budget, preferred='operations'):
+                    oid = row.get('id') or row.get('operation_id')
+                    created = row.get('created_at')
+                    if not _name(oid) or not isinstance(created, str):
+                        raise RemoteCallError('native_operations_unreadable')
+                    if created < floor:
+                        continue  # predates this scope's facts
+                    detail = self._request('GET', 'operations/' + quote(oid, safe=''),
+                                           budget=budget, params={'include_payload': True})
+                    if (not isinstance(detail, dict)
+                            or detail.get('operation_id', detail.get('id')) != oid
+                            or detail.get('bank_id', detail.get('bank', self.bank)) != self.bank):
+                        raise RemoteCallError('native_operation_mismatch')
+                    if _private_payload(detail.get('task_payload') or {}, scope):
+                        matched.add(oid)
+            if not matched:
+                return False
+            state['consolidation_operation_ids'] = sorted(
+                set(state.get('consolidation_operation_ids') or []) | matched)
+            state['reconciled_operation_ids'] = sorted(
+                set(state.get('reconciled_operation_ids') or []) | matched)
+            state['trigger_unknown'] = False
+            self._save_lease(self.ledger, lease)
+            return True
+
     def consolidate_batch(self, batch, retry_policy, *, single_poll=False):
         """single_poll: one pass; None while the scope still drains (the run
         scheduler re-polls), the proof dict when ready.  Without it the call

@@ -368,6 +368,21 @@ class NativeIsolation:
                     state = (lease or {}).get('scopes', {}).get(tag[0], {})
                     sealed = batch.get('receipts', {}).get('consolidated', {}).get('scoped_proof', {})
                     if not state.get('consolidation_operation_ids') and not sealed.get('operation_ids'):
+                        # Reconcile first: the server's own auto-consolidation
+                        # (default-on) may have produced these observations
+                        # outside the pipeline's manual trigger; completed
+                        # operations remain queryable, so the producing
+                        # operation can be recorded instead of failing closed.
+                        # Best effort: a failed recovery leaves the ownership
+                        # unproved and still fails closed below.
+                        try:
+                            recovered = runtime.reconcile_scope_operations(batch)
+                        except RemoteCallError:
+                            recovered = False
+                        if recovered:
+                            lease = runtime._load_lease(runtime.ledger)
+                            state = (lease or {}).get('scopes', {}).get(tag[0], {})
+                    if not state.get('consolidation_operation_ids') and not sealed.get('operation_ids'):
                         _fail('native_observation_ownership_unproved')
                 proof = {'backend': backend, 'bank': runtime.bank, 'batch_id': batch['batch_id'], 'scope': tag,
                          'document_id': doc, 'operation_id': batch['operation_id'], 'payload_sha256': digest,
