@@ -1355,16 +1355,11 @@ def _physical_snapshots(profile, views=None, *, fence_hash=None, only_sids=None,
     anchors = _profile_anchors(profile)
     keys = {sid: f"{profile['profile']}:cutover-session:{sid}" for sid in anchors}
     keys.update({sid: f"{profile['profile']}:hermes:{sid}" for sid in views if sid not in anchors})
-    # Scope (visibility for the ledger's epoch binding) is the full known set;
-    # only the scanned views produce snapshots. Extra sids widen visibility
-    # without fabricating snapshots for sessions that were not rebuilt.
-    scope_keys = dict(keys)
     for sid in extra_scope_sids:
-        scope_keys.setdefault(sid, f"{profile['profile']}:hermes:{sid}")
+        keys.setdefault(sid, f"{profile['profile']}:hermes:{sid}")
     if not anchors:
         keys[None] = f"{profile['profile']}:physical:empty"
-        scope_keys[None] = f"{profile['profile']}:physical:empty"
-    scope = sorted(scope_keys.values())
+    scope = sorted(keys.values())
     # The content-free descriptor fence is sufficient for empty anchors; future
     # payloads bind their own cleaned logical identities in snapshot_hash.
     fence = digest(profile) if fence_hash is None else fence_hash
@@ -1810,13 +1805,7 @@ def _scan_physical_sources(hermes_home, profile_mode, baseline, *,
                     continue  # nothing changed: skip the profile entirely
                 else:
                     dirty_sessions = dirty
-                    # Visibility must stay the full known set: the ledger's
-                    # epoch binding fails closed when previously seen sources
-                    # drop out of scope. The dirty subset only limits which
-                    # snapshots are rebuilt, never what stays visible.
-                    extra_scope_sids = tuple(sorted(
-                        set(previous_fp.get('scope_sids') or ())
-                        | set(previous_fp.get('sessions') or {})))
+                    extra_scope_sids = tuple(previous_fp.get('scope_sids') or ())
         result.extend(_scan_physical_profile(profile, home, unknown_rows=unknown_rows[name],
             policy_hash=policy_hash, header_transition=certs_by_profile.get(name),
             approved_successors=successors_by_profile.get(name, {}),

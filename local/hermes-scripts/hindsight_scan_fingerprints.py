@@ -131,6 +131,12 @@ def main(argv=None) -> int:
             else:  # mark-covered
                 if stored == fingerprint:
                     continue
+                if captured.get(key) is None:
+                    # No ledger state: the events are not provably captured.
+                    # Leave it dirty so the next scan still reads it.
+                    item['state'] = 'unproven'
+                    report.append(item)
+                    continue
                 if args.confirm != CONFIRM_COVERED:
                     raise SystemExit(
                         f'mark-covered requires --confirm {CONFIRM_COVERED}; '
