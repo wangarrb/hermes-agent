@@ -146,6 +146,10 @@ def main(argv=None) -> int:
         if args.action != 'show':
             scope = set(entry.get('scope_sids') or ())
             scope.update(entry['sessions'])
+            for path_text in (entry.get('artifacts') or {}):
+                base = Path(path_text).name
+                if base.startswith('session_') and base.endswith('.json'):
+                    scope.add(base[len('session_'):-len('.json')])
             entry['scope_sids'] = sorted(scope)
     if args.action == 'show':
         print(json.dumps(report, ensure_ascii=False, indent=1, default=str))
