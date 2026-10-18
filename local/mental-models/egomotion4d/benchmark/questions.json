@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "created": "2026-07-20",
+  "description": "A/B benchmark for mental_model pilot. Each question has ground-truth from D decisions. A=without mental_model, B=with mental_model.",
+  "questions": [
+    {
+      "id": "Q01",
+      "question": "DLT anchor-guided depth refine 是否可以用于 dense-depth refine 或 TSDF precision claim？",
+      "ground_truth": "不能。D25: DLT anchor PASS ≠ dense-depth promotion-safe。DLT 只能 diagnostic。",
+      "key_d_refs": ["D25"],
+      "expected_pitfall_triggers": ["DLT", "anchor", "depth refine", "promotion-safe"],
+      "pass_condition": "回答必须说明 DLT 只能 diagnostic，不能驱动 dense-depth refine 或 TSDF precision claim"
+    },
+    {
+      "id": "Q02",
+      "question": "能否通过修改 depth scale 来做 OFF/ON 对比实验验证深度改进入产品层？",
+      "ground_truth": "不能。D39: 改 depth scale 会改变 surfel population，off/on 不是同一批点。必须走 true fixed pixel-observation export/evaluator。",
+      "key_d_refs": ["D39"],
+      "expected_pitfall_triggers": ["USN", "scale normalization", "off/on", "same denominator"],
+      "pass_condition": "回答必须说明改 depth scale 会改变 surfel population，off/on 不可比"
+    },
+    {
+      "id": "Q03",
+      "question": "obs/pred 跨深度漂移 8.6-10.7x 是否需要逐 bin 修深度？",
+      "ground_truth": "不需要。D41: 漂移是近处深度对 + 远处三角化/低视差失效的 measurement artifact，非深度病。不得重新 framing 成逐 bin 修深度。",
+      "key_d_refs": ["D40", "D41"],
+      "expected_pitfall_triggers": ["obs/pred spread", "depth-dependent", "NEARFIELD", "triangulation"],
+      "pass_condition": "回答必须归因为 measurement artifact，不得提出逐 bin 修深度"
+    },
+    {
+      "id": "Q04",
+      "question": "canonical geometry 边界要求什么？DLT/TSDF/ground/PLY/evaluator 能否直接消费 raw depths/intrinsics/poses？",
+      "ground_truth": "不能。D24: 必须通过 canonical adapter 显式证明 camera_z_m、K/pixel canvas、world_from_camera、world_frame_id 一致，且 promotion_safe_geometry=true。",
+      "key_d_refs": ["D24"],
+      "expected_pitfall_triggers": [["canonical geometry", "canonical 几何", "规范几何"], "promotion-safe", "raw depth", "gauge"],
+      "pass_condition": "回答必须说明必须通过 canonical adapter 且 promotion_safe_geometry=true"
+    },
+    {
+      "id": "Q05",
+      "question": "static surfel/shared-surface 当前能否 promotion 到 map-level product？",
+      "ground_truth": "不能。D26: 当前只能 diagnostic。frame-colored layering 三场景全部退化。",
+      "key_d_refs": ["D26"],
+      "expected_pitfall_triggers": ["static surfel", "map-level", "promotion", "frame-colored"],
+      "pass_condition": "回答必须说明只能 diagnostic，不能 product promotion"
+    },
+    {
+      "id": "Q06",
+      "question": "多前端融合提升的 claim 需要满足哪些 gate？",
+      "ground_truth": "D23: 必须在 canonical geometry、same denominator、best single-source baseline、tail/coverage gate 和 RGB/投影可视化全部通过后才能 claim。",
+      "key_d_refs": ["D23"],
+      "expected_pitfall_triggers": ["multi-frontend", "claim", "denominator", "coverage gate"],
+      "pass_condition": "回答必须列出 canonical geometry + same denominator + baseline + tail/coverage gate + 可视化"
+    },
+    {
+      "id": "Q07",
+      "question": "PDAF affine-depth 的 p90 改善是否可信？能否继续扩大 affine range？",
+      "ground_truth": "不可信。D38: p90 改善是 nonphysical b 造成的 valid-set collapse / fit artifact。不继续扩 affine range。",
+      "key_d_refs": ["D38"],
+      "expected_pitfall_triggers": ["PDAF", "affine", "p90", "valid-set collapse"],
+      "pass_condition": "回答必须说明 p90 改善是 fit artifact，不能继续扩 range"
+    },
+    {
+      "id": "Q08",
+      "question": "screening_lambda 在机制层有效是否意味着产品层会通过？",
+      "ground_truth": "不。D37: 机制层 trade-off 不等于产品层通过。screening_lambda 局部有效但 product layer 只接受 no-op。",
+      "key_d_refs": ["D37"],
+      "expected_pitfall_triggers": ["screening_lambda", "mechanism vs product", "no-op"],
+      "pass_condition": "回答必须区分机制层有效和产品层通过"
+    },
+    {
+      "id": "Q09",
+      "question": "RoMa2 宽高比对 DLT 深度有什么影响？如何修复？",
+      "ground_truth": "D21: 宽高比导致 DLT 深度尺度偏移。padding 到 1280×1280 后 cam-Z median 从 32.6m 降到 9.7m。",
+      "key_d_refs": ["D21"],
+      "expected_pitfall_triggers": ["RoMa2", "aspect ratio", "padding", "depth scale"],
+      "pass_condition": "回答必须提到 padding 修复和尺度偏移"
+    },
+    {
+      "id": "Q10",
+      "question": "static-surface optimizer 下一版必须采用什么设计？禁止什么？",
+      "ground_truth": "D32: 必须采用 Shared Surface Objective v2 的 L0-L3 分层和 active objective。禁止 mean-plane averaging；temporal consistency/visibility/occlusion 必须进入优化。",
+      "key_d_refs": ["D32"],
+      "expected_pitfall_triggers": ["shared surface objective", "mean-plane", "L0-L3"],
+      "pass_condition": "回答必须提到 L0-L3 分层、禁止 mean-plane averaging"
+    },
+    {
+      "id": "Q11",
+      "question": "EGTR Stage7-lite non-sky TSDF 当前能否 promotion？阻塞条件是什么？",
+      "ground_truth": "D33: 只能 scoped diagnostic。阻塞：需再生 heldout source data，至少两个 independent scene/heldout 改善。",
+      "key_d_refs": ["D33"],
+      "expected_pitfall_triggers": ["EGTR", "Stage7", "TSDF", "heldout", "independent scene"],
+      "pass_condition": "回答必须提到需 heldout + 两个 independent scene"
+    },
+    {
+      "id": "Q12",
+      "question": "下结论或发波前必须做什么？知识管理双层机制是什么？",
+      "ground_truth": "D42: 必须检索已有 D 号写 related_decisions。双层：(a) AGENTS.md 硬规则下结论前必检索；(b) task body template 设必填字段。曾试 PreToolUse hook 已撤销。",
+      "key_d_refs": ["D42"],
+      "expected_pitfall_triggers": ["related_decisions", "load-bearing assumptions", "knowledge management"],
+      "pass_condition": "回答必须提到下结论前检索已有 D 号 + task body 必填字段"
+    },
+    {
+      "id": "Q13",
+      "question": "PPMB scalar-offset PatchMatch 线能否重开？重开条件是什么？",
+      "ground_truth": "D43: 已关闭。不得以 candidate count/propagation/shared objective/20f render p90/tolerance sweep/scalar-offset 调参重开。重开只能是新 higher-DOF surface state 或直接 product-risk-aware objective，并先证明 fixed-denominator product gate 可达。",
+      "key_d_refs": ["D43"],
+      "expected_pitfall_triggers": ["PPMB", "PatchMatch", "scalar-offset", "fixed-denominator"],
+      "pass_condition": "回答必须列出禁止重开的路径和唯一重开条件"
+    },
+    {
+      "id": "Q14",
+      "question": "region_conflict_selector 能否外推为 DAGE/TSDF/dynamic actor 的通用 product pass？",
+      "ground_truth": "D35: 不能。只适用于 fixed-pose Pi3X/100f static surfel。W5/W10 仍 diagnostic-only。",
+      "key_d_refs": ["D35"],
+      "expected_pitfall_triggers": ["region_conflict_selector", "scope", "diagnostic-only"],
+      "pass_condition": "回答必须说明不能外推，且 W5/W10 仍 diagnostic"
+    },
+    {
+      "id": "Q15",
+      "question": "DAGE 的 0.002m noise floor 下有 optimizer mechanism pass 是否意味着可以 product promotion？",
+      "ground_truth": "D36: 不能。mechanism pass ≠ product promotion。top-level 仍 BLOCKED_BY_INPUT_QUALITY。Canonical blockers 继续严格。",
+      "key_d_refs": ["D36"],
+      "expected_pitfall_triggers": ["DAGE", "noise floor", "mechanism vs product", "BLOCKED_BY_INPUT_QUALITY"],
+      "pass_condition": "回答必须区分 mechanism pass 和 product promotion"
+    }
+  ]
+}

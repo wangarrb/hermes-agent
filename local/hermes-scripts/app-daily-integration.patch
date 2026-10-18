@@ -1,0 +1,20 @@
+--- a/local/hermes-scripts/daily_report.py
++++ b/local/hermes-scripts/daily_report.py
+@@ -856,0 +857,2 @@
++    parser.add_argument("--app-sessions", type=Path, default=None,
++                        help="追加已授权 app session snapshot 目录；不推断 LLM 调用数")
+@@ -961,0 +964 @@
++    print("Codex token_count 为用量事件观察；实际请求、尝试、重试和成功数未知，不能与 app 消息数混加。")
+@@ -965 +968 @@
+-            ["来源", "调用", "输入", "Cache读", "输出", "命中率"],
++            ["来源", "usage事件", "输入", "Cache读", "输出", "命中率"],
+@@ -981 +984 @@
+-            ["来源", "调用", "输入", "Cache读", "输出", "命中率"],
++            ["来源", "usage事件", "输入", "Cache读", "输出", "命中率"],
+@@ -1161,0 +1165,6 @@
++    if args.app_sessions is not None:
++        from hindsight_app_usage import render_app_daily, UTC8
++        app_sessions = [json.loads(path.read_text(encoding="utf-8"))
++                        for path in sorted(args.app_sessions.glob("session_codex-app-*.json"))]
++        print(render_app_daily(app_sessions, start.astimezone(UTC8).date()))
++

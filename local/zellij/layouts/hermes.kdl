@@ -1,0 +1,12 @@
+layout {
+    pane split_direction="horizontal" {
+        pane split_direction="vertical" {
+            pane cwd="/home/wyr/workspace"
+            pane cwd="/home/wyr/workspace"
+        }
+        pane split_direction="vertical" {
+            pane cwd="/home/wyr/workspace"
+            pane cwd="/home/wyr/workspace"
+        }
+    }
+}

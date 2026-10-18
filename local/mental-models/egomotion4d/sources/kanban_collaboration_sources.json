@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "logical_id": "egomotion4d-kanban-collaboration",
+  "sources": [
+    {
+      "name": "kanban-publisher-result-notifications-design",
+      "path": "/home/wyr/.hermes/hermes-agent-repo/docs/superpowers/specs/2026-08-03-kanban-publisher-result-notifications-design.md",
+      "selectors": [{"kind": "whole_file"}]
+    },
+    {
+      "name": "multi-owner-project-workspaces-design",
+      "path": "/home/wyr/.hermes/hermes-agent-repo/docs/superpowers/specs/2026-08-03-multi-owner-project-workspaces-design.md",
+      "selectors": [{"kind": "whole_file"}]
+    },
+    {
+      "name": "start-kanban",
+      "path": "/home/wyr/.hermes/hermes-agent-repo/local/bin/start-kanban.sh",
+      "selectors": [
+        {"kind": "shell_function", "value": "workspace_for_role"},
+        {"kind": "shell_function", "value": "build_role_command"},
+        {"kind": "shell_function", "value": "usage"}
+      ]
+    },
+    {
+      "name": "base-listener",
+      "path": "/home/wyr/.hermes/hermes-agent-repo/plugins/kanban/base_listener.py",
+      "selectors": [
+        {"kind": "python_symbol", "value": "BaseInteractiveListener.wait_for_stable_composer_input"},
+        {"kind": "python_symbol", "value": "BaseInteractiveListener._handle_idle_task_followup"},
+        {"kind": "python_symbol", "value": "BaseInteractiveListener.pump_control_messages"},
+        {"kind": "python_symbol", "value": "BaseInteractiveListener.pump_result_notifications"}
+      ]
+    },
+    {
+      "name": "kanban-db",
+      "path": "/home/wyr/.hermes/hermes-agent-repo/hermes_cli/kanban_db.py",
+      "selectors": [
+        {"kind": "python_symbol", "value": "create_task"},
+        {"kind": "python_symbol", "value": "return_task_for_rework"},
+        {"kind": "python_symbol", "value": "lease_result_notifications"},
+        {"kind": "python_symbol", "value": "result_wait_state"}
+      ]
+    },
+    {
+      "name": "egomotion4d-agents",
+      "path": "/home/wyr/code/Egomotion4D/AGENTS.md",
+      "selectors": [{"kind": "markdown_heading", "value": "## 8. Kanban 任务系统"}]
+    },
+    {
+      "name": "reviewer-prompt",
+      "path": "/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/reviewer/kanban-system-prompt.md",
+      "selectors": [{"kind": "whole_file"}]
+    },
+    {
+      "name": "planner-prompt",
+      "path": "/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/planner/kanban-system-prompt.md",
+      "selectors": [{"kind": "whole_file"}]
+    },
+    {
+      "name": "implementer-prompt",
+      "path": "/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/implementer/kanban-system-prompt.md",
+      "selectors": [{"kind": "whole_file"}]
+    },
+    {
+      "name": "coordinator-prompt",
+      "path": "/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/coordinator/kanban-system-prompt.md",
+      "selectors": [{"kind": "whole_file"}]
+    },
+    {
+      "name": "continuous-execution-mode-protocol",
+      "path": "/home/wyr/code/Egomotion4D/.hermes-kanban/egomotion4d/continuous-execution-mode-protocol.md",
+      "selectors": [{"kind": "whole_file"}]
+    }
+  ]
+}

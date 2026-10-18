@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "logical_id": "egomotion4d-pose-gauge",
+  "questions": [
+    {"id": "PG01", "question": "Canonical geometry 下 DLT/TSDF/PLY 能直接消费 raw depth、K 和 pose 吗？", "ground_truth": "D24: no; canonical camera-z, canvas/K, transform and frame identity must be proven.", "key_d_refs": ["D24"], "expected_pitfall_triggers": ["canonical", "raw", "promotion"], "pass_condition": "Must reject raw consumption for promotion."},
+    {"id": "PG02", "question": "DLT anchor PASS 是否足以驱动 dense-depth refine 或 TSDF precision claim？", "ground_truth": "D25: no; pose/depth gauge mismatch keeps DLT diagnostic-only.", "key_d_refs": ["D25"], "expected_pitfall_triggers": ["diagnostic", "gauge", "0.1496"], "pass_condition": "Must keep DLT diagnostic."},
+    {"id": "PG03", "question": "Source-gauge blocker 应走 Route A 还是 Route B？Route B 能否产生 product PASS？", "ground_truth": "D61: Route A evidence-first; Route B default-off diagnostic-only.", "key_d_refs": ["D61"], "expected_pitfall_triggers": ["route a", "route b", "diagnostic"], "pass_condition": "Must reject Route B bypass."},
+    {"id": "PG04", "question": "能否把 scene0 的 pose/depth scale ratio 复制到 scene4 和 scene22？", "ground_truth": "D62: no; each scene needs independent evidence and ratios differ.", "key_d_refs": ["D62"], "expected_pitfall_triggers": ["per-scene", "1.521038", "1.231729"], "pass_condition": "Must prohibit scalar copying."},
+    {"id": "PG05", "question": "Scaled/unscaled HCR 跨 run 对比为什么不能单独证明收益？", "ground_truth": "D63: scaling changes population/denominator; use derived manifest and fixed-common evaluation.", "key_d_refs": ["D63"], "expected_pitfall_triggers": ["derived manifest", "population", "fixed-common"], "pass_condition": "Must identify denominator change."},
+    {"id": "PG06", "question": "Pi3X scene0 如何真正解除 pose-depth source-gauge blocker？", "ground_truth": "D70: independent GT calibration applies the same scalar to native pose translation and raw depth.", "key_d_refs": ["D70"], "expected_pitfall_triggers": ["same", "pose", "depth", "GT"], "pass_condition": "Must require coupled same-scalar calibration."},
+    {"id": "PG07", "question": "D72 六格 PASS 是否证明无 GT 单目系统天然恢复真实米制尺度？", "ground_truth": "No; D72 depends on independent per-scene GT calibration.", "key_d_refs": ["D72", "D76"], "expected_pitfall_triggers": ["independent", "GT", "not"], "pass_condition": "Must reject GT-free metric extrapolation."},
+    {"id": "PG08", "question": "统一 canonical gauge 与真实 meter 有什么区别？source-unit 和 algorithm-equivariance 两个 gate 能互相替代吗？", "ground_truth": "D76: gauge is not meter and the two gates are independent.", "key_d_refs": ["D76"], "expected_pitfall_triggers": ["source-unit", "equivariance", "independent"], "pass_condition": "Must state both independent gates."}
+  ]
+}

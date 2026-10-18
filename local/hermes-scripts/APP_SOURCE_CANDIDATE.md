@@ -1,0 +1,88 @@
+# Bounded App source and execution candidate
+
+The runner accepts explicit `--source-mode app --plan-only` or
+`--source-mode app --execute`. Planning reads the original three frozen
+sessions, their existing production exports and the existing ledger without
+constructing a runtime or capturing a batch. Execution performs the same
+bounded admission before entering the existing incremental pipeline.
+The original447 code-side raw-byte pins and one-read hash/parse stay unchanged.
+Newer items, other sessions and same-count content substitutions stay excluded.
+
+The supported API supplies opaque stable item IDs: the real447 contains444
+`msg_...` items and3 UUID items. UUID is not the item-ID contract. Session,
+turn, item and the exact composite origin are checked together. The task's
+existing approved source scope and bank/home/ledger target provide the local
+account boundary; no native account-ID field or new namespace is invented.
+
+The App view uses the same final physical source_key, normalized event_id and
+original default feed_epoch as its already-present production JSON export.
+The immutable payload is unchanged. Both views therefore use the existing
+per-source ledger cursor and deterministic batch/operation IDs. No global
+alias/ownership table or additional capture hook is needed.
+
+Each App observation is bounded to its own source key. It does not claim to
+observe the complete default physical feed and cannot shrink its existing
+source inventory. The normal physical reader retains its baseline, finite
+unknown-row exclusions, copy/ambiguity, epoch and schema checks.
+
+The read-only plan verifies actual source state and any relevant existing
+batch payload. It rejects a changed origin/body, competing known owner,
+mixed unauthorized source batch/derived parents and unrelated pending work.
+An existing unknown POST remains attached to its original operation UUID and
+phase; the plan does not call GET/POST or report it as completed. Execution
+passes that state to the existing delivery reconciliation rather than issuing
+a new operation ID or resetting its phase.
+
+Execution holds the existing bank lock across admission and processing. It
+uses the original runtime, native isolation, producer window, capture,
+operation reconciliation, summary quality gates and publication chain. The
+injected App reader revalidates the pinned exports and bounded snapshots.
+It does not sync or rewrite production session exports. The fixed home,
+ledger, bank, Hindsight endpoint and summary destination remain checked.
+
+Unrelated historical batches do not need new dual-view proofs. An existing
+unknown-row policy does not forbid all future sessions. Exact legacy/unknown
+identity or raw-export matches remain exclusions; incomplete historical
+coverage stays explicitly unknown, rather than becoming an unbounded demand
+to disprove every possible semantic copy.
+
+The earlier finite-contract framework was an overbroad candidate. It has been
+removed from the implementation; its prior fixture results do not establish
+real-data admission. The narrowed candidate must pass real opaque-ID fixtures,
+App/physical replay in both orders, immutable-payload/authorization failures,
+operation reconciliation and the existing physical rejection regressions.
+
+This candidate authorizes no deployment or production extraction. Actual
+execution has only been exercised against temporary files and a fixture
+runtime; no production runtime preflight or external model call was performed
+for this wiring change.
+
+The execution fixtures pass13/13 cases, using temporary exports and a real
+ledger through the actual runner and pipeline. They cover replay, lost POST
+acknowledgement, publication recovery and changed inputs/targets. An expanded
+16-file regression exposed a pre-existing delta publication bug: preserved
+model IDs were compared against canonical observation IDs. A separate minimal
+fix now projects only the temporary consumer comparison view to typed identity;
+the original model IDs, sealed bytes, quantity, text and hash checks remain.
+Nine added proof cases cover model/canonical/missing IDs and consumer omissions,
+duplicates and changed text. The new case reproduced the failure before fixing.
+
+The isolated final regression passes205/205 tests in7 affected files, including
+all50 concrete-runtime and68 publication cases. Automatic file retries are
+disabled. Earlier failing logs remain preserved. The old runtime fixture also
+needed temporary HERMES_HOME/Path.home isolation: legacy imports could otherwise
+select the production scripts tree and default profile paths. It now asserts
+that the publication module comes from this checkout. No credentials appear in
+the logs and no data was sent to an external service; the final run starts with
+an explicitly temporary HERMES_HOME. Validation and independent review receipts
+are recorded in the task's evidence directory.
+
+The real frozen447 plan now passes:3 sources,447 new messages,0 known messages
+and0 relevant conflicts. The existing60000-character capture budget projects6
+source batches; these are metadata calculations, not captured files or LLM-call
+counts. Ledger tables, baseline/unknown artifacts, original frozen/production
+exports and the3438-key physical-feed inventory stayed unchanged. This is
+evidence of read-only admission and projected grouping, not evidence that the
+production447 messages have already been retained or published. Historical
+App LLM request/attempt/retry/success counts remain unknown; assistant-message
+and tool counts are not substitutes for transport telemetry.

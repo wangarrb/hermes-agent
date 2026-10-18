@@ -1,0 +1,14 @@
+---
+# Zellij 4 分屏布局
+tabs:
+  - name: Hermes
+    direction: horizontal
+    split:
+      - direction: vertical
+        split:
+          - { cwd: /home/wyr/workspace }
+          - { cwd: /home/wyr/workspace }
+      - direction: vertical
+        split:
+          - { cwd: /home/wyr/workspace }
+          - { cwd: /home/wyr/workspace }
