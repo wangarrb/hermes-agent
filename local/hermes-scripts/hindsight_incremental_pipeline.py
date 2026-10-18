@@ -188,6 +188,7 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                 if window is not None:
                     report['cleanup'] = 'pending'
             snapshots = []
+            scan_fingerprints = None  # resume-only runs skip the scan branch but still reach the store guard
             if not knobs.get('resume_only'):
                 reader_options = {'profile_mode': 'all'}
                 legacy = ledger.initialization_manifest()

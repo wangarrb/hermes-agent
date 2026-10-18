@@ -454,6 +454,28 @@ def test_no_new_input_is_zero_delivery_llm_window_or_publish(setup):
     assert (runtime.generator_calls, runtime.windows, runtime.gates, runtime.publishes) == (0, 0, 0, 0)
 
 
+def test_resume_only_path_initializes_scan_fingerprints_guard(setup):
+    """Regression: resume-only skips the scan branch but still reaches the store guard.
+
+    scan_fingerprints was bound only inside the non-resume branch and then read
+    unconditionally after capture, so --resume-only raised UnboundLocalError
+    before it could drain preserved work.
+    """
+    _src, ledger, flow, cfg = setup
+    runtime = Runtime(ledger)
+
+    def forbidden_reader(*_a, **_k):
+        raise AssertionError('resume-only must not rescan sources')
+
+    resume_cfg = {'hermes_home': cfg['hermes_home'], 'bank': cfg['bank'],
+                  'incremental': {'resume_only': True}}
+    out = flow.run_incremental(resume_cfg, ledger=ledger, client=runtime, llm=runtime.generate_summary,
+                              source_reader=forbidden_reader, execute=True)
+    assert out['status'] == 'no_op'
+    assert runtime.posts == []
+    assert (runtime.generator_calls, runtime.windows, runtime.gates, runtime.publishes) == (0, 0, 0, 0)
+
+
 def test_append_only_new_arrival_completes_and_repeat_costs_zero(setup):
     src, ledger, flow, cfg = setup
     runtime = Runtime(ledger)
