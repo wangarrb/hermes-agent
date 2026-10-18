@@ -231,8 +231,11 @@ def test_recovery_never_turns_invalid_quality_evidence_into_pass(recovery, defec
         elif defect == 'summary':
             report['summary']['layered_avg_score'] = 100
         else:
-            report['summary']['layered_avg_term_recall'] = 0.5
-            report['results'][0]['layered']['term_recall'] = 0.5
+            # True regression (below the 0.5 baseline): a flat delta is
+            # eligible under the daily-increment no-degradation semantics,
+            # so the invalid-quality guard is exercised with a genuine drop.
+            report['summary']['layered_avg_term_recall'] = 0.4
+            report['results'][0]['layered']['term_recall'] = 0.4
         disk = Path(report['json_path'])
         disk.write_text(json.dumps({k: v for k, v in report.items() if k != 'json_path'}))
     runner.callback = corrupt

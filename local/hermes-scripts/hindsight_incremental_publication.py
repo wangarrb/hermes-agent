@@ -26,7 +26,11 @@ from hindsight_offline_v2_rebuild import eval_environment, run_json as default_r
 
 INCREMENTAL_PREFIX = 'hermes-offline-canonical::incremental::'
 CHECKS = ('schema', 'coverage', 'conflict', 'generic_eval', 'local_eval', 'scoped_drain')
-THRESHOLDS: dict = dict(min_term_recall_delta=0.001, min_layer_hit_delta=0,
+# min_term_recall_delta: daily-increment semantics = no-degradation (>=0), not
+# mandatory improvement; the strict +0.001 requirement dated from full-rebuild
+# eras where every rebuild was expected to add term coverage. User-approved
+# 2026-10-17. Other four thresholds unchanged.
+THRESHOLDS: dict = dict(min_term_recall_delta=0.0, min_layer_hit_delta=0,
     min_score_delta=0.0, max_case_term_regressions=2, case_regression_tolerance=0.05)
 
 

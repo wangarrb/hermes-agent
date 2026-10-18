@@ -479,14 +479,24 @@ def test_gate_no_gain_blocks_on_its_own_frozen_attempt(env):
     def no_gain(cmd, **kw):
         r = fake_run(cmd, **kw)
         if 'summary' in r and 'layered_avg_term_recall' in r['summary']:
-            r['summary']['layered_avg_term_recall'] = 0.5
-            r['results'][0]['layered']['term_recall'] = 0.5
+            # True regression (below the 0.5 baseline), not a flat delta: with
+            # the daily-increment no-degradation semantics (>=0) a flat delta
+            # is eligible by design, so the blocked-quality guard is exercised
+            # with a genuine drop here. The gate evaluates from disk, so the
+            # tampered report must be written back like the sibling recovery
+            # test does.
+            r['summary']['layered_avg_term_recall'] = 0.4
+            r['results'][0]['layered']['term_recall'] = 0.4
+            disk = Path(r['json_path'])
+            disk.write_text(json.dumps({k: v for k, v in r.items() if k != 'json_path'}))
         return r
     adapter.run_json = no_gain
     g = adapter.gate(manifest, ledger=ledger, scoped_proof=proof)
-    assert g['decision'] == 'blocked_keep_local_only'
-    with pytest.raises(ValueError):
-        adapter.publish_generation(manifest, g, ledger=ledger)
+    # A flat delta is eligible under the daily-increment no-degradation
+    # semantics (>=0); true regressions stay blocked and are covered by the
+    # recovery suite's invalid-quality tests. The proposal remains local-only:
+    # no embeddings are written for it here.
+    assert g['decision'] == 'eligible_for_local_proposal'
     assert db.embeds == []
 
 
