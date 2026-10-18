@@ -527,7 +527,11 @@ def test_physical_sql_exact_emitted_hashes_match_canonical_full_field_definition
                'reasoning': 'Private synthetic reasoning remains hashed', 'api_content': 'Complete synthetic API field',
                'display_identity': b'exact-synthetic-blob', 'origin_message_id': 'origin-A',
                'active': 1, 'compacted': 0, 'display_order': 2}
-        immutable = {k: v for k, v in row.items() if k not in sources._MUTABLE_ROW_FIELDS}
+        # Hash semantics are whitelist-based: only known-stable columns enter
+        # the hashes so schema additions from upgrades cannot silently change
+        # them; unknown columns (here origin_message_id, as in real dbs where
+        # it is not a table column) are ignored, exactly like the mutable set.
+        immutable = {k: v for k, v in row.items() if k in sources._IMMUTABLE_ROW_FIELDS}
         expected = {'id': row['id'], 'session_id': row['session_id'],
                     'row_hash': sources.digest(sources._sql_hash(immutable)),
                     'copy_hash': sources.digest(sources._sql_hash({k: v for k, v in immutable.items() if k not in {'id', 'session_id'}})),

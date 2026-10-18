@@ -635,6 +635,18 @@ SOURCE_UNKNOWN_POLICY_SCHEMA = 'hindsight-source-approved-unknown/1'
 SOURCE_TRANSITION_SCHEMA = 'hindsight-approved-sqlite-header-transition/1'
 COMPACTION_SUCCESSOR_SCHEMA = 'hindsight-source-approved-compaction-successor/1'
 _MUTABLE_ROW_FIELDS = {'active', 'compacted', 'display_order'}
+
+# Whitelist of immutable columns entering row/copy hashes. Schema additions
+# from upgrades (e.g. the message_uid family) must not silently join the
+# hash: receipt hashes recorded by older versions must keep verifying, so
+# only these known-stable columns are hashed and unknown columns are ignored.
+_IMMUTABLE_ROW_FIELDS = {
+    'id', 'session_id', 'role', 'content', 'tool_call_id', 'tool_calls', 'tool_name',
+    'timestamp', 'token_count', 'finish_reason', 'reasoning', 'reasoning_details',
+    'codex_reasoning_items', 'reasoning_content', 'codex_message_items',
+    'platform_message_id', 'observed', 'effect_disposition', 'api_content',
+    'display_kind', 'display_metadata', '_compressed_summary', 'display_identity',
+}
 _NATIVE_ORIGIN_FIELDS = ('origin_message_id', 'platform_message_id', 'original_id', 'message_id', 'event_id')
 
 
@@ -676,7 +688,7 @@ def _physical_record(raw, *, sqlite_row=False):
         # Mutable columns do not enter the emitted hashes, but still require
         # the same canonical-JSON validity as the former full-row pass.
         canonical_json(_sql_hash({k: v for k, v in raw.items() if k in _MUTABLE_ROW_FIELDS}))
-        immutable = {k: v for k, v in raw.items() if k not in _MUTABLE_ROW_FIELDS}
+        immutable = {k: v for k, v in raw.items() if k in _IMMUTABLE_ROW_FIELDS}
         origin = _native_origin(raw)
         return {'id': raw['id'], 'session_id': raw['session_id'],
                 'row_hash': digest(_sql_hash(immutable)),
@@ -1229,10 +1241,17 @@ def validate_source_transition_certificate(certificate, *, physical_baseline,
     new = certificate['new']
     _require_identity(new['identity'])
     _require_hash(new['structure_sha256'])
+    # Two admissible transitions: exact replacement (identical columns, new
+    # identity) and schema evolution (upgrade-added columns appended at the
+    # end; every original column must remain, in order, none renamed or
+    # dropped, so the old list is a strict prefix of the new one).
+    if new['message_columns'] != old['message_columns']:
+        if not (len(new['message_columns']) > len(old['message_columns'])
+                and new['message_columns'][:len(old['message_columns'])] == old['message_columns']):
+            raise ValueError('source transition schema evolution mismatch')
     if (new['application_id'] != old['application_id']
             or new['epoch'] != 'sqlite:' + digest({'inode': new['identity'], 'application_id': new['application_id']})
-            or type(new['schema_version']) is not int or new['schema_version'] < 0
-            or new['message_columns'] != old['message_columns']):
+            or type(new['schema_version']) is not int or new['schema_version'] < 0):
         raise ValueError('source transition replacement header mismatch')
     return certificate
 
@@ -1616,7 +1635,14 @@ def _scan_physical_profile(profile, home, *, unknown_rows=(), policy_hash=None, 
                         raise SourceChangedError('source_changed: approved native receipt inventory drift')
                 elif header['epoch'] != old_db['epoch'] or header['schema_version'] != old_db['schema_version']:
                     raise SourceChangedError('source_changed: SQLite physical epoch/schema/session loss')
-                if (header['message_columns'] != old_db['message_columns']
+                # Schema evolution (upgrade-added columns appended) is
+                # admissible: every baseline column must remain, in order, as
+                # a prefix of the current list; exact equality is the common
+                # case. Drops/renames/reorders still fail closed.
+                columns_ok = header['message_columns'] == old_db['message_columns'] or (
+                    len(header['message_columns']) > len(old_db['message_columns'])
+                    and header['message_columns'][:len(old_db['message_columns'])] == old_db['message_columns'])
+                if (not columns_ok
                         or not set(s['session_id'] for s in old_db['sessions']) <= set(sessions)):
                     raise SourceChangedError('source_changed: SQLite physical epoch/schema/session loss')
                 for old in old_db['sessions']:
