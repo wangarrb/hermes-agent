@@ -92,6 +92,8 @@ class IncrementalLedger:
         self.db_path = self.bank_dir / 'ledger.sqlite3'
         self.lock_path = self.bank_dir / 'producer.lock'
         self._local = threading.local()
+        self._batch_cache = {}
+        self._children_cache = {}
         if not self.db_path.exists():
             if not create:
                 raise LedgerNotInitializedError('missing incremental ledger; explicit initialize required')
@@ -193,6 +195,11 @@ class IncrementalLedger:
 
     def _put(self, con, table, key, value):
         column = {'meta': 'key', 'sources': 'source_key', 'batches': 'batch_id'}[table]
+        if table == 'batches':
+            # Invalidate the validated-batch cache on every batch write; the
+            # cache is only sound while batch metadata is unchanged.
+            self._batch_cache.clear()
+            self._children_cache.clear()
         text = canonical_json(value)
         con.execute(f'INSERT INTO {table} ({column},state,state_hash) VALUES (?,?,?) '
                     f'ON CONFLICT({column}) DO UPDATE SET state=excluded.state,state_hash=excluded.state_hash',
@@ -767,8 +774,13 @@ class IncrementalLedger:
                            'derived_batch_ids': [b['batch_id'] for b in batches]})
             return [b for b in batches if b is not None]
 
-    def _batch(self, con, batch_id, *, verify_payload=None):
-        batch = self._read(con, 'batches', batch_id)
+    def _batch(self, con, batch_id, *, verify_payload=None, state=None):
+        # Hot-path cache: pending_batches runs on every scheduler tick and the
+        # batch metadata is immutable until a write; reuse the validated dict
+        # (metadata-only path) and invalidate on any batches-table write.
+        if verify_payload is False and batch_id in self._batch_cache:
+            return self._batch_cache[batch_id]
+        batch = state if state is not None else self._read(con, 'batches', batch_id)
         if batch is None:
             raise KeyError(batch_id)
         if batch.get('bank') != self.bank or batch.get('batch_id') != batch_id or batch.get('phase') not in PHASES:
@@ -780,6 +792,7 @@ class IncrementalLedger:
         if verify_payload is None:
             verify_payload = batch['phase'] != 'published'
         if not verify_payload:
+            self._batch_cache[batch_id] = batch
             return batch
         _private(expected)
         fd = os.open(expected, os.O_RDONLY | os.O_NOFOLLOW)
@@ -805,8 +818,8 @@ class IncrementalLedger:
         if phases is not None and any(p not in PHASES for p in phases):
             raise ValueError('invalid phase filter')
         with self._connection() as con:
-            ids = [row[0] for row in con.execute('SELECT batch_id FROM batches ORDER BY rowid')]
-            batches = [self._batch(con, batch_id, verify_payload=False) for batch_id in ids]
+            rows = list(con.execute('SELECT batch_id, state FROM batches ORDER BY rowid'))
+            batches = [self._batch(con, row[0], verify_payload=False, state=json.loads(row[1])) for row in rows]
             return [b for b in batches if phases is None or b['phase'] in phases]
 
     def pending_batches(self, *, now: float, max_units: int = 12, max_chars: int = 500000) -> list[dict]:
@@ -919,11 +932,19 @@ class IncrementalLedger:
         return target
 
     def _children_for(self, con, batch_id):
+        # SQL-side JSON scan + per-run memo: the json_each query is still a
+        # full-table scan per call and _manifest_proof runs it for every batch
+        # on every validation pass. The children of a batch are immutable until
+        # a batches-table write, so memoize and invalidate on _put.
+        if batch_id in self._children_cache:
+            return self._children_cache[batch_id]
         children = []
-        for (key,) in con.execute('SELECT batch_id FROM batches'):
-            state = self._read(con, 'batches', key)
-            if batch_id in state.get('parent_batch_ids', []):
-                children.append(state)
+        for row in con.execute(
+                "SELECT state FROM batches WHERE EXISTS ("
+                "SELECT 1 FROM json_each(batches.state, '$.parent_batch_ids') WHERE value = ?)",
+                (batch_id,)):
+            children.append(json.loads(row['state']) if isinstance(row, sqlite3.Row) else json.loads(row[0]))
+        self._children_cache[batch_id] = children
         return children
 
     def _manifest_proof(self, con, batch, manifest, *, verify_files):

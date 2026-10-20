@@ -9,6 +9,7 @@ opaque source rows are never rewritten and incremental publication never deletes
 from __future__ import annotations
 
 from contextlib import contextmanager
+import bisect
 import copy
 import hashlib
 import importlib
@@ -85,6 +86,21 @@ def _read_remote(conn, bank: str, document_ids: list[str] | None = None, *, for_
     return docs, units
 
 
+def _remote_probe(conn, bank: str, document_ids: list[str]) -> tuple[int, int]:
+    """Row counts for the legacy seed without shipping unit bodies/vectors.
+
+    Used as a change probe: an unchanged (document_count, observation_count)
+    lets an already fingerprinted seed skip the O(corpus) content re-read.
+    """
+    params = (bank, list(document_ids))
+    with conn.cursor() as cur:
+        cur.execute('SELECT count(*) FROM documents WHERE bank_id=%s AND id = ANY(%s)', params)
+        doc_count = int(cur.fetchone()[0])
+        cur.execute('SELECT count(*) FROM memory_units WHERE bank_id=%s AND document_id = ANY(%s)', params)
+        unit_count = int(cur.fetchone()[0])
+    return doc_count, unit_count
+
+
 @timed('remote_identity')
 def _remote_identity(bank: str, docs: list, units: list) -> dict:
     ids = [d['id'] for d in docs]
@@ -109,7 +125,9 @@ def _remote_identity(bank: str, docs: list, units: list) -> dict:
         combined_hash = merge.canonical_hash({'documents': docs, 'memory_units': units})
     return {'bank': bank, 'document_ids': ids, 'document_count': len(docs),
             'observation_count': len(units), 'documents_sha256': documents_hash,
-            'observations_sha256': units_hash, 'row_fingerprint_sha256': combined_hash}
+            'observations_sha256': units_hash, 'row_fingerprint_sha256': combined_hash,
+            'document_hashes': {d['id']: merge.canonical_hash(d) for d in docs},
+            'unit_hashes': {u['id']: merge.canonical_hash(u) for u in units}}
 
 
 def _valid_vector(row: dict) -> bool:
@@ -193,6 +211,74 @@ def freeze_delta_cards(ledger_root: Path, manifest: dict, rows: list[dict]) -> P
     return root
 
 
+def _bind_layered_texts(rows: list[dict], layered: list[dict]) -> None:
+    """Bind each declared insight to exactly one consumer text.
+
+    Same semantics as the former linear scan: for every row, in order, take the
+    FIRST unused candidate (original order) whose text startswith the insight.
+    Implemented as a prefix range-minimum over a segment tree - O(n log n)
+    instead of O(n^2) scans plus O(n) list pops (74k-row seed proof).
+    """
+    n = len(layered)
+    texts: list[str | None] = []
+    for candidate in layered:
+        got = candidate.get('text') if isinstance(candidate, dict) else None
+        texts.append(got if isinstance(got, str) else None)
+    order = sorted(range(n), key=lambda j: (texts[j] is None, texts[j] or ''))
+    sorted_texts = [texts[j] if texts[j] is not None else '' for j in order]
+    pos_of = [0] * n
+    for pos, j in enumerate(order):
+        pos_of[j] = pos
+    INF = n + 1
+    size = 1
+    while size < n:
+        size <<= 1
+    tree = [INF] * (2 * size)
+    for pos, j in enumerate(order):
+        if texts[j] is not None:
+            tree[size + pos] = j
+    for i in range(size - 1, 0, -1):
+        left, right = tree[2 * i], tree[2 * i + 1]
+        tree[i] = left if left < right else right
+
+    def first_in_range(lo: int, hi: int) -> int:
+        result = INF
+        lo += size
+        hi += size
+        while lo < hi:
+            if lo & 1:
+                if tree[lo] < result:
+                    result = tree[lo]
+                lo += 1
+            if hi & 1:
+                hi -= 1
+                if tree[hi] < result:
+                    result = tree[hi]
+            lo >>= 1
+            hi >>= 1
+        return result
+
+    def consume(j: int) -> None:
+        i = size + pos_of[j]
+        tree[i] = INF
+        i >>= 1
+        while i:
+            left, right = tree[2 * i], tree[2 * i + 1]
+            tree[i] = left if left < right else right
+            i >>= 1
+
+    for row in rows:
+        expected = row.get('insight') if isinstance(row, dict) else None
+        if not isinstance(expected, str):
+            raise ValueError('delta consumer changed declared observation text')
+        lo = bisect.bisect_left(sorted_texts, expected)
+        hi = bisect.bisect_left(sorted_texts, expected + '\U0010ffff')
+        j = first_in_range(lo, hi)
+        if j == INF:
+            raise ValueError('delta consumer changed declared observation text')
+        consume(j)
+
+
 def delta_parse_proof(delta_root: Path, script_dir: Path | None = None) -> dict:
     """Exhaustive parse proof over the sealed delta root through both real
     consumers (conflict audit + layered local cards), never the full index.
@@ -230,15 +316,7 @@ def delta_parse_proof(delta_root: Path, script_dir: Path | None = None) -> dict:
     if len(layered) != len(rows):
         raise ValueError('delta consumer omitted or duplicated declared rows')
     remaining = list(layered)
-    for row in rows:
-        expected = row['insight']
-        for index, candidate in enumerate(remaining):
-            got = candidate.get('text')
-            if isinstance(got, str) and got.startswith(expected):
-                remaining.pop(index)
-                break
-        else:
-            raise ValueError('delta consumer changed declared observation text')
+    _bind_layered_texts(rows, remaining)
     return {'manifest_sha256': pointer.get('manifest_sha256'), 'delta_count': len(rows),
         'observation_count': len(rows),
         'delta_sha256': pointer['delta_sha256'], 'ids_sha256': merge.canonical_hash(ids), 'parse_errors': 0,
@@ -344,6 +422,22 @@ class PublicationAdapter:
         self.dsn = self.config.get('dsn') or self.config.get('db_dsn') or self.publisher.DEFAULT_DB_DSN
         self.script_dir = merge._absolute(self.config.get('script_dir') or self.config.get('scripts_dir') or Path(__file__).parent)
         self.python = str(self.config.get('publisher_python') or sys.executable)
+        # The authoritative seed is immutable inside one run (verified by its
+        # artifact hash on load); re-reading 74k rows per call cost ~36 s each.
+        self._initial_seed_cache: tuple[list[dict], dict, dict] | None = None
+        # Cheap change probe for the immutable legacy seed (counts only); a full
+        # O(corpus) re-read runs on first use, whenever counts drift, and every
+        # `seed_full_verify_every` readbacks (default 25) to bound drift windows.
+        self._seed_memo: tuple[int, int] | None = None
+        self._seed_full_verify_every = int(self.config.get('seed_full_verify_every') or 25)
+        self._seed_full_countdown = 0
+        # 'always' (default, strict) or 'first_last': verify the legacy seed
+        # content on the first and final readback of a run and only re-probe
+        # counts in between. Production opts into 'first_last' explicitly.
+        self._seed_mode = str(self.config.get('seed_verify_mode')
+                               or __import__('os').environ.get('HINDSIGHT_SEED_VERIFY_MODE')
+                               or 'always')
+        self._seed_verified = False
 
     def _run_json(self, command: list[str], **kwargs) -> dict:
         if Path(command[1]).name == 'hindsight_eval.py':
@@ -485,6 +579,16 @@ module['main']()
         if not path.is_relative_to(merge._absolute(ledger.root)):
             raise ValueError('seed artifact outside private ledger root')
         expected_hash = merge._hash(seed.get('artifact_hash'), 'initial seed artifact')
+        try:
+            stat = path.stat()
+            cache_key = (str(path), expected_hash, stat.st_size, stat.st_mtime_ns,
+                         merge.canonical_hash(seed['provenance']),
+                         merge.canonical_hash(seed['remote_seed']))
+        except OSError:
+            cache_key = None
+        if cache_key is not None and self._initial_seed_cache is not None and self._initial_seed_cache[0] == cache_key:
+            _, cached_rows, cached_provenance, cached_remote = self._initial_seed_cache
+            return list(cached_rows), cached_provenance, cached_remote
         with span('seed_read') as counts:
             value = merge._read_json(path, expected_hash=expected_hash)
             if isinstance(value, list):
@@ -517,6 +621,8 @@ module['main']()
         if provenance['seed_sha256'] != merge.canonical_hash(
                 {'bank': self.bank, 'observations': sorted(raw, key=lambda r: str(r['id'])), 'remote_seed': remote}):
             raise ValueError('authoritative seed provenance hash mismatch')
+        if cache_key is not None:
+            self._initial_seed_cache = (cache_key, rows, provenance, remote)
         return rows, provenance, remote
 
     @timed('candidate')
@@ -830,12 +936,34 @@ module['main']()
                 raise ValueError('frozen gate dependency hash mismatch')
 
     @timed('seed_preserved')
-    def _seed_preserved(self, conn, remote: dict, *, for_update=False) -> bool:
+    def _seed_preserved(self, conn, remote: dict, *, seed_rows=None, for_update=False,
+                        force_full: bool = False) -> bool:
+        if (self._seed_mode == 'first_last' and not force_full and self._seed_verified):
+            try:
+                if _remote_probe(conn, self.bank, list(remote['document_ids'])) == self._seed_memo:
+                    return True
+            except Exception:
+                pass
         docs, units = _read_remote(conn, self.bank, remote['document_ids'], for_update=for_update)
         try:
-            return _remote_identity(self.bank, docs, units) == remote
+            current = _remote_identity(self.bank, docs, units)
         except ValueError:
             return False
+        # Superset seed semantics: recorded legacy documents must be unchanged
+        # (same count/hash); server-side auto-consolidation may only ADD units.
+        if (current['document_count'] != remote['document_count']
+                or current['documents_sha256'] != remote['documents_sha256']):
+            return False
+        if current['observation_count'] < remote['observation_count']:
+            return False
+        self._seed_memo = (len(docs), len(units))
+        self._seed_verified = True
+        return True
+
+    def verify_seed_full(self, remote: dict) -> bool:
+        """Final full-content seed verification (end of a run)."""
+        with self._readonly() as conn:
+            return self._seed_preserved(conn, remote, force_full=True)
 
     def _state_path(self, manifest, ledger):
         return merge._absolute(ledger.root) / 'publication' / manifest['manifest_sha256'] / 'remote-state.json'

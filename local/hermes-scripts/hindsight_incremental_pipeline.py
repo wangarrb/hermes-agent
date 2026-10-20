@@ -551,6 +551,14 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
                     report['published'] = True
                     _record(report, 'publish', status='readback_verified', generation_id=manifest['generation_id'])
             remaining = [b for b in ledger.list_batches() if b['phase'] != 'published']
+            if (not remaining and execute and report.get('published')
+                    and getattr(client, '_seed_mode', 'always') == 'first_last'):
+                # End-of-run full seed verification: the middle of a run only
+                # re-probes counts, so the final state is asserted in full here.
+                seed_remote = ledger.initialization_manifest()['seed']['remote_seed']
+                with span('seed_full_verify_final'):
+                    if not client.verify_seed_full(seed_remote):
+                        raise ValueError('final authoritative legacy seed verification failed')
             report.update(status='deferred' if remaining else 'completed',
                           remaining_batches=len(remaining), used_units=used_units, used_chars=used_chars)
     except RetryDeferred as error:
@@ -563,6 +571,8 @@ def run_incremental(config, *, ledger, client, llm, clock=time.time, execute=Fal
         report['errors'].append({'class': error.error_class, 'type': type(error).__name__})
         report['status'] = 'deferred'
     except Exception as error:
+        import traceback
+        traceback.print_exc()
         category, _transient = classify_error(error)
         if reporter is not None:
             reporter.fail(error)
